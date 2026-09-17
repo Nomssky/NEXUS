@@ -4,7 +4,7 @@
 **Module:** Core Security & Identity Plane\
 **Depends on:** Governance, Policy & Safety Control, Agent Runtime, Tool
 Runtime, Model Router, Memory, Attention\
-**Next:** Persistence, State & Data Infrastructure System
+**Next Layer:** CONTRACTS (all successor modules exist and are canonical)
 
 ------------------------------------------------------------------------
 
@@ -1183,28 +1183,13 @@ Wajib diuji:
 
 ------------------------------------------------------------------------
 
-# 60. Next Module
+# 60. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+Architecture remains locked; no new modules from this cleanup.
 
-**PERSISTENCE_STATE_DATA_INFRASTRUCTURE.md**
+-   [Persistence & State Infrastructure](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md) owns durable state, databases, event store, workflow/agent/memory/artifact storage, secrets metadata, snapshots, checkpoints, transactions, recovery, backup, migration, consistency.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md) owns policy enforcement and authority precedence; Identity enforces, does not set policy.
+-   [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md) owns agent identity/lifecycle; [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) owns tool execution boundary; [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) owns external connectivity; Identity scopes access to all three.
+-   [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md) boundaries unchanged.
 
-Fokus:
-
-``` text
-Durable State
-Database
-Event Store
-Workflow State
-Agent State
-Memory Storage
-Artifact Storage
-Secrets Metadata
-Snapshots
-Checkpoints
-Transactions
-Recovery
-Backup
-Migration
-Consistency
-```
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

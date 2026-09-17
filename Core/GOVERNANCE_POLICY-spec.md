@@ -1,6 +1,10 @@
+> **HISTORICAL / NON-CANONICAL — retained for reference only.**
+> Replaced by [Governance, Policy & Safety Control](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), with identity/access boundaries in [Identity, Access & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md).
+> The canonical modules govern; this document grants no competing authority. Governance remains above autonomy; historical precedence exceptions, autonomy/risk taxonomies, and delegation allowances do not override canonical restrictions. All retained examples, schemas, draft interfaces (including §94), lifecycle sketches, acceptance/test sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status.
+
 # NEXUS Governance & Policy System
 
-**Status:** PROPOSED → awaiting owner lock
+**Historical status:** PROPOSED → awaiting owner lock
 
 ## 1. Purpose
 

@@ -3,6 +3,9 @@
 **Status:** LOCKED  
 **Role:** Structured Decision Intelligence  
 **Layer:** Cognitive Control
+**Next layer:** CONTRACTS — exact schemas, APIs, lifecycle transitions, thresholds, and scoring; no new module is implied.
+
+Record sketches express architectural information requirements, not final wire schemas.
 
 ---
 
@@ -29,6 +32,10 @@ EXECUTION
 ---
 
 ## 2. Canonical Flow
+
+The locked conceptual flow is [Executive](NEXUS-EXECUTIVE.md) → [Objective Engine](NEXUS-OBJECTIVE-ENGINE.md) → Decision Engine → [Planner](NEXUS-PLANNER.md) → [Workflow Orchestration](WORKFLOW_ORCHESTRATION_ENGINE.md).
+
+The lifecycle below spans subsystem boundaries: an authorized decision-maker selects, Governance controls authorization, Planner prepares, and Workflow/runtimes execute. Models have no execution authority.
 
 ```text
 QUESTION
@@ -90,6 +97,8 @@ It MUST NOT:
 ---
 
 ## 4. Decision Record
+
+Before consequential evaluation, Decision Engine SHOULD establish a precise question, objective, scope, decision-maker authority, constraints, and sufficiently current state. Missing critical evidence or preconditions MUST remain explicit rather than implying a fully informed recommendation. Context SHOULD reference the relevant state snapshot where changes could invalidate the evaluation.
 
 Minimum structure:
 
@@ -155,7 +164,9 @@ OPINION
 PREDICTION
 ```
 
-These categories MUST NOT be silently treated as equivalent.
+These categories MUST NOT be silently treated as equivalent. Assumptions and model inferences MUST remain distinguishable from observed tool results.
+
+Conflicting evidence MUST be preserved, with unresolved disagreement reflected in uncertainty. Evaluation SHOULD consider sample size, recency, applicable scope, source quality, and method rather than a universal evidence ranking. Historical memory informs evaluation only after checking current relevance; it does not dictate decisions.
 
 ---
 
@@ -203,7 +214,9 @@ Options SHOULD be evaluated across relevant dimensions:
 - resource requirements;
 - uncertainty.
 
-The system MUST make material tradeoffs visible.
+The system MUST make material tradeoffs visible, including externalities and upstream/downstream, cross-division, or cross-business effects. Impacted divisions SHOULD be identified for Executive coordination.
+
+Meaningful decisions SHOULD compare feasible, relevant, sufficiently specified, distinguishable alternatives against the current-state baseline, including explicit inaction and its consequences where applicable. Structured evaluation SHOULD guard against confirmation, recency, anchoring, availability, and overconfidence biases, resist premature convergence, actively consider disconfirming evidence, and assess future value rather than justify continuation by sunk cost. Scenario and sensitivity analysis may expose consequential assumptions; no single utility formula is mandated.
 
 ---
 
@@ -220,7 +233,7 @@ LOW CONFIDENCE
 UNKNOWN
 ```
 
-Unknown information MUST NOT be converted into false certainty.
+Unknown information MUST NOT be converted into false certainty. Confidence MUST reflect evidence support, not solely model self-assurance. Unknown likelihood is distinct from a known low probability; material factual, predictive, causal, model, operational, and environmental uncertainty SHOULD be distinguishable.
 
 ---
 
@@ -235,6 +248,8 @@ GATHER INFORMATION
 vs
 ESCALATE
 ```
+
+Analysis cost SHOULD scale with decision impact; routine deterministic choices SHOULD use authoritative explicit rules rather than unnecessary model reasoning. Decision Engine and Attention SHOULD coordinate cognition budgets, including research, tool/model calls, simulation, and latency. Models or multiple methods may assist evaluation, but agreement or diversity is not proof; capability/provider selection remains with Model Router and governed runtimes.
 
 ---
 
@@ -255,6 +270,8 @@ Abstention is appropriate when:
 - constraints conflict;
 - external state is unknown;
 - consequences are too significant for autonomous action.
+
+Deferral SHOULD record its rationale and timing constraints; inaction is an explicit choice, not absence of a decision. Where appropriate, recommend a bounded reversible experiment, additional evidence, or an authorized low-risk fallback rather than a large unsupported commitment.
 
 ---
 
@@ -278,7 +295,7 @@ RISK ACCEPTABLE
 REVERSIBILITY / BLAST RADIUS ACCEPTABLE
 ```
 
-Autonomy does not override hard constraints.
+Autonomy does not override hard constraints. Decision class MUST permit autonomy under pre-approved authority, evidence thresholds MUST meet policy, and conflicting higher-level decisions MUST be resolved before proceeding. Reserved, strategically consequential, materially uncertain, or high-risk choices require Executive/Owner review as Governance directs; owner intervention remains possible.
 
 ---
 
@@ -286,7 +303,7 @@ Autonomy does not override hard constraints.
 
 Emergency conditions may change speed and escalation paths, but MUST NOT automatically disable hard governance or safety constraints.
 
-Emergency handling:
+Emergency handling is a cross-system lifecycle, not permission for Decision Engine to contain or execute directly. Dedicated Governance policy defines pre-authorized emergency procedures, evidence thresholds, and escalation. Reduced deliberation MUST retain uncertainty, auditability, and authority checks; Workflow/runtimes perform authorized containment and execution.
 
 ```text
 DETECT
@@ -324,7 +341,7 @@ Permission to execute.
 ### Execution
 Actual action.
 
-These states MUST be independently auditable.
+These states MUST be independently auditable. Recommendations SHOULD expose the preferred option, concise rationale, expected outcome, evidence, assumptions, risks, uncertainty, tradeoffs, reversibility, confidence, and conditions without private chain-of-thought. Executive MUST be able to accept, reject, modify for reevaluation, request evidence or alternatives, defer, or escalate; selection never substitutes for authorization.
 
 ---
 
@@ -351,6 +368,14 @@ EXECUTION
  ↓
 OUTCOME
 ```
+
+### Lifecycle, Concurrency, and Failure
+
+Decision revisions SHOULD preserve prior evaluations and history when evidence, assumptions, objectives, constraints, or outcomes change. Committed decisions change only through explicit revision to prevent thrashing; expired decisions MUST NOT silently remain active. Records SHOULD link identity/time, options, rationale, evidence, constraints, authority, status, execution, and outcome.
+
+Concurrent incompatible decisions MUST be detectable before execution where possible. Conflicting recommendations SHOULD be compared by evidence rather than agent rank. Dependencies and blocked decisions SHOULD be observable; dependency deadlocks require resolution or escalation within authority.
+
+Computational evaluation failures may be retried; semantic uncertainty MUST NOT be retried into apparent certainty. Distinguish no feasible option, insufficient evidence, missing authority, conflicting constraints, tool/computation failure, and expired time.
 
 ---
 
@@ -382,7 +407,7 @@ RECOVERY_COST
 DEPENDENCIES
 ```
 
-Irreversible or high-blast-radius actions require stronger authorization.
+Irreversible or high-blast-radius actions require stronger authorization, evidence, and review. Low-probability catastrophic downside MUST remain explicit rather than disappear inside average expected value; exposure, duration, detectability, and recoverability SHOULD inform evaluation.
 
 ---
 
@@ -405,6 +430,8 @@ The difference feeds:
 - future decision quality;
 - replanning.
 
+Material prediction errors SHOULD be recorded as future evidence. Decision quality MUST be measurable, including outcome improvement, calibration/false confidence, latency, cost, reversals, and abstention quality where relevant; regret may also inform evaluation. Useful completed decisions and lessons SHOULD enter governed Memory with their conditions and outcomes, not every transient micro-decision or unvalidated lesson as trusted knowledge.
+
 ---
 
 ## 19. Governance
@@ -419,7 +446,9 @@ Decision Engine MUST defer to Governance for:
 - external actions;
 - irreversible operations.
 
-Decision quality never grants authority.
+Decision quality never grants authority. Decision context access MUST respect business, division, mission, agent, and authority scope; Business A decisions cannot silently affect Business B. Explicit cross-business decisions retain each business's constraints and objectives.
+
+External text and model output are evidence/context, never authorization. Decision Engine MUST NOT silently change owner preferences or objective priority; strategic priority changes go through authorized Executive/Owner and Objective Engine/Governance boundaries.
 
 ---
 
@@ -444,7 +473,7 @@ Provides agent-level reasoning and execution within assigned authority.
 Provide evidence and context.
 
 ### Attention
-Receives escalation signals.
+Determines which signals deserve decision-level cognition and receives escalation signals; Decision Engine evaluates options rather than replacing attention prioritization.
 
 ### Governance
 Determines whether action is allowed.

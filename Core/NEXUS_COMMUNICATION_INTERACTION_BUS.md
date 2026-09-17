@@ -1227,25 +1227,15 @@ NO GOVERNANCE BYPASS
 
 ---
 
-# 65. Next Module
+# 65. Existing Boundaries and CONTRACTS Next Layer
 
-**NEXUS KNOWLEDGE & INFORMATION INGESTION SYSTEM**
+Architecture remains locked; no new modules from this cleanup.
 
-Fokus:
+-   [Knowledge & Information Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) owns web/external information ingestion, documents, structured/unstructured data, source trust, ingestion pipelines, extraction, normalization, classification, provenance, knowledge formation, freshness, contradiction handling, research workflows, knowledge boundaries.
+-   [Memory & Context Intelligence](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md) owns durable memory admission and context assembly; Knowledge owns source-based extraction and knowledge formation.
+-   [Attention & Priority Intelligence](NEXUS-ATTENTION-PRIORITY-INTELLIGENCE.md) owns human-attention prioritization and escalation; Communication carries information/intent, not authority.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md), [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md), [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) boundaries unchanged.
 
-- web and external information ingestion
-- documents
-- structured/unstructured data
-- source trust
-- ingestion pipelines
-- extraction
-- normalization
-- classification
-- provenance
-- knowledge formation
-- freshness
-- contradiction handling
-- research workflows
-- knowledge boundaries
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.
 - malicious-content defense
 - integration with Memory, Event, Model, Tool, Security, and Objective systems

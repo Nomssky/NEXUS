@@ -1285,27 +1285,11 @@ Wajib diuji:
 
 ------------------------------------------------------------------------
 
-# 66. Next Module
+# 66. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+Architecture remains locked; no new modules from this cleanup.
 
-**NEXUS_SCHEDULING_RESOURCE_RUNTIME.md**
+-   [Scheduling & Resource Runtime](NEXUS-SCHEDULING-RESOURCE-RUNTIME.md) owns 24/7 scheduler, job queue, worker pool, concurrency, prioritization, resource allocation (CPU/GPU/model/tool capacity), business fairness, agent scheduling, backpressure, rate limits, deadlines.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md), [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md), [Memory](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md), [Knowledge Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) boundaries unchanged.
 
-Fokus:
-
-``` text
-24/7 Scheduler
-Job Queue
-Worker Pool
-Concurrency
-Prioritization
-Resource Allocation
-CPU/GPU
-Model Capacity
-Tool Capacity
-Business Fairness
-Agent Scheduling
-Backpressure
-Rate Limits
-Deadlines
-```
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

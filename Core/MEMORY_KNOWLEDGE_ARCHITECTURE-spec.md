@@ -1,6 +1,10 @@
+> **HISTORICAL / NON-CANONICAL — retained for reference only.**
+> Replaced by [Memory & Context Intelligence](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md) for memory lifecycle, retrieval, and context, and [Knowledge & Information Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) for source-based knowledge formation, extraction, and entity resolution.
+> The canonical modules govern; this document grants no competing authority. All retained examples, taxonomies, schemas, interface drafts, acceptance/test sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status.
+
 # NEXUS Memory & Knowledge Architecture
 
-**Status:** PROPOSED → awaiting owner lock
+**Historical status:** PROPOSED → awaiting owner lock
 
 ## 1. Purpose
 

@@ -1,6 +1,10 @@
+> **HISTORICAL / NON-CANONICAL — retained for reference only.**
+> Replaced by [Tool Runtime & Capability Execution](NEXUS-TOOL-RUNTIME-CAPABILITY.md) for governed tool execution and [API Integration Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) for connectors, authentication protocols, and external connectivity. Result admission belongs to [Memory & Context Intelligence](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md) and source-based knowledge formation to [Knowledge & Information Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md).
+> The canonical modules govern; this document grants no competing authority. All retained examples, taxonomies, schemas, interface drafts, acceptance/test sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status.
+
 # NEXUS Tool & Integration Runtime
 
-**Status:** PROPOSED → awaiting owner lock
+**Historical status:** PROPOSED → awaiting owner lock
 
 ## 1. Purpose
 

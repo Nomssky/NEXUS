@@ -347,7 +347,7 @@ NEXUS harus dapat mengenali bahwa:
 
 mungkin merujuk pada entity yang sama.
 
-Entity resolution harus menyimpan confidence dan evidence.
+Entity resolution harus menyimpan confidence dan evidence. Resolved entities harus memiliki stable identifiers; mentions hanya digabung bila evidence/confidence cukup, tanpa menghapus ambiguous alternatives atau melintasi unauthorized scope. Normalized metadata/entity references harus tersedia sebelum indexing; frequently queried structured facts tidak boleh bergantung pada embeddings saja.
 
 ---
 
@@ -635,6 +635,10 @@ CONTRADICTION_DETECTED
 ```
 
 Event kemudian dapat memicu workflow atau Attention.
+
+### 33.1 Change Semantics
+
+Change detection harus membedakan real change dari formatting noise dan menahan re-ingestion loop untuk content yang merujuk dirinya sendiri. Perubahan critical knowledge dapat memicu revalidation/replanning pada workflow yang bergantung padanya; dependency tracking ditentukan oleh konsumen, bukan oleh ingestion layer. Ingestion event tidak diperlakukan sebagai authority, hanya trigger untuk proses milik modul lain.
 
 ---
 
@@ -998,7 +1002,7 @@ CHANGED
 REMOVED
 ```
 
-NEXUS harus membedakan source unavailable dengan information false.
+NEXUS harus membedakan source unavailable dengan information false. Partial ingestion state harus tetap terlacak ketika source berubah status, sehingga failures tidak diam-diam diabaikan atau dianggap sebagai facts.
 
 ---
 
@@ -1110,24 +1114,8 @@ Wajib menangani:
 
 ---
 
-# 61. Next Module
+# 61. Existing Boundary and CONTRACTS Next Layer
 
-**NEXUS API & INTEGRATION GATEWAY**
+Eksternal connectivity sudah dimiliki oleh **NEXUS API INTEGRATION GATEWAY** (lihat [NEXUS-API-INTEGRATION-GATEWAY.md](NEXUS-API-INTEGRATION-GATEWAY.md)): unified API layer, external API integrations, webhooks, authentication, rate limits, API versioning, connector lifecycle, request/response validation, integration scopes, external system state, retries/idempotency, webhook security, dan multi-business isolation. Acquisition dari API/webhook source types melewati Gateway; konsumsi hasilnya tetap milik modul ini.
 
-Fokus:
-
-- unified API layer
-- internal service communication
-- external API integrations
-- webhooks
-- authentication
-- rate limits
-- API versioning
-- connector lifecycle
-- request/response validation
-- integration scopes
-- external system state
-- retries/idempotency
-- webhook security
-- multi-business isolation
-- integration with Tool Runtime, Security, Governance, Identity, Communication, Knowledge, Workflow, and Observability
+Arsitektur tetap locked; tidak ada modul baru dari cleanup ini. Layer berikutnya adalah **CONTRACTS**: source identity/provenance field schemas, chunk/entity/claim schemas, extraction/normalization interfaces, retrieval handoffs, dan test implementations. Daftar field, contoh, dan interfaces dalam dokumen ini adalah conceptual contract candidates; normative boundary requirements tetap berlaku.

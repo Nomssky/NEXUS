@@ -1,6 +1,10 @@
+> **HISTORICAL / NON-CANONICAL — retained for reference only.**
+> Replaced by [Executive](NEXUS-EXECUTIVE.md); its canonical requirements govern owner-intent interpretation and coordination.
+> The canonical flow is Executive → Objective → Decision → Planner → Workflow; models have no execution authority. Retained examples, taxonomies, schemas, API/interface drafts, acceptance sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status. The legacy body is preserved; missing architectural requirements are consolidated in the canonical owner.
+
 # NEXUS Executive
 
-**Status:** PROPOSED → awaiting owner lock
+**Historical status:** PROPOSED → awaiting owner lock
 
 ## 1. Definition
 

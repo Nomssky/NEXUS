@@ -867,6 +867,14 @@ cross-business isolation
 
 > **A NEXUS workflow is a durable autonomous execution process, not a chat session. It coordinates agents, tools, events, memory, and objectives across time; survives interruption; recovers from failure; and replans when reality changes, while remaining bounded by governance and business scope.**
 
-## Next Layer
+## Existing Boundaries and CONTRACTS Next Layer
 
-After this is locked, proceed to **Agent Runtime & Agent Lifecycle System**: creation, configuration, spawning, assignment, isolation, model/tool access, collaboration, supervision, pause/resume, and termination of agents.
+Architecture remains locked; no new modules from this cleanup.
+
+-   [Agent Runtime & Lifecycle](NEXUS-AGENT-RUNTIME-LIFECYCLE.md) owns creation, configuration, spawning, assignment, isolation, model/tool access, collaboration, supervision, pause/resume, and termination of agents.
+-   [Planner](NEXUS-PLANNER.md) owns objective-aligned, authorized plan construction and decomposition; Workflow executes, does not re-plan autonomously.
+-   [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) owns external action boundary; [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) owns connectors/auth/provider reconciliation; Workflow coordinates via Tool Runtime.
+-   [Scheduling](NEXUS-SCHEDULING-RESOURCE-RUNTIME.md) owns priority/dependency/resource scheduling; [Event & Trigger](EVENT_TRIGGER_SYSTEM.md) owns wake/evaluate/route; Workflow consumes both.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Memory](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md), [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md) boundaries unchanged.
+
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

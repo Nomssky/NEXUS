@@ -1,6 +1,9 @@
 # NEXUS Agent Runtime & Lifecycle System
 
-**Status:** PROPOSED → awaiting owner lock
+> **HISTORICAL / NONCANONICAL — superseded source specification.** Replacement: [Agent Runtime & Lifecycle](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), with [Identity, Access & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md) and [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) retaining their respective boundaries.
+> The canonical owners govern; this source grants no competing authority. Historical lifecycle alternatives, examples, schemas, API/interface drafts, acceptance sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status. The source body is preserved for traceability.
+
+**Status:** HISTORICAL / NONCANONICAL (original proposal retained below)
 
 ## 1. Purpose
 
