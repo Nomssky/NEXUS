@@ -1071,24 +1071,12 @@ Modul dianggap selesai jika:
 
 ---
 
-# 55. Next Module
+# 55. Existing Boundaries and CONTRACTS Next Layer
 
-**NEXUS SECURITY & THREAT DEFENSE SYSTEM**
+Architecture remains locked; no new modules from this cleanup.
 
-Fokus berikutnya:
+-   [Security & Threat Defense](NEXUS_SECURITY_THREAT_DEFENSE.md) owns threat model, attack surface, prompt injection, agent hijacking, tool abuse, credential attacks, supply-chain security, sandbox escape, malicious artifacts, cross-business attacks, model/provider security, runtime isolation, anomaly-driven defense, incident response, security recovery.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md) owns policy enforcement; Configuration executes desired state, does not set policy.
+-   [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md), [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md), [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) boundaries unchanged.
 
-- threat model
-- attack surface
-- prompt injection
-- agent hijacking
-- tool abuse
-- credential attacks
-- supply-chain security
-- sandbox escape
-- malicious artifacts
-- cross-business attacks
-- model/provider security
-- runtime isolation
-- anomaly-driven defense
-- incident response
-- security recovery
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

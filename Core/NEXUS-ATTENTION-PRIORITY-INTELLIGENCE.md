@@ -4,15 +4,27 @@
 **Module:** Core Intelligence\
 **Depends on:** Event Trigger System, Objective Engine, Memory & Context
 Intelligence, Workflow & Orchestration, Agent Runtime\
-**Next:** Governance, Policy & Safety Control System
+**Next layer:** CONTRACTS; existing module boundaries are referenced in §55.
 
 ------------------------------------------------------------------------
 
 ## 1. Purpose
 
 NEXUS Attention adalah sistem yang menentukan **apa yang layak
-diperhatikan NEXUS, seberapa penting, kapan harus bertindak, kapan harus
+diperhatikan NEXUS, seberapa penting, kapan perlu review, kapan harus
 memberi tahu owner, dan kapan harus tetap diam**.
+
+Attention mengelola awareness, terutama human attention, bukan execution
+authority. Attention dapat merekomendasikan routing ke specialist atau
+Executive untuk review tanpa selalu menginterupsi owner; sistem ini tidak
+menjalankan task, membuat/redefinisi objective, menetapkan strategi, atau
+menggantikan Executive/Decision Engine. Execution scheduling tetap milik
+Scheduler/Orchestrator, dan semua tindakan tunduk pada Governance.
+
+Event (kejadian tercatat), signal (interpretasi relevan), dan attention item
+(concern yang diprioritaskan) harus berbeda. Event normalization tetap milik
+Event Trigger System; Attention menilai signal terhadap active context,
+bukan menggantikan event history atau Observability.
 
 Attention bukan sekadar notification system.
 
@@ -91,7 +103,11 @@ PAUSE
 EMERGENCY
 ```
 
-Attention tidak identik dengan interrupt.
+Attention tidak identik dengan interrupt. Outcome ACT_AUTONOMOUSLY, PAUSE,
+dan EMERGENCY adalah rekomendasi/handoff kepada komponen berwenang, bukan
+izin atau eksekusi oleh Attention. Field autonomous_action_allowed (§12)
+hanya mencerminkan hasil governance yang harus divalidasi kembali sebelum
+side effect; field tersebut tidak menerbitkan authority.
 
 ------------------------------------------------------------------------
 
@@ -199,7 +215,16 @@ attention_score =
   - noise_penalty
 ```
 
-Score digunakan untuk ranking.
+Score digunakan untuk ranking, bukan formula wajib atau authorization.
+Relevance terhadap objective, mission, incident, policy, owner instruction,
+dan monitored condition harus dinilai dalam business/division scope aktif.
+Novelty dan anomaly dari sistem pendeteksi dapat menaikkan prioritas bila
+bermakna; novelty saja tidak membenarkan interrupt. Deadline pressure harus
+mempertimbangkan sisa waktu dan pekerjaan, bukan kedekatan deadline saja.
+
+Objective priority memengaruhi tetapi tidak menentukan seluruh ranking:
+objective rendah dapat menghasilkan critical signal, sedangkan objective
+tinggi yang sehat tidak membutuhkan perhatian terus-menerus.
 
 Hard escalation rules dapat melewati scoring.
 
@@ -221,7 +246,10 @@ governance violation
 emergency condition
 ```
 
-Namun hard rule tetap tunduk pada governance.
+Namun hard rule tetap tunduk pada governance. Attention tidak boleh
+menciptakan kategori emergency sendiri. Direct owner messages harus mendapat
+penanganan khusus; explicit owner interruption mengikuti authority dan
+aturan escalation Governance, bukan diperlakukan sebagai noise biasa.
 
 ------------------------------------------------------------------------
 
@@ -338,6 +366,13 @@ max owner interruptions / hour
 max urgent notifications / day
 max concurrent high-attention workflows
 ```
+
+Budget harus mempertimbangkan expected value relatif terhadap cognitive
+cost, model calls, monitoring, dan investigation. Analisis mahal berprioritas
+rendah dapat ditunda saat resource terbatas tanpa menyembunyikan mandatory
+critical signals. Perubahan focus harus mempertimbangkan current focus dan
+switching cost; frequent low-value context switching harus ditekan.
+Budget ini tidak memberikan Attention kontrol atas execution scheduling.
 
 ------------------------------------------------------------------------
 
@@ -621,7 +656,17 @@ information becomes stale
 → confidence turun
 ```
 
-Attention bukan static score.
+Attention bukan static score. Item harus dikurangi prioritasnya atau ditutup
+ketika objective selesai, mission dibatalkan, watch expired, atau konteks
+tidak lagi relevan. Kondisi yang masih aktif tidak boleh hilang hanya karena
+umur item; decay tidak menghapus historical evidence. Memory historis tidak
+boleh mendominasi bukti terkini.
+
+Persistent watch adalah standing condition, bukan satu event. Watch harus
+memiliki scope, expected responder, kondisi trigger, dan expiry/cancellation;
+evaluasi menggunakan event/time triggers dari sistem terkait. Attention item
+harus mempertahankan ownership dan destination review, termasuk specialist
+atau Executive untuk konflik, cross-objective reasoning, dan replanning.
 
 ------------------------------------------------------------------------
 
@@ -713,7 +758,8 @@ dependency unavailable
 verification failed
 ```
 
-Attention dapat kemudian:
+Attention dapat merekomendasikan handoff kepada Planner, Orchestrator,
+Model Router, atau Agent Runtime sesuai authority untuk:
 
 ``` text
 replan workflow
@@ -819,6 +865,10 @@ Business C → CRITICAL
 ```
 
 Critical Business C tidak boleh tertutup oleh aktivitas Business A/B.
+Business/division scope harus dipertahankan pada signal, queue, ownership,
+dan destination. Global summaries atau coordinated cross-division items
+hanya boleh mengekspos konteks sesuai explicit authorization; global queue
+bukan izin untuk broadcast sensitive signals lintas scope.
 
 ------------------------------------------------------------------------
 
@@ -842,7 +892,10 @@ business priority
 objective priority
 ```
 
-Critical events tetap dapat bypass fairness queue.
+Critical events tetap dapat bypass fairness queue sesuai policy, tetapi
+recurring high-priority signals tidak boleh selamanya membuat necessary
+lower-priority review kelaparan. Aging, bounded queues, atau reserved review
+capacity harus menjaga fairness tanpa menunda mandatory critical handling.
 
 ------------------------------------------------------------------------
 
@@ -884,7 +937,11 @@ Provider outage
 1 root-cause attention
 ```
 
-Sub-events tetap disimpan untuk audit.
+Sub-events tetap disimpan untuk audit. Deduplication/aggregation harus
+mempertahankan count, first/latest occurrence, duration, severity, affected
+scope, dan referensi evidence. Correlated attention storms harus diringkas
+menjadi incident yang koheren, bukan unbounded interruptions; dugaan common
+cause tidak boleh menghapus bukti atau dianggap kepastian tanpa dasar.
 
 ------------------------------------------------------------------------
 
@@ -900,7 +957,11 @@ issue already being handled
 duplicate root cause
 ```
 
-Suppression harus memiliki reason dan expiry.
+Suppression harus memiliki reason, scope, dan expiry. Suppression/cooldown
+tidak boleh menyembunyikan kenaikan severity, perubahan scope, new evidence,
+policy violations, critical security signals, atau direct owner messages.
+Meaningful state changes harus mereset cooldown dan memicu re-evaluation;
+acknowledgement atau dismiss bukan bukti bahwa kondisi telah selesai.
 
 ------------------------------------------------------------------------
 
@@ -953,6 +1014,9 @@ security breach suspicion
 ```
 
 lebih baik masuk review queue daripada diabaikan sepenuhnya.
+
+Governance harus menentukan acceptable false-positive/false-negative
+thresholds menurut signal class, terutama untuk mandatory critical signals.
 
 ------------------------------------------------------------------------
 
@@ -1034,6 +1098,18 @@ Digunakan untuk:
 -   improving policies
 -   learning recurring patterns.
 
+Trace harus menghubungkan signal/evidence, scope, classification/priority,
+relevance, urgency, risk, objective alignment, keputusan, destination,
+suppression reason, timestamp, dan outcome. Ini operational audit record,
+bukan hidden model reasoning.
+
+Attention harus bekerja tanpa UI aktif. Saat failure, durable events tidak
+boleh hilang dan Executive harus dapat mendeteksi degraded Attention.
+Restart harus memulihkan unresolved items, critical watches, queue priorities,
+ownership/scope, suppression, dan cooldown yang masih berlaku. Recovery harus
+mengendalikan duplicate processing tanpa menganggap semua historical events
+sebagai fresh interruptions; durable event history bukan milik Attention saja.
+
 ------------------------------------------------------------------------
 
 # 48. Attention Analytics
@@ -1052,6 +1128,12 @@ escalation_rate
 suppression_rate
 autonomous_resolution_rate
 notification_rate
+duplicate_rate
+stale_attention_rate
+time_to_detection
+time_to_routing
+attention_cost
+objective_impact_coverage
 ```
 
 ------------------------------------------------------------------------
@@ -1074,7 +1156,9 @@ same warning
 
 Pattern tersebut dapat menjadi input untuk policy improvement.
 
-Automatic policy changes tetap harus melalui governance.
+Automatic policy changes tetap harus melalui governance. Learned ranking
+tidak boleh diam-diam mengubah critical attention policy; owner feedback
+harus dibedakan antara preference dan policy melalui authority semantics.
 
 ------------------------------------------------------------------------
 
@@ -1141,7 +1225,12 @@ Minimal test:
 -   decision pack
 -   digest
 -   audit
--   recovery after restart.
+-   recovery after restart, termasuk watches, ownership, suppression/cooldown,
+    dan replay tanpa interruption storm
+-   persistent watch trigger/expiry serta operasi tanpa UI
+-   suppression safety saat severity/scope/evidence berubah
+-   evidence-preserving deduplication dan anti-starvation
+-   handoff tidak menciptakan objective, authority, atau execution permission.
 
 ------------------------------------------------------------------------
 
@@ -1183,26 +1272,22 @@ Minimal test:
 
 ------------------------------------------------------------------------
 
-# 55. Next Module
+# 55. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+[Governance, Policy & Safety Control](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md)
+sudah menjadi authority boundary untuk policy, approval, safety, emergency
+controls, dan human control; bukan modul baru yang menunggu dibuat.
+[Event Trigger System](EVENT_TRIGGER_SYSTEM.md) memiliki event normalization,
+[Executive](NEXUS-EXECUTIVE.md) dan [Decision Engine](NEXUS-DECISION-ENGINE.md)
+memiliki strategic review/decision, sedangkan
+[Scheduling & Resource Runtime](NEXUS-SCHEDULING-RESOURCE-RUNTIME.md) dan
+[Workflow & Orchestration](WORKFLOW_ORCHESTRATION_ENGINE.md) memiliki execution
+scheduling/orchestration. Attention memprioritaskan awareness dan review,
+bukan mengambil authority komponen tersebut.
 
-**GOVERNANCE_POLICY_SAFETY_CONTROL.md**
-
-Fokus:
-
-``` text
-Governance
-Policy Engine
-Permission
-Authority
-Approval
-Risk
-Safety
-Human control
-Emergency controls
-Agent boundaries
-Business isolation
-Audit
-Compliance
-```
+Layer berikutnya adalah **CONTRACTS**, bukan penambahan modul atau implementasi.
+Exact signal/item/watch schemas, lifecycle transitions, scoring/queue
+algorithms, thresholds, trace fields, dan API §51 adalah nonbinding draft
+interface/schema candidates sampai divalidasi pada layer tersebut; normative
+boundary requirements tetap berlaku. [Legacy Attention](ATTENTION-spec.md)
+disimpan hanya sebagai historical reference, termasuk alternatif desainnya.

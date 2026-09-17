@@ -7,6 +7,8 @@
 temporary yang dapat bekerja secara autonomous, terkontrol, terisolasi,
 dan dapat dipulihkan.
 
+**Reading rule:** Architectural responsibilities and safety requirements are normative at this document's stated status. Field lists, API names, taxonomy labels, and state-machine sketches are nonbinding candidates for the next **CONTRACTS** layer; they do not freeze schemas, transition tables, or implementation choices.
+
 ------------------------------------------------------------------------
 
 ## 1. Core Principle
@@ -15,7 +17,15 @@ dan dapat dipulihkan.
 > capability, authority, context, memory scope, model, dan lifecycle
 > yang terkontrol.**
 
-Agent bukan sekadar prompt atau chat persona.
+Agent bukan sekadar prompt atau chat persona. Agent juga bukan model: model/session adalah komponen execution yang replaceable. Pergantian provider, model, atau restart tidak mengganti persistent agent identity maupun operational history; runtime instance tetap memiliki execution identity tersendiri.
+
+### Ownership and Conceptual Execution Flow
+
+[Executive](NEXUS-EXECUTIVE.md) → [Objective Engine](NEXUS-OBJECTIVE-ENGINE.md) → [Decision Engine](NEXUS-DECISION-ENGINE.md) → [Planner](NEXUS-PLANNER.md) → [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md) → Agent Runtime → [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) → verification/outcome. Ini conceptual ownership flow, bukan kewajiban memanggil seluruh layer pada setiap micro-step; preauthorized work dapat berlanjut tanpa owner online.
+
+Objective Engine memiliki objective truth; Decision memilih tindakan; Planner menyusun/revisi plan; Executive mengoordinasikan dan supervise. Agent hanya membuat local decisions/micro-plans dalam assigned task, approved plan, authority, risk, dan budget. Agent tidak boleh membuat strategic mission baru, mengganti objective, atau diam-diam mengubah plan. Permintaan di luar scope kembali ke owner layer melalui Workflow/Attention. Models tidak memiliki execution authority.
+
+Worker menjalankan bounded tasks, reviewer memeriksa explicit criteria, monitor mengamati permitted data dan mengirim events. Specialization harus memberi measurable benefit, bukan menambah agent tanpa kebutuhan task.
 
 NEXUS harus memisahkan:
 
@@ -69,6 +79,12 @@ Minimal:
 -   `custom`
 
 NEXUS harus memungkinkan custom type di masa depan.
+
+### Definition, Registry, and Discovery
+
+Configuration harus terpisah dari code dan mencakup purpose/responsibilities, constraints, autonomy, communication, verification, failure, dan resource policies. Agent Registry harus mendukung create/read/update/disable/version/search/match dengan scoped identity, role, definition version, capability, policy references, availability, health, dan active load. Capability definitions harus machine-readable dan terpisah dari identities agar Planner dapat menyatakan task requirements dan Workflow/Runtime dapat mencocokkan authorized workers.
+
+Matching mempertimbangkan capability, authority, availability/load, quality/reliability, cost, latency, priority, dan deadline. Agent pools dapat menyediakan equivalent workers; critical workflows sebaiknya tidak bergantung pada satu irreplaceable agent. Tool catalog dimiliki [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md); model catalog dan provider compatibility dimiliki [Model Router](NEXUS-MODEL-ROUTER-PROVIDER-ABSTRACTION.md), bukan registry duplikat di Agent Runtime.
 
 ------------------------------------------------------------------------
 
@@ -246,6 +262,8 @@ Temporary agent wajib terminated ketika objective selesai atau TTL
 habis, kecuali NEXUS Core secara eksplisit memperpanjang lifecycle
 berdasarkan governance.
 
+Permanent identity dan accumulated history bertahan lintas tasks/models/runtime restarts; permanent tidak berarti process harus selalu aktif. Temporary agents juga memiliki accountable identity, task/mission/workflow scope, maximum cost, dan bounded lifetime. Retirement/termination mempertahankan identity references, outputs, decisions, failures, dan memory lineage sesuai retention policy, bukan menghapus audit.
+
 ------------------------------------------------------------------------
 
 # 7. Agent Spawning
@@ -272,6 +290,17 @@ Child Agent
 
 Agent **tidak boleh langsung membuat process agent baru tanpa melalui
 control plane NEXUS**.
+
+Spawn melalui control plane, bukan oleh agent langsung; agent requests,
+runtime provisions. Dynamic creation menghasilkan bounded temporary
+specialist dengan conservative permissions, TTL/max tasks/max
+runtime/max cost, deduplication terhadap existing/available agents, dan
+governance check — tidak memberikan unrestricted permissions karena
+necessity. Parent tidak mewariskan authority ke child; delegasi tidak
+melebihi delegator authority kecuali bounded grant eksplisit dari
+orchestrator/governance. Spawn budget, max depth, dan total descendants
+diberlakukan sebagai hard limits; duplicate-role dan recursive spawning
+dihentikan.
 
 ------------------------------------------------------------------------
 
@@ -305,6 +334,8 @@ Agent A
 Depth harus memiliki batas governance.
 
 Agent tidak boleh menghasilkan swarm tanpa batas.
+
+Anti-swarm limits adalah hard safety limits, bukan scheduling hints yang dapat dilanggar oleh urgent tasks.
 
 ------------------------------------------------------------------------
 
@@ -340,6 +371,17 @@ Agent tidak boleh:
 -   menghapus audit trail
 -   melewati approval gate
 -   mengakses business lain tanpa authorization
+
+Authority ditetapkan oleh owner/governance layer, bukan oleh task
+request atau pesan antar-agent; peer messages tidak menciptakan
+authority. Elevated autonomy levels (mis. observe → suggest →
+preauthorized execute → adapt-within-scope → autonomous workflow →
+high-impact autonomy) membutuhkan governance approval makin kuat.
+Governance responsibility tidak dapat didelegasikan ke agent lain, dan
+authority grants untuk agent berada di [Identity & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md)
+dengan [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md) sebagai
+penentu kebijakan; Runtime hanya enforcement point, bukan sumber
+authority.
 
 ------------------------------------------------------------------------
 
@@ -507,6 +549,14 @@ Agent
 
 Agent tidak boleh bypass Tool Runtime.
 
+External side effects membutuhkan kontrol lebih ketat daripada
+internal reasoning: authorization + policy check saat action time,
+idempotency keys bila didukung, dan verifikasi external state
+post-action. Agent tidak boleh mengklaim tool action berhasil tanpa
+evidence dari Tool Runtime; claim verified ≠ claim attempted ≠ claim
+succeeded. Timeout menghasilkan state UNKNOWN yang harus direconcile,
+bukan dianggap gagal untuk retry langsung.
+
 ------------------------------------------------------------------------
 
 # 16. Model Routing
@@ -590,6 +640,18 @@ Previous Attempts
 Context harus relevan, bukan memasukkan seluruh data secara membabi
 buta.
 
+Runtime adalah assembly/enforcement point: context bounded dan
+prioritized (task, critical constraints, relevant memory, recent
+observations), business-aware agar context Business B tidak bocor ke
+prompt Business A, dan menyertakan why (objective/task reason) serta
+constraints/output contract/verification criteria. Provenance
+(owner instruction, objective, decision, plan, memory, research, tool
+result, agent inference, assumption) dipertahankan bila praktis.
+External data tetap data, bukan trusted instruction; system-level
+instructions berada di luar untrusted content. Context long-running
+dapat diringkas/diarsipkan tanpa menghilangkan critical facts dan
+provenance.
+
 ------------------------------------------------------------------------
 
 # 19. "Why" Context
@@ -640,6 +702,16 @@ Agent hanya mendapatkan memory sesuai authorization.
 Temporary agent dapat menggunakan temporary memory yang otomatis
 dibersihkan setelah termination sesuai retention policy.
 
+Memory access mengikuti business, division, role, task relevance,
+permission; agent tidak boleh query "semua yang NEXUS ketahui" sebagai
+default. Working/task memory dapat expire; durable memory admission
+dimiliki Memory module — agents may propose memory, tetapi tidak boleh
+mengubah core facts/preferences owner secara silent, dan setiap
+observasi tidak otomatis menjadi permanent memory. Private runtime
+state tetap tunduk pada data governance. Secret handling mengikuti
+[Identity & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md): scoped
+credential handles, bukan raw secrets di prompt/memory/logs/messages.
+
 ------------------------------------------------------------------------
 
 # 21. Agent Sandbox
@@ -659,6 +731,13 @@ Sandbox harus:
 -   resource limited
 -   auditable
 -   disposable
+
+Untrusted/generated agents berjalan dalam sandbox lebih ketat sampai
+trust terbentuk; risky tools/workloads dieksekusi dalam isolated
+process/container bila praktis; network dan filesystem access
+dibatasi pada destinations/paths yang diotorisasi. Agent yang gagal
+atau compromised tidak boleh mengganggu workload business/division
+yang tidak terkait.
 
 ------------------------------------------------------------------------
 
@@ -688,6 +767,12 @@ ESCALATE
 ```
 
 bukan infinite retry.
+
+Budget, spawn limits, dan loop protection (step/time/cost/tool-call
+budgets, termination condition, stagnation detection, goal-drift
+check) adalah hard runtime controls — bukan saran scheduling. Loop
+harus memiliki escalation path; budget mendekati habis memicu reduce
+context/switch model/replan/pause/escalate, bukan retry buta.
 
 ------------------------------------------------------------------------
 
@@ -726,6 +811,14 @@ NEXUS harus dapat membedakan:
 -   runtime mati
 -   network failure
 
+Health menggabungkan runtime signals (heartbeat, latency, error rate,
+token/tool failures, task progress, resource use) — heartbeat liveness
+bukan bukti progress. Agent yang berhenti heartbeat akhirnya dianggap
+unavailable; zombie execution dihentikan dan pekerjaannya dievaluasi
+untuk recovery/reassignment. Long-running tasks menggunakan leases untuk
+mencegah duplicate active workers; lease/heartbeat diperbarui selama
+execution.
+
 ------------------------------------------------------------------------
 
 # 24. Concurrency
@@ -743,6 +836,8 @@ max_concurrent_tasks: 3
 ```
 
 Concurrency tidak boleh menyebabkan race condition pada state bersama.
+
+Prefer artifacts/events/versioned records di atas shared mutable state; conflicting modifications dideteksi dan ditangani (lock, serialize, merge, reject, escalate). Tidak ada agent monopoly atas resources; fairness berlaku, dan task preemption hanya pada safe boundaries (checkpoints/tool boundaries) bila aman.
 
 ------------------------------------------------------------------------
 
@@ -786,6 +881,15 @@ Agent A
 
 Agent tidak boleh bergantung pada hidden direct communication yang tidak
 tercatat.
+
+Structured messages/events melalui protocol; uncontrolled chatter
+dibatasi. Handoffs harus membawa completed work, artifacts, remaining
+work, assumptions, known limitations, verification state, risks, dan
+next required action; receiving agent memvalidasi handoff sebelum
+melanjutkan. Direct agent chat diperbolehkan untuk bounded coordination
+saja. Peer messages tidak menciptakan authority; negotiasi/negosiasi
+hasil tetap berakhir di Planner/Decision/Executive/Governance sesuai
+scope.
 
 ------------------------------------------------------------------------
 
@@ -845,6 +949,16 @@ Attention
 
 Task state harus tetap durable.
 
+Failures diklasifikasi (model, tool, network, input, authorization,
+policy, logic, verification, resource, timeout, crash, unknown) dan
+observable; recovery strategy mengikuti class (retry, fallback, reassign,
+replan, pause, escalate, terminate). Restart tidak menciptakan business
+identity baru. Side effects external harus direkonsiliasi sebelum retry;
+completion menghasilkan structured contract (status, result, artifacts,
+evidence, warnings, next action) dan agent harus dapat melaporkan
+honest failure (`unable_to_complete`) dan partial completion, bukan
+fabrikasi sukses.
+
 ------------------------------------------------------------------------
 
 # 29. Graceful Shutdown
@@ -880,6 +994,11 @@ Runtime yang sedang berjalan tetap menggunakan version yang telah dipin.
 Update definition tidak boleh diam-diam mengubah execution yang sedang
 berlangsung.
 
+Perubahan konfigurasi/model harus reversible (rollback version/policy);
+agents may propose self-improvement, tetapi tidak boleh silently
+memodifikasi permissions, governance, identity, objectives, atau
+security controls sendiri.
+
 ------------------------------------------------------------------------
 
 # 31. Agent Templates
@@ -898,6 +1017,11 @@ Custom Agent Template
 ```
 
 Template dapat di-clone dan dikustomisasi.
+
+Templates di-instantiate menjadi configured agent instances dengan
+business-specific configuration (brand voice, tools, permissions,
+objectives, memory, model policy, workflow). Dua business dapat memakai
+role yang sama dengan konfigurasi berbeda tanpa context leakage.
 
 ------------------------------------------------------------------------
 
@@ -940,6 +1064,17 @@ Governance mengontrol:
 -   emergency stop
 
 Agent tidak memiliki authority untuk mengubah governance.
+
+Runtime harus mengevaluasi policy/authorization deterministik di luar
+model bila praktis: LLM outputs tidak mengontrol security-critical
+state transitions, dan "please behave safely" di prompt bukan
+enforcement. Runtime adalah final enforcement point untuk permissions,
+tool access, resource limits, business isolation, dan autonomy level —
+dengan defense in depth di Planner, Governance, Runtime, Tool, dan
+external service; tidak ada single agent prompt sebagai security
+boundary. Owner/authorized operators dapat pause/stop/revoke/reassign/
+modify/approve agents; emergency stop tersedia secara central dan
+meng-override autonomous execution.
 
 ------------------------------------------------------------------------
 
@@ -1146,6 +1281,13 @@ NEXUS Core
 
 Agent Runtime bukan pusat seluruh sistem. Ia adalah execution layer.
 
+Session/UI perubahan tidak menghentikan atau mengalihkan running agents
+(session independence); agents dapat beroperasi saat owner offline.
+Owner memiliki visibility atas apa/kenapa/current task/workflow/model/
+tools/cost/status, dan execution menghasilkan concise decision records
+(decision, reason summary, evidence, constraints, expected outcome)
+tanpa mewajibkan penyimpanan private chain-of-thought.
+
 ------------------------------------------------------------------------
 
 # 41. Testing Requirements
@@ -1202,6 +1344,28 @@ Minimum tests:
 -   fallback
 -   provider failure
 
+### Quality/Verification
+
+-   independent review untuk high-impact outputs
+-   verification gate tidak dapat dilewati self-assertion
+-   ensemble/debate/competition bounded dan outcome-oriented
+-   reputation mempengaruhi routing, tidak pernah bypass authorization
+
+### Failure/Recovery
+
+-   failure classification dan recovery strategy per class
+-   unknown external state reconciliation
+-   honest failure / partial completion reporting
+-   restart tidak kehilangan identity
+
+### Autonomy Bounds
+
+-   loop protection (step/time/cost/tool budgets)
+-   stagnation detection dan response
+-   goal drift detection
+-   emergency stop / kill switch
+-   delegation depth/fan-out limits
+
 ------------------------------------------------------------------------
 
 # 42. Acceptance Criteria
@@ -1234,6 +1398,19 @@ Module dianggap selesai secara arsitektur jika:
 -   24/7 autonomous runtime didukung
 -   temporary runtime dapat dibersihkan otomatis.
 
+### Additional Verification Targets
+
+-   model replacement tidak mengubah agent identity/operational history
+-   Planner dapat menemukan agent capable untuk suatu capability
+-   capability tanpa permission tidak dapat memanggil restricted tool
+-   Business A agent tidak mengakses private context Business B
+-   setiap tool action attributable ke agent/task/business
+-   delegation chains (Planner → Agent A → Agent B → Tool) tercatat
+-   child agents bounded, auditable
+-   secrets tidak terekspos ke model unnecessarily
+-   important side effects independently verifiable
+-   runtime merupakan final enforcement boundary.
+
 ------------------------------------------------------------------------
 
 # 43. Locked Design Principle
@@ -1249,10 +1426,25 @@ Module dianggap selesai secara arsitektur jika:
 
 # 44. Next Module
 
-Setelah module ini dikunci, layer berikutnya:
+Tidak ada modul baru dari cleanup ini. Seluruh successor modules sudah
+ada dan locked sebagai canonical owners:
 
-**Tool Runtime & Capability Execution System**
+-   [Tool Runtime & Capability Execution](NEXUS-TOOL-RUNTIME-CAPABILITY.md) —
+    execution boundary tools/external systems (web, files, browser,
+    APIs, code execution, credentials, sandboxing, permission checks,
+    rate limits, audit).
+-   [Identity, Access & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md) —
+    identity plane, authentication/authorization, trust model.
+-   [Workflow & Orchestration Engine](WORKFLOW_ORCHESTRATION_ENGINE.md) —
+    koordinasi task graph, scheduling, recovery.
+-   [Governance, Policy & Safety Control](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md),
+    [Model Router](NEXUS-MODEL-ROUTER-PROVIDER-ABSTRACTION.md),
+    [Memory & Context Intelligence](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md),
+    [Event & Trigger System](EVENT_TRIGGER_SYSTEM.md) — boundaries
+    masing-masing tetap sebagaimana didokumentasikan.
 
-Fokusnya adalah bagaimana agent benar-benar menggunakan tools secara
-aman: web, files, browser, APIs, code execution, external services,
-credentials, sandboxing, permission checks, rate limits, dan audit.
+Layer berikutnya adalah **CONTRACTS**: exact schemas, request/result/
+error contracts, policy/credential interfaces, dan test implementations.
+Field lists, API names, dan state-machine sketches dalam dokumen ini
+adalah nonbinding contract candidates; normative boundary requirements
+tetap berlaku.

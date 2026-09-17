@@ -1,6 +1,9 @@
 # NEXUS Workflow & Orchestration System
 
-**Status:** PROPOSED → awaiting owner lock
+> **HISTORICAL / NONCANONICAL — superseded source specification.** Replacement: [Workflow & Orchestration Engine](WORKFLOW_ORCHESTRATION_ENGINE.md).
+> The canonical owner governs; this source grants no competing authority. Planning remains with [Planner](NEXUS-PLANNER.md), not Workflow. Historical lifecycle alternatives, examples, schemas, API/interface drafts, acceptance sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status. The source body is preserved for traceability.
+
+**Status:** HISTORICAL / NONCANONICAL (original proposal retained below)
 
 ## 1. Purpose
 

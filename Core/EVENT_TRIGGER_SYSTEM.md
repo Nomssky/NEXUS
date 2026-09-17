@@ -1191,10 +1191,14 @@ Autonomous triggers can be paused or disabled.
 
 > **NEXUS does not wait for commands. NEXUS continuously observes events, evaluates their significance against objectives and governance, and autonomously decides whether to ignore, remember, pay attention, replan, or act.**
 
-## 141. Next Layer
+## 141. Existing Boundaries and CONTRACTS Next Layer
 
-The next major subsystem is:
+Architecture remains locked; no new modules from this cleanup.
 
-**Workflow & Orchestration Engine**
+-   [Workflow & Orchestration Engine](WORKFLOW_ORCHESTRATION_ENGINE.md) owns durable multi-step execution, parallel work, dependencies, retries, checkpoints, pause/resume, failure recovery, and replanning.
+-   [Attention & Priority Intelligence](NEXUS-ATTENTION-PRIORITY-INTELLIGENCE.md) owns human-attention prioritization, escalation, and review routing.
+-   [Decision Engine](NEXUS-DECISION-ENGINE.md) owns decision evaluation; Event & Trigger routes, does not decide.
+-   [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md) and [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) own execution boundaries; events never bypass Governance, Identity, Security.
+-   [Scheduling](NEXUS-SCHEDULING-RESOURCE-RUNTIME.md), [Memory](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md) boundaries unchanged.
 
-It will define how NEXUS turns decisions into durable multi-step work that can run for minutes, hours, or days, including parallel execution, dependencies, retries, checkpoints, pause/resume, failure recovery, and replanning.
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

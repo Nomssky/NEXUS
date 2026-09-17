@@ -1173,26 +1173,12 @@ Wajib diuji:
 
 ------------------------------------------------------------------------
 
-# 65. Next Module
+# 65. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+Architecture remains locked; no new modules from this cleanup.
 
-**NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md**
+-   [Observability, Audit & Telemetry](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md) owns logs, metrics, traces, audit, decision/agent/workflow traces, cost tracking, health monitoring, anomaly detection, dashboards, alerts, forensics.
+-   [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md) owns agent lifecycle/scheduling; [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md) owns work orchestration; [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md) owns tool execution scheduling; Scheduling provides shared priority/dependency/resource scheduling infrastructure.
+-   [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md), [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md) boundaries unchanged.
 
-Fokus:
-
-``` text
-Logs
-Metrics
-Traces
-Audit
-Decision Trace
-Agent Trace
-Workflow Trace
-Cost Tracking
-Health Monitoring
-Anomaly Detection
-Dashboards
-Alerts
-Forensics
-```
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

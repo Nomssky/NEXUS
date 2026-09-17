@@ -1096,24 +1096,12 @@ Modul dianggap selesai jika:
 
 ---
 
-# 54. Next Module
+# 54. Existing Boundaries and CONTRACTS Next Layer
 
-**NEXUS COMMUNICATION & INTERACTION BUS**
+Architecture remains locked; no new modules from this cleanup.
 
-Fokus:
+-   [Communication & Interaction Bus](NEXUS_COMMUNICATION_INTERACTION_BUS.md) owns internal agent communication, business/division messaging, owner ↔ NEXUS communication, async messages, agent-to-agent protocols, message identity, delivery guarantees, routing, priority, context, attachments/artifacts, security, multi-business isolation, human interaction, conversational sessions as control surface without stopping autonomous execution.
+-   [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md) owns authentication/authorization; [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md) owns policy; Security enforces across boundaries, does not set them.
+-   [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md), [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md), [Model Router](NEXUS-MODEL-ROUTER-PROVIDER-ABSTRACTION.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md) boundaries unchanged.
 
-- internal agent communication
-- business/division messaging
-- owner ↔ NEXUS communication
-- asynchronous messages
-- agent-to-agent protocols
-- message identity
-- delivery guarantees
-- routing
-- priority
-- context
-- attachments/artifacts
-- security
-- multi-business isolation
-- human interaction
-- conversational sessions sebagai control surface tanpa menghentikan autonomous execution
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

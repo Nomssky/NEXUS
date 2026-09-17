@@ -76,6 +76,12 @@ approval_policy:
 Tool definition tidak boleh memberikan authority lebih besar daripada
 governance.
 
+### Registry and Lifecycle Requirements
+
+Tool Registry harus mendukung registration, inspection, scoped discovery, enable/disable, versioning, deprecation, dan retirement. Compatible versions mempertahankan stable identity; behavior changes harus auditable dan tidak diam-diam mengubah workflow semantics. Definitions mendeklarasikan side effects, runtime compatibility, dependencies, health, dan machine-/human-readable usage guidance dengan safe examples bila berguna.
+
+Installation/custom tools harus reversible dan melalui source/version, manifest, permission, risk/security, sandbox, serta compatibility checks tanpa perubahan Core. Installation tidak memberikan permissions, credentials, cross-business access, atau governance authority. Untrusted extensions tetap isolated tanpa production credentials/broad access; trust bersifat evidence-based, revocable, dan membatasi allowed environments. Deprecation menyediakan warning, replacement/migration path, dan shutdown window bila applicable.
+
 ------------------------------------------------------------------------
 
 # 3. Tool Categories
@@ -1013,6 +1019,8 @@ Emergency controls berada di governance/control plane.
 
 Agent tidak dapat menonaktifkan emergency stop.
 
+Disabled tools harus fail closed untuk new invocations; active work harus dihentikan/drain secara aman sambil mempertahankan unknown side effects untuk reconciliation. Emergency recovery memerlukan investigation, safety verification, dan explicit re-enable. Unusual usage/scope violations harus observable dan dapat diteruskan ke Security/Attention. Audit retention mengikuti policy tanpa menyimpan sensitive payload atau private chain-of-thought; concise purpose/policy reasons cukup.
+
 ------------------------------------------------------------------------
 
 # 41. Multi-Business Isolation
@@ -1161,26 +1169,13 @@ Module dianggap selesai secara arsitektur jika:
 
 ------------------------------------------------------------------------
 
-# 47. Next Module
+# 47. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah Tool Runtime dikunci, layer berikutnya:
+Architecture tetap locked; tidak ada module baru dari cleanup ini.
 
-**Model Router & Provider Abstraction System**
+-   [Model Router](NEXUS-MODEL-ROUTER-PROVIDER-ABSTRACTION.md) memiliki inference/provider selection; Tool Runtime tetap model-independent dan menormalisasi model-specific tool calls tanpa bergantung pada keberhasilan agent/model.
+-   [API Integration Gateway](NEXUS-API-INTEGRATION-GATEWAY.md) memiliki connectors, authentication protocols, provider retries/rate limits, dan provider-state reconciliation. Runtime mengendalikan authorization, total execution budget, dan outcome evidence; kedua layer memakai operation identity/budget yang sama, bukan independent retry loops.
+-   [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md) dan [Scheduling](NEXUS-SCHEDULING-RESOURCE-RUNTIME.md) memiliki orchestration, priority, dan scheduling. Internal/owner/meta-tools tetap governed; request capability bukan grant authority.
+-   [Memory](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md) memiliki durable memory admission/context; [Knowledge Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) memiliki source-based extraction/knowledge formation. Tool/file execution tidak memiliki competing knowledge pipeline.
 
-Fokus:
-
--   local-first inference
--   Ollama
--   Hugging Face/local models
--   OpenRouter
--   custom providers
--   per-agent/per-task model selection
--   fallback
--   model health
--   cost/latency/quality routing
--   context limits
--   structured output
--   model capability registry
--   provider credentials
--   privacy policy
--   inference observability
+Layer berikutnya adalah **CONTRACTS**: detailed manifests, request/result/error schemas, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, dan test implementations. Field lists, examples, dan interfaces dalam dokumen ini adalah conceptual contract candidates; normative boundary requirements tetap berlaku. SDK/marketplace/certification implementation bukan perluasan architecture yang disetujui di sini.

@@ -3,6 +3,9 @@
 **Status:** LOCKED  
 **Role:** Authoritative Objective Intelligence  
 **Layer:** Cognitive Control / Intent
+**Next layer:** CONTRACTS — exact schemas, APIs, transitions, and algorithms; no new module is implied.
+
+Record sketches express architectural information requirements, not final wire schemas.
 
 ---
 
@@ -16,7 +19,9 @@ It answers three fundamental questions:
 2. **WHY** does that objective exist?
 3. **HOW DO WE KNOW** whether progress is real?
 
-The Objective Engine does not execute work. Execution belongs to Planner, Workflow Orchestration, Agent Runtime, Tool Runtime, and external integration boundaries.
+The locked conceptual flow is [Executive](NEXUS-EXECUTIVE.md) → Objective Engine → [Decision Engine](NEXUS-DECISION-ENGINE.md) → [Planner](NEXUS-PLANNER.md) → [Workflow Orchestration](WORKFLOW_ORCHESTRATION_ENGINE.md).
+
+Objective Engine owns objective truth; Planner prepares plans, not execution. Workflow and the governed Agent/Tool runtimes own execution and external integration handoffs. Models have no execution authority; Objective Engine neither calls external tools nor selects models.
 
 ---
 
@@ -88,11 +93,15 @@ OWNER
 
 An objective may have parent and child objectives.
 
-Every derived objective MUST retain a reference to its origin.
+Every derived objective MUST retain a parent and source lineage, remain revisable, and preserve parent intent, constraints, and policy. Generated objectives MUST remain distinguishable from direct owner intent and cannot silently become owner-level objectives.
+
+Objectives describe outcomes; missions coordinate effort, tasks describe work, and actions perform concrete steps. Objectives may exist without an immediate mission or activation. Structuring ambiguous owner intent MUST NOT change its fundamental meaning; business and division objectives retain explicit scope.
 
 ---
 
 ## 5. Objective Identity
+
+Each objective MUST have a stable unique identity and recorded source. Identity and lineage persist through revisions.
 
 Minimum objective record:
 
@@ -162,7 +171,7 @@ Qualified leads increase by the defined target while remaining within
 the approved acquisition cost and policy constraints.
 ```
 
-WHY is mandatory for strategic and owner-originated objectives.
+WHY is mandatory for strategic and owner-originated objectives. Objective constraints are binding, not optimization preferences; Governance remains authoritative over permission.
 
 ---
 
@@ -178,7 +187,11 @@ Supported relations:
 - `DERIVED_FROM`
 - `RELATED_TO`
 
-Relations MUST be explicit and auditable.
+Relations MUST have explicit semantics and be auditable. The engine MUST prevent circular parentage, impossible lineage, orphaned consequential missions, and silently accepted conflicting constraints. It represents objective conflicts; Executive/Decision/Governance resolve them within authority rather than the engine silently erasing or choosing an objective. Revision preserves history and does not silently mutate historical truth; hard deletion must not break audit lineage.
+
+### Priority
+
+Priority MUST distinguish local operational priority from inherited strategic importance and urgency. Owner priority, value, risk, dependencies, deadlines, resources, and business impact SHOULD inform prioritization; urgency alone does not outrank strategic importance. Lower-level priority cannot override higher-level constraints. Blocked dependencies SHOULD be visible to Attention and Executive.
 
 ---
 
@@ -200,7 +213,7 @@ EXPIRED
 ARCHIVED
 ```
 
-State transitions MUST be governed and recorded.
+State transitions MUST be governed and recorded. DRAFT is unactivated; ACTIVE is pursued; PAUSED is intentionally suspended; BLOCKED lacks a dependency or condition; AT_RISK indicates threatened achievement. ACHIEVED requires verified criteria; FAILED means criteria cannot be met within scope/time; ABANDONED is explicit discontinuation; SUPERSEDED is replacement; EXPIRED ends validity. ARCHIVED is retention, not a successful operational outcome.
 
 ---
 
@@ -247,7 +260,9 @@ OBJECTIVE PROGRESS
 OBJECTIVE ACHIEVEMENT
 ```
 
-Proxy metrics MUST be explicitly marked as proxies.
+Proxy metrics MUST be explicitly marked as proxies. Activity, output, and outcome metrics SHOULD remain distinct, with outcomes generally carrying greater objective significance. Metric evidence SHOULD retain its definition, source, baseline/target, measurement window, freshness, and confidence.
+
+Progress may be UNKNOWN and MUST NOT be fabricated from missing evidence or task counts. Confidence MUST reflect evidence quality, not model self-assurance. Evaluation SHOULD compare intent, plan, execution, and outcomes to expose ineffective strategies, side effects, and incomplete evidence as well as proxy drift.
 
 ---
 
@@ -316,7 +331,7 @@ Relevant Evidence
 
 The Planner MUST preserve this context during decomposition.
 
-Agents MUST NOT receive an objective without sufficient lineage to understand its purpose and constraints.
+Agents MUST NOT receive an objective without sufficient lineage to understand its purpose and constraints. Access and queries MUST be scope-authorized and provide only relevant objective context, not unrelated global or other-business memory. Consumers SHOULD be able to retrieve lineage, scoped active/blocked/at-risk objectives, dependencies, conflicts, criteria, metrics, and health without prescribing API signatures.
 
 ---
 
@@ -332,15 +347,15 @@ Planner uses the Objective Engine to answer:
 - Which objectives conflict?
 - What evidence already exists?
 
-Planner converts objective intent into an executable plan without redefining it.
+Planner converts objective-aligned, authorized decisions into executable plans without redefining intent or bypassing Decision Engine.
 
 ---
 
 ## 15. Objective-Aware Decision Making
 
-Decision Engine MUST reference objective IDs.
+Decision Engine MUST reference objective IDs for objective-driven work. Authorized maintenance, recovery, or governance exceptions require an explicit purpose and authority basis, not invented owner intent.
 
-A decision is valid only when its relationship to the objective is understandable.
+A decision is valid only when its relationship to the objective, or its governed exception, is understandable.
 
 The system SHOULD detect decisions that optimize local task metrics while harming higher-level objectives.
 
@@ -387,7 +402,11 @@ EVALUATE
  └── COMPLETE
 ```
 
-Completion MUST be evidence-based.
+Completion MUST be evidence-based. Decomposition and execution above occur through Planner and Workflow, not Objective Engine.
+
+Creation is distinct from activation; activation requires Governance-defined authority. Temporary objectives SHOULD have explicit scope and applicable expiry, remain distinguishable from enduring strategy, and not automatically enter long-term strategic memory. Expiry SHOULD prompt evaluation for renewal, revision, replacement, or escalation; automatic renewal MUST be policy-controlled. Stale or abandoned objectives SHOULD be identifiable rather than silently pursued.
+
+Cancellation MUST retain related mission/decision history. Affected active work must be evaluated for safe stopping, redirection, or completion through Executive/Planner/Workflow according to policy, not directly terminated by an objective record change.
 
 ---
 
@@ -395,12 +414,7 @@ Completion MUST be evidence-based.
 
 Each objective MUST belong to an explicit scope.
 
-At minimum:
-
-```text
-business_id
-division_id
-```
+Business and division references MUST be present where applicable. Owner/system-level objectives retain their explicit higher scope rather than inventing a business or division; a division reference is not mandatory for a business-wide objective.
 
 Cross-business objectives require explicit authorization.
 
@@ -443,20 +457,24 @@ The system MUST preserve:
 - authorization;
 - timestamps.
 
-Objective truth MUST survive process restart.
+Objective truth MUST survive process restart with definitions, state, lineage, and history intact; pending updates MUST be recoverable or safely rejected, never silently lost. Concurrent progress, metric, and priority updates MUST NOT silently overwrite one another; ordering/versioning or transactions preserve consistency.
+
+Important events SHOULD be append-only where practical, with current state consistent with authoritative history; this does not mandate event-sourced storage. Archive or supersede historical objectives by default. Hard deletion is exceptional and MUST NOT destroy required audit lineage.
+
+Material lifecycle, priority, progress/metric, dependency, conflict, drift, and expiry changes SHOULD emit scoped attention signals through Event Trigger System; event contracts remain its responsibility.
 
 ---
 
 ## 21. Integration
 
 ### Executive
-Owns operational interpretation and prioritization but reads objective truth from Objective Engine.
+Decides what deserves action and prioritizes but reads objective truth from Objective Engine.
 
 ### Decision Engine
 Evaluates options against objectives and constraints.
 
 ### Planner
-Transforms objectives into executable plans.
+Transforms objective-aligned, authorized decisions into executable plans.
 
 ### Workflow Orchestration
 Executes durable plans.
@@ -468,7 +486,7 @@ Provides governed agent execution.
 Receives objective-related signals.
 
 ### Memory
-Stores relevant contextual and historical information.
+Stores relevant contextual and historical information but MUST NOT silently rewrite authoritative objective truth.
 
 ### Event Trigger System
 Can activate evaluation or workflows related to objectives.

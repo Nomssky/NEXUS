@@ -1,6 +1,9 @@
 # NEXUS Event & Trigger System
 
-**Status:** PROPOSED → awaiting owner lock
+> **HISTORICAL / NONCANONICAL — superseded source specification.** Replacement: [Event & Trigger System](EVENT_TRIGGER_SYSTEM.md).
+> The canonical owner governs; this source grants no competing authority. Historical lifecycle alternatives, examples, schemas, API/interface drafts, acceptance sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status. The source body is preserved for traceability; the replacement's LOCKED status does not promote this legacy proposal.
+
+**Status:** HISTORICAL / NONCANONICAL (original proposal retained below)
 
 ## 1. Purpose
 

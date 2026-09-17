@@ -4,7 +4,7 @@
 **Module:** Core Intelligence Infrastructure\
 **Depends on:** Objective Engine, Agent Runtime & Lifecycle, Workflow &
 Orchestration, Model Router, Tool Runtime\
-**Next:** NEXUS Attention & Priority Intelligence System
+**Next layer:** CONTRACTS; existing module boundaries are referenced in §58.
 
 ------------------------------------------------------------------------
 
@@ -1368,25 +1368,12 @@ Minimal test:
 
 ------------------------------------------------------------------------
 
-# 58. Next Module
+# 58. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+Architecture remains locked; no new modules from this cleanup.
 
-**NEXUS_ATTENTION_PRIORITY_INTELLIGENCE.md**
+-   [Attention & Priority Intelligence](NEXUS-ATTENTION-PRIORITY-INTELLIGENCE.md) owns human-attention prioritization, escalation, and review routing.
+-   [Knowledge & Information Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) owns source-based extraction and knowledge formation; Memory owns durable admission and context assembly.
+-   [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md), [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md), [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Persistence](NEXUS-PERSISTENCE-STATE-DATA-INFRASTRUCTURE.md), [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md) boundaries unchanged.
 
-Fokus:
-
-``` text
-Attention
-Priority
-Urgency
-Importance
-Interruptions
-Escalation
-Owner notification
-Autonomous awareness
-Attention budget
-Quiet mode
-Critical events
-Decision thresholds
-```
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

@@ -144,7 +144,7 @@ Secret Store
 Gateway
 ```
 
-Only the minimum required credential material is exposed to the integration path.
+Only the minimum required credential material is exposed to the integration path. Credentials remain in credential infrastructure, referenced by business, service/action, environment, and lifetime. Rotation/refresh must not require changes to agent definitions or redeployment of agent logic; tool code, provider configuration, credentials, and agent permissions remain separate. OAuth delegation must remain scoped; authentication is infrastructure behavior, never prompt logic.
 
 ## 7. Authorization
 

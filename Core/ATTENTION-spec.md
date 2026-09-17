@@ -1,6 +1,10 @@
+> **HISTORICAL / NON-CANONICAL — retained for reference only.**
+> Replaced by [Attention & Priority Intelligence](NEXUS-ATTENTION-PRIORITY-INTELLIGENCE.md); authority remains with [Governance, Policy & Safety Control](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md).
+> The canonical modules govern; this document grants no competing authority. Its computational-focus framing is historical: canonical Attention prioritizes awareness, especially human attention, and review routing, not execution or strategic decision authority. All retained examples, taxonomies, schemas, draft interfaces, lifecycle sketches, acceptance/test sketches, and open questions are nonbinding candidates for the next CONTRACTS layer, not approved contracts or a mandate for new modules. Historical approval/lock wording below is not current status.
+
 # NEXUS Attention
 
-**Status:** PROPOSED → awaiting owner lock
+**Historical status:** PROPOSED → awaiting owner lock
 
 ## 1. Definition
 

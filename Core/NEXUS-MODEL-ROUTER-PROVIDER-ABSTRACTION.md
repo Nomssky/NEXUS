@@ -4,7 +4,7 @@
 **Module:** Core Infrastructure\
 **Depends on:** Agent Runtime & Lifecycle, Workflow & Orchestration,
 Tool Runtime & Capability Execution\
-**Next:** Memory & Context Intelligence System
+**Next Layer:** CONTRACTS (all successor modules exist and are canonical)
 
 ------------------------------------------------------------------------
 
@@ -1455,24 +1455,12 @@ Module dianggap selesai jika:
 
 ------------------------------------------------------------------------
 
-# 53. Next Module
+# 53. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+Architecture remains locked; no new modules from this cleanup.
 
-**MEMORY_CONTEXT_INTELLIGENCE.md**
+-   [Memory & Context Intelligence](NEXUS-MEMORY-CONTEXT-INTELLIGENCE.md) owns memory, context, retrieval, knowledge, short-term state, long-term memory, business/agent/objective memory, context compression, forgetting/retention.
+-   [Knowledge & Information Ingestion](NEXUS_KNOWLEDGE_INFORMATION_INGESTION.md) owns source-based extraction and knowledge formation; Memory owns durable admission and context assembly.
+-   [Agent Runtime](NEXUS-AGENT-RUNTIME-LIFECYCLE.md), [Tool Runtime](NEXUS-TOOL-RUNTIME-CAPABILITY.md), [API Gateway](NEXUS-API-INTEGRATION-GATEWAY.md), [Workflow](WORKFLOW_ORCHESTRATION_ENGINE.md), [Governance](NEXUS-GOVERNANCE-POLICY-SAFETY-CONTROL.md), [Identity](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md), [Security](NEXUS_SECURITY_THREAT_DEFENSE.md), [Observability](NEXUS_OBSERVABILITY_AUDIT_TELEMETRY.md), [Configuration](NEXUS_CONFIGURATION_CONTROL_PLANE.md) boundaries unchanged.
 
-Fokus berikutnya:
-
-``` text
-Memory
-Context
-Retrieval
-Knowledge
-Short-term state
-Long-term memory
-Business memory
-Agent memory
-Objective memory
-Context compression
-Forgetting/retention
-```
+Next layer is **CONTRACTS**: detailed schemas, state machines, request/result/error contracts, policy/credential interfaces, adapter protocols, queue/reconciliation handoffs, and test implementations. Field lists, API names, and state-machine sketches in this document are nonbinding contract candidates; normative boundary requirements remain in effect.

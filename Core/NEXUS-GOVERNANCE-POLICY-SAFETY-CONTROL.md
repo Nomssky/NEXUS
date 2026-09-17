@@ -4,7 +4,7 @@
 **Module:** Core Control Plane\
 **Depends on:** Event Trigger System, Workflow & Orchestration, Agent
 Runtime, Tool Runtime, Model Router, Memory & Context, Attention\
-**Next:** Identity, Access & Trust System
+**Next layer:** CONTRACTS; existing module boundaries are referenced in §59.
 
 ------------------------------------------------------------------------
 
@@ -55,6 +55,19 @@ AUDIT
 
 Tidak ada agent yang dapat melewati governance hanya karena memiliki
 kemampuan teknis.
+
+Governance berada di atas autonomy, termasuk operasi 24/7. Owner menetapkan
+objective, batas authority, dan preauthorization melalui jalur governance
+resmi; routine low-risk work dapat berjalan tanpa approval per action hanya
+dalam policy eksplisit. Operasi consequential membutuhkan authorization
+owner-defined, dan semua autonomy tetap dibatasi scope, tool, waktu, budget,
+risk, serta termination conditions. Mode autonomy tidak memberikan permission.
+
+Decision Engine mengusulkan, Planner menyusun rencana, Governance
+mengotorisasi, dan runtime menegakkan. Model, agent reputation, maupun
+keberhasilan historis tidak memberikan authority. Policy dalam prompt saja
+bukan security boundary; enforcement harus berada di luar model, melalui
+Governance, Tool Runtime, dan credential isolation.
 
 ------------------------------------------------------------------------
 
@@ -193,7 +206,15 @@ EXPORT
 ADMIN
 ```
 
-Permission harus scoped.
+Permission harus scoped dan mengikuti least authority. Agent/task hanya
+menerima permission yang diperlukan; task dapat mempersempit, bukan
+memperluas authority. Temporary authority harus berupa lease yang berakhir
+pada expiry, task completion, atau revocation sesuai grant.
+
+Expired/revoked authority harus ditolak sebelum side effect baru. Queued
+actions wajib memvalidasi ulang current policy, authority, approval, risk,
+dan budget pada execution boundary, bukan mengandalkan izin saat enqueue.
+Memory atau approval lama tidak dapat memberikan current authority.
 
 ------------------------------------------------------------------------
 
@@ -243,6 +264,10 @@ Cross-business access hanya boleh jika:
 3.  data scope jelas
 4.  audit tersedia.
 
+Consequential operations wajib memiliki business context eksplisit;
+ambiguous business scope harus ditolak. UI/session switching tidak boleh
+mengubah scope autonomous task atau menghentikan background business lain.
+
 ------------------------------------------------------------------------
 
 # 11. Division Isolation
@@ -260,7 +285,8 @@ Research
 Agent Media tidak otomatis dapat menjalankan action Business.
 
 NEXUS Executive dapat melakukan cross-division orchestration sesuai
-authority.
+authority. Berbagi approved artifact tidak memberikan unrestricted access
+ke resource division asal.
 
 ------------------------------------------------------------------------
 
@@ -290,6 +316,12 @@ REQUIRE_APPROVAL
 ALLOW_WITH_CONSTRAINTS
 ESCALATE
 ```
+
+Evaluation harus menghasilkan structured decision beserta reason,
+matched policy/version, constraints, required approval/verification, dan
+validity. Verification yang diwajibkan serta deferred/blocked work tidak
+boleh diperlakukan sebagai unconditional ALLOW; exact effect encoding
+menunggu CONTRACTS.
 
 ------------------------------------------------------------------------
 
@@ -558,7 +590,14 @@ network
 agent spawn budget
 ```
 
-Budget enforcement harus berada di control boundary.
+Budget enforcement harus berada di control boundary. Spending limits harus
+mendukung per-action, time-window, campaign, dan business scopes.
+
+Denial tidak boleh ditafsir ulang sebagai permission, dilewati dengan tool
+substitution/delegation, atau dihindari dengan memecah action. Governance
+harus mengevaluasi intended aggregate action bila memungkinkan, termasuk
+akumulasi spending lintas calls; agent tidak boleh memilih policy yang
+paling menguntungkan untuk menghindari batas.
 
 ------------------------------------------------------------------------
 
@@ -575,7 +614,10 @@ TTL exists
 scope is valid
 ```
 
-Recursive spawning harus diblokir.
+Recursive spawning harus diblokir. Delegated agent trees tetap dibatasi
+jumlah child, total runtime/cost, scope, dan complexity. Promosi temporary
+agent menjadi persistent harus melalui explicit lifecycle rules; creation
+atau promotion tidak otomatis memberikan broad authority.
 
 ------------------------------------------------------------------------
 
@@ -619,6 +661,12 @@ Tool Runtime menangani:
 how execution occurs
 ```
 
+Tool/plugin installation tidak otomatis memberikan credentials, business
+access, publishing rights, atau financial authority. Credential use harus
+diatur terpisah dari agent identity menurut actor, action, business, dan
+validity. Extensions harus memiliki manifest, declared permissions, trust,
+version/source, dan sandbox policy yang dievaluasi sebelum digunakan.
+
 ------------------------------------------------------------------------
 
 # 29. Model Governance
@@ -640,6 +688,12 @@ Contoh:
 sensitive data
 → local model only
 ```
+
+Data access/egress harus mempertimbangkan classification, purpose, business,
+division, actor, tool, dan operation. Local inference sebaiknya diprioritaskan
+jika policy mengizinkan dan kualitas memadai; cloud routing hanya bila
+explicitly allowed. Provider eligibility, capability, latency, quality,
+dan cost harus dievaluasi tanpa mengurangi data restrictions.
 
 ------------------------------------------------------------------------
 
@@ -665,6 +719,11 @@ analyze
 summarize
 classify
 ```
+
+Communication authority harus membedakan draft, queue, send, reply, dan
+broadcast. Publishing policy harus mengikat platform/account, content
+category, frequency, schedule/campaign, serta approval state; izin membuat
+draft tidak memberikan izin mengirim atau mempublikasikannya.
 
 ------------------------------------------------------------------------
 
@@ -707,7 +766,10 @@ sandboxing
 ```
 
 Guardrail harus dieksekusi di luar model reasoning sehingga model tidak
-dapat menghapusnya melalui prompt.
+dapat menghapusnya melalui prompt. Network/browser policy harus mencakup
+domain, protocol, account, action, upload/download, dan submission sesuai
+scope. Code execution memerlukan explicit sandbox policy untuk CPU, memory,
+time, network, filesystem, processes, dan packages.
 
 ------------------------------------------------------------------------
 
@@ -784,7 +846,11 @@ PROVIDER FREEZE
 ```
 
 Emergency control harus dapat menghentikan autonomous execution sesuai
-scope.
+scope. Business/division pause atau tool-category freeze tidak boleh
+menghentikan scope lain yang tidak terdampak kecuali containment policy
+mengharuskannya. Suspension harus mempertahankan history. Saat suspected
+compromise, kontrol harus dapat membekukan side effects, revoke credentials,
+membatasi model/tool access, preserve evidence, dan notify authorized owner.
 
 ------------------------------------------------------------------------
 
@@ -816,6 +882,9 @@ audited
 ```
 
 Tidak boleh bergantung sepenuhnya pada model yang sedang bermasalah.
+Kill switch harus mencegah consequential actions baru segera; safe shutdown
+untuk in-flight work harus diupayakan tanpa menjanjikan pembatalan side
+effects yang sudah terjadi.
 
 ------------------------------------------------------------------------
 
@@ -853,13 +922,18 @@ REVALIDATE POLICY
 RESTORE
 ```
 
-Tidak otomatis resume semua execution tanpa policy check.
+Tidak otomatis resume semua execution tanpa policy check. Policy state
+harus durable, protected dari ordinary agent modification, dan recoverable.
+Recovery harus memvalidasi integrity, memulihkan current permissions,
+revalidate queued actions, dan melanjutkan hanya authorized work tanpa
+duplicate side effects. Restored agents tidak boleh mempertahankan revoked
+atau nonexistent permissions (no ghost authority).
 
 ------------------------------------------------------------------------
 
 # 41. Governance Decision Explainability
 
-Setiap DENY / APPROVAL / CONSTRAINT harus dapat menjawab:
+Setiap ALLOW / DENY / APPROVAL / CONSTRAINT harus dapat menjawab:
 
 ``` text
 Who requested?
@@ -892,7 +966,10 @@ timestamp
 execution_reference
 ```
 
-Audit log harus tamper-resistant.
+Audit log harus tamper-resistant. Approval provenance harus mencatat
+approver, exact action/scope, timestamp, expiration, dan policy context.
+Inspection/debugging harus menunjukkan matched rules, precedence, constraints,
+dan final decision tanpa mengekspos secrets.
 
 ------------------------------------------------------------------------
 
@@ -910,8 +987,11 @@ created_by
 approved_by
 ```
 
-Execution harus dapat direconstruct berdasarkan policy version yang
-berlaku saat decision dibuat.
+Execution harus dapat direconstruct berdasarkan policy version saat decision
+dan revalidation pada execution boundary. Policy changes tidak boleh menulis
+ulang historical decisions. Safe rollback ke policy version sebelumnya harus
+didukung melalui authorized change path dan current authority validation,
+bukan memulihkan revoked permissions secara diam-diam.
 
 ------------------------------------------------------------------------
 
@@ -927,7 +1007,15 @@ DRAFT
 → SUPERSEDED / DISABLED
 ```
 
-Critical governance policy tidak boleh berubah diam-diam.
+Critical governance policy tidak boleh berubah diam-diam. Natural-language
+owner intent harus dikompilasi menjadi structured policy, divalidasi, dan
+disimulasikan sebelum authorized activation; ambiguous high-impact policy
+tidak boleh aktif otomatis dan harus meminta clarification.
+
+Policy drift terhadap objective, division responsibilities, tools, atau
+agent authority harus memicu review, bukan authority expansion. Feedback,
+learning, repeated denials, dan agent proposals hanya dapat merekomendasikan
+perubahan; activation tetap membutuhkan authorized governance path.
 
 ------------------------------------------------------------------------
 
@@ -950,12 +1038,17 @@ Policy simulator sebaiknya tersedia untuk melihat:
 "Jika agent melakukan X, apakah policy mengizinkan?"
 ```
 
-tanpa benar-benar mengeksekusi action.
+tanpa benar-benar mengeksekusi action. Simulation harus dapat membandingkan
+historical requests terhadap proposed policy. Tests harus mencakup allow,
+deny, boundary/conflict, expired/revoked authority, cross-business attempts,
+dan budget exhaustion.
 
 ------------------------------------------------------------------------
 
 # 46. Governance Conflict
 
+Authorization/policy evaluation harus deterministic bila memungkinkan;
+LLM boleh membantu interpretasi tetapi tidak menjadi sole enforcement.
 Jika dua policy conflict:
 
 ``` text
@@ -974,7 +1067,9 @@ ESCALATE
 
 # 47. Objective vs Governance
 
-Objective tidak pernah override governance.
+Objective tidak pernah override governance. Explicit objective constraints
+harus ikut membatasi action; kemampuan teknis atau permission umum tidak
+membenarkan pelanggaran constraint tersebut.
 
 ``` text
 OBJECTIVE
@@ -1046,7 +1141,10 @@ inspect audit
 override within authorized scope
 ```
 
-Human override juga harus diaudit.
+Human override juga harus diaudit dan hanya melalui supported authorized
+path; owner preference bukan bypass mandatory system safety. Governance view
+harus memperlihatkan active policies, scoped agent/tool permissions, autonomy
+bounds, budgets, approvals, dan restrictions kepada pihak berwenang.
 
 ------------------------------------------------------------------------
 
@@ -1129,11 +1227,20 @@ critical external side effects → DENY
 safe read-only actions → policy-dependent
 ```
 
-Fail-open tidak boleh digunakan untuk dangerous actions.
+Fail-open tidak boleh digunakan untuk dangerous actions. Saat authority
+consequential action tidak pasti, jangan execute: preserve blocked task
+context, explain uncertainty, dan escalate tanpa mengubah denial menjadi izin.
 
 ------------------------------------------------------------------------
 
 # 55. Observability
+
+Governance harus mendeteksi contradictory policies, orphaned/unbounded
+permissions, expired credentials, missing owners, dan stale approvals.
+Permission terkait agent/tool/division yang dihapus atau dinonaktifkan harus
+diidentifikasi dan dibersihkan melalui authorized path. Persistent permissions
+harus direview berkala; high-risk permissions sebaiknya expire kecuali
+persistence sengaja diotorisasi.
 
 Metrics:
 
@@ -1149,6 +1256,10 @@ governance_blocks
 emergency_events
 authority_violations
 cross_scope_attempts
+autonomous_actions
+reversals
+security_events
+budget_violations
 ```
 
 ------------------------------------------------------------------------
@@ -1170,7 +1281,13 @@ Wajib diuji:
 -   policy tampering
 -   audit tampering
 -   emergency control failure
--   fail-open behavior.
+-   fail-open behavior
+-   lease expiry/revocation dan queued-action revalidation sebelum side effects
+-   aggregate-action limits, tool substitution, dan delegation circumvention
+-   UI/session switching tanpa perubahan autonomous business scope
+-   natural-language ambiguity, policy drift, dan authorized activation/rollback
+-   recovery tanpa ghost authority atau duplicate side effects
+-   permission cleanup dan review.
 
 ------------------------------------------------------------------------
 
@@ -1216,29 +1333,23 @@ Wajib diuji:
 
 ------------------------------------------------------------------------
 
-# 59. Next Module
+# 59. Existing Boundaries and CONTRACTS Next Layer
 
-Setelah module ini di-lock:
+[Identity, Access & Trust](NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md) sudah memiliki
+identity, authentication, membership, credentials, sessions, dan access
+lifecycle; bukan modul baru yang menunggu dibuat.
+[Tool Runtime & Capability](NEXUS-TOOL-RUNTIME-CAPABILITY.md) menegakkan tool
+execution, [Model Router](NEXUS-MODEL-ROUTER-PROVIDER-ABSTRACTION.md) menerapkan
+provider/model policy, dan [Attention](NEXUS-ATTENTION-PRIORITY-INTELLIGENCE.md)
+mengelola awareness/escalation tanpa execution authority. Governance tetap
+berada di atas autonomy seluruh komponen tersebut.
 
-**IDENTITY_ACCESS_TRUST_SYSTEM.md**
-
-Fokus:
-
-``` text
-Users
-Personas
-Identity
-Authentication
-Agent identity
-Service identity
-Credentials
-Secrets
-Roles
-Permissions
-Trust
-Sessions
-Device identity
-Business membership
-Division membership
-Access lifecycle
-```
+Layer berikutnya adalah **CONTRACTS**, bukan penambahan modul atau implementasi.
+Exact policy/result schemas, effect encoding, authority leases, approval
+provenance, precedence algorithms, risk/autonomy taxonomies, dan API §52 adalah
+nonbinding draft interface/schema candidates sampai divalidasi pada layer
+tersebut; normative boundary requirements tetap berlaku.
+[Legacy Governance](GOVERNANCE_POLICY-spec.md) hanya historical reference:
+emergency exceptions, separate delegation grants, dan recursive delegation
+di sana tidak melonggarkan restrictive precedence, bounded child authority,
+atau larangan recursive spawning canonical.
