@@ -1,0 +1,17 @@
+# Build artifacts
+/bin/
+*.exe
+
+# Test/coverage artifacts
+*.out
+coverage.txt
+
+# Local environment (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/

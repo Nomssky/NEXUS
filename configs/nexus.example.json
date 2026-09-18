@@ -1,0 +1,18 @@
+{
+  "nexus": {
+    "id": "nx:nexus:local",
+    "environment": "development"
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "health": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "lifecycle": {
+    "shutdown_timeout_seconds": 30
+  }
+}
