@@ -41,7 +41,7 @@ Tool Runtime is the **controlled execution boundary**. Tool results are **untrus
 | `request` | ToolRequest | yes | What the tool should do (see §2.4) |
 | `input` | map[string,any] | yes | Tool input parameters |
 | `output` | ToolOutput | no | Tool result (populated after execution) |
-| `result_status` | enum | yes | One of: `success`, `failure`, `timeout`, `cancelled`, `unknown` |
+| `result_status` | enum | yes | One of: `success`, `failure`, `timeout`, `cancelled`, `unknown`. Status `unknown` is the lowercase serialization of the runtime `UNKNOWN_OUTCOME` state; it MUST NOT be collapsed into `success` or `failure` and requires reconciliation before retry. |
 | `side_effect_classification` | enum | yes | One of: `none`, `read_only`, `reversible`, `irreversible` |
 | `idempotency_key` | string | conditionally | Required for irreversible side effects |
 | `timeout` | integer | yes | Timeout in seconds |
@@ -63,7 +63,7 @@ Tool Runtime is the **controlled execution boundary**. Tool results are **untrus
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `authorization_id` | string | yes | Authorization check identifier |
-| `decision` | enum | yes | One of: `ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS` |
+| `decision` | enum | yes | One of: `ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE` |
 | `constraints` | list[string] | no | Constraints if ALLOW_WITH_CONSTRAINTS |
 | `checked_at` | datetime | yes | When authorization was checked |
 | `expires_at` | datetime | no | When authorization expires |

@@ -41,7 +41,7 @@ Every unit of work must pass through the admission pipeline before execution:
 | 2. VALIDATE | Schema Validator | Schema validation | VALIDATION error |
 | 3. IDENTITY | Identity | Actor identity verification | AUTH error |
 | 4. AUTHORIZATION | Governance | Authority resolution | AUTHORIZATION error |
-| 5. POLICY | Governance | Policy evaluation | POLICY_DENIED or REQUIRE_APPROVAL |
+| 5. POLICY | Governance | Policy evaluation | Error `POLICY_DENIED` (governance outcome `DENY`) or approval gate (governance outcome `REQUIRE_APPROVAL`) |
 | 6. APPROVAL | Governance | Approval gate (if required) | Pending until approved/denied |
 | 7. RESOURCE CHECK | Scheduler | Resource availability check | RESOURCE_UNAVAILABLE |
 | 8. SCHEDULE | Scheduler | Queue placement and scheduling | QUEUED or DEFERRED |

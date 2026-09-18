@@ -170,6 +170,16 @@ Knowledge is **validated, normalized information** derived from memory, events, 
 | `basis` | enum | yes | One of: `direct_observation`, `verified_source`, `inference`, `model_output`, `human_report` |
 | `last_assessed` | datetime | yes | When confidence was last evaluated |
 
+> **Deferred reconciliation (audit finding P2):** memory-level `confidence`
+> (`factual`, `verified`, `provisional`, `inferred`, `uncertain`, `contradicted`)
+> and knowledge-level `KnowledgeConfidence.level` (`verified`, `probable`,
+> `possible`, `uncertain`, `disputed`) are two distinct vocabularies. They are
+> intentionally NOT unified in this contracts layer; unifying them is deferred to
+> a dedicated memory/knowledge phase. Until then, memory confidence describes
+> *provenance strength of a stored item* and knowledge confidence describes
+> *epistemic certainty of a belief*. Both are advisory and neither grants
+> authority. See `contracts/CONTRACTS_CROSS_PHASE_AUDIT.md`.
+
 ### 3.5 KnowledgeSource
 
 | Field | Type | Required | Description |
