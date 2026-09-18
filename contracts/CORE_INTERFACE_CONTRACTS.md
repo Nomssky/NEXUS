@@ -73,11 +73,18 @@ All contracts must use a common error envelope:
 ```yaml
 error:
   code: string          # Machine-readable code
-  category: enum        # One of: VALIDATION, AUTH, AUTHORIZATION, POLICY_DENIAL,
+  category: enum        # One of: VALIDATION, AUTH, AUTHORIZATION, POLICY_DENIED,
                         #   APPROVAL_REQUIRED, RESOURCE_UNAVAILABLE, TIMEOUT,
                         #   DEPENDENCY_FAILURE, RATE_LIMIT, CONFLICT,
                         #   UNKNOWN_OUTCOME, CANCELLATION, SECURITY_REJECTION,
                         #   INTERNAL_FAILURE
+                        # NOTE: error *category* names are canonical here.
+                        # Governance *outcomes* (ALLOW, DENY, REQUIRE_APPROVAL,
+                        # ALLOW_WITH_CONSTRAINTS, ESCALATE) are a distinct
+                        # vocabulary defined in SCHEMA_GOVERNANCE_ATTENTION.md.
+                        # A governance DENY surfaces as category POLICY_DENIED;
+                        # a governance REQUIRE_APPROVAL surfaces as category
+                        # APPROVAL_REQUIRED.
   message: string       # Human-readable description
   details: object       # Optional structured details
   retryable: boolean    # Whether caller should retry
@@ -92,7 +99,7 @@ error:
 | `VALIDATION` | Input did not pass schema or business validation | No |
 | `AUTH` | Authentication failed | No |
 | `AUTHORIZATION` | Authenticated but not authorized | No |
-| `POLICY_DENIAL` | Governance policy blocked the action | No |
+| `POLICY_DENIED` | Governance policy blocked the action (governance outcome `DENY`) | No |
 | `APPROVAL_REQUIRED` | Action requires human approval | No |
 | `RESOURCE_UNAVAILABLE` | Required resource is temporarily unavailable | Yes |
 | `TIMEOUT` | Operation exceeded time limit | Maybe |

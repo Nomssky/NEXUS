@@ -287,6 +287,23 @@ REQUESTED → AUTHORIZING → SENT → {ACCEPTED, REJECTED}
 | `IRREVERSIBLE_SIDE_EFFECT` | Side effect that cannot be undone | No | Yes |
 | `UNKNOWN_SIDE_EFFECT` | Unknown if side effect occurred | No | Reconcile first |
 
+**Vocabulary mapping (cross-phase reconciliation):** the runtime/execution layer
+(`SCHEMA_EXECUTION.md`, field `side_effect_classification`) uses the coarser values
+`none`, `read_only`, `reversible`, `irreversible`. This external layer refines them
+for boundary safety. Mapping:
+
+| Runtime value | External classification(s) |
+|---|---|
+| `none` | `READ_ONLY` |
+| `read_only` | `READ_ONLY` |
+| `reversible` | `IDEMPOTENT_WRITE`, `REVERSIBLE_SIDE_EFFECT` |
+| `irreversible` | `NON_IDEMPOTENT_WRITE`, `IRREVERSIBLE_SIDE_EFFECT` |
+| (any, when outcome uncertain) | `UNKNOWN_SIDE_EFFECT` |
+
+The runtime value governs internal retry eligibility; the external classification
+governs boundary retry/reconciliation safety. Neither is a governance outcome and
+neither grants authority.
+
 ### 7.2 Classification Rules
 
 | Rule | Description |

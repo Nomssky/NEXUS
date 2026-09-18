@@ -289,7 +289,7 @@ A Decision is a **recommendation**. It is NOT authorization. A decision must pas
 | `decision_type` | enum | yes | One of: `strategic`, `tactical`, `operational`, `technical` |
 | `status` | enum | yes | Lifecycle state (see §5.3) |
 | `actor_id` | string | yes | Who/what made this decision |
-| `actor_type` | enum | yes | One of: `human`, `agent`, `system` |
+| `actor_type` | enum | yes | One of: `human`, `agent`, `system`, `service` (aligned with Common Envelope `actor_type`) |
 | `objective_id` | string | conditionally | Objective this decision serves |
 | `why` | string | yes | WHY this decision was made |
 | `inputs` | list[DecisionInput] | yes | Data/references that informed this decision |
@@ -427,7 +427,7 @@ Outcome is **evidence** for objective evaluation. It is NOT automatically proof 
 | `objective_id` | string | yes | Objective this outcome relates to |
 | `expected_outcome_ref` | string | no | Reference to expected outcome definition |
 | `actual_result` | string | yes | What actually happened |
-| `success_state` | enum | yes | One of: `success`, `failure`, `partial`, `unknown` |
+| `success_state` | enum | yes | One of: `success`, `failure`, `partial`, `unknown`. Status `unknown` is the lowercase serialization of the runtime `UNKNOWN_OUTCOME` state; it MUST NOT be collapsed into `success` or `failure` and requires reconciliation. |
 | `verification_state` | enum | yes | One of: `unverified`, `verified`, `disputed` |
 | `evidence` | list[Evidence] | no | Supporting evidence |
 | `confidence` | float | no | Confidence in this outcome (0.0-1.0) |
