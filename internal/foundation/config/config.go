@@ -33,12 +33,42 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 )
 
-// Config is the top-level M0 configuration.
+// Config is the top-level configuration. M0 defined nexus/logging/health/
+// lifecycle; M1 adds a security section whose validation fails closed.
 type Config struct {
 	Nexus     NexusConfig     `json:"nexus"`
 	Logging   LoggingConfig   `json:"logging"`
 	Health    HealthConfig    `json:"health"`
 	Lifecycle LifecycleConfig `json:"lifecycle"`
+	Security  SecurityConfig  `json:"security"`
+}
+
+// SecurityConfig configures the security primitives foundation (component C04
+// posture). It deliberately contains NO field that grants authority: it may only
+// restrict or enable safe behavior, never expand privileges (CONFIGURATION ≠
+// AUTHORITY). Secret-bearing values are represented only as SecretRef.
+type SecurityConfig struct {
+	// AuditEnabled toggles security audit emission. It may be disabled only
+	// outside production; disabling it in production fails closed (§18).
+	AuditEnabled bool `json:"audit_enabled"`
+	// RequireAuthentication makes an authenticated identity mandatory for any
+	// context entering the foundation. It is only an *enforcement switch*: turning
+	// it on adds a check, it never grants anyone permission.
+	RequireAuthentication bool `json:"require_authentication"`
+	// EnforceBusinessScope requires an explicit business context on scoped
+	// operations. It narrows behavior; it never widens access.
+	EnforceBusinessScope bool `json:"enforce_business_scope"`
+	// DevAllowUnsafeOverrides enables development-only convenience behavior.
+	// It MUST be false in production (fails closed if true there) and is recorded
+	// as an explicit, isolated development affordance.
+	DevAllowUnsafeOverrides bool `json:"dev_allow_unsafe_overrides"`
+	// EgressAllowList is the set of allowed outbound destinations (host[:port]).
+	// Empty means no egress is permitted by default (deny-by-default). It is a
+	// restriction, never an authority grant.
+	EgressAllowList []string `json:"egress_allow_list"`
+	// SandboxEnabled reports whether untrusted execution must run sandboxed.
+	// Enabling it is defensive; it can only be disabled outside production.
+	SandboxEnabled bool `json:"sandbox_enabled"`
 }
 
 // NexusConfig identifies this NEXUS installation.
@@ -103,6 +133,14 @@ func Defaults() Config {
 		},
 		Lifecycle: LifecycleConfig{
 			ShutdownTimeoutSeconds: 30,
+		},
+		Security: SecurityConfig{
+			AuditEnabled:            true,
+			RequireAuthentication:   true,
+			EnforceBusinessScope:    true,
+			DevAllowUnsafeOverrides: false,
+			EgressAllowList:         nil, // deny-by-default
+			SandboxEnabled:          true,
 		},
 	}
 }
@@ -169,6 +207,14 @@ type fileConfig struct {
 	Lifecycle *struct {
 		ShutdownTimeoutSeconds *int `json:"shutdown_timeout_seconds"`
 	} `json:"lifecycle"`
+	Security *struct {
+		AuditEnabled            *bool    `json:"audit_enabled"`
+		RequireAuthentication   *bool    `json:"require_authentication"`
+		EnforceBusinessScope    *bool    `json:"enforce_business_scope"`
+		DevAllowUnsafeOverrides *bool    `json:"dev_allow_unsafe_overrides"`
+		EgressAllowList         []string `json:"egress_allow_list"`
+		SandboxEnabled          *bool    `json:"sandbox_enabled"`
+	} `json:"security"`
 }
 
 func loadFile(path string) (fileConfig, error) {
@@ -224,6 +270,27 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	if fc.Lifecycle != nil && fc.Lifecycle.ShutdownTimeoutSeconds != nil {
 		cfg.Lifecycle.ShutdownTimeoutSeconds = *fc.Lifecycle.ShutdownTimeoutSeconds
 	}
+	if fc.Security != nil {
+		s := fc.Security
+		if s.AuditEnabled != nil {
+			cfg.Security.AuditEnabled = *s.AuditEnabled
+		}
+		if s.RequireAuthentication != nil {
+			cfg.Security.RequireAuthentication = *s.RequireAuthentication
+		}
+		if s.EnforceBusinessScope != nil {
+			cfg.Security.EnforceBusinessScope = *s.EnforceBusinessScope
+		}
+		if s.DevAllowUnsafeOverrides != nil {
+			cfg.Security.DevAllowUnsafeOverrides = *s.DevAllowUnsafeOverrides
+		}
+		if s.EgressAllowList != nil {
+			cfg.Security.EgressAllowList = append([]string(nil), s.EgressAllowList...)
+		}
+		if s.SandboxEnabled != nil {
+			cfg.Security.SandboxEnabled = *s.SandboxEnabled
+		}
+	}
 }
 
 // Environment variable keys. Only non-secret, operational settings are
@@ -238,6 +305,14 @@ const (
 	EnvHealthHost       = "NEXUS_HEALTH_HOST"
 	EnvHealthPort       = "NEXUS_HEALTH_PORT"
 	EnvShutdownTimeoutS = "NEXUS_SHUTDOWN_TIMEOUT_SECONDS"
+
+	// M1 security keys. These can only tighten or enable defensive behavior.
+	EnvSecurityAuditEnabled            = "NEXUS_SECURITY_AUDIT_ENABLED"
+	EnvSecurityRequireAuthentication   = "NEXUS_SECURITY_REQUIRE_AUTHENTICATION"
+	EnvSecurityEnforceBusinessScope    = "NEXUS_SECURITY_ENFORCE_BUSINESS_SCOPE"
+	EnvSecurityDevAllowUnsafeOverrides = "NEXUS_SECURITY_DEV_ALLOW_UNSAFE_OVERRIDES"
+	EnvSecurityEgressAllowList         = "NEXUS_SECURITY_EGRESS_ALLOW_LIST"
+	EnvSecuritySandboxEnabled          = "NEXUS_SECURITY_SANDBOX_ENABLED"
 )
 
 func applyEnv(cfg *Config, environ []string) error {
@@ -277,7 +352,73 @@ func applyEnv(cfg *Config, environ []string) error {
 		}
 		cfg.Lifecycle.ShutdownTimeoutSeconds = s
 	}
+
+	// Security-sensitive environment values fail closed on malformed input: a
+	// typo must not silently leave a security switch in a weaker state.
+	var secErr error
+	setBool := func(key string, dst *bool) {
+		v, ok := envMap[key]
+		if !ok || secErr != nil {
+			return
+		}
+		b, err := parseStrictBool(v)
+		if err != nil {
+			secErr = nerrors.Configuration("config.env_invalid",
+				fmt.Sprintf("%s must be true or false", key)).WithDetail("env", key)
+			return
+		}
+		*dst = b
+	}
+	setBool(EnvSecurityAuditEnabled, &cfg.Security.AuditEnabled)
+	setBool(EnvSecurityRequireAuthentication, &cfg.Security.RequireAuthentication)
+	setBool(EnvSecurityEnforceBusinessScope, &cfg.Security.EnforceBusinessScope)
+	setBool(EnvSecurityDevAllowUnsafeOverrides, &cfg.Security.DevAllowUnsafeOverrides)
+	setBool(EnvSecuritySandboxEnabled, &cfg.Security.SandboxEnabled)
+	if secErr != nil {
+		return secErr
+	}
+	if v, ok := envMap[EnvSecurityEgressAllowList]; ok {
+		list, err := parseEgressList(v)
+		if err != nil {
+			return err
+		}
+		cfg.Security.EgressAllowList = list
+	}
 	return nil
+}
+
+// parseEgressList parses the egress allow-list strictly: entries are trimmed of
+// surrounding spaces, but an empty entry (e.g. "a,,b") is a configuration error
+// rather than being silently dropped, so a typo cannot silently widen or narrow
+// the egress posture.
+func parseEgressList(v string) ([]string, error) {
+	if strings.TrimSpace(v) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if t == "" {
+			return nil, nerrors.Validation("config.egress_entry_empty",
+				"egress allow-list contains an empty entry")
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+// parseStrictBool accepts only explicit true/false spellings so that an invalid
+// security value fails closed rather than defaulting.
+func parseStrictBool(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1":
+		return true, nil
+	case "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid bool %q", v)
+	}
 }
 
 func parseEnviron(environ []string) map[string]string {
@@ -335,6 +476,36 @@ func (c Config) Validate() error {
 	if c.Lifecycle.ShutdownTimeoutSeconds < 0 {
 		return nerrors.Configuration("config.invalid", "lifecycle.shutdown_timeout_seconds must be >= 0").
 			WithDetail("value", c.Lifecycle.ShutdownTimeoutSeconds)
+	}
+	// Security-sensitive configuration fails closed (§18). These checks only
+	// ever reject unsafe combinations; none of them can grant authority.
+	if c.IsProduction() {
+		if !c.Security.AuditEnabled {
+			return nerrors.Configuration("config.security_unsafe",
+				"security.audit_enabled must be true in production")
+		}
+		if !c.Security.RequireAuthentication {
+			return nerrors.Configuration("config.security_unsafe",
+				"security.require_authentication must be true in production")
+		}
+		if !c.Security.EnforceBusinessScope {
+			return nerrors.Configuration("config.security_unsafe",
+				"security.enforce_business_scope must be true in production")
+		}
+		if !c.Security.SandboxEnabled {
+			return nerrors.Configuration("config.security_unsafe",
+				"security.sandbox_enabled must be true in production")
+		}
+		if c.Security.DevAllowUnsafeOverrides {
+			return nerrors.Configuration("config.security_unsafe",
+				"security.dev_allow_unsafe_overrides must be false in production")
+		}
+	}
+	for _, host := range c.Security.EgressAllowList {
+		if strings.TrimSpace(host) == "" {
+			return nerrors.Configuration("config.security_invalid",
+				"security.egress_allow_list must not contain empty entries")
+		}
 	}
 	return nil
 }
