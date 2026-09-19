@@ -1,0 +1,26 @@
+{
+  "nexus": {
+    "id": "nx:nexus:local",
+    "environment": "development"
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "health": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "lifecycle": {
+    "shutdown_timeout_seconds": 30
+  },
+  "security": {
+    "audit_enabled": true,
+    "require_authentication": true,
+    "enforce_business_scope": true,
+    "dev_allow_unsafe_overrides": false,
+    "egress_allow_list": [],
+    "sandbox_enabled": true
+  }
+}
