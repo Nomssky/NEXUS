@@ -15,6 +15,7 @@ a formal unlock procedure.
 | M1 — Identity & Security | `7efefd1` | PR #5 | 2026-09-20 | **LOCKED** |
 | M2 — Governance Engine | `e85ccc7` | PR #9 | 2026-09-20 | **LOCKED** |
 | M3 — Persistence + Events + Observability | `2580b58` | PR #11 | 2026-09-20 | **LOCKED** |
+| M4 — Core Cognition | `ecc674f` | PR #13 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -91,12 +92,24 @@ Once locked, a milestone's code:
   - Optimistic concurrency
   - Business isolation
 
+## M4 Lock Details
+
+- **Commit:** `ecc674f` (merge of PR #13)
+- **Scope:** C08 Core Cognitive Control (Objective, Decision, Planner, Executive)
+- **Components:** objective (lifecycle, hierarchy, WHY, decomposition), decision (framing, evidence, options, recommend/abstain/escalate), planner (plan, mission, task, dependencies, validation), executive (intent → objective → decision → plan)
+- **Tests:** TEST-M4-001..024 (24 tests)
+- **Invariants:**
+  - WHY mandatory for all objectives
+  - WHY preserved through decomposition
+  - Objective ≠ Authorization
+  - C08 does not execute actions
+  - Business isolation enforced
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M4 — Core Cognition | Available | M3 locked ✅ |
-| M5 — First Bootable NEXUS | Blocked | M4 |
+| M5 — First Bootable NEXUS | Available | M4 locked ✅ |
 | M6 — Model Router | Blocked | M5 |
 | M7 — First Safe Autonomous Agent | Blocked | M6 |
 | M8 — Memory + Knowledge | Blocked | M5 |
