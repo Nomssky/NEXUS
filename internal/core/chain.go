@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
@@ -137,62 +138,67 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Outcome:   fmt.Sprintf("job=%s", job.ID),
 	})
 
-	// Step 8: Assign to agent (optional — log but don't fail)
-	agentDef, err := e.chainAgent(ctx, req)
-	if err != nil {
+	// Step 8: Execute via task executor
+	execOutcome, execErr := e.chainExecute(ctx, req, wf)
+	if execErr != nil {
 		audit = append(audit, AuditEntry{
 			Step:      string(StepAgent),
-			Action:    "assign agent",
-			Actor:     "agent-runtime",
+			Action:    "execute task",
+			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   fmt.Sprintf("skipped: %v", err),
+			Outcome:   fmt.Sprintf("error: %v", execErr),
 		})
 	} else {
 		audit = append(audit, AuditEntry{
 			Step:      string(StepAgent),
-			Action:    "assign agent",
-			Actor:     "agent-runtime",
+			Action:    "execute task",
+			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   fmt.Sprintf("agent=%s", agentDef.ID),
+			Outcome:   fmt.Sprintf("status=%s agent=%s", execOutcome.Status, execOutcome.AgentID),
+		})
+		audit = append(audit, AuditEntry{
+			Step:      string(StepModel),
+			Action:    "model routing",
+			Actor:     "executor",
+			Timestamp: e.now(),
+			Duration:  e.now().Sub(start),
+			Outcome:   "completed via executor",
+		})
+		audit = append(audit, AuditEntry{
+			Step:      string(StepTool),
+			Action:    "tool execution",
+			Actor:     "executor",
+			Timestamp: e.now(),
+			Duration:  e.now().Sub(start),
+			Outcome:   "completed via executor",
+		})
+		audit = append(audit, AuditEntry{
+			Step:      string(StepVerify),
+			Action:    "verify outcome",
+			Actor:     "executor",
+			Timestamp: e.now(),
+			Duration:  e.now().Sub(start),
+			Outcome:   fmt.Sprintf("verified: %s", execOutcome.Status),
 		})
 	}
 
-	// Steps 9-10: Model/Tool (completed via agent)
-	audit = append(audit, AuditEntry{
-		Step:      string(StepModel),
-		Action:    "model routing",
-		Actor:     "model-router",
-		Timestamp: e.now(),
-		Duration:  e.now().Sub(start),
-		Outcome:   "completed",
-	})
-
-	audit = append(audit, AuditEntry{
-		Step:      string(StepTool),
-		Action:    "tool execution",
-		Actor:     "tool-registry",
-		Timestamp: e.now(),
-		Duration:  e.now().Sub(start),
-		Outcome:   "completed",
-	})
-
-	// Step 11: Verify
-	audit = append(audit, AuditEntry{
-		Step:      string(StepVerify),
-		Action:    "verify outcome",
-		Actor:     "core",
-		Timestamp: e.now(),
-		Duration:  e.now().Sub(start),
-		Outcome:   "verified",
-	})
-
 	// Step 12: Outcome
+	status := "completed"
+	var outcomeResult *Outcome
+	if execErr != nil {
+		status = "failed"
+	} else if execOutcome != nil {
+		outcomeResult = &Outcome{
+			Summary: execOutcome.Output,
+		}
+	}
+
 	return &Response{
 		RequestID:  req.ID,
-		Status:     "completed",
-		Outcome:    &Outcome{Summary: "request processed through canonical chain"},
+		Status:     status,
+		Outcome:    outcomeResult,
 		AuditTrail: audit,
 		Duration:   e.now().Sub(start),
 	}
@@ -317,6 +323,25 @@ func (e *Engine) chainSchedule(_ context.Context, req *Request, wf *workflow.Wor
 func (e *Engine) chainAgent(_ context.Context, req *Request) (*agent.AgentDefinition, error) {
 	// No agent available by default — agents are provisioned separately
 	return nil, fmt.Errorf("no agent available for business %s", req.Context.BusinessID)
+}
+
+// chainExecute submits the work to the task executor and waits for completion.
+func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Workflow) (*executor.Outcome, error) {
+	workReq := &executor.WorkRequest{
+		TaskID:        wf.ID,
+		CorrelationID: req.Context.CorrelationID,
+		BusinessID:    req.Context.BusinessID,
+		ActorID:       req.Context.ActorID,
+		Intent:        req.Intent,
+		Priority:      req.Priority,
+		Constraints:   req.Constraints,
+	}
+
+	// Use a reasonable timeout for execution
+	execCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	return e.taskExec.SubmitSync(execCtx, workReq)
 }
 
 // chainError creates an error response with audit trail.

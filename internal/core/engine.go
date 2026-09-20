@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
@@ -49,6 +50,7 @@ type Engine struct {
 	scheduler    *scheduler.Scheduler
 	agentRuntime *agent.AgentRuntime
 	toolRegistry *tool.ToolRegistry
+	taskExec     *executor.Executor
 
 	// Intelligence
 	modelRegistry *modelrouter.ModelRegistry
@@ -125,6 +127,13 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 	e.scheduler = scheduler.NewScheduler()
 	e.agentRuntime = agent.NewAgentRuntime()
 	e.toolRegistry = tool.NewToolRegistry()
+	e.taskExec = executor.New(
+		e.agentRuntime,
+		e.toolRegistry,
+		e.govEngine,
+		e.eventBus,
+		executor.DefaultConfig(),
+	)
 
 	// Intelligence
 	e.modelRegistry = modelrouter.NewModelRegistry()
@@ -171,6 +180,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	})
 	e.healthServer.MarkReady()
 
+	// Start the task executor
+	if err := e.taskExec.Start(ctx); err != nil {
+		return fmt.Errorf("executor start: %w", err)
+	}
+
 	// Start request processing loop
 	go e.processRequests(ctx)
 
@@ -190,6 +204,9 @@ func (e *Engine) Stop(_ context.Context) error {
 	e.shutdownOnce.Do(func() {
 		close(e.shutdownCh)
 	})
+
+	// Stop the task executor
+	e.taskExec.Stop(context.Background())
 
 	// Give goroutine time to exit
 	time.Sleep(50 * time.Millisecond)
@@ -280,4 +297,9 @@ func (e *Engine) ToolRegistry() *tool.ToolRegistry {
 // AgentRuntime returns the engine's agent runtime.
 func (e *Engine) AgentRuntime() *agent.AgentRuntime {
 	return e.agentRuntime
+}
+
+// TaskExecutor returns the engine's task executor.
+func (e *Engine) TaskExecutor() *executor.Executor {
+	return e.taskExec
 }
