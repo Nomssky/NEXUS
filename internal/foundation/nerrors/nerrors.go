@@ -222,6 +222,26 @@ func Internal(code, message string) *Error {
 	return New(code, CategoryInternalFailure, message)
 }
 
+// Auth reports an authentication failure (the identity was not authenticated).
+//
+// AUTH is distinct from AUTHORIZATION: AUTH means "we do not know/trust who you
+// are"; AUTHORIZATION means "we know who you are, but you may not do this".
+func Auth(code, message string) *Error {
+	return New(code, CategoryAuth, message)
+}
+
+// Authorization reports that an established identity lacks authority for an
+// action. It is distinct from POLICY_DENIED (a governance policy decision) and
+// from AUTH (authentication).
+func Authorization(code, message string) *Error {
+	return New(code, CategoryAuthorization, message)
+}
+
+// SecurityRejection reports a security boundary violation.
+func SecurityRejection(code, message string) *Error {
+	return New(code, CategorySecurityRejection, message)
+}
+
 // UnknownOutcome reports an operation whose outcome is uncertain.
 //
 // The distinction UNKNOWN_OUTCOME ≠ FAILURE and UNKNOWN_OUTCOME ≠ SUCCESS is

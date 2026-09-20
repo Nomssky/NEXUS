@@ -21,9 +21,11 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
+	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/version"
 )
 
@@ -41,19 +43,22 @@ type Options struct {
 
 // App is a runnable NEXUS process instance.
 type App struct {
-	cfg    config.Config
-	log    *logging.Logger
-	health *health.Server
-	life   *lifecycle.Manager
-	srv    *http.Server
-	opts   Options
+	cfg     config.Config
+	snap    config.Snapshot
+	log     *logging.Logger
+	health  *health.Server
+	life    *lifecycle.Manager
+	srv     *http.Server
+	opts    Options
+	egress  *security.EgressPolicy
+	members *identity.MembershipSet
 }
 
 // New loads configuration and constructs an App. It performs startup validation;
 // on invalid/missing required configuration it returns a canonical VALIDATION
 // error and does NOT construct a partially valid App.
 func New(opts Options) (*App, error) {
-	cfg, err := config.Load(config.LoadOptions{
+	cfg, snap, err := config.LoadSnapshot(config.LoadOptions{
 		FilePath: opts.ConfigFile,
 		Environ:  opts.Environ,
 	})
@@ -75,9 +80,12 @@ func New(opts Options) (*App, error) {
 	})
 
 	a := &App{
-		cfg:    cfg,
-		log:    log,
-		health: health.NewServer(),
+		cfg:     cfg,
+		snap:    snap,
+		log:     log,
+		health:  health.NewServer(),
+		egress:  security.NewEgressPolicy(cfg.Security.EgressAllowList),
+		members: identity.NewMembershipSet(),
 		life: lifecycle.New(lifecycle.Options{
 			ShutdownTimeout: time.Duration(cfg.Lifecycle.ShutdownTimeoutSeconds) * time.Second,
 		}),
@@ -89,6 +97,16 @@ func New(opts Options) (*App, error) {
 
 // Config returns the effective configuration.
 func (a *App) Config() config.Config { return a.cfg }
+
+// ConfigSnapshot returns the immutable configuration snapshot.
+func (a *App) ConfigSnapshot() config.Snapshot { return a.snap }
+
+// Egress returns the deny-by-default egress policy from configuration.
+func (a *App) Egress() *security.EgressPolicy { return a.egress }
+
+// Memberships returns the (empty at M1) membership set. It is exposed so later
+// milestones can populate it; M1 does not persist memberships.
+func (a *App) Memberships() *identity.MembershipSet { return a.members }
 
 // Logger returns the structured logger.
 func (a *App) Logger() *logging.Logger { return a.log }
@@ -144,11 +162,25 @@ func (a *App) registerHooks() {
 func (a *App) Run(ctx context.Context) lifecycle.ExitCode {
 	a.log.Info("nexus starting", logging.Fields{
 		Context: map[string]any{
-			"version":     version.Version,
-			"commit":      version.Commit,
-			"environment": a.cfg.Nexus.Environment,
+			"version":            version.Version,
+			"commit":             version.Commit,
+			"environment":        a.cfg.Nexus.Environment,
+			"config_fingerprint": a.snap.Fingerprint(),
 		},
 	})
+
+	// Security posture is logged as a non-secret summary. The presence of the
+	// posture never grants authority; it only records defensive switches.
+	if a.cfg.Security.AuditEnabled {
+		a.log.Info("security posture active", logging.Fields{
+			Context: map[string]any{
+				"require_authentication": a.cfg.Security.RequireAuthentication,
+				"enforce_business_scope": a.cfg.Security.EnforceBusinessScope,
+				"sandbox_enabled":        a.cfg.Security.SandboxEnabled,
+				"egress_deny_all":        a.egress.Empty(),
+			},
+		})
+	}
 
 	startCtx, cancel := context.WithTimeout(ctx, a.shutdownBudgetOrDefault())
 	defer cancel()

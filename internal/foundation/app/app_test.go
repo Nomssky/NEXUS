@@ -10,9 +10,52 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
+	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 )
 
 func noEnv() func() []string { return func() []string { return nil } }
+
+// TEST-M1-035: M1 security primitives are wired into startup — the app exposes a
+// config snapshot, a deny-by-default egress policy, and an (empty) membership set.
+func TestAppSecurityWiring(t *testing.T) {
+	a, err := New(Options{Environ: func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+		}
+	}})
+	if err != nil {
+		t.Fatalf("expected app to construct: %v", err)
+	}
+	if a.ConfigSnapshot().Fingerprint() == "" {
+		t.Fatal("config snapshot must have a fingerprint")
+	}
+	if a.Egress() == nil || !a.Egress().Empty() {
+		t.Fatal("default egress must be deny-by-default (empty allow-list)")
+	}
+	if a.Memberships() == nil {
+		t.Fatal("membership set must be initialized")
+	}
+}
+
+// TEST-M1-036: production start fails closed when a security switch is weakened.
+func TestAppProductionSecurityFailsClosed(t *testing.T) {
+	_, err := New(Options{Environ: func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:prod",
+			"NEXUS_ENVIRONMENT=production",
+			"NEXUS_SECURITY_REQUIRE_AUTHENTICATION=false",
+			"NEXUS_HEALTH_ENABLED=false",
+		}
+	}})
+	if err == nil {
+		t.Fatal("production with weakened security must fail to start")
+	}
+	if nerrors.CategoryOf(err) != nerrors.CategoryValidation {
+		t.Fatalf("expected VALIDATION, got %s", nerrors.CategoryOf(err))
+	}
+}
 
 // TEST-M0-001: valid configuration starts the application and reaches a running
 // lifecycle state.
