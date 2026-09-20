@@ -9,6 +9,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
+	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/scheduler"
@@ -42,7 +43,8 @@ const (
 //	  → VERIFY → OUTCOME
 func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	start := e.now()
-	audit := make([]AuditEntry, 0, 12)
+	audit := make([]AuditEntry, 0, 14)
+	e.chainEmit(req, "chain.started", "core", req.Intent)
 
 	// Step 1: Validate
 	if err := e.chainValidate(ctx, req); err != nil {
@@ -69,6 +71,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   "allowed",
 	})
+	e.chainEmit(req, "chain.governance.passed", "governance", "allowed")
 
 	// Step 2b: Retrieve relevant context from memory
 	memContext := e.chainMemoryRead(ctx, req)
@@ -80,6 +83,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("found=%d entries", len(memContext)),
 	})
+	e.chainEmit(req, "chain.memory.read", "memory", fmt.Sprintf("found=%d", len(memContext)))
 
 	// Step 2c: Attention scoring
 	attItem := e.chainAttentionScore(ctx, req)
@@ -95,6 +99,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("score=%.2f suppressed=%v", attItemScore(attItem), suppressed),
 	})
+	e.chainEmit(req, "chain.attention.scored", "attention", fmt.Sprintf("score=%.2f", attItemScore(attItem)))
 
 	// Step 3: Create objective from intent
 	objective, err := e.chainObjective(ctx, req)
@@ -109,6 +114,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("objective=%s", objective.ID),
 	})
+	e.chainEmit(req, "chain.objective.created", "objective-engine", objective.ID)
 
 	// Step 4: Decision
 	decision, err := e.chainDecision(ctx, req, objective)
@@ -123,6 +129,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("decision=%s", decision.ID),
 	})
+	e.chainEmit(req, "chain.decision.made", "decision-engine", decision.ID)
 
 	// Step 5: Plan
 	plan, err := e.chainPlan(ctx, req, objective, decision)
@@ -137,6 +144,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("plan=%s", plan.ID),
 	})
+	e.chainEmit(req, "chain.plan.created", "planner", plan.ID)
 
 	// Step 6: Create workflow from plan
 	wf, err := e.chainWorkflow(ctx, req, plan)
@@ -151,6 +159,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("workflow=%s", wf.ID),
 	})
+	e.chainEmit(req, "chain.workflow.created", "workflow-engine", wf.ID)
 
 	// Step 7: Schedule
 	job, err := e.chainSchedule(ctx, req, wf)
@@ -165,6 +174,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("job=%s", job.ID),
 	})
+	e.chainEmit(req, "chain.schedule.scheduled", "scheduler", job.ID)
 
 	// Step 8: Execute via task executor
 	execOutcome, execErr := e.chainExecute(ctx, req, wf)
@@ -186,6 +196,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Duration:  e.now().Sub(start),
 			Outcome:   fmt.Sprintf("status=%s agent=%s", execOutcome.Status, execOutcome.AgentID),
 		})
+		e.chainEmit(req, "chain.executor.completed", "executor", execOutcome.Status)
 		audit = append(audit, AuditEntry{
 			Step:      string(StepModel),
 			Action:    "model routing",
@@ -233,6 +244,9 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("stored status=%s", status),
 	})
+	e.chainEmit(req, "chain.memory.written", "memory", status)
+
+	e.chainEmit(req, "chain.completed", "core", status)
 
 	return &Response{
 		RequestID:  req.ID,
@@ -472,4 +486,20 @@ func attItemScore(item *attention.AttentionItem) float64 {
 		return 0
 	}
 	return item.Score
+}
+
+// chainEmit publishes an event to the bus for chain step observation.
+// Failures are silently ignored - event emission must not block the chain.
+func (e *Engine) chainEmit(req *Request, eventType, actor, outcome string) {
+	payload := fmt.Sprintf(`{"step":"%s","actor":"%s","outcome":"%s"}`, eventType, actor, outcome)
+	_ = e.eventBus.Publish(&event.Event{
+		ID:            fmt.Sprintf("%s-%s", req.ID, eventType),
+		Type:          event.EventType(eventType),
+		Source:        "chain",
+		Timestamp:     e.now(),
+		BusinessID:    req.Context.BusinessID,
+		CorrelationID: req.ID,
+		Priority:      event.PriorityNormal,
+		Data:          []byte(payload),
+	})
 }

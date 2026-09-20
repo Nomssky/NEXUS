@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
+	"sync"
+
+	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 )
@@ -515,6 +518,72 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 	for _, step := range requiredSteps {
 		if !steps[step] {
 			t.Errorf("expected step '%s' in audit trail", step)
+		}
+	}
+}
+
+// TEST-CORE-025: Chain emits events at each step via event bus
+func TestChainEmitsEvents(t *testing.T) {
+	now := time.Now()
+	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Collect events via subscription
+	var receivedEvents []*event.Event
+	var eventsMu sync.Mutex
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
+		receivedEvents = append(receivedEvents, ev)
+		return nil
+	}))
+
+	req := &Request{
+		ID:       "req-events",
+		Context:  NewRequestContext("corr-events", "biz-1", "user-1"),
+		Intent:   "event emission test",
+		Priority: 5,
+	}
+
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	e.EventBus().Dispatch()
+	e.EventBus().Dispatch()
+	time.Sleep(50 * time.Millisecond)
+	e.EventBus().Dispatch()
+	e.EventBus().Dispatch()
+
+	eventsMu.Lock()
+	defer eventsMu.Unlock()
+
+	// Verify key events were emitted
+	expectedTypes := []string{
+		"chain.started",
+		"chain.governance.passed",
+		"chain.memory.read",
+		"chain.attention.scored",
+		"chain.objective.created",
+		"chain.decision.made",
+		"chain.plan.created",
+		"chain.workflow.created",
+		"chain.schedule.scheduled",
+		"chain.executor.completed",
+		"chain.memory.written",
+		"chain.completed",
+	}
+
+	found := make(map[string]bool)
+	for _, ev := range receivedEvents {
+		found[string(ev.Type)] = true
+	}
+
+	for _, et := range expectedTypes {
+		if !found[et] {
+			t.Errorf("expected event type '%s' to be emitted", et)
 		}
 	}
 }
