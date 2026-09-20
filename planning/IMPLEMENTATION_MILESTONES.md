@@ -87,12 +87,14 @@ exit criterion expressed as *observable, testable* behavior.
   full audit; spawn storm prevented by hard limits.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M8 — Memory + Knowledge
+## M8 — Memory + Knowledge 🔒 LOCKED
+- **Status:** LOCKED (PR #21, SHA `50663e3`, merged 2026-09-20)
 - **Scope:** C09 memory admission/retrieval with scope, context assembly,
   knowledge ingestion with provenance.
 - **Components:** C09 (depends on C05, C06, C07).
 - **Exit:** scoped retrieval (no "everything NEXUS knows"); observation ≠
   permanent memory; memory/knowledge can never authorize.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M9 — Attention + Controlled Autonomous Workflow
 - **Scope:** C10 full (priority, aggregation, dedup, suppression guardrails,

@@ -19,6 +19,7 @@ a formal unlock procedure.
 | M5 — First Bootable NEXUS | `a788918` | PR #15 | 2026-09-20 | **LOCKED** |
 | M6 — Model Router + Providers | `9c654d7` | PR #17 | 2026-09-20 | **LOCKED** |
 | M7 — First Safe Autonomous Agent | `9c56599` | PR #19 | 2026-09-20 | **LOCKED** |
+| M8 — Memory + Knowledge | `50663e3` | PR #21 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -152,12 +153,25 @@ Once locked, a milestone's code:
   - Business isolation
   - Full audit trail
 
+## M8 Lock Details
+
+- **Commit:** `50663e3` (merge of PR #21)
+- **Scope:** C09 Memory & Context Intelligence
+- **Components:** memory (admission, scoped retrieval, archive, forget), context (assembly, token budget), knowledge (ingestion pipeline, provenance)
+- **Tests:** TEST-M8-001..020 (20 tests)
+- **Invariants:**
+  - Scoped retrieval (no "everything NEXUS knows")
+  - Observation ≠ permanent memory
+  - Memory/knowledge can never authorize
+  - Knowledge untrusted until validated
+  - Provenance always tracked
+  - Business isolation
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M8 — Memory + Knowledge | Available | M5 locked ✅ |
-| M9 — Attention + Autonomous Workflow | Blocked | M8 |
+| M9 — Attention + Autonomous Workflow | Available | M8 locked ✅ |
 | M10 — Multi-Business Parallel | Blocked | M9 |
 | M11 — 24/7 Hardening | Blocked | M10 |
 
