@@ -11,6 +11,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/scheduler"
 	"github.com/Nomssky/NEXUS/internal/foundation/workflow"
@@ -58,6 +59,13 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   "passed",
 	})
+
+	// Hardening: circuit breaker gate
+	if !e.circuitBreaker.Allow() {
+		err := fmt.Errorf("circuit breaker open: too many recent failures")
+		return e.chainError(req, err, StepValidate, audit, start)
+	}
+	e.chainEmit(req, "chain.hardening.circuit_breaker.ok", "hardening", e.circuitBreaker.State())
 
 	// Step 2: Governance check
 	if err := e.chainGovernance(ctx, req); err != nil {
@@ -187,6 +195,17 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Duration:  e.now().Sub(start),
 			Outcome:   fmt.Sprintf("error: %v", execErr),
 		})
+
+		// Hardening: record failure for circuit breaker
+		e.circuitBreaker.RecordFailure()
+		// Recovery: detect and track the failure
+		failRec := e.recoveryMgr.Detect(
+			hardening.FailureTaskUnknown,
+			"executor",
+			req.Context.BusinessID,
+			fmt.Sprintf("execution failed: %v", execErr),
+		)
+		e.chainEmit(req, "chain.hardening.failure_detected", "hardening", failRec.ID)
 	} else {
 		audit = append(audit, AuditEntry{
 			Step:      string(StepAgent),
