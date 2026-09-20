@@ -17,6 +17,7 @@ a formal unlock procedure.
 | M3 — Persistence + Events + Observability | `2580b58` | PR #11 | 2026-09-20 | **LOCKED** |
 | M4 — Core Cognition | `ecc674f` | PR #13 | 2026-09-20 | **LOCKED** |
 | M5 — First Bootable NEXUS | `a788918` | PR #15 | 2026-09-20 | **LOCKED** |
+| M6 — Model Router + Providers | `9c654d7` | PR #17 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -120,12 +121,25 @@ Once locked, a milestone's code:
   - Task dependencies enforced
   - Verification from evidence
 
+## M6 Lock Details
+
+- **Commit:** `9c654d7` (merge of PR #17)
+- **Scope:** C12 Model Router & Provider Abstraction
+- **Components:** registry (model definitions, capabilities, pricing), provider (interface, local, remote), router (routing, local-first, failover), health (monitoring), accounting (tokens/cost)
+- **Tests:** TEST-M6-001..022 (22 tests)
+- **Invariants:**
+  - Routing ≠ Authorization
+  - Local-first policy
+  - Failover without unsafe duplicates
+  - Privacy-aware routing
+  - Provider credential isolation
+  - Business isolation in accounting
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M6 — Model Router | Available | M5 locked ✅ |
-| M7 — First Safe Autonomous Agent | Blocked | M6 |
+| M7 — First Safe Autonomous Agent | Available | M6 locked ✅ |
 | M8 — Memory + Knowledge | Blocked | M5 |
 | M9 — Attention + Autonomous Workflow | Blocked | M8 |
 | M10 — Multi-Business Parallel | Blocked | M9 |
