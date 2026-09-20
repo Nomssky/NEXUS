@@ -47,12 +47,14 @@ exit criterion expressed as *observable, testable* behavior.
   semantics honored (no fake exactly-once); replay causes no external side effect.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M4 — Core Cognition
+## M4 — Core Cognition 🔒 LOCKED
+- **Status:** LOCKED (PR #13, SHA `ecc674f`, merged 2026-09-20)
 - **Scope:** C08 Objective (WHY + success criteria + scope), Decision, Planner
   (plan + validation handoff), Executive (coordination).
 - **Components:** C08.
 - **Exit:** owner intent → objective → decision → validated plan, all governed
   and persisted; WHY lineage intact; none of these execute actions.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M5 — FIRST BOOTABLE NEXUS
 - **Scope:** C11 Workflow + Scheduling, minimal C12 (agent invocation), minimal
