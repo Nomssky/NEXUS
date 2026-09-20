@@ -21,6 +21,7 @@ a formal unlock procedure.
 | M7 — First Safe Autonomous Agent | `9c56599` | PR #19 | 2026-09-20 | **LOCKED** |
 | M8 — Memory + Knowledge | `50663e3` | PR #21 | 2026-09-20 | **LOCKED** |
 | M9 — Attention + Autonomous Workflow | `335484c` | PR #23 | 2026-09-20 | **LOCKED** |
+| M10 — Multi-Business Parallel | `cd969ce` | PR #25 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -183,12 +184,24 @@ Once locked, a milestone's code:
   - Suppression never hides critical security signals
   - Suppression never hides direct owner messages
 
+## M10 Lock Details
+
+- **Commit:** `cd969ce` (merge of PR #25)
+- **Scope:** Multi-Business Parallel Operation (all layers hardened)
+- **Components:** isolation tests across workflow, scheduler, agent, memory, knowledge, tool, model router, accounting, attention
+- **Tests:** TEST-M10-001..015 (15 tests)
+- **Invariants:**
+  - business_id required on all structures
+  - No cross-business data leak
+  - Parallel execution
+  - UI switch never stops other businesses
+  - Cross-business requires explicit policy + audit
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M10 — Multi-Business Parallel | Available | M9 locked ✅ |
-| M11 — 24/7 Hardening | Blocked | M10 |
+| M11 — 24/7 Hardening | Available | M10 locked ✅ |
 
 ---
 
