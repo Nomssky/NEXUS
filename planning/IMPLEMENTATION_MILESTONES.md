@@ -66,13 +66,15 @@ exit criterion expressed as *observable, testable* behavior.
   evidence, recorded, and recoverable after restart. **Governance never bypassed.**
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M6 — Model Router + Providers
+## M6 — Model Router + Providers 🔒 LOCKED
+- **Status:** LOCKED (PR #17, SHA `9c654d7`, merged 2026-09-20)
 - **Scope:** C12 Model Router (needs-based, local-first), Provider Interface,
   capability registry, health registry, invocation accounting, failover with
   reconcile-before-failover for side-effecting ops.
 - **Components:** C12.
 - **Exit:** local provider invoked via router; a provider failure routes/fails
   over without unsafe duplicate; routing ≠ authorization enforced.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M7 — FIRST SAFE AUTONOMOUS AGENT
 - **Scope:** C12 agent lifecycle with the full M7 attribute set (plan §10),
