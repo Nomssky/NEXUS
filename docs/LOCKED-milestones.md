@@ -16,6 +16,7 @@ a formal unlock procedure.
 | M2 — Governance Engine | `e85ccc7` | PR #9 | 2026-09-20 | **LOCKED** |
 | M3 — Persistence + Events + Observability | `2580b58` | PR #11 | 2026-09-20 | **LOCKED** |
 | M4 — Core Cognition | `ecc674f` | PR #13 | 2026-09-20 | **LOCKED** |
+| M5 — First Bootable NEXUS | `a788918` | PR #15 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -105,12 +106,25 @@ Once locked, a milestone's code:
   - C08 does not execute actions
   - Business isolation enforced
 
+## M5 Lock Details
+
+- **Commit:** `a788918` (merge of PR #15)
+- **Scope:** C11 Workflow + Scheduling + minimal C12 Agent + minimal C13 Tool
+- **Components:** workflow (lifecycle, task graph, dependencies, verification), scheduler (job queue, priority, leasing, deadline, retry), agent (definition, provisioning, lifecycle, heartbeat), tool (READ-ONLY registry, validation, business isolation)
+- **Tests:** TEST-M5-001..038 (38 tests)
+- **Invariants:**
+  - WHY mandatory for all workflows
+  - Business isolation across all components
+  - Governance never bypassed
+  - Read-only tools only (M5 scope)
+  - Task dependencies enforced
+  - Verification from evidence
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M5 — First Bootable NEXUS | Available | M4 locked ✅ |
-| M6 — Model Router | Blocked | M5 |
+| M6 — Model Router | Available | M5 locked ✅ |
 | M7 — First Safe Autonomous Agent | Blocked | M6 |
 | M8 — Memory + Knowledge | Blocked | M5 |
 | M9 — Attention + Autonomous Workflow | Blocked | M8 |
