@@ -7,8 +7,10 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
+	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/scheduler"
 	"github.com/Nomssky/NEXUS/internal/foundation/workflow"
 )
@@ -66,6 +68,32 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Timestamp: e.now(),
 		Duration:  e.now().Sub(start),
 		Outcome:   "allowed",
+	})
+
+	// Step 2b: Retrieve relevant context from memory
+	memContext := e.chainMemoryRead(ctx, req)
+	audit = append(audit, AuditEntry{
+		Step:      "memory_read",
+		Action:    "retrieve context",
+		Actor:     "memory",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   fmt.Sprintf("found=%d entries", len(memContext)),
+	})
+
+	// Step 2c: Attention scoring
+	attItem := e.chainAttentionScore(ctx, req)
+	suppressed := false
+	if attItem != nil {
+		suppressed = e.attentionEng.ShouldSuppress(attItem)
+	}
+	audit = append(audit, AuditEntry{
+		Step:      "attention_score",
+		Action:    "score attention",
+		Actor:     "attention",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   fmt.Sprintf("score=%.2f suppressed=%v", attItemScore(attItem), suppressed),
 	})
 
 	// Step 3: Create objective from intent
@@ -194,6 +222,17 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Summary: execOutcome.Output,
 		}
 	}
+
+	// Step 13: Store outcome in memory
+	e.chainMemoryWrite(ctx, req, status, outcomeResult)
+	audit = append(audit, AuditEntry{
+		Step:      "memory_write",
+		Action:    "store outcome",
+		Actor:     "memory",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   fmt.Sprintf("stored status=%s", status),
+	})
 
 	return &Response{
 		RequestID:  req.ID,
@@ -372,4 +411,65 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 		AuditTrail: audit,
 		Duration:   e.now().Sub(start),
 	}
+}
+
+// chainMemoryRead retrieves relevant context from memory before objective creation.
+func (e *Engine) chainMemoryRead(_ context.Context, req *Request) []*memory.MemoryEntry {
+	query := &memory.MemoryQuery{
+		BusinessID:    req.Context.BusinessID,
+		Keywords:      req.Intent,
+		MaxResults:    5,
+		MinConfidence: 0.3,
+	}
+	return e.memoryStore.Retrieve(query)
+}
+
+// chainMemoryWrite stores the outcome as a memory entry after execution.
+func (e *Engine) chainMemoryWrite(_ context.Context, req *Request, status string, outcome *Outcome) {
+	content := fmt.Sprintf("Request '%s' completed with status: %s", req.Intent, status)
+	if outcome != nil && outcome.Summary != "" {
+		content = outcome.Summary
+	}
+
+	_ = e.memoryStore.Admit(&memory.MemoryEntry{
+		Type:        memory.MemoryTypeEpisodic,
+		BusinessID:  req.Context.BusinessID,
+		ObjectiveID: req.Context.ObjectiveID,
+		Content:     content,
+		Summary:     fmt.Sprintf("outcome: %s", status),
+		Provenance: memory.Provenance{
+			Source:     "chain",
+			SourceID:   req.ID,
+			Confidence: 1.0,
+		},
+		Tags: []string{"outcome", status},
+	})
+}
+
+// chainAttentionScore submits the request to the attention engine for scoring.
+func (e *Engine) chainAttentionScore(_ context.Context, req *Request) *attention.AttentionItem {
+	urgency := req.Priority
+	if urgency > 10 {
+		urgency = 10
+	}
+
+	item, _ := e.attentionEng.SubmitItem(
+		req.Intent,
+		fmt.Sprintf("Owner request from %s", req.Context.ActorID),
+		req.Context.BusinessID,
+		"owner",
+		urgency,
+		5, // importance
+		2, // risk
+		0.8,
+	)
+	return item
+}
+
+// attItemScore safely extracts the score from an attention item.
+func attItemScore(item *attention.AttentionItem) float64 {
+	if item == nil {
+		return 0
+	}
+	return item.Score
 }
