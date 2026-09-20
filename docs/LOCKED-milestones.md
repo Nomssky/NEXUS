@@ -13,6 +13,7 @@ a formal unlock procedure.
 |-----------|-----|--------|-------------|--------|
 | M0 — Foundation | `252f717` | PR #7 | 2026-09-20 | **LOCKED** |
 | M1 — Identity & Security | `7efefd1` | PR #5 | 2026-09-20 | **LOCKED** |
+| M2 — Governance Engine | `e85ccc7` | PR #9 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -63,12 +64,24 @@ Once locked, a milestone's code:
 
 ---
 
+## M2 Lock Details
+
+- **Commit:** `e85ccc7` (merge of PR #9)
+- **Scope:** C03 Governance & Policy Engine
+- **Components:** outcome (5 canonical outcomes), policy (records, matching), engine (evaluation, precedence, override), approval (request/approve/deny, timeout), failsafe (default deny)
+- **Tests:** TEST-M2-001..030 (30 tests)
+- **Invariants:**
+  - Governance outcomes exactly 5 (structural type constraint)
+  - Fail-safe default deny
+  - More-restrictive-wins
+  - No self-approval
+  - Precedence hierarchy preserved
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M2 — Governance Engine | Available | M1 locked ✅ |
-| M3 — Persistence + Events | Blocked | M2 |
+| M3 — Persistence + Events | Available | M2 locked ✅ |
 | M4 — Core Cognition | Blocked | M3 |
 | M5 — First Bootable NEXUS | Blocked | M4 |
 | M6 — Model Router | Blocked | M5 |

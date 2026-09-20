@@ -28,12 +28,14 @@ exit criterion expressed as *observable, testable* behavior.
   never appear in logs; cross-business scope resolution tested.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M2 — Governance Engine
+## M2 — Governance Engine 🔒 LOCKED
+- **Status:** LOCKED (PR #9, SHA `e85ccc7`, merged 2026-09-20)
 - **Scope:** C03 policy engine + approval engine + constraint evaluation;
   exactly 5 canonical outcomes; precedence; fail-safe.
 - **Components:** C03 (depends on C01, C02, C05-stub).
 - **Exit:** all 5 outcomes producible; more-restrictive-wins; unresolved conflict
   → `DENY+ESCALATE`; fail-safe when governance unavailable; no self-approval.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M3 — Persistence + Event Substrate + Observability
 - **Scope:** C05 durable stores (all categories, per plan §13); C07 correlation/
