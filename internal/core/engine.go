@@ -13,6 +13,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
@@ -63,6 +64,11 @@ type Engine struct {
 
 	// Attention
 	attentionEng *attention.FullAttentionEngine
+
+	// Hardening
+	circuitBreaker *hardening.CircuitBreaker
+	backpressure   *hardening.Backpressure
+	recoveryMgr    *hardening.RecoveryManager
 
 	// Processing
 	requests  chan *Request
@@ -151,6 +157,11 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 		attention.SuppressionGuard{},
 	)
 
+	// Hardening
+	e.circuitBreaker = hardening.NewCircuitBreakerWithClock(5, 30*time.Second, e.now)
+	e.backpressure = hardening.NewBackpressureWithClock(100, e.now)
+	e.recoveryMgr = hardening.NewRecoveryManagerWithClock(e.now)
+
 	return e
 }
 
@@ -227,10 +238,16 @@ func (e *Engine) SubmitRequest(req *Request) error {
 	}
 	e.mu.RUnlock()
 
+	// Backpressure gate: reject if queue is full
+	if !e.backpressure.Accept() {
+		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
+	}
+
 	select {
 	case e.requests <- req:
 		return nil
 	case <-e.shutdownCh:
+		e.backpressure.Release()
 		return fmt.Errorf("engine shutting down")
 	}
 }
@@ -302,4 +319,19 @@ func (e *Engine) AgentRuntime() *agent.AgentRuntime {
 // TaskExecutor returns the engine's task executor.
 func (e *Engine) TaskExecutor() *executor.Executor {
 	return e.taskExec
+}
+
+// CircuitBreaker returns the engine's circuit breaker for external inspection.
+func (e *Engine) CircuitBreaker() *hardening.CircuitBreaker {
+	return e.circuitBreaker
+}
+
+// Backpressure returns the engine's backpressure controller for external inspection.
+func (e *Engine) Backpressure() *hardening.Backpressure {
+	return e.backpressure
+}
+
+// RecoveryManager returns the engine's recovery manager for external inspection.
+func (e *Engine) RecoveryManager() *hardening.RecoveryManager {
+	return e.recoveryMgr
 }
