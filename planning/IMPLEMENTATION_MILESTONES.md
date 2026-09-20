@@ -96,7 +96,8 @@ exit criterion expressed as *observable, testable* behavior.
   permanent memory; memory/knowledge can never authorize.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M9 — Attention + Controlled Autonomous Workflow
+## M9 — Attention + Controlled Autonomous Workflow 🔒 LOCKED
+- **Status:** LOCKED (PR #23, SHA `335484c`, merged 2026-09-20)
 - **Scope:** C10 full (priority, aggregation, dedup, suppression guardrails,
   cooldown, budget, quiet-hours, escalation, notification); autonomous workflow
   control loops.
@@ -104,6 +105,7 @@ exit criterion expressed as *observable, testable* behavior.
 - **Exit:** ATTENTION ≠ AUTHORITY enforced; suppression never hides severity
   increases/scope changes/new evidence/policy violations/critical security
   signals/direct owner messages.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M10 — Multi-Business Parallel Operation
 - **Scope:** isolation hardening across all layers via `business_id`
