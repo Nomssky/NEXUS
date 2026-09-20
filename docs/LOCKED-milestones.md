@@ -14,6 +14,7 @@ a formal unlock procedure.
 | M0 — Foundation | `252f717` | PR #7 | 2026-09-20 | **LOCKED** |
 | M1 — Identity & Security | `7efefd1` | PR #5 | 2026-09-20 | **LOCKED** |
 | M2 — Governance Engine | `e85ccc7` | PR #9 | 2026-09-20 | **LOCKED** |
+| M3 — Persistence + Events + Observability | `2580b58` | PR #11 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -77,12 +78,24 @@ Once locked, a milestone's code:
   - No self-approval
   - Precedence hierarchy preserved
 
+## M3 Lock Details
+
+- **Commit:** `2580b58` (merge of PR #11)
+- **Scope:** C05 Persistence + C06 Event Substrate + C07 Observability
+- **Components:** store (Record, Store interface, MemStore), event (Event, Bus, priority queue, dedup), observability (Tracer, MetricsCollector, AuditLog, MemRecorder)
+- **Tests:** TEST-M3-001..044 (44 tests)
+- **Invariants:**
+  - Events are facts never commands
+  - Observability cannot grant authority
+  - Secrets redacted before storage
+  - Optimistic concurrency
+  - Business isolation
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M3 — Persistence + Events | Available | M2 locked ✅ |
-| M4 — Core Cognition | Blocked | M3 |
+| M4 — Core Cognition | Available | M3 locked ✅ |
 | M5 — First Bootable NEXUS | Blocked | M4 |
 | M6 — Model Router | Blocked | M5 |
 | M7 — First Safe Autonomous Agent | Blocked | M6 |
