@@ -37,13 +37,15 @@ exit criterion expressed as *observable, testable* behavior.
   → `DENY+ESCALATE`; fail-safe when governance unavailable; no self-approval.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M3 — Persistence + Event Substrate + Observability
+## M3 — Persistence + Event Substrate + Observability 🔒 LOCKED
+- **Status:** LOCKED (PR #11, SHA `2580b58`, merged 2026-09-20)
 - **Scope:** C05 durable stores (all categories, per plan §13); C07 correlation/
   audit/metrics/traces; C06 event bus, priority queues, worker pool, dedup, DLQ,
   safe replay, triggers.
 - **Components:** C05, C06, C07.
 - **Exit:** record survives restart; correlation chain reconstructable; delivery
   semantics honored (no fake exactly-once); replay causes no external side effect.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M4 — Core Cognition
 - **Scope:** C08 Objective (WHY + success criteria + scope), Decision, Planner
