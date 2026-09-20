@@ -10,19 +10,23 @@ exit criterion expressed as *observable, testable* behavior.
 
 ---
 
-## M0 — Repository Foundation
+## M0 — Repository Foundation 🔒 LOCKED
+- **Status:** LOCKED (PR #7, SHA `252f717`, merged 2026-09-20)
 - **Scope:** language/tooling scaffold, CI, config schema (C01 skeleton),
   persistence/event/observability interface stubs, invariant test harness.
 - **Components:** none functional (scaffold for C01+).
 - **Exit:** builds from one command; CI green; config schema validates; invariant
   test harness runnable (even if mostly skipped).
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M1 — Identity + Security Primitives
+## M1 — Identity + Security Primitives 🔒 LOCKED
+- **Status:** LOCKED (PR #5, SHA `7efefd1`, merged 2026-09-20)
 - **Scope:** C01 (full config), C02 (identity/scope/membership/businesses/
   divisions), C04 (secret store interface, sandbox hooks, egress allow-list).
 - **Components:** C01, C02, C04.
 - **Exit:** identity ≠ authority enforced; `secret_ref` resolution works; secrets
   never appear in logs; cross-business scope resolution tested.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M2 — Governance Engine
 - **Scope:** C03 policy engine + approval engine + constraint evaluation;
