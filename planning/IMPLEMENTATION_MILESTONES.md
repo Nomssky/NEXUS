@@ -76,7 +76,8 @@ exit criterion expressed as *observable, testable* behavior.
   over without unsafe duplicate; routing ≠ authorization enforced.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M7 — FIRST SAFE AUTONOMOUS AGENT
+## M7 — FIRST SAFE AUTONOMOUS AGENT 🔒 LOCKED
+- **Status:** LOCKED (PR #19, SHA `9c56599`, merged 2026-09-20)
 - **Scope:** C12 agent lifecycle with the full M7 attribute set (plan §10),
   anti-spawn-storm controls, heartbeat/recovery, lease fencing; basic C10 needed
   for review routing.
@@ -84,6 +85,7 @@ exit criterion expressed as *observable, testable* behavior.
 - **Exit:** an agent runs a bounded, governed task autonomously with explicit
   capabilities ⊆ authority, resource/timeout budgets, single retry owner, and
   full audit; spawn storm prevented by hard limits.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M8 — Memory + Knowledge
 - **Scope:** C09 memory admission/retrieval with scope, context assembly,
