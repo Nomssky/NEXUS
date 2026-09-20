@@ -15,4 +15,7 @@ coverage.txt
 .DS_Store
 .idea/
 .vscode/
-nexus
+
+# Binaries
+/nexus
+/doc-processor

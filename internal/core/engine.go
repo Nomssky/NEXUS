@@ -271,3 +271,13 @@ func (e *Engine) EventBus() *event.MemBus {
 func (e *Engine) Store() *store.MemStore {
 	return e.store
 }
+
+// ToolRegistry returns the engine's tool registry.
+func (e *Engine) ToolRegistry() *tool.ToolRegistry {
+	return e.toolRegistry
+}
+
+// AgentRuntime returns the engine's agent runtime.
+func (e *Engine) AgentRuntime() *agent.AgentRuntime {
+	return e.agentRuntime
+}
