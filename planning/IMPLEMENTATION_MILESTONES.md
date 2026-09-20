@@ -134,6 +134,14 @@ exit criterion expressed as *observable, testable* behavior.
   Audit trail shows all integration points. 23 core tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M11b — Integration: Chain Event Emission 🔒 LOCKED
+- **Status:** LOCKED (PR #35, SHA `da58118`, merged 2026-09-20)
+- **Scope:** Emit events via MemBus at every chain step for observability.
+- **Components:** C03 (Event), C12 (Core).
+- **Exit:** 12 event types emitted per chain execution (started→completed).
+  24 core tests pass. Race clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
