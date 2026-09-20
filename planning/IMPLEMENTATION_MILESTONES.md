@@ -126,6 +126,14 @@ exit criterion expressed as *observable, testable* behavior.
   unsafe duplicate side effects; graceful shutdown/drain verified.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M11 — Integration: Memory + Attention 🔒 LOCKED
+- **Status:** LOCKED (PR #34, SHA `de9c2e9`, merged 2026-09-20)
+- **Scope:** Wire Memory and Attention into the canonical execution chain.
+- **Components:** C05 (Memory), C06 (Attention), C12 (Core).
+- **Exit:** Chain includes memory_read, attention_score, memory_write steps.
+  Audit trail shows all integration points. 23 core tests pass. Race clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
