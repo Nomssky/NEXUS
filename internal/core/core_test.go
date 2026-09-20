@@ -7,6 +7,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
+	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 )
 
 // TEST-CORE-001: RequestContext creation
@@ -336,5 +337,184 @@ func TestWHYChainPreserved(t *testing.T) {
 	}
 	if ctx.WhyChain[1] != "objective level why" {
 		t.Errorf("expected second why, got %s", ctx.WhyChain[1])
+	}
+}
+
+// TEST-CORE-021: Memory read returns context before objective creation
+func TestMemoryReadInChain(t *testing.T) {
+	now := time.Now()
+	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Pre-populate memory
+	_ = e.memoryStore.Admit(&memory.MemoryEntry{
+		Type:       memory.MemoryTypeEpisodic,
+		BusinessID: "biz-1",
+		Content:    "previous invoice processing result",
+		Summary:    "invoice processed",
+		Provenance: memory.Provenance{Source: "test", Confidence: 1.0},
+		Tags:       []string{"invoice"},
+	})
+
+	req := &Request{
+		ID:       "req-mem",
+		Context:  NewRequestContext("corr-mem", "biz-1", "user-1"),
+		Intent:   "process invoice",
+		Priority: 5,
+	}
+
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-mem")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	// Check that memory_read step is in audit trail
+	found := false
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "memory_read" {
+			found = true
+			if entry.Outcome == "" {
+				t.Error("expected non-empty outcome for memory_read")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected memory_read step in audit trail")
+	}
+}
+
+// TEST-CORE-022: Attention scoring in chain
+func TestAttentionScoreInChain(t *testing.T) {
+	now := time.Now()
+	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:       "req-att",
+		Context:  NewRequestContext("corr-att", "biz-1", "user-1"),
+		Intent:   "urgent task",
+		Priority: 8,
+	}
+
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-att")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	// Check that attention_score step is in audit trail
+	found := false
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "attention_score" {
+			found = true
+			if entry.Outcome == "" {
+				t.Error("expected non-empty outcome for attention_score")
+			}
+		}
+	}
+	if !found {
+		t.Error("expected attention_score step in audit trail")
+	}
+}
+
+// TEST-CORE-023: Memory write after execution
+func TestMemoryWriteInChain(t *testing.T) {
+	now := time.Now()
+	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:       "req-memwrite",
+		Context:  NewRequestContext("corr-memwrite", "biz-1", "user-1"),
+		Intent:   "test memory write",
+		Priority: 5,
+	}
+
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-memwrite")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	// Check that memory_write step is in audit trail
+	found := false
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "memory_write" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected memory_write step in audit trail")
+	}
+
+	// Verify memory was actually written
+	query := &memory.MemoryQuery{
+		BusinessID: "biz-1",
+		MaxResults: 10,
+	}
+	entries := e.memoryStore.Retrieve(query)
+	if len(entries) == 0 {
+		t.Error("expected at least 1 memory entry after chain execution")
+	}
+}
+
+// TEST-CORE-024: Full chain has memory and attention steps
+func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
+	now := time.Now()
+	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:       "req-full-steps",
+		Context:  NewRequestContext("corr-full", "biz-1", "user-1"),
+		Intent:   "full chain test",
+		Priority: 5,
+	}
+
+	e.SubmitRequest(req)
+	time.Sleep(200 * time.Millisecond)
+
+	result, _ := e.GetResult("req-full-steps")
+	if result == nil {
+		t.Fatal("expected result")
+	}
+
+	// Collect all steps
+	steps := make(map[string]bool)
+	for _, entry := range result.AuditTrail {
+		steps[entry.Step] = true
+	}
+
+	// Verify key steps exist
+	requiredSteps := []string{
+		"validate", "governance", "memory_read", "attention_score",
+		"objective", "decision", "plan", "workflow", "schedule",
+		"agent", "memory_write",
+	}
+	for _, step := range requiredSteps {
+		if !steps[step] {
+			t.Errorf("expected step '%s' in audit trail", step)
+		}
 	}
 }
