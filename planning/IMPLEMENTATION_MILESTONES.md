@@ -117,12 +117,14 @@ exit criterion expressed as *observable, testable* behavior.
   layers; cross-business requires explicit policy + audit.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M11 — 24/7 Hardening + Recovery + Chaos Validation
+## M11 — 24/7 Hardening + Recovery + Chaos Validation 🔒 LOCKED
+- **Status:** LOCKED (PR #27, SHA `7013fa7`, merged 2026-09-20)
 - **Scope:** full failure playbook (plan §19); process/machine/provider/network/
   DB failure; worker death; unknown-outcome; queue storm; backpressure.
 - **Components:** all.
 - **Exit:** chaos suite green; crash → restart → reconstruct → reconcile; no
   unsafe duplicate side effects; graceful shutdown/drain verified.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ---
 
