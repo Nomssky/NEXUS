@@ -107,13 +107,15 @@ exit criterion expressed as *observable, testable* behavior.
   signals/direct owner messages.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M10 — Multi-Business Parallel Operation
+## M10 — Multi-Business Parallel Operation 🔒 LOCKED
+- **Status:** LOCKED (PR #25, SHA `cd969ce`, merged 2026-09-20)
 - **Scope:** isolation hardening across all layers via `business_id`
   (+`division_id`); parallel execution; UI switch never stops other businesses.
 - **Components:** all (hardened).
 - **Exit:** isolation tests green at DB, event, workflow, agent, memory,
   knowledge, tool, model, provider, credential, config, observability, attention
   layers; cross-business requires explicit policy + audit.
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M11 — 24/7 Hardening + Recovery + Chaos Validation
 - **Scope:** full failure playbook (plan §19); process/machine/provider/network/
