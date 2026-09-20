@@ -22,6 +22,7 @@ a formal unlock procedure.
 | M8 — Memory + Knowledge | `50663e3` | PR #21 | 2026-09-20 | **LOCKED** |
 | M9 — Attention + Autonomous Workflow | `335484c` | PR #23 | 2026-09-20 | **LOCKED** |
 | M10 — Multi-Business Parallel | `cd969ce` | PR #25 | 2026-09-20 | **LOCKED** |
+| M11 — 24/7 Hardening + Recovery + Chaos Validation | `7013fa7` | PR #27 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -199,10 +200,24 @@ Once locked, a milestone's code:
 
 ## Unlocked Milestones
 
-| Milestone | Status | Blocked By |
-|-----------|--------|------------|
-| M11 — 24/7 Hardening | Available | M10 locked ✅ |
+> **All milestones (M0–M11) are now LOCKED.** No remaining unlocked milestones.
 
 ---
 
-*Last updated: 2026-09-20*
+## M11 Lock Details
+
+- **Commit:** `7013fa7` (merge of PR #27)
+- **Scope:** 24/7 Hardening + Recovery + Chaos Validation
+- **Components:** hardening (RecoveryManager, CircuitBreaker, Backpressure, GracefulShutdown)
+- **Tests:** TEST-M11-001..020 (20 tests)
+- **Invariants:**
+  - Crash → restart → reconstruct → reconcile
+  - No unsafe duplicate side effects
+  - Graceful shutdown/drain verified
+  - Unknown outcome → reconcile before retry
+  - Backpressure prevents queue storms
+  - Circuit breaker prevents cascade failures
+
+---
+
+*Last updated: 2026-09-20 — All milestones M0–M11 LOCKED*
