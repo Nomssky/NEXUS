@@ -18,6 +18,7 @@ a formal unlock procedure.
 | M4 — Core Cognition | `ecc674f` | PR #13 | 2026-09-20 | **LOCKED** |
 | M5 — First Bootable NEXUS | `a788918` | PR #15 | 2026-09-20 | **LOCKED** |
 | M6 — Model Router + Providers | `9c654d7` | PR #17 | 2026-09-20 | **LOCKED** |
+| M7 — First Safe Autonomous Agent | `9c56599` | PR #19 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -135,12 +136,27 @@ Once locked, a milestone's code:
   - Provider credential isolation
   - Business isolation in accounting
 
+## M7 Lock Details
+
+- **Commit:** `9c56599` (merge of PR #19)
+- **Scope:** C12 Agent Lifecycle (enhanced) + C10 Attention (basic)
+- **Components:** agent (identity, authority chain, budget, spawn controls, heartbeat/recovery, lease fencing, cancel semantics, termination), attention (items, priority, escalation, review routing)
+- **Tests:** TEST-M7-001..024 (24 tests)
+- **Invariants:**
+  - capabilities ⊆ authority ⊆ parent authority
+  - capability ≠ permission
+  - Agent cannot modify policy/audit/approval
+  - Cancel ≠ failure
+  - Timeout → UNKNOWN, not failure
+  - Spawn storm prevented by hard limits
+  - Business isolation
+  - Full audit trail
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M7 — First Safe Autonomous Agent | Available | M6 locked ✅ |
-| M8 — Memory + Knowledge | Blocked | M5 |
+| M8 — Memory + Knowledge | Available | M5 locked ✅ |
 | M9 — Attention + Autonomous Workflow | Blocked | M8 |
 | M10 — Multi-Business Parallel | Blocked | M9 |
 | M11 — 24/7 Hardening | Blocked | M10 |
