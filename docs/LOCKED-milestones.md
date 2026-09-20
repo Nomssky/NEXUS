@@ -20,6 +20,7 @@ a formal unlock procedure.
 | M6 — Model Router + Providers | `9c654d7` | PR #17 | 2026-09-20 | **LOCKED** |
 | M7 — First Safe Autonomous Agent | `9c56599` | PR #19 | 2026-09-20 | **LOCKED** |
 | M8 — Memory + Knowledge | `50663e3` | PR #21 | 2026-09-20 | **LOCKED** |
+| M9 — Attention + Autonomous Workflow | `335484c` | PR #23 | 2026-09-20 | **LOCKED** |
 
 ## Lock Criteria
 
@@ -167,12 +168,26 @@ Once locked, a milestone's code:
   - Provenance always tracked
   - Business isolation
 
+## M9 Lock Details
+
+- **Commit:** `335484c` (merge of PR #23)
+- **Scope:** C10 Full Attention & Priority Intelligence
+- **Components:** attention (priority scoring, suppression guardrails, cooldown, budget, quiet-hours, escalation levels, notification routing)
+- **Tests:** TEST-M9-001..020 (20 tests)
+- **Invariants:**
+  - ATTENTION ≠ AUTHORITY
+  - Suppression never hides severity increases
+  - Suppression never hides scope changes
+  - Suppression never hides new evidence
+  - Suppression never hides policy violations
+  - Suppression never hides critical security signals
+  - Suppression never hides direct owner messages
+
 ## Unlocked Milestones
 
 | Milestone | Status | Blocked By |
 |-----------|--------|------------|
-| M9 — Attention + Autonomous Workflow | Available | M8 locked ✅ |
-| M10 — Multi-Business Parallel | Blocked | M9 |
+| M10 — Multi-Business Parallel | Available | M9 locked ✅ |
 | M11 — 24/7 Hardening | Blocked | M10 |
 
 ---
