@@ -56,13 +56,15 @@ exit criterion expressed as *observable, testable* behavior.
   and persisted; WHY lineage intact; none of these execute actions.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M5 — FIRST BOOTABLE NEXUS
+## M5 — FIRST BOOTABLE NEXUS 🔒 LOCKED
+- **Status:** LOCKED (PR #15, SHA `a788918`, merged 2026-09-20)
 - **Scope:** C11 Workflow + Scheduling, minimal C12 (agent invocation), minimal
   C13 (READ-ONLY tool), wired to M0–M4.
 - **Components:** C11 + minimal C12 + minimal C13.
 - **Exit:** the 17-step boot sequence in `IMPLEMENTATION_PLAN.md §9` completes;
   a controlled owner request produces a task executed once, verified from
   evidence, recorded, and recoverable after restart. **Governance never bypassed.**
+- **Lock:** No modifications permitted without explicit unlock procedure.
 
 ## M6 — Model Router + Providers
 - **Scope:** C12 Model Router (needs-based, local-first), Provider Interface,
