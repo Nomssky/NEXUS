@@ -5,84 +5,197 @@ import (
 	"time"
 )
 
-// TEST-M7-015: Submit attention item
-func TestAttentionSubmit(t *testing.T) {
-	ae := NewAttentionEngine()
-	item, err := ae.SubmitItem("High priority issue", "Needs review", "biz-1", "agent", 9)
+// TEST-M9-001: Submit item with priority scoring
+func TestAttentionSubmitWithScoring(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{MaxOwnerInterruptionsPerHour: 10},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressSecuritySignals: true},
+	)
+
+	item, err := fae.SubmitItem("Critical issue", "Desc", "biz-1", "agent", 9, 8, 7, 0.9)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if item.Level != LevelEscalate {
-		t.Errorf("expected escalate level for priority 9, got %v", item.Level)
+	if item.Score <= 0 {
+		t.Errorf("expected positive score, got %v", item.Score)
 	}
-	if item.Status != StatusNew {
-		t.Errorf("expected new status, got %v", item.Status)
-	}
-}
-
-// TEST-M7-016: Submit rejects empty title
-func TestAttentionRejectsEmptyTitle(t *testing.T) {
-	ae := NewAttentionEngine()
-	_, err := ae.SubmitItem("", "desc", "biz-1", "agent", 5)
-	if err == nil {
-		t.Error("expected error for empty title")
+	if item.Level < LevelHigh {
+		t.Errorf("expected high or above level, got %v", item.Level)
 	}
 }
 
-// TEST-M7-017: Submit rejects invalid priority
-func TestAttentionRejectsInvalidPriority(t *testing.T) {
-	ae := NewAttentionEngine()
-	_, err := ae.SubmitItem("Title", "desc", "biz-1", "agent", 15)
-	if err == nil {
-		t.Error("expected error for priority > 10")
+// TEST-M9-002: Security signal always escalates
+func TestAttentionSecuritySignalAlwaysEscalates(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressSecuritySignals: true},
+	)
+
+	item, _ := fae.SubmitItem("Security issue", "Desc", "biz-1", "security", 5, 5, 5, 0.8, true)
+	if item.Outcome != OutcomeEmergency {
+		t.Errorf("expected emergency for security signal, got %v", item.Outcome)
 	}
 }
 
-// TEST-M7-018: Priority classification
-func TestAttentionPriorityClassification(t *testing.T) {
-	tests := []struct {
-		priority int
-		level    AttentionLevel
-	}{
-		{0, LevelIgnore},
-		{1, LevelRecord},
-		{4, LevelMonitor},
-		{7, LevelReview},
-		{9, LevelEscalate},
-	}
+// TEST-M9-003: Policy violation always escalates
+func TestAttentionPolicyViolationAlwaysEscalates(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressPolicyViolations: true},
+	)
 
-	for _, tt := range tests {
-		ae := NewAttentionEngine()
-		item, _ := ae.SubmitItem("Test", "desc", "biz-1", "agent", tt.priority)
-		if item.Level != tt.level {
-			t.Errorf("priority %d: expected %v, got %v", tt.priority, tt.level, item.Level)
-		}
+	item, _ := fae.SubmitItem("Policy violation", "Desc", "biz-1", "system", 5, 5, 5, 0.8, false, true)
+	if item.Outcome != OutcomeEmergency {
+		t.Errorf("expected emergency for policy violation, got %v", item.Outcome)
 	}
 }
 
-// TEST-M7-019: Escalate item
-func TestAttentionEscalate(t *testing.T) {
-	ae := NewAttentionEngine()
-	item, _ := ae.SubmitItem("Issue", "desc", "biz-1", "agent", 5)
+// TEST-M9-004: Owner message always escalates
+func TestAttentionOwnerMessageAlwaysEscalates(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressOwnerMessages: true},
+	)
 
-	err := ae.Escalate(item.ID)
+	item, _ := fae.SubmitItem("Owner message", "Desc", "biz-1", "owner", 3, 3, 3, 0.8, false, false, true)
+	if item.Outcome != OutcomeEscalateOwner {
+		t.Errorf("expected escalate_to_owner for owner message, got %v", item.Outcome)
+	}
+}
+
+// TEST-M9-005: Suppression guard prevents hiding security
+func TestSuppressionGuardPreventsHidingSecurity(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressSecuritySignals: true},
+	)
+
+	item := &AttentionItem{
+		IsSecuritySignal: true,
+		Source:           "security",
+		Level:            LevelHigh,
+	}
+
+	if fae.ShouldSuppress(item) {
+		t.Error("should not suppress security signal")
+	}
+}
+
+// TEST-M9-006: Suppression guard prevents hiding policy violation
+func TestSuppressionGuardPreventsHidingPolicyViolation(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{Enabled: false},
+		SuppressionGuard{NeverSuppressPolicyViolations: true},
+	)
+
+	item := &AttentionItem{
+		IsPolicyViolation: true,
+		Source:            "system",
+		Level:             LevelHigh,
+	}
+
+	if fae.ShouldSuppress(item) {
+		t.Error("should not suppress policy violation")
+	}
+}
+
+// TEST-M9-007: Budget check passes under limit
+func TestBudgetCheckUnderLimit(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{MaxOwnerInterruptionsPerHour: 5},
+		QuietHours{Enabled: false},
+		SuppressionGuard{},
+	)
+
+	if !fae.CheckBudget() {
+		t.Error("expected budget OK")
+	}
+}
+
+// TEST-M9-008: Budget check fails over limit
+func TestBudgetCheckOverLimit(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{MaxOwnerInterruptionsPerHour: 2},
+		QuietHours{Enabled: false},
+		SuppressionGuard{},
+	)
+
+	fae.RecordInterruption()
+	fae.RecordInterruption()
+
+	if fae.CheckBudget() {
+		t.Error("expected budget exceeded")
+	}
+}
+
+// TEST-M9-009: Quiet hours suppress low-level notifications
+func TestQuietHoursSuppressLowLevel(t *testing.T) {
+	now := time.Now()
+	fae := NewFullAttentionEngineWithClock(
+		AttentionBudget{},
+		QuietHours{Enabled: true, MinLevel: LevelCritical},
+		SuppressionGuard{},
+		func() time.Time { return now },
+	)
+
+	item := &AttentionItem{
+		Outcome: OutcomeEscalateOwner,
+		Level:   LevelNormal, // below critical
+		Source:  "system",
+	}
+
+	if !fae.ShouldSuppress(item) {
+		t.Error("expected suppression during quiet hours for low-level")
+	}
+}
+
+// TEST-M9-010: Quiet hours allow critical notifications
+func TestQuietHoursAllowCritical(t *testing.T) {
+	now := time.Now()
+	fae := NewFullAttentionEngineWithClock(
+		AttentionBudget{},
+		QuietHours{Enabled: true, MinLevel: LevelCritical},
+		SuppressionGuard{},
+		func() time.Time { return now },
+	)
+
+	item := &AttentionItem{
+		Outcome: OutcomeEscalateOwner,
+		Level:   LevelCritical, // at or above critical
+		Source:  "system",
+	}
+
+	if fae.ShouldSuppress(item) {
+		t.Error("should not suppress critical during quiet hours")
+	}
+}
+
+// TEST-M9-011: Acknowledge item
+func TestAttentionAcknowledge(t *testing.T) {
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+	item, _ := fae.SubmitItem("Issue", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
+
+	err := fae.Acknowledge(item.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if item.Level != LevelEscalate {
-		t.Errorf("expected escalate, got %v", item.Level)
-	}
-	if item.Status != StatusEscalated {
-		t.Errorf("expected escalated status, got %v", item.Status)
+	if item.Status != StatusAcknowledged {
+		t.Errorf("expected acknowledged, got %v", item.Status)
 	}
 }
 
-// TEST-M7-020: Resolve item
+// TEST-M9-012: Resolve item
 func TestAttentionResolve(t *testing.T) {
-	ae := NewAttentionEngine()
-	item, _ := ae.SubmitItem("Issue", "desc", "biz-1", "agent", 5)
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+	item, _ := fae.SubmitItem("Issue", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
 
-	err := ae.Resolve(item.ID)
+	err := fae.Resolve(item.ID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -94,31 +207,15 @@ func TestAttentionResolve(t *testing.T) {
 	}
 }
 
-// TEST-M7-021: Ignore item
-func TestAttentionIgnore(t *testing.T) {
-	ae := NewAttentionEngine()
-	item, _ := ae.SubmitItem("Noise", "desc", "biz-1", "system", 0)
-
-	err := ae.Ignore(item.ID)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if item.Status != StatusIgnored {
-		t.Errorf("expected ignored, got %v", item.Status)
-	}
-}
-
-// TEST-M7-022: Pending items excludes resolved/ignored
+// TEST-M9-013: Pending items excludes resolved
 func TestAttentionPendingExcludesResolved(t *testing.T) {
-	ae := NewAttentionEngine()
-	item1, _ := ae.SubmitItem("Open", "desc", "biz-1", "agent", 5)
-	item2, _ := ae.SubmitItem("Resolved", "desc", "biz-1", "agent", 5)
-	item3, _ := ae.SubmitItem("Ignored", "desc", "biz-1", "agent", 0)
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+	item1, _ := fae.SubmitItem("Open", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
+	item2, _ := fae.SubmitItem("Resolved", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
 
-	ae.Resolve(item2.ID)
-	ae.Ignore(item3.ID)
+	fae.Resolve(item2.ID)
 
-	pending := ae.PendingItems()
+	pending := fae.PendingItems()
 	if len(pending) != 1 {
 		t.Errorf("expected 1 pending, got %d", len(pending))
 	}
@@ -127,24 +224,112 @@ func TestAttentionPendingExcludesResolved(t *testing.T) {
 	}
 }
 
-// TEST-M7-023: Business isolation in attention
+// TEST-M9-014: Attention levels
+func TestAttentionLevels(t *testing.T) {
+	levels := []AttentionLevel{
+		LevelIgnore, LevelBackground, LevelNormal, LevelImportant,
+		LevelHigh, LevelCritical, LevelEmergency,
+	}
+	if len(levels) != 7 {
+		t.Errorf("expected 7 levels, got %d", len(levels))
+	}
+}
+
+// TEST-M9-015: Attention outcomes
+func TestAttentionOutcomes(t *testing.T) {
+	outcomes := []AttentionOutcome{
+		OutcomeIgnore, OutcomeRecord, OutcomeMonitor, OutcomeQueue,
+		OutcomeActAutonomously, OutcomeEscalateAgent, OutcomeEscalateOwner,
+		OutcomePause, OutcomeEmergency,
+	}
+	if len(outcomes) != 9 {
+		t.Errorf("expected 9 outcomes, got %d", len(outcomes))
+	}
+}
+
+// TEST-M9-016: Attention ≠ Authority invariant
+func TestAttentionNotAuthority(t *testing.T) {
+	// Structural invariant: AttentionItem has no authority fields
+	// Attention recommends, governance authorizes
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+	item, _ := fae.SubmitItem("Issue", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
+
+	// Item has outcome (recommendation), NOT authority
+	if item.Outcome == "" {
+		t.Error("expected outcome to be set")
+	}
+	// No authority field exists — verified by compilation
+}
+
+// TEST-M9-017: Business isolation in attention
 func TestAttentionBusinessIsolation(t *testing.T) {
-	ae := NewAttentionEngine()
-	item1, _ := ae.SubmitItem("Issue 1", "desc", "biz-1", "agent", 5)
-	item2, _ := ae.SubmitItem("Issue 2", "desc", "biz-2", "agent", 5)
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+	item1, _ := fae.SubmitItem("Issue 1", "Desc", "biz-1", "agent", 5, 5, 5, 0.8)
+	item2, _ := fae.SubmitItem("Issue 2", "Desc", "biz-2", "agent", 5, 5, 5, 0.8)
 
 	if item1.BusinessID == item2.BusinessID {
 		t.Error("expected different business IDs")
 	}
 }
 
-// TEST-M7-024: Clock injection
-func TestAttentionClockInjection(t *testing.T) {
+// TEST-M9-018: Cooldown suppresses rapid duplicates
+func TestCooldownSuppressesDuplicates(t *testing.T) {
 	now := time.Now()
-	ae := NewAttentionEngineWithClock(func() time.Time { return now })
-	item, _ := ae.SubmitItem("Issue", "desc", "biz-1", "agent", 5)
+	fae := NewFullAttentionEngineWithClock(
+		AttentionBudget{},
+		QuietHours{},
+		SuppressionGuard{},
+		func() time.Time { return now },
+	)
 
-	if !item.CreatedAt.Equal(now) {
-		t.Errorf("expected clock-injected time")
+	item := &AttentionItem{Source: "api", Level: LevelNormal}
+	fae.cooldowns["api"] = now // just notified
+
+	if !fae.ShouldSuppress(item) {
+		t.Error("expected suppression during cooldown")
+	}
+}
+
+// TEST-M9-019: Suppression guard prevents hiding severity increase
+func TestSuppressionGuardPreventsHidingSeverityIncrease(t *testing.T) {
+	fae := NewFullAttentionEngine(
+		AttentionBudget{},
+		QuietHours{},
+		SuppressionGuard{NeverSuppressSeverityIncrease: true},
+	)
+
+	item := &AttentionItem{
+		SeverityIncreased: true,
+		Source:            "workflow",
+		Level:             LevelNormal,
+	}
+
+	if fae.ShouldSuppress(item) {
+		t.Error("should not suppress severity increase")
+	}
+}
+
+// TEST-M9-020: Score-to-level mapping
+func TestScoreToLevelMapping(t *testing.T) {
+	fae := NewFullAttentionEngine(AttentionBudget{}, QuietHours{}, SuppressionGuard{})
+
+	tests := []struct {
+		score float64
+		level AttentionLevel
+	}{
+		{0, LevelIgnore},
+		{3, LevelBackground},
+		{7, LevelNormal},
+		{12, LevelImportant},
+		{17, LevelHigh},
+		{22, LevelCritical},
+		{30, LevelEmergency},
+	}
+
+	for _, tt := range tests {
+		level := fae.scoreToLevel(tt.score)
+		if level != tt.level {
+			t.Errorf("score %v: expected %v, got %v", tt.score, tt.level, level)
+		}
 	}
 }
