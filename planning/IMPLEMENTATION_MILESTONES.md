@@ -158,6 +158,14 @@ exit criterion expressed as *observable, testable* behavior.
   20 gateway tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M12 — Persistence: FileStore 🔒 LOCKED
+- **Status:** LOCKED (PR #40, SHA `3aa6848`, merged 2026-09-21)
+- **Scope:** Disk-backed Store implementation with engine integration.
+- **Components:** C05 (Persistence & State), C12 (Core).
+- **Exit:** FileStore implements Store interface. WithPersistence option.
+  NewEngine returns error. 40+ store tests pass. Race clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
