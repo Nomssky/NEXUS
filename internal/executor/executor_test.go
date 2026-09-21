@@ -33,6 +33,7 @@ func testExecutor(t *testing.T) *Executor {
 		tool.NewToolRegistry(),
 		govEngine,
 		event.NewMemBus(),
+		nil, // no model router in tests
 		DefaultConfig(),
 		WithClock(func() time.Time { return now }),
 	)
@@ -210,6 +211,7 @@ func TestGovernanceDenied(t *testing.T) {
 		tool.NewToolRegistry(),
 		govEngine,
 		event.NewMemBus(),
+		nil, // no model router in tests
 		DefaultConfig(),
 		WithClock(func() time.Time { return now }),
 	)
@@ -343,6 +345,7 @@ func TestEventEmission(t *testing.T) {
 			},
 		}),
 		bus,
+		nil, // no model router in tests
 		DefaultConfig(),
 		WithClock(func() time.Time { return now }),
 	)
@@ -445,6 +448,7 @@ func TestConcurrentExecution(t *testing.T) {
 		tool.NewToolRegistry(),
 		governance.NewEngine(nil),
 		event.NewMemBus(),
+		nil, // no model router in tests
 		cfg,
 	)
 
@@ -494,6 +498,7 @@ func TestCapacityLimit(t *testing.T) {
 		tool.NewToolRegistry(),
 		govEngine,
 		event.NewMemBus(),
+		nil, // no model router in tests
 		cfg,
 	)
 

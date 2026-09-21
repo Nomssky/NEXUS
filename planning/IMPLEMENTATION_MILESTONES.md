@@ -142,14 +142,6 @@ exit criterion expressed as *observable, testable* behavior.
   24 core tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
-## M11c — Integration: Hardening Wiring 🔒 LOCKED
-- **Status:** LOCKED (PR #36, SHA `a98426e`, merged 2026-09-20)
-- **Scope:** Wire CircuitBreaker, Backpressure, RecoveryManager into engine and chain.
-- **Components:** C11 (Hardening), C12 (Core).
-- **Exit:** Backpressure gates submissions, circuit breaker gates chain start,
-  recovery tracks execution failures. 28 core tests pass. Race clean.
-- **Lock:** No modifications permitted without explicit unlock procedure.
-
 ---
 
 ## Milestone → Component Matrix

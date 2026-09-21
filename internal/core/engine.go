@@ -133,18 +133,20 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 	e.scheduler = scheduler.NewScheduler()
 	e.agentRuntime = agent.NewAgentRuntime()
 	e.toolRegistry = tool.NewToolRegistry()
+
+	// Intelligence (create before executor so it can use the router)
+	e.modelRegistry = modelrouter.NewModelRegistry()
+	e.modelRouter = modelrouter.NewModelRouter(e.modelRegistry, modelrouter.RoutingPolicyLocalFirst)
+	e.invAccounting = modelrouter.NewInvocationAccounting()
+
 	e.taskExec = executor.New(
 		e.agentRuntime,
 		e.toolRegistry,
 		e.govEngine,
 		e.eventBus,
+		e.modelRouter,
 		executor.DefaultConfig(),
 	)
-
-	// Intelligence
-	e.modelRegistry = modelrouter.NewModelRegistry()
-	e.modelRouter = modelrouter.NewModelRouter(e.modelRegistry, modelrouter.RoutingPolicyLocalFirst)
-	e.invAccounting = modelrouter.NewInvocationAccounting()
 
 	// Memory & Knowledge
 	e.memoryStore = memory.NewMemoryStore()

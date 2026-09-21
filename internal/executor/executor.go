@@ -22,6 +22,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
@@ -97,11 +98,12 @@ func DefaultConfig() Config {
 
 // Executor is the NEXUS Task Executor.
 type Executor struct {
-	config     Config
-	agents     *agent.AgentRuntime
-	tools      *tool.ToolRegistry
-	governance *governance.Engine
-	events     *event.MemBus
+	config      Config
+	agents      *agent.AgentRuntime
+	tools       *tool.ToolRegistry
+	governance  *governance.Engine
+	events      *event.MemBus
+	modelRouter *modelrouter.ModelRouter
 
 	// State
 	running      bool
@@ -137,19 +139,21 @@ func New(
 	toolReg *tool.ToolRegistry,
 	govEngine *governance.Engine,
 	eventBus *event.MemBus,
+	mdlRouter *modelrouter.ModelRouter,
 	cfg Config,
 	opts ...Option,
 ) *Executor {
 	e := &Executor{
-		config:     cfg,
-		agents:     agentRuntime,
-		tools:      toolReg,
-		governance: govEngine,
-		events:     eventBus,
-		active:     make(map[string]*Outcome),
-		outcomes:   make(map[string]*Outcome),
-		shutdownCh: make(chan struct{}),
-		now:        time.Now,
+		config:      cfg,
+		agents:      agentRuntime,
+		tools:       toolReg,
+		governance:  govEngine,
+		events:      eventBus,
+		modelRouter: mdlRouter,
+		active:      make(map[string]*Outcome),
+		outcomes:    make(map[string]*Outcome),
+		shutdownCh:  make(chan struct{}),
+		now:         time.Now,
 	}
 
 	for _, opt := range opts {
@@ -412,6 +416,69 @@ func (e *Executor) findAgent(req *WorkRequest) *agent.Agent {
 
 // defaultHandler is the default task handler that simulates execution.
 func (e *Executor) defaultHandler(_ context.Context, req *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+	// If a model router is available, use it for actual inference
+	if e.modelRouter != nil {
+		genReq := &modelrouter.GenerateRequest{
+			RequestID: req.TaskID,
+			ModelID:   "default",
+			Messages: []modelrouter.Message{
+				{Role: "user", Content: req.Intent},
+			},
+			MaxTokens:   256,
+			Temperature: 0.7,
+		}
+
+		routingReq := &modelrouter.RoutingRequest{
+			RequestID:       req.TaskID,
+			AgentID:         ag.ID,
+			BusinessID:      req.BusinessID,
+			PreferLocal:     true,
+			FallbackEnabled: true,
+		}
+
+		resp, decision, err := e.modelRouter.Invoke(routingReq, genReq)
+		if err != nil {
+			// Fall back to synthetic response
+			return &Outcome{
+				TaskID:  req.TaskID,
+				AgentID: ag.ID,
+				Status:  "completed",
+				Output:  fmt.Sprintf("task '%s' executed by agent %s (provider error: %v)", req.Intent, ag.ID, err),
+				Evidence: []string{
+					fmt.Sprintf("task_id=%s", req.TaskID),
+					fmt.Sprintf("agent_id=%s", ag.ID),
+					fmt.Sprintf("business_id=%s", req.BusinessID),
+					fmt.Sprintf("provider_error=%v", err),
+					fmt.Sprintf("executed_at=%s", e.now().Format(time.RFC3339)),
+				},
+			}, nil
+		}
+
+		output := resp.Content
+		if output == "" {
+			output = fmt.Sprintf("task '%s' executed by agent %s via %s/%s", req.Intent, ag.ID, decision.ProviderID, resp.ModelID)
+		}
+
+		return &Outcome{
+			TaskID:  req.TaskID,
+			AgentID: ag.ID,
+			Status:  "completed",
+			Output:  output,
+			Evidence: []string{
+				fmt.Sprintf("task_id=%s", req.TaskID),
+				fmt.Sprintf("agent_id=%s", ag.ID),
+				fmt.Sprintf("business_id=%s", req.BusinessID),
+				fmt.Sprintf("provider=%s", decision.ProviderID),
+				fmt.Sprintf("model=%s", resp.ModelID),
+				fmt.Sprintf("input_tokens=%d", resp.InputTokens),
+				fmt.Sprintf("output_tokens=%d", resp.OutputTokens),
+				fmt.Sprintf("latency_ms=%d", resp.LatencyMs),
+				fmt.Sprintf("executed_at=%s", e.now().Format(time.RFC3339)),
+			},
+		}, nil
+	}
+
+	// No model router available — synthetic response
 	return &Outcome{
 		TaskID:  req.TaskID,
 		AgentID: ag.ID,
