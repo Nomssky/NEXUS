@@ -150,6 +150,14 @@ exit criterion expressed as *observable, testable* behavior.
   compile. 47+ tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M11e — Integration: C14 Control Surface 🔒 LOCKED
+- **Status:** LOCKED (PR #39, SHA `c0a5ec7`, merged 2026-09-21)
+- **Scope:** HTTP control surface for runtime management and introspection.
+- **Components:** C14 (Communication & Control Surface), C12 (Gateway).
+- **Exit:** 5 control endpoints (status, pause, resume, metrics, components).
+  20 gateway tests pass. Race clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
