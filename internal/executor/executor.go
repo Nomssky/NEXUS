@@ -432,6 +432,7 @@ func (e *Executor) defaultHandler(_ context.Context, req *WorkRequest, ag *agent
 			RequestID:       req.TaskID,
 			AgentID:         ag.ID,
 			BusinessID:      req.BusinessID,
+			RequiredCaps:    []modelrouter.ModelCapability{modelrouter.CapabilityReasoning, modelrouter.CapabilityToolCalling},
 			PreferLocal:     true,
 			FallbackEnabled: true,
 		}

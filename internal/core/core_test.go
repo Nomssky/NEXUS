@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -615,7 +616,7 @@ func TestBackpressureRejectsWhenFull(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected backpressure rejection error")
 	}
-	if !contains(err.Error(), "backpressure") {
+	if !strings.Contains(err.Error(), "backpressure") {
 		t.Errorf("expected backpressure error, got: %v", err)
 	}
 }
@@ -657,7 +658,7 @@ func TestCircuitBreakerTrips(t *testing.T) {
 	if result.Error == nil {
 		t.Fatal("expected error in response")
 	}
-	if !contains(result.Error.Message, "circuit breaker") {
+	if !strings.Contains(result.Error.Message, "circuit breaker") {
 		t.Errorf("expected circuit breaker error, got: %s", result.Error.Message)
 	}
 }
@@ -692,57 +693,4 @@ func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	if e.RecoveryManager().RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", e.RecoveryManager().RecordCount())
 	}
-}
-
-// TEST-CORE-029: Hardening events appear in chain audit trail
-func TestHardeningEventsInChain(t *testing.T) {
-	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
-	ctx := context.Background()
-	e.Start(ctx)
-	defer e.Stop(ctx)
-
-	req := &Request{
-		ID:       "req-hardening-events",
-		Context:  NewRequestContext("corr-hard", "biz-1", "user-1"),
-		Intent:   "hardening event test",
-		Priority: 5,
-	}
-
-	e.SubmitRequest(req)
-	time.Sleep(100 * time.Millisecond)
-	e.EventBus().Dispatch()
-	e.EventBus().Dispatch()
-	time.Sleep(50 * time.Millisecond)
-	e.EventBus().Dispatch()
-	e.EventBus().Dispatch()
-
-	result, ok := e.GetResult("req-hardening-events")
-	if !ok {
-		t.Fatal("expected result")
-	}
-
-	// Check hardening events in audit
-	found := false
-	for _, entry := range result.AuditTrail {
-		if entry.Step == "hardening" || contains(entry.Outcome, "circuit_breaker") {
-			found = true
-		}
-	}
-	// Circuit breaker check is part of chain — it should appear
-	// (it won't show as audit step, but the event should be emitted)
-	_ = found // event emission is verified by TestChainEmitsEvents
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstr(s, substr))
-}
-
-func containsSubstr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

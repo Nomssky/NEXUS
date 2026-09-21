@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/executor"
-	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -32,7 +31,6 @@ const (
 	StepModel      ChainStep = "model"
 	StepTool       ChainStep = "tool"
 	StepVerify     ChainStep = "verify"
-	StepOutcome    ChainStep = "outcome"
 )
 
 // executeChain runs the canonical execution chain for a request.
@@ -59,6 +57,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Duration:  e.now().Sub(start),
 		Outcome:   "passed",
 	})
+	e.chainEmit(req, "chain.validate.passed", "core", "passed")
 
 	// Hardening: circuit breaker gate
 	if !e.circuitBreaker.Allow() {
@@ -304,11 +303,11 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		Resource:   "core",
 		BusinessID: req.Context.BusinessID,
 	})
-	if decision.Outcome == governance.DENY {
+	if !decision.IsAllowing() {
 		return &ChainError{
 			Code:      "POLICY_DENIED",
 			Category:  "POLICY_DENIED",
-			Message:   fmt.Sprintf("governance denied: %s", decision.Reason),
+			Message:   fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason),
 			ChainStep: string(StepGovernance),
 		}
 	}
@@ -391,12 +390,6 @@ func (e *Engine) chainSchedule(_ context.Context, req *Request, wf *workflow.Wor
 	return job, nil
 }
 
-// chainAgent assigns an agent to execute the work.
-func (e *Engine) chainAgent(_ context.Context, req *Request) (*agent.AgentDefinition, error) {
-	// No agent available by default — agents are provisioned separately
-	return nil, fmt.Errorf("no agent available for business %s", req.Context.BusinessID)
-}
-
 // chainExecute submits the work to the task executor and waits for completion.
 func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Workflow) (*executor.Outcome, error) {
 	workReq := &executor.WorkRequest{
@@ -464,7 +457,7 @@ func (e *Engine) chainMemoryWrite(_ context.Context, req *Request, status string
 		content = outcome.Summary
 	}
 
-	_ = e.memoryStore.Admit(&memory.MemoryEntry{
+	if memErr := e.memoryStore.Admit(&memory.MemoryEntry{
 		Type:        memory.MemoryTypeEpisodic,
 		BusinessID:  req.Context.BusinessID,
 		ObjectiveID: req.Context.ObjectiveID,
@@ -476,7 +469,9 @@ func (e *Engine) chainMemoryWrite(_ context.Context, req *Request, status string
 			Confidence: 1.0,
 		},
 		Tags: []string{"outcome", status},
-	})
+	}); memErr != nil {
+		e.chainEmit(req, "chain.error", "memory", fmt.Sprintf("admit failed: %v", memErr))
+	}
 }
 
 // chainAttentionScore submits the request to the attention engine for scoring.
@@ -486,7 +481,7 @@ func (e *Engine) chainAttentionScore(_ context.Context, req *Request) *attention
 		urgency = 10
 	}
 
-	item, _ := e.attentionEng.SubmitItem(
+	item, attErr := e.attentionEng.SubmitItem(
 		req.Intent,
 		fmt.Sprintf("Owner request from %s", req.Context.ActorID),
 		req.Context.BusinessID,
@@ -496,6 +491,9 @@ func (e *Engine) chainAttentionScore(_ context.Context, req *Request) *attention
 		2, // risk
 		0.8,
 	)
+	if attErr != nil {
+		e.chainEmit(req, "chain.error", "attention", fmt.Sprintf("submit failed: %v", attErr))
+	}
 	return item
 }
 
