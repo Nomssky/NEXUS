@@ -30,6 +30,7 @@ type Launcher struct {
 	engine  *core.Engine
 	gateway *gateway.Server
 	life    *lifecycle.Manager
+	initErr error
 }
 
 // Options configures the launcher.
@@ -43,7 +44,17 @@ type Options struct {
 
 // New creates a new launcher with all components wired.
 func New(opts Options) *Launcher {
-	engine := core.NewEngine(&opts.Config)
+	engine, err := core.NewEngine(&opts.Config)
+	if err != nil {
+		// Store error; will be returned by Start
+		return &Launcher{
+			cfg:     opts.Config,
+			log:     opts.Logger,
+			health:  opts.Health,
+			life:    opts.Lifecycle,
+			initErr: err,
+		}
+	}
 	gw := gateway.NewServer(engine, opts.Addr)
 
 	return &Launcher{
@@ -58,6 +69,10 @@ func New(opts Options) *Launcher {
 
 // Start starts the Core Runtime and HTTP Gateway.
 func (l *Launcher) Start(ctx context.Context) error {
+	if l.initErr != nil {
+		return fmt.Errorf("initialization failed: %w", l.initErr)
+	}
+
 	// Start the core engine
 	if err := l.engine.Start(ctx); err != nil {
 		return fmt.Errorf("core engine start: %w", err)

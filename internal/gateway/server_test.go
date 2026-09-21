@@ -16,7 +16,7 @@ import (
 // TEST-GW-001: Health endpoint returns ok
 func TestHealthEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -37,7 +37,7 @@ func TestHealthEndpoint(t *testing.T) {
 // TEST-GW-002: Ready endpoint returns ready when engine running
 func TestReadyEndpointRunning(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -62,7 +62,7 @@ func TestReadyEndpointRunning(t *testing.T) {
 // TEST-GW-003: Ready endpoint returns not ready when engine stopped
 func TestReadyEndpointNotReady(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	req := httptest.NewRequest("GET", "/ready", nil)
@@ -77,7 +77,7 @@ func TestReadyEndpointNotReady(t *testing.T) {
 // TEST-GW-004: Status endpoint returns engine status
 func TestStatusEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -98,7 +98,7 @@ func TestStatusEndpoint(t *testing.T) {
 // TEST-GW-005: Submit request — missing intent
 func TestSubmitRequestMissingIntent(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -119,7 +119,7 @@ func TestSubmitRequestMissingIntent(t *testing.T) {
 // TEST-GW-006: Submit request — missing business_id
 func TestSubmitRequestMissingBusiness(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -140,7 +140,7 @@ func TestSubmitRequestMissingBusiness(t *testing.T) {
 // TEST-GW-007: Submit request — successful
 func TestSubmitRequestSuccess(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -170,7 +170,7 @@ func TestSubmitRequestSuccess(t *testing.T) {
 // TEST-GW-008: Submit request with custom correlation ID
 func TestSubmitRequestCustomCorrelation(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -197,7 +197,7 @@ func TestSubmitRequestCustomCorrelation(t *testing.T) {
 // TEST-GW-009: Get result — not found
 func TestGetResultNotFound(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	req := httptest.NewRequest("GET", "/api/v1/requests/nonexistent", nil)
@@ -212,7 +212,7 @@ func TestGetResultNotFound(t *testing.T) {
 // TEST-GW-010: Get result — found
 func TestGetResultFound(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -251,7 +251,7 @@ func TestGetResultFound(t *testing.T) {
 // TEST-GW-011: Invalid JSON body
 func TestSubmitRequestInvalidJSON(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -271,7 +271,7 @@ func TestSubmitRequestInvalidJSON(t *testing.T) {
 // TEST-GW-012: Submit to stopped engine returns 503
 func TestSubmitToStoppedEngine(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	body := `{"intent": "test", "business_id": "biz-1", "actor_id": "user-1"}`
@@ -288,7 +288,7 @@ func TestSubmitToStoppedEngine(t *testing.T) {
 // TEST-GW-013: Health endpoint — consistent format
 func TestHealthEndpointFormat(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -306,7 +306,7 @@ func TestHealthEndpointFormat(t *testing.T) {
 // TEST-GW-014: Submit request — priority field
 func TestSubmitRequestWithPriority(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -327,7 +327,7 @@ func TestSubmitRequestWithPriority(t *testing.T) {
 // TEST-GW-015: Server creation
 func TestServerCreation(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":8080", WithClock(func() time.Time { return now }))
 
 	if srv == nil {
@@ -341,7 +341,7 @@ func TestServerCreation(t *testing.T) {
 // TEST-GW-016: Control status endpoint returns component health
 func TestControlStatusEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -370,7 +370,7 @@ func TestControlStatusEndpoint(t *testing.T) {
 // TEST-GW-017: Control metrics endpoint returns executor stats
 func TestControlMetricsEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -405,7 +405,7 @@ func TestControlMetricsEndpoint(t *testing.T) {
 // TEST-GW-018: Control components endpoint lists all components
 func TestControlComponentsEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -437,7 +437,7 @@ func TestControlComponentsEndpoint(t *testing.T) {
 // TEST-GW-019: Control pause endpoint stops the engine
 func TestControlPauseEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)
@@ -468,7 +468,7 @@ func TestControlPauseEndpoint(t *testing.T) {
 // TEST-GW-020: Control resume endpoint returns error when engine can't restart
 func TestControlResumeEndpoint(t *testing.T) {
 	now := time.Now()
-	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	engine.Start(ctx)
 

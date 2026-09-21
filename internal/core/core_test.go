@@ -63,7 +63,7 @@ func TestRequestContextClone(t *testing.T) {
 
 // TEST-CORE-004: Engine creation
 func TestEngineCreation(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	if e == nil {
 		t.Fatal("expected non-nil engine")
 	}
@@ -74,7 +74,7 @@ func TestEngineCreation(t *testing.T) {
 
 // TEST-CORE-005: Engine start and stop
 func TestEngineStartStop(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	ctx := context.Background()
 
 	if err := e.Start(ctx); err != nil {
@@ -94,7 +94,7 @@ func TestEngineStartStop(t *testing.T) {
 
 // TEST-CORE-006: Engine double start prevented
 func TestEngineDoubleStart(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	ctx := context.Background()
 
 	e.Start(ctx)
@@ -108,7 +108,7 @@ func TestEngineDoubleStart(t *testing.T) {
 // TEST-CORE-007: Submit request to running engine
 func TestSubmitRequest(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -138,7 +138,7 @@ func TestSubmitRequest(t *testing.T) {
 
 // TEST-CORE-008: Chain validation — missing request ID
 func TestChainValidationMissingID(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	req := &Request{
 		Context: NewRequestContext("corr-1", "biz-1", "user-1"),
 		Intent:  "test",
@@ -151,7 +151,7 @@ func TestChainValidationMissingID(t *testing.T) {
 
 // TEST-CORE-009: Chain validation — missing business ID
 func TestChainValidationMissingBusiness(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	req := &Request{
 		ID:      "req-1",
 		Context: NewRequestContext("corr-1", "", "user-1"),
@@ -165,7 +165,7 @@ func TestChainValidationMissingBusiness(t *testing.T) {
 
 // TEST-CORE-010: Chain validation — missing intent
 func TestChainValidationMissingIntent(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	req := &Request{
 		ID:      "req-1",
 		Context: NewRequestContext("corr-1", "biz-1", "user-1"),
@@ -179,7 +179,7 @@ func TestChainValidationMissingIntent(t *testing.T) {
 // TEST-CORE-011: Full chain execution
 func TestFullChainExecution(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -212,7 +212,7 @@ func TestFullChainExecution(t *testing.T) {
 // TEST-CORE-012: Audit trail captures chain steps
 func TestAuditTrailChainSteps(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -281,7 +281,7 @@ func TestRequestWithTimeout(t *testing.T) {
 
 // TEST-CORE-016: Submit to stopped engine fails
 func TestSubmitToStoppedEngine(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	req := &Request{
 		ID:      "req-1",
 		Context: NewRequestContext("corr-1", "biz-1", "user-1"),
@@ -294,7 +294,7 @@ func TestSubmitToStoppedEngine(t *testing.T) {
 
 // TEST-CORE-017: Health check
 func TestEngineHealth(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	ctx := context.Background()
 
 	// Before start — down
@@ -314,7 +314,7 @@ func TestEngineHealth(t *testing.T) {
 
 // TEST-CORE-018: EventBus accessible
 func TestEngineEventBus(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	if e.EventBus() == nil {
 		t.Error("expected non-nil event bus")
 	}
@@ -322,7 +322,7 @@ func TestEngineEventBus(t *testing.T) {
 
 // TEST-CORE-019: Store accessible
 func TestEngineStore(t *testing.T) {
-	e := NewEngine(nil)
+	e, _ := NewEngine(nil)
 	if e.Store() == nil {
 		t.Error("expected non-nil store")
 	}
@@ -348,7 +348,7 @@ func TestWHYChainPreserved(t *testing.T) {
 // TEST-CORE-021: Memory read returns context before objective creation
 func TestMemoryReadInChain(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -398,7 +398,7 @@ func TestMemoryReadInChain(t *testing.T) {
 // TEST-CORE-022: Attention scoring in chain
 func TestAttentionScoreInChain(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -438,7 +438,7 @@ func TestAttentionScoreInChain(t *testing.T) {
 // TEST-CORE-023: Memory write after execution
 func TestMemoryWriteInChain(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -485,7 +485,7 @@ func TestMemoryWriteInChain(t *testing.T) {
 // TEST-CORE-024: Full chain has memory and attention steps
 func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -527,7 +527,7 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 // TEST-CORE-025: Chain emits events at each step via event bus
 func TestChainEmitsEvents(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -593,7 +593,7 @@ func TestChainEmitsEvents(t *testing.T) {
 // TEST-CORE-026: Backpressure rejects when queue is full
 func TestBackpressureRejectsWhenFull(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -624,7 +624,7 @@ func TestBackpressureRejectsWhenFull(t *testing.T) {
 // TEST-CORE-027: Circuit breaker trips after consecutive failures
 func TestCircuitBreakerTrips(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -666,7 +666,7 @@ func TestCircuitBreakerTrips(t *testing.T) {
 // TEST-CORE-028: RecoveryManager records failures on execution errors
 func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	now := time.Now()
-	e := NewEngine(nil, WithClock(func() time.Time { return now }))
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
