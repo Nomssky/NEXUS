@@ -142,6 +142,14 @@ exit criterion expressed as *observable, testable* behavior.
   24 core tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M11d — Integration: Provider Wiring 🔒 LOCKED
+- **Status:** LOCKED (PR #37, SHA `ae9e928`, merged 2026-09-20)
+- **Scope:** Wire ModelRouter into Executor for real provider inference.
+- **Components:** C07 (ModelRouter), C10 (Executor), C12 (Core).
+- **Exit:** Executor defaultHandler routes through ModelRouter. All 31 packages
+  compile. 47+ tests pass. Race clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
