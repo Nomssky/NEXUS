@@ -203,6 +203,7 @@ func (bp *Backpressure) RejectedCount() int {
 
 // RecoveryManager handles failure detection and recovery.
 type RecoveryManager struct {
+	mu       sync.RWMutex
 	failures map[string]*FailureRecord
 	now      func() time.Time
 }
@@ -225,6 +226,8 @@ func NewRecoveryManagerWithClock(now func() time.Time) *RecoveryManager {
 
 // Detect records a failure detection.
 func (rm *RecoveryManager) Detect(mode FailureMode, component, businessID, description string) *FailureRecord {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	now := rm.now()
 	record := &FailureRecord{
 		ID:          fmt.Sprintf("fail-%d", now.UnixNano()),
@@ -242,6 +245,8 @@ func (rm *RecoveryManager) Detect(mode FailureMode, component, businessID, descr
 
 // StartRecovery begins recovery for a failure.
 func (rm *RecoveryManager) StartRecovery(failureID string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	record, ok := rm.failures[failureID]
 	if !ok {
 		return fmt.Errorf("failure %s not found", failureID)
@@ -253,6 +258,8 @@ func (rm *RecoveryManager) StartRecovery(failureID string) error {
 
 // Reconcile marks a failure as being reconciled.
 func (rm *RecoveryManager) Reconcile(failureID string, sideEffects []string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	record, ok := rm.failures[failureID]
 	if !ok {
 		return fmt.Errorf("failure %s not found", failureID)
@@ -265,6 +272,8 @@ func (rm *RecoveryManager) Reconcile(failureID string, sideEffects []string) err
 
 // CompleteRecovery marks a failure as recovered.
 func (rm *RecoveryManager) CompleteRecovery(failureID string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
 	record, ok := rm.failures[failureID]
 	if !ok {
 		return fmt.Errorf("failure %s not found", failureID)
@@ -278,12 +287,16 @@ func (rm *RecoveryManager) CompleteRecovery(failureID string) error {
 
 // GetRecord returns a failure record by ID.
 func (rm *RecoveryManager) GetRecord(failureID string) (*FailureRecord, bool) {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
 	record, ok := rm.failures[failureID]
 	return record, ok
 }
 
 // RecordCount returns the total number of failure records.
 func (rm *RecoveryManager) RecordCount() int {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
 	return len(rm.failures)
 }
 

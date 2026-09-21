@@ -24,6 +24,11 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/workflow"
 )
 
+const (
+	// maxResults bounds the in-memory results map to prevent unbounded growth.
+	maxResults = 1000
+)
+
 // Engine is the NEXUS Core Runtime — the central orchestrator that wires
 // all foundation packages into a cohesive, running system.
 type Engine struct {
@@ -56,11 +61,9 @@ type Engine struct {
 	// Intelligence
 	modelRegistry *modelrouter.ModelRegistry
 	modelRouter   *modelrouter.ModelRouter
-	invAccounting *modelrouter.InvocationAccounting
 
 	// Memory & Knowledge
 	memoryStore *memory.MemoryStore
-	knowledge   *memory.KnowledgeIngestion
 
 	// Attention
 	attentionEng *attention.FullAttentionEngine
@@ -71,9 +74,10 @@ type Engine struct {
 	recoveryMgr    *hardening.RecoveryManager
 
 	// Processing
-	requests  chan *Request
-	results   map[string]*Response
-	resultsMu sync.RWMutex
+	requests    chan *Request
+	results     map[string]*Response
+	resultOrder []string // FIFO order for eviction
+	resultsMu   sync.RWMutex
 
 	// Shutdown
 	shutdownCh   chan struct{}
@@ -91,12 +95,13 @@ func WithClock(now func() time.Time) EngineOption {
 // NewEngine creates a new Core Runtime engine with all foundation components wired.
 func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 	e := &Engine{
-		config:     cfg,
-		status:     lifecycle.StateCreated,
-		now:        time.Now,
-		requests:   make(chan *Request, 100),
-		results:    make(map[string]*Response),
-		shutdownCh: make(chan struct{}),
+		config:      cfg,
+		status:      lifecycle.StateCreated,
+		now:         time.Now,
+		requests:    make(chan *Request, 100),
+		results:     make(map[string]*Response),
+		resultOrder: make([]string, 0, maxResults),
+		shutdownCh:  make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -137,7 +142,6 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 	// Intelligence (create before executor so it can use the router)
 	e.modelRegistry = modelrouter.NewModelRegistry()
 	e.modelRouter = modelrouter.NewModelRouter(e.modelRegistry, modelrouter.RoutingPolicyLocalFirst)
-	e.invAccounting = modelrouter.NewInvocationAccounting()
 
 	e.taskExec = executor.New(
 		e.agentRuntime,
@@ -150,7 +154,6 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 
 	// Memory & Knowledge
 	e.memoryStore = memory.NewMemoryStore()
-	e.knowledge = memory.NewKnowledgeIngestion(e.memoryStore)
 
 	// Attention
 	e.attentionEng = attention.NewFullAttentionEngine(
@@ -274,7 +277,16 @@ func (e *Engine) processRequests(ctx context.Context) {
 			result := e.executeChain(ctx, req)
 			e.resultsMu.Lock()
 			e.results[req.ID] = result
+			e.resultOrder = append(e.resultOrder, req.ID)
+			// Evict oldest entries if over capacity
+			for len(e.resultOrder) > maxResults {
+				delete(e.results, e.resultOrder[0])
+				e.resultOrder = e.resultOrder[1:]
+			}
 			e.resultsMu.Unlock()
+
+			// Release backpressure slot
+			e.backpressure.Release()
 
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{
