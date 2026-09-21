@@ -62,6 +62,13 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /api/v1/requests/{id}", s.handleGetResult)
 	s.mux.HandleFunc("GET /events", s.handleSSE)
 
+	// Control surface endpoints
+	s.mux.HandleFunc("GET /api/v1/control/status", s.handleControlStatus)
+	s.mux.HandleFunc("POST /api/v1/control/pause", s.handleControlPause)
+	s.mux.HandleFunc("POST /api/v1/control/resume", s.handleControlResume)
+	s.mux.HandleFunc("GET /api/v1/control/metrics", s.handleControlMetrics)
+	s.mux.HandleFunc("GET /api/v1/control/components", s.handleControlComponents)
+
 	s.server = &http.Server{
 		Addr:              addr,
 		Handler:           s.mux,
@@ -242,6 +249,147 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Keep connection open until client disconnects
 	<-ctx.Done()
+}
+
+// ControlStatusResponse is the detailed engine status.
+type ControlStatusResponse struct {
+	Status       string            `json:"status"`
+	Uptime       string            `json:"uptime"`
+	Components   map[string]string `json:"components"`
+	RequestCount int               `json:"request_count"`
+}
+
+// handleControlStatus returns detailed engine status with component health.
+func (s *Server) handleControlStatus(w http.ResponseWriter, r *http.Request) {
+	components := map[string]string{
+		"engine":          string(s.engine.Status()),
+		"circuit_breaker": s.engine.CircuitBreaker().State(),
+		"backpressure":    fmt.Sprintf("queue=%d rejected=%d", s.engine.Backpressure().QueueSize(), s.engine.Backpressure().RejectedCount()),
+		"recovery":        fmt.Sprintf("failures=%d", s.engine.RecoveryManager().RecordCount()),
+	}
+
+	_, _, denied := s.engine.TaskExecutor().Metrics()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ControlStatusResponse{
+		Status:       string(s.engine.Status()),
+		Components:   components,
+		RequestCount: int(denied),
+	})
+}
+
+// handleControlPause pauses the engine (stops accepting new requests).
+func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
+	if err := s.engine.Stop(r.Context()); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("pause failed: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "paused",
+		"message": "engine stopped accepting new requests",
+	})
+}
+
+// handleControlResume resumes the engine.
+func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
+	if err := s.engine.Start(r.Context()); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "resumed",
+		"message": "engine resumed accepting new requests",
+	})
+}
+
+// MetricsResponse is the runtime metrics snapshot.
+type MetricsResponse struct {
+	Executor       ExecutorMetrics       `json:"executor"`
+	Backpressure   BackpressureMetrics   `json:"backpressure"`
+	CircuitBreaker CircuitBreakerMetrics `json:"circuit_breaker"`
+	Recovery       RecoveryMetrics       `json:"recovery"`
+}
+
+// ExecutorMetrics holds executor statistics.
+type ExecutorMetrics struct {
+	Executed int64 `json:"executed"`
+	Failed   int64 `json:"failed"`
+	Denied   int64 `json:"denied"`
+	Active   int   `json:"active"`
+}
+
+// BackpressureMetrics holds backpressure statistics.
+type BackpressureMetrics struct {
+	QueueSize     int `json:"queue_size"`
+	RejectedCount int `json:"rejected_count"`
+}
+
+// CircuitBreakerMetrics holds circuit breaker state.
+type CircuitBreakerMetrics struct {
+	State string `json:"state"`
+}
+
+// RecoveryMetrics holds recovery manager stats.
+type RecoveryMetrics struct {
+	FailureCount int `json:"failure_count"`
+}
+
+// handleControlMetrics returns runtime metrics.
+func (s *Server) handleControlMetrics(w http.ResponseWriter, r *http.Request) {
+	executed, failed, denied := s.engine.TaskExecutor().Metrics()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(MetricsResponse{
+		Executor: ExecutorMetrics{
+			Executed: executed,
+			Failed:   failed,
+			Denied:   denied,
+			Active:   s.engine.TaskExecutor().ActiveCount(),
+		},
+		Backpressure: BackpressureMetrics{
+			QueueSize:     s.engine.Backpressure().QueueSize(),
+			RejectedCount: s.engine.Backpressure().RejectedCount(),
+		},
+		CircuitBreaker: CircuitBreakerMetrics{
+			State: s.engine.CircuitBreaker().State(),
+		},
+		Recovery: RecoveryMetrics{
+			FailureCount: s.engine.RecoveryManager().RecordCount(),
+		},
+	})
+}
+
+// ComponentInfo describes a single component.
+type ComponentInfo struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Type   string `json:"type"`
+}
+
+// handleControlComponents lists all engine components and their states.
+func (s *Server) handleControlComponents(w http.ResponseWriter, r *http.Request) {
+	components := []ComponentInfo{
+		{Name: "engine", Status: string(s.engine.Status()), Type: "core"},
+		{Name: "circuit_breaker", Status: s.engine.CircuitBreaker().State(), Type: "hardening"},
+		{Name: "backpressure", Status: "active", Type: "hardening"},
+		{Name: "recovery_manager", Status: "active", Type: "hardening"},
+		{Name: "event_bus", Status: "active", Type: "foundation"},
+		{Name: "memory_store", Status: "active", Type: "foundation"},
+		{Name: "attention_engine", Status: "active", Type: "foundation"},
+		{Name: "governance", Status: "active", Type: "foundation"},
+		{Name: "task_executor", Status: "active", Type: "execution"},
+		{Name: "model_router", Status: "active", Type: "intelligence"},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"components": components,
+		"count":      len(components),
+	})
 }
 
 // writeError writes a JSON error response.

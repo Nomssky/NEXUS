@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/core"
+	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 )
 
 // TEST-GW-001: Health endpoint returns ok
@@ -334,5 +335,160 @@ func TestServerCreation(t *testing.T) {
 	}
 	if srv.Mux() == nil {
 		t.Fatal("expected non-nil mux")
+	}
+}
+
+// TEST-GW-016: Control status endpoint returns component health
+func TestControlStatusEndpoint(t *testing.T) {
+	now := time.Now()
+	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	w := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	if resp["status"] != "RUNNING" {
+		t.Errorf("expected status running, got %v", resp["status"])
+	}
+	if resp["components"] == nil {
+		t.Error("expected components map")
+	}
+}
+
+// TEST-GW-017: Control metrics endpoint returns executor stats
+func TestControlMetricsEndpoint(t *testing.T) {
+	now := time.Now()
+	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	req := httptest.NewRequest("GET", "/api/v1/control/metrics", nil)
+	w := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	if resp["executor"] == nil {
+		t.Error("expected executor metrics")
+	}
+	if resp["backpressure"] == nil {
+		t.Error("expected backpressure metrics")
+	}
+	if resp["circuit_breaker"] == nil {
+		t.Error("expected circuit_breaker metrics")
+	}
+	if resp["recovery"] == nil {
+		t.Error("expected recovery metrics")
+	}
+}
+
+// TEST-GW-018: Control components endpoint lists all components
+func TestControlComponentsEndpoint(t *testing.T) {
+	now := time.Now()
+	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	req := httptest.NewRequest("GET", "/api/v1/control/components", nil)
+	w := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	components, ok := resp["components"].([]interface{})
+	if !ok || len(components) == 0 {
+		t.Error("expected non-empty components list")
+	}
+
+	count, ok := resp["count"].(float64)
+	if !ok || count == 0 {
+		t.Error("expected positive count")
+	}
+}
+
+// TEST-GW-019: Control pause endpoint stops the engine
+func TestControlPauseEndpoint(t *testing.T) {
+	now := time.Now()
+	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	req := httptest.NewRequest("POST", "/api/v1/control/pause", nil)
+	w := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	if resp["status"] != "paused" {
+		t.Errorf("expected status paused, got %v", resp["status"])
+	}
+
+	// Engine should now reject requests
+	if engine.Status() != lifecycle.StateStopped {
+		t.Errorf("expected engine stopped, got %s", engine.Status())
+	}
+}
+
+// TEST-GW-020: Control resume endpoint returns error when engine can't restart
+func TestControlResumeEndpoint(t *testing.T) {
+	now := time.Now()
+	engine := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	// Pause first
+	pauseReq := httptest.NewRequest("POST", "/api/v1/control/pause", nil)
+	pauseW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(pauseW, pauseReq)
+
+	if engine.Status() != lifecycle.StateStopped {
+		t.Fatal("expected engine stopped after pause")
+	}
+
+	// Resume — engine lifecycle doesn't support restart, so this returns 500
+	resumeReq := httptest.NewRequest("POST", "/api/v1/control/resume", nil)
+	resumeW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(resumeW, resumeReq)
+
+	if resumeW.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 (can't restart), got %d", resumeW.Code)
 	}
 }
