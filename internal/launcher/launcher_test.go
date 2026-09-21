@@ -125,7 +125,7 @@ func TestLauncherSubmitRequest(t *testing.T) {
 	})
 
 	// Inject clock for deterministic testing
-	_ = core.NewEngine(&cfg, core.WithClock(func() time.Time { return now }))
+	_, _ = core.NewEngine(&cfg, core.WithClock(func() time.Time { return now }))
 
 	ctx := context.Background()
 	l.Start(ctx)

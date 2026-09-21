@@ -59,7 +59,11 @@ func run() int {
 	_ = healthSrv // Used by lifecycle
 
 	// Create the core engine
-	engine := core.NewEngine(&config.Config{})
+	engine, err := core.NewEngine(&config.Config{})
+	if err != nil {
+		fmt.Printf("engine creation failed: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Register document processing tools
 	toolReg := engine.ToolRegistry()

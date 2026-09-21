@@ -39,7 +39,7 @@ type Engine struct {
 
 	// Foundation components
 	eventBus     *event.MemBus
-	store        *store.MemStore
+	store        store.Store
 	healthServer *health.Server
 
 	// Governance
@@ -79,6 +79,9 @@ type Engine struct {
 	resultOrder []string // FIFO order for eviction
 	resultsMu   sync.RWMutex
 
+	// Persistence
+	persistErr error
+
 	// Shutdown
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
@@ -92,8 +95,22 @@ func WithClock(now func() time.Time) EngineOption {
 	return func(e *Engine) { e.now = now }
 }
 
+// WithPersistence configures the engine to use a FileStore rooted at dir.
+// Records survive engine restarts. Returns an error if the directory
+// cannot be created or loaded.
+func WithPersistence(dir string) EngineOption {
+	return func(e *Engine) {
+		fs, err := store.NewFileStoreWithClock(dir, e.now)
+		if err != nil {
+			e.persistErr = err
+			return
+		}
+		e.store = fs
+	}
+}
+
 // NewEngine creates a new Core Runtime engine with all foundation components wired.
-func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
+func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e := &Engine{
 		config:      cfg,
 		status:      lifecycle.StateCreated,
@@ -110,7 +127,9 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 
 	// Wire foundation components
 	e.eventBus = event.NewMemBus()
-	e.store = store.NewMemStore()
+	if e.store == nil {
+		e.store = store.NewMemStore()
+	}
 	e.healthServer = health.NewServer()
 
 	// Governance — permissive default policy so the runtime can operate
@@ -167,7 +186,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) *Engine {
 	e.backpressure = hardening.NewBackpressureWithClock(100, e.now)
 	e.recoveryMgr = hardening.NewRecoveryManagerWithClock(e.now)
 
-	return e
+	return e, nil
 }
 
 // Status returns the current engine status.
@@ -316,7 +335,7 @@ func (e *Engine) EventBus() *event.MemBus {
 }
 
 // Store returns the engine's persistent store.
-func (e *Engine) Store() *store.MemStore {
+func (e *Engine) Store() store.Store {
 	return e.store
 }
 
