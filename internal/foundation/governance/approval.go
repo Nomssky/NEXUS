@@ -2,6 +2,7 @@ package governance
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -31,6 +32,7 @@ type ApprovalRequest struct {
 
 // ApprovalEngine manages approval workflows for governance decisions.
 type ApprovalEngine struct {
+	mu      sync.RWMutex
 	pending map[string]*ApprovalRequest // decisionID -> request
 	now     func() time.Time
 }
@@ -71,6 +73,8 @@ func (ae *ApprovalEngine) RequestApproval(decision Decision, req Request, config
 		RequestedAt: now,
 	}
 
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
 	ae.pending[ar.DecisionID] = ar
 	return ar, nil
 }
@@ -78,6 +82,8 @@ func (ae *ApprovalEngine) RequestApproval(decision Decision, req Request, config
 // Approve approves a pending approval request.
 // Returns an error if the approver is the requester (self-approval prohibited).
 func (ae *ApprovalEngine) Approve(decisionID, approver, reason string) error {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
 	ar, ok := ae.pending[decisionID]
 	if !ok {
 		return fmt.Errorf("approval request %s not found", decisionID)
@@ -109,6 +115,8 @@ func (ae *ApprovalEngine) Approve(decisionID, approver, reason string) error {
 
 // Deny denies a pending approval request.
 func (ae *ApprovalEngine) Deny(decisionID, approver, reason string) error {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
 	ar, ok := ae.pending[decisionID]
 	if !ok {
 		return fmt.Errorf("approval request %s not found", decisionID)
@@ -130,12 +138,16 @@ func (ae *ApprovalEngine) Deny(decisionID, approver, reason string) error {
 
 // GetApproval returns the current state of an approval request.
 func (ae *ApprovalEngine) GetApproval(decisionID string) (*ApprovalRequest, bool) {
+	ae.mu.RLock()
+	defer ae.mu.RUnlock()
 	ar, ok := ae.pending[decisionID]
 	return ar, ok
 }
 
 // PendingApprovals returns all pending approval requests.
 func (ae *ApprovalEngine) PendingApprovals() []*ApprovalRequest {
+	ae.mu.RLock()
+	defer ae.mu.RUnlock()
 	var out []*ApprovalRequest
 	for _, ar := range ae.pending {
 		out = append(out, ar)
@@ -146,6 +158,8 @@ func (ae *ApprovalEngine) PendingApprovals() []*ApprovalRequest {
 // CheckTimeouts checks for timed-out approval requests and auto-denes them
 // if configured.
 func (ae *ApprovalEngine) CheckTimeouts() []*ApprovalRequest {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
 	now := ae.now()
 	var timedOut []*ApprovalRequest
 

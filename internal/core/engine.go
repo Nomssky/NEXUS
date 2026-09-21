@@ -84,9 +84,6 @@ type Engine struct {
 	// Shutdown
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
-
-	// Context saved from Start for Resume
-	startCtx context.Context
 }
 
 // EngineOption configures the engine.
@@ -210,7 +207,6 @@ func (e *Engine) Start(ctx context.Context) error {
 		return fmt.Errorf("engine already started (status: %s)", e.status)
 	}
 	e.status = lifecycle.StateRunning
-	e.startCtx = ctx
 	e.mu.Unlock()
 
 	// Register health check
@@ -271,7 +267,6 @@ func (e *Engine) Resume(ctx context.Context) error {
 	// Create a fresh shutdown channel (the old one was closed during Stop)
 	e.shutdownCh = make(chan struct{})
 	e.status = lifecycle.StateRunning
-	e.startCtx = ctx
 	e.mu.Unlock()
 
 	// Restart request processing loop

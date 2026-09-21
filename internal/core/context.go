@@ -128,6 +128,10 @@ type Response struct {
 	// RequestID links back to the original request.
 	RequestID string `json:"request_id"`
 
+	// BusinessID identifies the business scope of the request.
+	// Used for authorization checks on result retrieval.
+	BusinessID string `json:"business_id"`
+
 	// Status is the final status: completed, failed, cancelled, escalated.
 	Status string `json:"status"`
 

@@ -10,7 +10,6 @@ package launcher
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"time"
 
@@ -40,6 +39,9 @@ type Options struct {
 	Health    *health.Server
 	Lifecycle *lifecycle.Manager
 	Addr      string // HTTP listen address (e.g., ":8080")
+	// ControlAPIKey is the API key required for /api/v1/control/* endpoints.
+	// If empty, control endpoints are unprotected (backward compatible).
+	ControlAPIKey string
 }
 
 // New creates a new launcher with all components wired.
@@ -55,7 +57,7 @@ func New(opts Options) *Launcher {
 			initErr: err,
 		}
 	}
-	gw := gateway.NewServer(engine, opts.Addr)
+	gw := gateway.NewServer(engine, opts.Addr, gateway.WithControlAPIKey(opts.ControlAPIKey))
 
 	return &Launcher{
 		cfg:     opts.Config,
@@ -79,14 +81,28 @@ func (l *Launcher) Start(ctx context.Context) error {
 	}
 	l.log.Info("core engine started", logging.Fields{})
 
-	// Start the HTTP gateway
+	// Start the HTTP gateway — capture error for propagation
+	gwErr := make(chan error, 1)
 	go func() {
 		if err := l.gateway.Start(ctx); err != nil && err != http.ErrServerClosed {
+			gwErr <- err
 			l.log.Error("gateway server error", logging.Fields{
 				Context: map[string]any{"err": err.Error()},
 			})
 		}
+		close(gwErr)
 	}()
+
+	// Brief wait to detect immediate startup failures (e.g., port in use)
+	select {
+	case err := <-gwErr:
+		if err != nil {
+			return fmt.Errorf("gateway start: %w", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		// Gateway started successfully (or is still starting)
+	}
+
 	l.log.Info("gateway started", logging.Fields{
 		Context: map[string]any{"addr": l.cfg.Health.Host},
 	})
@@ -96,11 +112,14 @@ func (l *Launcher) Start(ctx context.Context) error {
 
 // Stop gracefully shuts down the gateway and core engine.
 func (l *Launcher) Stop(ctx context.Context) error {
+	var errs []error
+
 	// Stop gateway first (stop accepting new requests)
 	if err := l.gateway.Stop(ctx); err != nil {
 		l.log.Error("gateway stop error", logging.Fields{
 			Context: map[string]any{"err": err.Error()},
 		})
+		errs = append(errs, fmt.Errorf("gateway: %w", err))
 	}
 
 	// Then stop the core engine (drain in-flight)
@@ -108,8 +127,12 @@ func (l *Launcher) Stop(ctx context.Context) error {
 		l.log.Error("engine stop error", logging.Fields{
 			Context: map[string]any{"err": err.Error()},
 		})
+		errs = append(errs, fmt.Errorf("engine: %w", err))
 	}
 
+	if len(errs) > 0 {
+		return fmt.Errorf("shutdown errors: %v", errs)
+	}
 	return nil
 }
 
@@ -161,13 +184,4 @@ func (l *Launcher) Run(ctx context.Context) lifecycle.ExitCode {
 	code := l.life.WaitForShutdownSignal(ctx)
 	l.log.Info("nexus system stopped", logging.Fields{})
 	return code
-}
-
-// defaultAddr returns the default HTTP listen address.
-func defaultAddr(cfg config.Config) string {
-	host := cfg.Health.Host
-	if host == "" {
-		host = "0.0.0.0"
-	}
-	return net.JoinHostPort(host, "8080")
 }

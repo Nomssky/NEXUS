@@ -21,10 +21,14 @@ type MemBus struct {
 	consumers map[EventType][]*subscriber
 	allSubs   []*subscriber
 	dedup     map[string]bool // idempotency key -> processed
+	dedupKeys []string        // ordered keys for FIFO eviction
 	dedupSize int
 	nextID    int
 	now       func() time.Time
 }
+
+// maxDedupSize limits the dedup map to prevent unbounded memory growth.
+const maxDedupSize = 10000
 
 // NewMemBus creates a new in-memory event bus.
 func NewMemBus() *MemBus {
@@ -55,7 +59,16 @@ func (b *MemBus) Publish(event *Event) error {
 			return nil // already processed, skip
 		}
 		b.dedup[event.IdempotencyKey] = true
+		b.dedupKeys = append(b.dedupKeys, event.IdempotencyKey)
 		b.dedupSize++
+
+		// Evict oldest entries when map exceeds capacity
+		for len(b.dedupKeys) > maxDedupSize {
+			old := b.dedupKeys[0]
+			b.dedupKeys = b.dedupKeys[1:]
+			delete(b.dedup, old)
+			b.dedupSize--
+		}
 	}
 
 	// Enqueue
@@ -174,17 +187,30 @@ func (b *MemBus) DedupSize() int {
 
 // getMatchingConsumers returns subscribers that should receive events of the given type.
 // Must be called with mu held (at least RLock).
+// Deduplicates: a subscriber registered for both wildcard and type-specific
+// subscriptions receives the event only once.
 func (b *MemBus) getMatchingConsumers(eventType EventType) []*subscriber {
+	seen := make(map[int]bool)
 	var result []*subscriber
 
 	// Wildcard subscribers
 	if subs, ok := b.consumers["*"]; ok {
-		result = append(result, subs...)
+		for _, sub := range subs {
+			if !seen[sub.id] {
+				seen[sub.id] = true
+				result = append(result, sub)
+			}
+		}
 	}
 
 	// Type-specific subscribers
 	if subs, ok := b.consumers[eventType]; ok {
-		result = append(result, subs...)
+		for _, sub := range subs {
+			if !seen[sub.id] {
+				seen[sub.id] = true
+				result = append(result, sub)
+			}
+		}
 	}
 
 	return result

@@ -268,6 +268,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 
 	return &Response{
 		RequestID:  req.ID,
+		BusinessID: req.Context.BusinessID,
 		Status:     status,
 		Outcome:    outcomeResult,
 		AuditTrail: audit,
@@ -439,6 +440,7 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 
 	return &Response{
 		RequestID:  req.ID,
+		BusinessID: req.Context.BusinessID,
 		Status:     "failed",
 		Error:      chainErr,
 		AuditTrail: audit,

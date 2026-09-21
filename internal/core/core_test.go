@@ -2,12 +2,14 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
-	"sync"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
@@ -692,5 +694,227 @@ func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	}
 	if e.RecoveryManager().RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", e.RecoveryManager().RecordCount())
+	}
+}
+
+// =====================================================================
+// P2 TEST COVERAGE GAPS
+// =====================================================================
+
+// TEST-CORE-030: WithPersistence error path — invalid directory
+func TestPersistenceErrorPath(t *testing.T) {
+	// Create engine with persistence pointing to an invalid path (file, not dir)
+	f, err := os.CreateTemp("", "not-a-dir-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	defer os.Remove(f.Name())
+
+	_, err = NewEngine(nil, WithPersistence(f.Name()))
+	if err == nil {
+		t.Fatal("expected error for invalid persistence directory")
+	}
+	// Error should indicate the directory issue
+	if !strings.Contains(err.Error(), "not a directory") && !strings.Contains(err.Error(), "filestore") {
+		t.Errorf("expected filestore/dir error, got: %v", err)
+	}
+}
+
+// TEST-CORE-031: WithPersistence success path
+func TestPersistenceSuccessPath(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	e, err := NewEngine(nil,
+		WithPersistence(dir),
+		WithClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if e == nil {
+		t.Fatal("expected engine")
+	}
+}
+
+// TEST-CORE-032: Resume lifecycle — start, stop, resume, submit
+func TestResumeLifecycle(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+
+	// Start
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if e.Status() != lifecycle.StateRunning {
+		t.Fatalf("expected RUNNING, got %s", e.Status())
+	}
+
+	// Stop
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if e.Status() != lifecycle.StateStopped {
+		t.Fatalf("expected STOPPED, got %s", e.Status())
+	}
+
+	// Resume
+	if err := e.Resume(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if e.Status() != lifecycle.StateRunning {
+		t.Fatalf("expected RUNNING after resume, got %s", e.Status())
+	}
+
+	// Submit after resume — should work
+	req := &Request{
+		ID:      "req-resume-1",
+		Context: NewRequestContext("corr-1", "biz-1", "user-1"),
+		Intent:  "test resume",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit after resume: %v", err)
+	}
+
+	// Wait and verify result
+	time.Sleep(200 * time.Millisecond)
+	result, ok := e.GetResult("req-resume-1")
+	if !ok {
+		t.Fatal("expected result after resume")
+	}
+	if result.BusinessID != "biz-1" {
+		t.Errorf("expected business_id biz-1, got %s", result.BusinessID)
+	}
+}
+
+// TEST-CORE-033: Resume fails on non-stopped engine
+func TestResumeFailsOnRunning(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	if err := e.Resume(ctx); err == nil {
+		t.Fatal("expected error resuming running engine")
+	}
+}
+
+// TEST-CORE-034: Concurrent request submissions
+func TestConcurrentSubmissions(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errors := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req := &Request{
+				ID:      fmt.Sprintf("req-concurrent-%d", idx),
+				Context: NewRequestContext(fmt.Sprintf("corr-%d", idx), "biz-1", "user-1"),
+				Intent:  fmt.Sprintf("concurrent test %d", idx),
+			}
+			if err := e.SubmitRequest(req); err != nil {
+				errors <- fmt.Errorf("submit %d: %w", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Wait for all to process (poll for completion)
+	deadline := time.After(5 * time.Second)
+	allDone := false
+	for !allDone {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for concurrent results")
+		default:
+		}
+		allDone = true
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("req-concurrent-%d", i)
+			if _, ok := e.GetResult(id); !ok {
+				allDone = false
+				time.Sleep(50 * time.Millisecond)
+				break
+			}
+		}
+	}
+}
+
+// TEST-CORE-035: ChainError includes CorrelationID and Timestamp
+func TestChainErrorFields(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Submit with empty intent to trigger validation error
+	req := &Request{
+		ID:      "req-error-fields",
+		Context: NewRequestContext("corr-err", "biz-err", "user-err"),
+		Intent:  "", // empty intent triggers validation failure
+	}
+	_ = e.SubmitRequest(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-error-fields")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	if result.Error == nil {
+		t.Fatal("expected error in result")
+	}
+	if result.Error.CorrelationID == "" {
+		t.Error("expected CorrelationID in error")
+	}
+	if result.Error.Timestamp.IsZero() {
+		t.Error("expected Timestamp in error")
+	}
+	if result.BusinessID != "biz-err" {
+		t.Errorf("expected business_id 'biz-err', got %q", result.BusinessID)
+	}
+}
+
+// TEST-CORE-036: BusinessID propagated through chain
+func TestBusinessIDInResponse(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-biz-id",
+		Context: NewRequestContext("corr-biz", "my-business", "user-1"),
+		Intent:  "test business id",
+	}
+	_ = e.SubmitRequest(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-biz-id")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.BusinessID != "my-business" {
+		t.Errorf("expected business_id 'my-business', got %q", result.BusinessID)
 	}
 }

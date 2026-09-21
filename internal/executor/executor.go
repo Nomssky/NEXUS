@@ -306,9 +306,28 @@ func (e *Executor) executeWork(req *WorkRequest) {
 	}()
 
 	// Step 1: Governance check
-	if !e.checkGovernance(req) {
+	decision := e.checkGovernance(req)
+	switch decision.Outcome {
+	case governance.DENY:
 		outcome.Status = "denied"
-		outcome.Error = "governance denied execution"
+		outcome.Error = fmt.Sprintf("governance denied: %s", decision.Reason)
+		e.emitEvent("executor.denied", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.REQUIRE_APPROVAL:
+		outcome.Status = "pending_approval"
+		outcome.Error = fmt.Sprintf("governance requires approval: %s", decision.Reason)
+		e.emitEvent("executor.pending_approval", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.ESCALATE:
+		outcome.Status = "escalated"
+		outcome.Error = fmt.Sprintf("governance escalated: %s", decision.Reason)
+		e.emitEvent("executor.escalated", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.ALLOW, governance.ALLOW_WITH_CONSTRAINTS:
+		// proceed
+	default:
+		outcome.Status = "denied"
+		outcome.Error = fmt.Sprintf("governance unknown outcome: %s", decision.Outcome)
 		e.emitEvent("executor.denied", req.TaskID, req.CorrelationID, outcome)
 		return
 	}
@@ -362,14 +381,14 @@ func (e *Executor) executeWork(req *WorkRequest) {
 }
 
 // checkGovernance evaluates governance for the work request.
-func (e *Executor) checkGovernance(req *WorkRequest) bool {
-	decision := e.governance.Evaluate(governance.Request{
+// Returns the governance decision for the caller to handle.
+func (e *Executor) checkGovernance(req *WorkRequest) governance.Decision {
+	return e.governance.Evaluate(governance.Request{
 		Actor:      req.ActorID,
 		Action:     "execute_task",
 		Resource:   "workflow",
 		BusinessID: req.BusinessID,
 	})
-	return decision.Outcome != governance.DENY
 }
 
 // findAgent finds or provisions an agent for the work request.
