@@ -166,6 +166,16 @@ exit criterion expressed as *observable, testable* behavior.
   NewEngine returns error. 40+ store tests pass. Race clean.
 - **Lock:** No modifications permitted without explicit unlock procedure.
 
+## M13 — Full System Audit Fix 🔒 LOCKED
+- **Status:** LOCKED (SHA `3774085`, pushed 2026-09-21)
+- **Scope:** 33 issues found in full system audit — all resolved.
+- **Components:** C01–C14 (all components touched).
+- **Exit:** 6 critical data races fixed (mutexes on governance, cognition,
+  workflow, agent, memory, engine persistence). 8 high broken features fixed
+  (event payloads, resume, SSE, chain IDs, auth). 12 medium design gaps fixed.
+  7 low improvements. 391 tests pass. Race detector clean.
+- **Lock:** No modifications permitted without explicit unlock procedure.
+
 ---
 
 ## Milestone → Component Matrix
