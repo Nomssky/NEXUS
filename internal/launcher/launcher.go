@@ -29,6 +29,7 @@ type Launcher struct {
 	engine  *core.Engine
 	gateway *gateway.Server
 	life    *lifecycle.Manager
+	addr    string // actual gateway listen address
 	initErr error
 }
 
@@ -66,6 +67,7 @@ func New(opts Options) *Launcher {
 		engine:  engine,
 		gateway: gw,
 		life:    opts.Lifecycle,
+		addr:    opts.Addr,
 	}
 }
 
@@ -104,7 +106,7 @@ func (l *Launcher) Start(ctx context.Context) error {
 	}
 
 	l.log.Info("gateway started", logging.Fields{
-		Context: map[string]any{"addr": l.cfg.Health.Host},
+		Context: map[string]any{"addr": l.addr},
 	})
 
 	return nil
@@ -175,7 +177,7 @@ func (l *Launcher) Run(ctx context.Context) lifecycle.ExitCode {
 	l.health.MarkReady()
 	l.log.Info("nexus system ready", logging.Fields{
 		Context: map[string]any{
-			"addr":          l.cfg.Health.Host,
+			"addr":          l.addr,
 			"engine_status": string(l.engine.Status()),
 		},
 	})

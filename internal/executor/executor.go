@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
@@ -124,6 +125,9 @@ type Executor struct {
 	totalFailed   int64
 	totalDenied   int64
 	metricsMu     sync.RWMutex
+
+	// Event sequence for unique IDs
+	evtSeq atomic.Int64
 }
 
 // Option configures the executor.
@@ -545,7 +549,7 @@ func (e *Executor) emitEvent(eventType string, taskID, corrID string, data inter
 	}
 
 	evt := &event.Event{
-		ID:            fmt.Sprintf("exec-%d", e.now().UnixNano()),
+		ID:            fmt.Sprintf("exec-%d-%d", e.now().UnixNano(), e.evtSeq.Add(1)),
 		Type:          event.EventType(eventType),
 		Source:        "executor",
 		Timestamp:     e.now(),

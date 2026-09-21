@@ -16,10 +16,12 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/core"
@@ -34,6 +36,7 @@ type Server struct {
 	mux           *http.ServeMux
 	now           func() time.Time
 	controlAPIKey string
+	corrSeq       atomic.Int64 // monotonic sequence for correlation IDs
 
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
@@ -142,7 +145,8 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
-			if r.Header.Get("X-API-Key") != s.controlAPIKey {
+			got := r.Header.Get("X-API-Key")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.controlAPIKey)) != 1 {
 				s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
 				return
 			}
@@ -233,7 +237,7 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	// Extract correlation ID from header or generate one
 	corrID := r.Header.Get("X-Correlation-ID")
 	if corrID == "" {
-		corrID = fmt.Sprintf("api-%d", s.now().UnixNano())
+		corrID = fmt.Sprintf("api-%d-%d", s.now().UnixNano(), s.corrSeq.Add(1))
 	}
 
 	// Create core request
