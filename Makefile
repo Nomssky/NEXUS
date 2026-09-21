@@ -10,7 +10,7 @@ COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS  = -X github.com/Nomssky/NEXUS/internal/foundation/version.Version=$(VERSION)
 LDFLAGS += -X github.com/Nomssky/NEXUS/internal/foundation/version.Commit=$(COMMIT)
 
-.PHONY: help build run test test-race cover vet fmt fmt-check check clean
+.PHONY: help build run test test-race cover vet lint fmt fmt-check check clean
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -28,11 +28,14 @@ test: ## Run the full test suite.
 test-race: ## Run tests with the race detector.
 	$(GO) test -race ./...
 
-cover: ## Run tests with coverage summary.
-	$(GO) test -cover ./...
+cover: ## Run tests with coverage profile and summary.
+	$(GO) test -coverprofile=coverage.out ./...
+	$(GO) tool cover -func=coverage.out | tail -1
 
 vet: ## Run static analysis (go vet).
 	$(GO) vet ./...
+
+lint: vet ## Alias for vet — runs static analysis.
 
 fmt: ## Format all Go source.
 	gofmt -w .

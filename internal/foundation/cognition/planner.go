@@ -2,6 +2,7 @@ package cognition
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -101,6 +102,7 @@ type Plan struct {
 // Planner is forbidden from redefining objectives, overriding decisions,
 // executing actions directly, or creating unbounded loops.
 type Planner struct {
+	mu    sync.RWMutex
 	plans map[string]*Plan
 	now   func() time.Time
 }
@@ -130,6 +132,9 @@ func (p *Planner) CreatePlan(
 		return nil, fmt.Errorf("at least one objective ID is required")
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	now := p.now()
 	plan := &Plan{
 		ID:           fmt.Sprintf("plan-%d", now.UnixNano()),
@@ -152,6 +157,9 @@ func (p *Planner) CreatePlan(
 func (p *Planner) AddMission(
 	planID, objectiveID, title, description, why string,
 ) (*Mission, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	plan, ok := p.plans[planID]
 	if !ok {
 		return nil, fmt.Errorf("plan %s not found", planID)
@@ -176,6 +184,9 @@ func (p *Planner) AddTask(
 	planID, missionID, title, description string,
 	dependencies []string,
 ) (*Task, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	plan, ok := p.plans[planID]
 	if !ok {
 		return nil, fmt.Errorf("plan %s not found", planID)
@@ -202,6 +213,9 @@ func (p *Planner) AddTask(
 // Validate transitions a plan to validated status.
 // A validated plan is ready for workflow execution.
 func (p *Planner) Validate(planID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	plan, ok := p.plans[planID]
 	if !ok {
 		return fmt.Errorf("plan %s not found", planID)
@@ -224,11 +238,15 @@ func (p *Planner) Validate(planID string) error {
 
 // Get returns a plan by ID.
 func (p *Planner) Get(planID string) (*Plan, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	plan, ok := p.plans[planID]
 	return plan, ok
 }
 
 // PlanCount returns the total number of plans.
 func (p *Planner) PlanCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return len(p.plans)
 }

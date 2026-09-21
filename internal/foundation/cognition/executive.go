@@ -2,6 +2,7 @@ package cognition
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -42,6 +43,7 @@ type Request struct {
 // Executive is forbidden from executing actions, owning model/provider
 // selection, or owning workflow durability. Models have no execution authority.
 type Executive struct {
+	mu              sync.RWMutex
 	objectiveEngine *ObjectiveEngine
 	decisionEngine  *DecisionEngine
 	planner         *Planner
@@ -85,6 +87,9 @@ func (ex *Executive) ReceiveIntent(
 	if purpose == "" {
 		return nil, fmt.Errorf("purpose (WHY) is required")
 	}
+
+	ex.mu.Lock()
+	defer ex.mu.Unlock()
 
 	now := ex.now()
 	req := &Request{
@@ -171,11 +176,15 @@ func (ex *Executive) ReceiveIntent(
 
 // GetRequest returns a request by ID.
 func (ex *Executive) GetRequest(requestID string) (*Request, bool) {
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	req, ok := ex.requests[requestID]
 	return req, ok
 }
 
 // RequestCount returns the total number of requests.
 func (ex *Executive) RequestCount() int {
+	ex.mu.RLock()
+	defer ex.mu.RUnlock()
 	return len(ex.requests)
 }

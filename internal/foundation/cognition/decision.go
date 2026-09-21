@@ -2,6 +2,7 @@ package cognition
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -91,6 +92,7 @@ type Evidence struct {
 // It prevents NEXUS from confusing options, evaluations, recommendations,
 // decisions, authorizations, and executions.
 type DecisionEngine struct {
+	mu        sync.RWMutex
 	decisions map[string]*Decision
 	now       func() time.Time
 }
@@ -122,6 +124,9 @@ func (de *DecisionEngine) FrameDecision(
 		return nil, fmt.Errorf("decision question is required")
 	}
 
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	now := de.now()
 	d := &Decision{
 		ID:            fmt.Sprintf("dec-%d", now.UnixNano()),
@@ -141,6 +146,9 @@ func (de *DecisionEngine) FrameDecision(
 
 // AddEvidence adds evidence to a decision.
 func (de *DecisionEngine) AddEvidence(decisionID string, evidence Evidence) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -154,6 +162,9 @@ func (de *DecisionEngine) AddEvidence(decisionID string, evidence Evidence) erro
 
 // AddOption adds an option to a decision.
 func (de *DecisionEngine) AddOption(decisionID string, option Option) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -166,6 +177,9 @@ func (de *DecisionEngine) AddOption(decisionID string, option Option) error {
 
 // Evaluate transitions a decision to evaluating status.
 func (de *DecisionEngine) Evaluate(decisionID string) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -178,6 +192,9 @@ func (de *DecisionEngine) Evaluate(decisionID string) error {
 
 // Recommend sets the recommended option for a decision.
 func (de *DecisionEngine) Recommend(decisionID, optionID, reasoning string) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -192,6 +209,9 @@ func (de *DecisionEngine) Recommend(decisionID, optionID, reasoning string) erro
 
 // Decide records the final decision.
 func (de *DecisionEngine) Decide(decisionID, optionID string) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -205,6 +225,9 @@ func (de *DecisionEngine) Decide(decisionID, optionID string) error {
 
 // Abstain records that the decision engine abstains due to insufficient evidence.
 func (de *DecisionEngine) Abstain(decisionID, reason string) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -218,6 +241,9 @@ func (de *DecisionEngine) Abstain(decisionID, reason string) error {
 
 // Escalate marks a decision as needing higher authority.
 func (de *DecisionEngine) Escalate(decisionID, reason string) error {
+	de.mu.Lock()
+	defer de.mu.Unlock()
+
 	d, ok := de.decisions[decisionID]
 	if !ok {
 		return fmt.Errorf("decision %s not found", decisionID)
@@ -231,11 +257,15 @@ func (de *DecisionEngine) Escalate(decisionID, reason string) error {
 
 // Get returns a decision by ID.
 func (de *DecisionEngine) Get(decisionID string) (*Decision, bool) {
+	de.mu.RLock()
+	defer de.mu.RUnlock()
 	d, ok := de.decisions[decisionID]
 	return d, ok
 }
 
 // DecisionCount returns the total number of decisions.
 func (de *DecisionEngine) DecisionCount() int {
+	de.mu.RLock()
+	defer de.mu.RUnlock()
 	return len(de.decisions)
 }

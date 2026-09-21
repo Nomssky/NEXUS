@@ -192,6 +192,7 @@ type SpawnSafety struct {
 
 // AgentRuntime manages agent lifecycle and task execution.
 type AgentRuntime struct {
+	mu          sync.RWMutex
 	agents      map[string]*Agent
 	spawnSafety *SpawnSafety
 	now         func() time.Time
@@ -229,6 +230,9 @@ func (ar *AgentRuntime) ProvisionAgent(def *AgentDefinition) (*Agent, error) {
 		return nil, fmt.Errorf("invalid agent definition: %w", err)
 	}
 
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	now := ar.now()
 	agent := &Agent{
 		ID:         fmt.Sprintf("agent-%d", now.UnixNano()),
@@ -245,6 +249,9 @@ func (ar *AgentRuntime) ProvisionAgent(def *AgentDefinition) (*Agent, error) {
 
 // StartAgent transitions an agent from provisioning to running.
 func (ar *AgentRuntime) StartAgent(agentID string) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -261,6 +268,9 @@ func (ar *AgentRuntime) StartAgent(agentID string) error {
 
 // AssignTask assigns a task to an agent with budget enforcement.
 func (ar *AgentRuntime) AssignTask(agentID string, exec *TaskExecution) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -291,6 +301,9 @@ func (ar *AgentRuntime) AssignTask(agentID string, exec *TaskExecution) error {
 
 // CompleteTask marks the agent's current task as completed.
 func (ar *AgentRuntime) CompleteTask(agentID string, outcome *TaskOutcome) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -320,6 +333,9 @@ func (ar *AgentRuntime) CompleteTask(agentID string, outcome *TaskOutcome) error
 
 // Heartbeat records a heartbeat from an agent.
 func (ar *AgentRuntime) Heartbeat(agentID string) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -339,6 +355,9 @@ func (ar *AgentRuntime) Heartbeat(agentID string) error {
 
 // CheckHeartbeat checks if an agent is unresponsive.
 func (ar *AgentRuntime) CheckHeartbeat(agentID string, timeout time.Duration) AgentStatus {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return AgentStatusFailed
@@ -363,6 +382,9 @@ func (ar *AgentRuntime) CheckHeartbeat(agentID string, timeout time.Duration) Ag
 
 // CheckLease checks if an agent's lease has expired.
 func (ar *AgentRuntime) CheckLease(agentID string) bool {
+	ar.mu.RLock()
+	defer ar.mu.RUnlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return false
@@ -377,6 +399,9 @@ func (ar *AgentRuntime) CheckLease(agentID string) bool {
 
 // SpawnChild spawns a child agent with anti-spawn-storm controls.
 func (ar *AgentRuntime) SpawnChild(req *SpawnRequest) (*Agent, error) {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	parent, ok := ar.agents[req.ParentAgentID]
 	if !ok {
 		return nil, fmt.Errorf("parent agent %s not found", req.ParentAgentID)
@@ -411,11 +436,17 @@ func (ar *AgentRuntime) SpawnChild(req *SpawnRequest) (*Agent, error) {
 		}
 	}
 
-	// Provision child
-	child, err := ar.ProvisionAgent(req.Definition)
-	if err != nil {
-		return nil, err
+	// Provision child (inline — ar.mu already held, skip ProvisionAgent's own lock)
+	now := ar.now()
+	child := &Agent{
+		ID:         fmt.Sprintf("agent-%d", now.UnixNano()),
+		RuntimeID:  fmt.Sprintf("rt-%d", now.UnixNano()),
+		Definition: req.Definition,
+		Status:     AgentStatusProvisioning,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
+	ar.agents[child.ID] = child
 
 	child.ParentAgentID = req.ParentAgentID
 	child.Depth = parent.Depth + 1
@@ -447,6 +478,9 @@ func (ar *AgentRuntime) propagateDescendantCount(agentID string) {
 
 // TerminateAgent gracefully terminates an agent.
 func (ar *AgentRuntime) TerminateAgent(agentID string) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -464,6 +498,9 @@ func (ar *AgentRuntime) TerminateAgent(agentID string) error {
 
 // CancelTask cancels an agent's current task (cancel ≠ failure).
 func (ar *AgentRuntime) CancelTask(agentID string) error {
+	ar.mu.Lock()
+	defer ar.mu.Unlock()
+
 	agent, ok := ar.agents[agentID]
 	if !ok {
 		return fmt.Errorf("agent %s not found", agentID)
@@ -482,12 +519,16 @@ func (ar *AgentRuntime) CancelTask(agentID string) error {
 
 // GetAgent returns an agent by ID.
 func (ar *AgentRuntime) GetAgent(agentID string) (*Agent, bool) {
+	ar.mu.RLock()
+	defer ar.mu.RUnlock()
 	agent, ok := ar.agents[agentID]
 	return agent, ok
 }
 
 // AgentCount returns the total number of agents.
 func (ar *AgentRuntime) AgentCount() int {
+	ar.mu.RLock()
+	defer ar.mu.RUnlock()
 	return len(ar.agents)
 }
 

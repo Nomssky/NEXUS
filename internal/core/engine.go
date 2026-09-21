@@ -49,7 +49,6 @@ type Engine struct {
 	objectiveEng *cognition.ObjectiveEngine
 	decisionEng  *cognition.DecisionEngine
 	planner      *cognition.Planner
-	executive    *cognition.Executive
 
 	// Execution
 	workflowEng  *workflow.WorkflowEngine
@@ -85,6 +84,9 @@ type Engine struct {
 	// Shutdown
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
+
+	// Context saved from Start for Resume
+	startCtx context.Context
 }
 
 // EngineOption configures the engine.
@@ -125,6 +127,11 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		opt(e)
 	}
 
+	// Check for errors recorded during option application (e.g. persistence setup).
+	if e.persistErr != nil {
+		return nil, e.persistErr
+	}
+
 	// Wire foundation components
 	e.eventBus = event.NewMemBus()
 	if e.store == nil {
@@ -150,7 +157,6 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e.objectiveEng = cognition.NewObjectiveEngine()
 	e.decisionEng = cognition.NewDecisionEngine()
 	e.planner = cognition.NewPlanner()
-	e.executive = cognition.NewExecutive(e.objectiveEng, e.decisionEng, e.planner)
 
 	// Execution
 	e.workflowEng = workflow.NewWorkflowEngine()
@@ -204,6 +210,7 @@ func (e *Engine) Start(ctx context.Context) error {
 		return fmt.Errorf("engine already started (status: %s)", e.status)
 	}
 	e.status = lifecycle.StateRunning
+	e.startCtx = ctx
 	e.mu.Unlock()
 
 	// Register health check
@@ -253,6 +260,26 @@ func (e *Engine) Stop(_ context.Context) error {
 	return nil
 }
 
+// Resume resumes the engine from STOPPED state back to RUNNING.
+// It creates a fresh shutdown channel and restarts the request processing loop.
+func (e *Engine) Resume(ctx context.Context) error {
+	e.mu.Lock()
+	if e.status != lifecycle.StateStopped {
+		e.mu.Unlock()
+		return fmt.Errorf("cannot resume: engine not stopped (status: %s)", e.status)
+	}
+	// Create a fresh shutdown channel (the old one was closed during Stop)
+	e.shutdownCh = make(chan struct{})
+	e.status = lifecycle.StateRunning
+	e.startCtx = ctx
+	e.mu.Unlock()
+
+	// Restart request processing loop
+	go e.processRequests(ctx)
+
+	return nil
+}
+
 // SubmitRequest submits a new request to the engine for processing.
 func (e *Engine) SubmitRequest(req *Request) error {
 	e.mu.RLock()
@@ -287,25 +314,34 @@ func (e *Engine) GetResult(requestID string) (*Response, bool) {
 // processRequests is the main processing loop.
 func (e *Engine) processRequests(ctx context.Context) {
 	for {
+		// Read shutdown channel under lock to avoid racing with Resume().
+		e.mu.RLock()
+		shutdownCh := e.shutdownCh
+		e.mu.RUnlock()
+
 		select {
-		case <-e.shutdownCh:
+		case <-shutdownCh:
 			return
 		case <-ctx.Done():
 			return
 		case req := <-e.requests:
+			// Release the backpressure slot immediately after dequeuing.
+			// Accept() was called in SubmitRequest; exactly one Release()
+			// must follow per Accept — never skip, never duplicate.
+			e.backpressure.Release()
+
 			result := e.executeChain(ctx, req)
 			e.resultsMu.Lock()
 			e.results[req.ID] = result
 			e.resultOrder = append(e.resultOrder, req.ID)
-			// Evict oldest entries if over capacity
+			// Evict oldest entry if over capacity. The FIFO slice makes
+			// each eviction O(1) — only one entry is removed per insert,
+			// and the 1000-entry cap keeps total memory bounded.
 			for len(e.resultOrder) > maxResults {
 				delete(e.results, e.resultOrder[0])
 				e.resultOrder = e.resultOrder[1:]
 			}
 			e.resultsMu.Unlock()
-
-			// Release backpressure slot
-			e.backpressure.Release()
 
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{

@@ -3,6 +3,7 @@ package governance
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,7 @@ import (
 //   - No self-approval: requesters cannot approve their own actions.
 //   - Fail-safe: when governance is unavailable, default to DENY.
 type Engine struct {
+	mu       sync.RWMutex
 	policies []*Policy
 	now      func() time.Time // injectable clock for testing
 }
@@ -41,11 +43,15 @@ func NewEngineWithClock(policies []*Policy, now func() time.Time) *Engine {
 
 // SetPolicies replaces the engine's policy set.
 func (e *Engine) SetPolicies(policies []*Policy) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.policies = policies
 }
 
 // Policies returns a copy of the current policy set.
 func (e *Engine) Policies() []*Policy {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	out := make([]*Policy, len(e.policies))
 	copy(out, e.policies)
 	return out
@@ -65,6 +71,9 @@ func (e *Engine) Policies() []*Policy {
 //
 // If no policy matches, the outcome is DENY (fail-safe / default deny).
 func (e *Engine) Evaluate(req Request) Decision {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	now := e.now()
 
 	// Step 1-3: Find all matching active policies

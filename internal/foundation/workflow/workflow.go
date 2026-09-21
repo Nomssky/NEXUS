@@ -18,6 +18,7 @@ package workflow
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -131,6 +132,7 @@ type Workflow struct {
 // WorkflowEngine manages workflow lifecycle and task execution.
 // It turns plans into durable workflows with task graphs.
 type WorkflowEngine struct {
+	mu        sync.RWMutex
 	workflows map[string]*Workflow
 	tasks     map[string]*Task // task index by task ID
 	now       func() time.Time
@@ -163,6 +165,9 @@ func (we *WorkflowEngine) CreateWorkflow(
 		return nil, fmt.Errorf("WHY is required for all workflows")
 	}
 
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	now := we.now()
 	wf := &Workflow{
 		ID:          fmt.Sprintf("wf-%d", now.UnixNano()),
@@ -189,6 +194,9 @@ func (we *WorkflowEngine) AddTask(
 	dependencies []string,
 	verificationCriteria []string,
 ) (*Task, error) {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return nil, fmt.Errorf("workflow %s not found", workflowID)
@@ -216,6 +224,9 @@ func (we *WorkflowEngine) AddTask(
 
 // Activate transitions a workflow from draft to ready.
 func (we *WorkflowEngine) Activate(workflowID string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return fmt.Errorf("workflow %s not found", workflowID)
@@ -247,6 +258,9 @@ func (we *WorkflowEngine) Activate(workflowID string) error {
 
 // Start transitions a workflow from ready to running.
 func (we *WorkflowEngine) Start(workflowID string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return fmt.Errorf("workflow %s not found", workflowID)
@@ -263,6 +277,9 @@ func (we *WorkflowEngine) Start(workflowID string) error {
 
 // CompleteTask marks a task as completed with a result.
 func (we *WorkflowEngine) CompleteTask(taskID string, result *TaskResult) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	task, ok := we.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("task %s not found", taskID)
@@ -302,6 +319,9 @@ func (we *WorkflowEngine) CompleteTask(taskID string, result *TaskResult) error 
 
 // VerifyTask sets the verification status of a task from evidence.
 func (we *WorkflowEngine) VerifyTask(taskID string, passed bool, evidence []string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	task, ok := we.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("task %s not found", taskID)
@@ -329,6 +349,9 @@ func (we *WorkflowEngine) VerifyTask(taskID string, passed bool, evidence []stri
 
 // Complete marks a workflow as completed.
 func (we *WorkflowEngine) Complete(workflowID string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return fmt.Errorf("workflow %s not found", workflowID)
@@ -350,6 +373,9 @@ func (we *WorkflowEngine) Complete(workflowID string) error {
 
 // Cancel cancels a workflow.
 func (we *WorkflowEngine) Cancel(workflowID string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return fmt.Errorf("workflow %s not found", workflowID)
@@ -371,6 +397,9 @@ func (we *WorkflowEngine) Cancel(workflowID string) error {
 
 // AssignTaskToWorker assigns a task to a worker agent.
 func (we *WorkflowEngine) AssignTaskToWorker(taskID, agentID string) error {
+	we.mu.Lock()
+	defer we.mu.Unlock()
+
 	task, ok := we.tasks[taskID]
 	if !ok {
 		return fmt.Errorf("task %s not found", taskID)
@@ -388,18 +417,25 @@ func (we *WorkflowEngine) AssignTaskToWorker(taskID, agentID string) error {
 
 // GetWorkflow returns a workflow by ID.
 func (we *WorkflowEngine) GetWorkflow(workflowID string) (*Workflow, bool) {
+	we.mu.RLock()
+	defer we.mu.RUnlock()
 	wf, ok := we.workflows[workflowID]
 	return wf, ok
 }
 
 // GetTask returns a task by ID.
 func (we *WorkflowEngine) GetTask(taskID string) (*Task, bool) {
+	we.mu.RLock()
+	defer we.mu.RUnlock()
 	task, ok := we.tasks[taskID]
 	return task, ok
 }
 
 // ReadyTasks returns all tasks that are ready to be scheduled.
 func (we *WorkflowEngine) ReadyTasks(workflowID string) []*Task {
+	we.mu.RLock()
+	defer we.mu.RUnlock()
+
 	wf, ok := we.workflows[workflowID]
 	if !ok {
 		return nil
@@ -416,10 +452,14 @@ func (we *WorkflowEngine) ReadyTasks(workflowID string) []*Task {
 
 // WorkflowCount returns the total number of workflows.
 func (we *WorkflowEngine) WorkflowCount() int {
+	we.mu.RLock()
+	defer we.mu.RUnlock()
 	return len(we.workflows)
 }
 
 // TaskCount returns the total number of tasks.
 func (we *WorkflowEngine) TaskCount() int {
+	we.mu.RLock()
+	defer we.mu.RUnlock()
 	return len(we.tasks)
 }

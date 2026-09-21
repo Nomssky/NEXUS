@@ -139,6 +139,12 @@ func (fs *FileStore) Delete(id string) error {
 }
 
 // List returns records matching the given filter.
+//
+// NOTE: FileStore uses the shared matchesFilter function (from memstore.go),
+// which skips soft-deleted records (Status == "deleted") unless the filter's
+// Status field is explicitly set to RecordStatusDeleted. This is inherited
+// behavior from MemStore — callers must set Filter.Status to include deleted
+// records.
 func (fs *FileStore) List(filter Filter) ([]*Record, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()

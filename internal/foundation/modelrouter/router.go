@@ -102,6 +102,10 @@ func (mr *ModelRouter) RegisterProvider(provider Provider) {
 
 // Route selects the best model/provider for a request.
 // This implements routing ≠ authorization: routing selects, governance authorizes.
+// NOTE: Provider selection is deterministic (not load-balanced) — this is
+// intentional for failover semantics. The primary use case is selecting the
+// best provider and falling back to alternatives on failure, not distributing
+// load across providers.
 func (mr *ModelRouter) Route(req *RoutingRequest) (*RoutingDecision, error) {
 	mr.mu.RLock()
 	defer mr.mu.RUnlock()

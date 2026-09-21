@@ -483,12 +483,16 @@ func TestControlResumeEndpoint(t *testing.T) {
 		t.Fatal("expected engine stopped after pause")
 	}
 
-	// Resume — engine lifecycle doesn't support restart, so this returns 500
+	// Resume — engine should restart successfully
 	resumeReq := httptest.NewRequest("POST", "/api/v1/control/resume", nil)
 	resumeW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resumeW, resumeReq)
 
-	if resumeW.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 (can't restart), got %d", resumeW.Code)
+	if resumeW.Code != http.StatusOK {
+		t.Fatalf("expected 200 on resume, got %d", resumeW.Code)
+	}
+
+	if engine.Status() != lifecycle.StateRunning {
+		t.Fatal("expected engine running after resume")
 	}
 }

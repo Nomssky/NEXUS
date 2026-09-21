@@ -172,6 +172,12 @@ type ChainError struct {
 
 	// ChainStep identifies where in the chain the error occurred.
 	ChainStep string `json:"chain_step"`
+
+	// CorrelationID links the error to a specific request for tracing.
+	CorrelationID string `json:"correlation_id,omitempty"`
+
+	// Timestamp records when this error occurred.
+	Timestamp time.Time `json:"timestamp"`
 }
 
 // Error implements the error interface.

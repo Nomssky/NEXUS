@@ -15,6 +15,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -503,6 +504,8 @@ func (e *Executor) GetOutcome(taskID string) (*Outcome, bool) {
 }
 
 // ActiveCount returns the number of currently active tasks.
+// The read lock is held for the duration of the call (via defer), ensuring
+// the count is consistent with the live active-tasks map.
 func (e *Executor) ActiveCount() int {
 	e.activeMu.RLock()
 	defer e.activeMu.RUnlock()
@@ -522,11 +525,26 @@ func (e *Executor) emitEvent(eventType string, taskID, corrID string, data inter
 		return
 	}
 
-	_ = e.events.Publish(&event.Event{
-		ID:         fmt.Sprintf("exec-%d", e.now().UnixNano()),
-		Type:       event.EventType(eventType),
-		Source:     "executor",
-		Timestamp:  e.now(),
-		BusinessID: "",
-	})
+	evt := &event.Event{
+		ID:            fmt.Sprintf("exec-%d", e.now().UnixNano()),
+		Type:          event.EventType(eventType),
+		Source:        "executor",
+		Timestamp:     e.now(),
+		CorrelationID: corrID,
+	}
+
+	// Serialize data payload
+	if data != nil {
+		jsonData, err := json.Marshal(data)
+		if err == nil {
+			evt.Data = jsonData
+		}
+	}
+
+	// Extract BusinessID from Outcome if available
+	if o, ok := data.(*Outcome); ok && o.BusinessID != "" {
+		evt.BusinessID = o.BusinessID
+	}
+
+	_ = e.events.Publish(evt)
 }

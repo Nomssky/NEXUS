@@ -21,6 +21,7 @@ package memory
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -137,8 +138,8 @@ func (ms *MemoryStore) Admit(entry *MemoryEntry) error {
 // Retrieve queries memory entries with scope enforcement.
 // Scoped retrieval: only returns entries matching the query's business/division scope.
 func (ms *MemoryStore) Retrieve(query *MemoryQuery) []*MemoryEntry {
-	ms.mu.RLock()
-	defer ms.mu.RUnlock()
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
 
 	var results []*MemoryEntry
 	for _, entry := range ms.entries {
@@ -173,6 +174,13 @@ func (ms *MemoryStore) Retrieve(query *MemoryQuery) []*MemoryEntry {
 		// Tag filter
 		if len(query.Tags) > 0 && !hasAnyTag(entry.Tags, query.Tags) {
 			continue
+		}
+
+		// Keyword filter: if keywords are specified, entry content must contain at least one keyword (case-insensitive).
+		if query.Keywords != "" {
+			if !contentMatchesKeywords(entry.Content, query.Keywords) {
+				continue
+			}
 		}
 
 		// Update access tracking
@@ -246,6 +254,18 @@ func hasAnyTag(entryTags, queryTags []string) bool {
 	}
 	for _, t := range queryTags {
 		if tagSet[t] {
+			return true
+		}
+	}
+	return false
+}
+
+// contentMatchesKeywords returns true if content contains at least one of the
+// space-separated keywords (case-insensitive substring match).
+func contentMatchesKeywords(content, keywords string) bool {
+	contentLower := strings.ToLower(content)
+	for _, kw := range strings.Fields(keywords) {
+		if strings.Contains(contentLower, strings.ToLower(kw)) {
 			return true
 		}
 	}

@@ -16,6 +16,7 @@ package cognition
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -90,6 +91,7 @@ type Objective struct {
 // ObjectiveEngine manages objective lifecycle and hierarchy.
 // It preserves WHY through every decomposition layer.
 type ObjectiveEngine struct {
+	mu         sync.RWMutex
 	objectives map[string]*Objective
 	now        func() time.Time
 }
@@ -121,6 +123,22 @@ func (oe *ObjectiveEngine) CreateObjective(
 		return nil, fmt.Errorf("purpose (WHY) is mandatory for all objectives")
 	}
 
+	oe.mu.Lock()
+	defer oe.mu.Unlock()
+
+	return oe.createObjectiveLocked(objType, title, purpose, desiredOutcome, owner, businessID)
+}
+
+// createObjectiveLocked is the internal implementation that assumes the caller holds mu.
+func (oe *ObjectiveEngine) createObjectiveLocked(
+	objType ObjectiveType,
+	title, purpose, desiredOutcome, owner string,
+	businessID string,
+) (*Objective, error) {
+	if purpose == "" {
+		return nil, fmt.Errorf("purpose (WHY) is mandatory for all objectives")
+	}
+
 	now := oe.now()
 	obj := &Objective{
 		ID:             fmt.Sprintf("obj-%d", now.UnixNano()),
@@ -142,6 +160,9 @@ func (oe *ObjectiveEngine) CreateObjective(
 
 // Activate transitions an objective from draft to active.
 func (oe *ObjectiveEngine) Activate(objectiveID string) error {
+	oe.mu.Lock()
+	defer oe.mu.Unlock()
+
 	obj, ok := oe.objectives[objectiveID]
 	if !ok {
 		return fmt.Errorf("objective %s not found", objectiveID)
@@ -158,6 +179,9 @@ func (oe *ObjectiveEngine) Activate(objectiveID string) error {
 
 // Complete marks an objective as completed.
 func (oe *ObjectiveEngine) Complete(objectiveID string) error {
+	oe.mu.Lock()
+	defer oe.mu.Unlock()
+
 	obj, ok := oe.objectives[objectiveID]
 	if !ok {
 		return fmt.Errorf("objective %s not found", objectiveID)
@@ -176,6 +200,9 @@ func (oe *ObjectiveEngine) Complete(objectiveID string) error {
 
 // Block marks an objective as blocked.
 func (oe *ObjectiveEngine) Block(objectiveID string) error {
+	oe.mu.Lock()
+	defer oe.mu.Unlock()
+
 	obj, ok := oe.objectives[objectiveID]
 	if !ok {
 		return fmt.Errorf("objective %s not found", objectiveID)
@@ -188,12 +215,16 @@ func (oe *ObjectiveEngine) Block(objectiveID string) error {
 
 // Get returns an objective by ID.
 func (oe *ObjectiveEngine) Get(objectiveID string) (*Objective, bool) {
+	oe.mu.RLock()
+	defer oe.mu.RUnlock()
 	obj, ok := oe.objectives[objectiveID]
 	return obj, ok
 }
 
 // Children returns all objectives that are children of the given objective.
 func (oe *ObjectiveEngine) Children(objectiveID string) []*Objective {
+	oe.mu.RLock()
+	defer oe.mu.RUnlock()
 	var children []*Objective
 	for _, obj := range oe.objectives {
 		if obj.ParentObjectiveID == objectiveID {
@@ -210,6 +241,9 @@ func (oe *ObjectiveEngine) Decompose(
 	childType ObjectiveType,
 	title, desiredOutcome string,
 ) (*Objective, error) {
+	oe.mu.Lock()
+	defer oe.mu.Unlock()
+
 	parent, ok := oe.objectives[parentID]
 	if !ok {
 		return nil, fmt.Errorf("parent objective %s not found", parentID)
@@ -219,7 +253,7 @@ func (oe *ObjectiveEngine) Decompose(
 		return nil, fmt.Errorf("can only decompose active objectives (parent status: %s)", parent.Status)
 	}
 
-	child, err := oe.CreateObjective(
+	child, err := oe.createObjectiveLocked(
 		childType,
 		title,
 		parent.Purpose, // WHY preserved from parent
@@ -239,5 +273,7 @@ func (oe *ObjectiveEngine) Decompose(
 
 // ObjectiveCount returns the total number of objectives.
 func (oe *ObjectiveEngine) ObjectiveCount() int {
+	oe.mu.RLock()
+	defer oe.mu.RUnlock()
 	return len(oe.objectives)
 }

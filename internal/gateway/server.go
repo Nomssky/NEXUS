@@ -28,10 +28,15 @@ import (
 
 // Server is the HTTP Gateway server.
 type Server struct {
-	engine *core.Engine
-	server *http.Server
-	mux    *http.ServeMux
-	now    func() time.Time
+	engine        *core.Engine
+	server        *http.Server
+	mux           *http.ServeMux
+	now           func() time.Time
+	controlAPIKey string
+
+	// SSE concurrency limiter — buffered channel acts as a semaphore.
+	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
+	sseClients chan struct{}
 }
 
 // ServerOption configures the gateway server.
@@ -42,12 +47,19 @@ func WithClock(now func() time.Time) ServerOption {
 	return func(s *Server) { s.now = now }
 }
 
+// WithControlAPIKey sets the API key required for control endpoints.
+// If empty, control endpoints are unprotected (backward compatible).
+func WithControlAPIKey(key string) ServerOption {
+	return func(s *Server) { s.controlAPIKey = key }
+}
+
 // NewServer creates a new HTTP Gateway server.
 func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s := &Server{
-		engine: engine,
-		mux:    http.NewServeMux(),
-		now:    time.Now,
+		engine:     engine,
+		mux:        http.NewServeMux(),
+		now:        time.Now,
+		sseClients: make(chan struct{}, 10),
 	}
 
 	for _, opt := range opts {
@@ -82,6 +94,17 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 
 // Start starts the HTTP server.
 func (s *Server) Start(ctx context.Context) error {
+	// Start event dispatch goroutine (H3 fix: SSE never receives events)
+	go s.dispatchLoop(ctx)
+
+	// Wrap handler with auth middleware for control endpoints (H8 fix)
+	var handler http.Handler = s.mux
+	if s.controlAPIKey != "" {
+		handler = s.authMiddleware(s.mux)
+	}
+
+	s.server.Handler = handler
+
 	go func() {
 		<-ctx.Done()
 		s.server.Shutdown(context.Background())
@@ -91,6 +114,38 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("gateway server error: %w", err)
 	}
 	return nil
+}
+
+// dispatchLoop periodically dispatches events from the MemBus so that
+// SSE subscribers receive them. Without this goroutine, events are published
+// but never delivered because Dispatch() is never called.
+func (s *Server) dispatchLoop(ctx context.Context) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.engine.Status() == lifecycle.StateRunning {
+				s.engine.EventBus().Dispatch()
+			}
+		}
+	}
+}
+
+// authMiddleware checks X-API-Key on control endpoints.
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.URL.Path) >= 18 && r.URL.Path[:18] == "/api/v1/control/" {
+			if r.Header.Get("X-API-Key") != s.controlAPIKey {
+				s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Stop gracefully shuts down the HTTP server.
@@ -149,6 +204,8 @@ type submitRequest struct {
 
 // handleSubmitRequest processes a new request.
 func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
+
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid request body")
@@ -219,6 +276,15 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 
 // handleSSE streams events via Server-Sent Events.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// Acquire SSE client slot (semaphore). Reject with 503 if at capacity.
+	select {
+	case s.sseClients <- struct{}{}:
+		defer func() { <-s.sseClients }()
+	default:
+		s.writeError(w, http.StatusServiceUnavailable, "RESOURCE_LIMIT", "maximum SSE clients reached")
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "streaming not supported")
@@ -280,6 +346,11 @@ func (s *Server) handleControlStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleControlPause pauses the engine (stops accepting new requests).
 func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
+	if s.engine.Status() != lifecycle.StateRunning {
+		s.writeError(w, http.StatusConflict, "ALREADY_PAUSED", "engine already paused")
+		return
+	}
+
 	if err := s.engine.Stop(r.Context()); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("pause failed: %v", err))
 		return
@@ -294,7 +365,7 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 
 // handleControlResume resumes the engine.
 func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
-	if err := s.engine.Start(r.Context()); err != nil {
+	if err := s.engine.Resume(r.Context()); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
 		return
 	}

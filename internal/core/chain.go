@@ -88,7 +88,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Actor:     "memory",
 		Timestamp: e.now(),
 		Duration:  e.now().Sub(start),
-		Outcome:   fmt.Sprintf("found=%d entries", len(memContext)),
+		Outcome:   fmt.Sprintf("found=%d", len(memContext)),
 	})
 	e.chainEmit(req, "chain.memory.read", "memory", fmt.Sprintf("found=%d", len(memContext)))
 
@@ -154,7 +154,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	e.chainEmit(req, "chain.plan.created", "planner", plan.ID)
 
 	// Step 6: Create workflow from plan
-	wf, err := e.chainWorkflow(ctx, req, plan)
+	wf, err := e.chainWorkflow(ctx, req, objective, plan)
 	if err != nil {
 		return e.chainError(req, err, StepWorkflow, audit, start)
 	}
@@ -192,7 +192,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   fmt.Sprintf("error: %v", execErr),
+			Outcome:   fmt.Sprintf("error=%v", execErr),
 		})
 
 		// Hardening: record failure for circuit breaker
@@ -221,7 +221,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   "completed via executor",
+			Outcome:   "status=completed model=executor",
 		})
 		audit = append(audit, AuditEntry{
 			Step:      string(StepTool),
@@ -229,7 +229,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   "completed via executor",
+			Outcome:   "status=completed tool=executor",
 		})
 		audit = append(audit, AuditEntry{
 			Step:      string(StepVerify),
@@ -237,7 +237,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Actor:     "executor",
 			Timestamp: e.now(),
 			Duration:  e.now().Sub(start),
-			Outcome:   fmt.Sprintf("verified: %s", execOutcome.Status),
+			Outcome:   fmt.Sprintf("status=%s", execOutcome.Status),
 		})
 	}
 
@@ -260,7 +260,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Actor:     "memory",
 		Timestamp: e.now(),
 		Duration:  e.now().Sub(start),
-		Outcome:   fmt.Sprintf("stored status=%s", status),
+		Outcome:   fmt.Sprintf("status=%s", status),
 	})
 	e.chainEmit(req, "chain.memory.written", "memory", status)
 
@@ -319,8 +319,8 @@ func (e *Engine) chainObjective(_ context.Context, req *Request) (*cognition.Obj
 	obj, err := e.objectiveEng.CreateObjective(
 		cognition.ObjectiveTypeOwner,
 		req.Intent,
-		req.Intent,
-		req.Intent,
+		fmt.Sprintf("Fulfill owner intent: %s", req.Intent),
+		fmt.Sprintf("Achieve: %s", req.Intent),
 		req.Context.ActorID,
 		req.Context.BusinessID,
 	)
@@ -359,12 +359,12 @@ func (e *Engine) chainPlan(_ context.Context, req *Request, obj *cognition.Objec
 }
 
 // chainWorkflow creates a workflow from the plan.
-func (e *Engine) chainWorkflow(_ context.Context, req *Request, plan *cognition.Plan) (*workflow.Workflow, error) {
+func (e *Engine) chainWorkflow(_ context.Context, req *Request, objective *cognition.Objective, plan *cognition.Plan) (*workflow.Workflow, error) {
 	wf, err := e.workflowEng.CreateWorkflow(
 		plan.ID,
-		plan.Scope,
+		objective.ID,
 		req.Context.BusinessID,
-		plan.Scope,
+		req.Intent,
 		"auto-generated from plan",
 		req.Intent,
 		req.Context.ActorID,
@@ -420,6 +420,13 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 			ChainStep: string(step),
 		}
 	}
+	// Ensure correlation_id and timestamp are always set on the error.
+	if req.Context != nil {
+		chainErr.CorrelationID = req.Context.CorrelationID
+	}
+	if chainErr.Timestamp.IsZero() {
+		chainErr.Timestamp = e.now()
+	}
 
 	audit = append(audit, AuditEntry{
 		Step:      string(step),
@@ -427,7 +434,7 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 		Actor:     "core",
 		Timestamp: e.now(),
 		Duration:  e.now().Sub(start),
-		Outcome:   fmt.Sprintf("error: %s", err.Error()),
+		Outcome:   fmt.Sprintf("error=%s", err.Error()),
 	})
 
 	return &Response{

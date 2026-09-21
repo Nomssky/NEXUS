@@ -119,6 +119,10 @@ func (tr *ToolRegistry) RegisterTool(def *ToolDefinition) error {
 }
 
 // ValidateRequest validates a tool request against the tool definition.
+// NOTE: No JSON Schema enforcement on tool parameters — this is intentional
+// for extensibility. Adding schema validation would require a JSON Schema
+// library, violating the zero-dependency policy. Business isolation and
+// tool existence checks are the enforced boundaries.
 func (tr *ToolRegistry) ValidateRequest(req *ToolRequest) error {
 	def, ok := tr.tools[req.ToolID]
 	if !ok {
