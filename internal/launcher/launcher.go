@@ -41,7 +41,7 @@ type Options struct {
 	Lifecycle *lifecycle.Manager
 	Addr      string // HTTP listen address (e.g., ":8080")
 	// ControlAPIKey is the API key required for /api/v1/control/* endpoints.
-	// If empty, control endpoints are unprotected (backward compatible).
+	// If empty, control endpoints are disabled (403 fail-closed), not open.
 	ControlAPIKey string
 }
 

@@ -70,14 +70,16 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 
 ## 4. Findings Table
 
-### P0 — Critical (4 findings) — ALL FIXED
+### P0 — Critical (4 findings) — ALL FIXED (fail-closed)
 
 | ID | Status | File:Line | Finding | Fix |
 |----|--------|-----------|---------|-----|
-| **G-001** | **FIXED** | `gateway/server.go:141` | Auth middleware `[:18]` vs 16-char literal — never matched | Changed to `strings.HasPrefix(r.URL.Path, "/api/v1/control/")` |
-| **G-002** | **FIXED** | `gateway/server.go:258-275` | `handleGetResult` no authorization — cross-tenant data leakage | Added optional `business_id` query param check; when provided, enforces scope match. Response now includes `BusinessID` field. |
-| **G-003** | **FIXED** | `gateway/server.go:278-318` | SSE no business-scope filtering — all events leaked | Added `business_id` query param filter on event consumer |
-| **L-001** | **FIXED** | `launcher/launcher.go:58` | `controlAPIKey` never wired to gateway | Added `ControlAPIKey` to launcher `Options`, wired to `gateway.WithControlAPIKey()` |
+| **G-001** | **FIXED** | `gateway/server.go:145-167` | Auth middleware `[:18]` vs 16-char literal — never matched; middleware only installed when key non-empty | `Handler()` always wraps `authMiddleware`; `strings.HasPrefix(..., "/api/v1/control/")`; empty key → 403 `CONTROL_DISABLED`; `ConstantTimeCompare` |
+| **G-002** | **FIXED** | `gateway/server.go:284-313` | `handleGetResult` no authorization — cross-tenant data leakage | `business_id` query param **required** (400 if omitted); scope mismatch → 403; response includes `BusinessID` |
+| **G-003** | **FIXED** | `gateway/server.go:320-371` | SSE no business-scope filtering — all events leaked | `business_id` query param **required** (400 if omitted); consumer drops events where `e.BusinessID != filter` (unscoped events never delivered) |
+| **L-001** | **FIXED** | `launcher/launcher.go:45,61` | `controlAPIKey` never wired to gateway | `ControlAPIKey` in launcher `Options`, wired via `gateway.WithControlAPIKey()` |
+
+**Residual (accepted, tracked separately):** `business_id` and `actor_id` are still client-asserted — gateway does not yet bind them to an authenticated identity via `foundation/identity`. Scope checks prevent accidental omission, not a determined caller who knows another tenant's `business_id`.
 
 ### P1 — High (13 findings)
 
@@ -291,11 +293,12 @@ go.mod unchanged (zero deps confirmed)
 
 | Order | Finding | Fix | Files | Status |
 |-------|---------|-----|-------|--------|
-| A1 | G-001 | `strings.HasPrefix` instead of broken `[:18]` comparison | `gateway/server.go:141` | ✅ FIXED + TESTED |
-| A2 | L-001 | `ControlAPIKey` in launcher Options, wired to gateway | `launcher/launcher.go:42,58` | ✅ FIXED |
-| A3 | G-002 | Authorization check on `handleGetResult` via `business_id` query param | `gateway/server.go:258`, `core/context.go:131` | ✅ FIXED + TESTED |
-| A4 | G-003 | Business-scope filtering on SSE subscription | `gateway/server.go:278` | ✅ FIXED + TESTED |
-| A5 | T-001+T-002 | 9 security regression tests added (auth, cross-tenant, SSE) | `gateway/server_test.go` | ✅ 9 NEW TESTS |
+| A1 | G-001 | Always-on `Handler()` + `strings.HasPrefix`; empty key → 403 fail-closed | `gateway/server.go:145-167` | ✅ FIXED + TESTED |
+| A2 | L-001 | `ControlAPIKey` in launcher Options, wired to gateway | `launcher/launcher.go:45,61` | ✅ FIXED |
+| A3 | G-002 | Fail-closed `business_id` required on `handleGetResult` (400 omit / 403 mismatch) | `gateway/server.go:284-313` | ✅ FIXED + TESTED |
+| A4 | G-003 | Fail-closed `business_id` required on SSE; filter always active | `gateway/server.go:320-371` | ✅ FIXED + TESTED |
+| A5 | T-001+T-002 | Security regression tests (auth, empty-key 403, cross-tenant, fail-closed, SSE) | `gateway/server_test.go` | ✅ 10+ NEW TESTS |
+| A6 | residual | `business_id`/`actor_id` not bound to authenticated identity — deferred, not P0 | `gateway` + `foundation/identity` | ⚠️ BACKLOG |
 
 ### Phase B: Correctness — P1 ✅ COMPLETE
 

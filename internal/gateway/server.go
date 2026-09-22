@@ -8,7 +8,8 @@
 //   - Status endpoints
 //
 // Key invariants:
-//   - All requests require business_id
+//   - All requests require business_id (enforced fail-closed on submit, result
+//     retrieval, and SSE streaming)
 //   - Correlation ID propagated from HTTP headers
 //   - Governance checked at API boundary
 //   - No internal details leaked in error responses
@@ -102,13 +103,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start event dispatch goroutine (H3 fix: SSE never receives events)
 	go s.dispatchLoop(ctx)
 
-	// Wrap handler with auth middleware for control endpoints (H8 fix)
-	var handler http.Handler = s.mux
-	if s.controlAPIKey != "" {
-		handler = s.authMiddleware(s.mux)
-	}
-
-	s.server.Handler = handler
+	// Install auth middleware unconditionally (fail-closed): control endpoints
+	// are protected even when no API key is configured — see authMiddleware.
+	s.server.Handler = s.Handler()
 
 	go func() {
 		<-ctx.Done()
@@ -142,10 +139,24 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 	}
 }
 
+// Handler returns the production HTTP handler: every route wrapped with auth
+// middleware. Start() installs this on the server; security regression tests
+// must exercise this (not raw Mux()) so the real request path is covered.
+func (s *Server) Handler() http.Handler {
+	return s.authMiddleware(s.mux)
+}
+
 // authMiddleware checks X-API-Key on control endpoints.
+// Fail-closed: if no control API key is configured, control endpoints are
+// disabled entirely (403) rather than left unprotected.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
+			if s.controlAPIKey == "" {
+				s.writeError(w, http.StatusForbidden, "CONTROL_DISABLED",
+					"control API key not configured — control endpoints disabled")
+				return
+			}
 			got := r.Header.Get("X-API-Key")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.controlAPIKey)) != 1 {
 				s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
@@ -266,10 +277,18 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetResult returns the result of a processed request.
-// When business_id query parameter is provided, authorization is enforced —
-// callers can only retrieve results belonging to their own business scope.
-// When omitted, the check is skipped for backward compatibility.
+// Fail-closed authorization: the business_id query parameter is REQUIRED.
+// Without it the request is rejected (400) — callers cannot bypass the scope
+// check by omitting the parameter. With it, callers can only retrieve results
+// belonging to their own business scope (403 on mismatch).
 func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
+	// Authorization scope is mandatory — no unscoped result access.
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
 	// Extract request ID from URL path: /api/v1/requests/{id}
 	id := r.PathValue("id")
 	if id == "" {
@@ -283,12 +302,10 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authorization: when business_id is provided, enforce scope match
-	if businessID := r.URL.Query().Get("business_id"); businessID != "" {
-		if result.BusinessID != businessID {
-			s.writeError(w, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
-			return
-		}
+	// Enforce scope match
+	if result.BusinessID != businessID {
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -296,9 +313,18 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSSE streams events via Server-Sent Events.
-// Supports optional business_id query parameter for scope filtering — when set,
-// only events matching the business scope are delivered to the client.
+// Fail-closed scoping: the business_id query parameter is REQUIRED. Only events
+// matching the business scope are delivered; unscoped events (empty BusinessID)
+// are never streamed to a scoped client. Requests without business_id are
+// rejected (400) — scoping cannot be bypassed by omitting the parameter.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// Authorization scope is mandatory — no unscoped event stream.
+	businessFilter := r.URL.Query().Get("business_id")
+	if businessFilter == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
 	// Acquire SSE client slot (semaphore). Reject with 503 if at capacity.
 	select {
 	case s.sseClients <- struct{}{}:
@@ -320,15 +346,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Optional business scope filter
-	businessFilter := r.URL.Query().Get("business_id")
-
 	// Subscribe to events
 	bus := s.engine.EventBus()
 	consumer := event.ConsumerFunc(func(e *event.Event) error {
-		// Filter by business scope if requested
-		if businessFilter != "" && e.BusinessID != businessFilter {
-			return nil // skip events from other businesses
+		// Filter by business scope (always active — businessFilter is required)
+		if e.BusinessID != businessFilter {
+			return nil // skip events from other businesses and unscoped events
 		}
 		data, _ := json.Marshal(e)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)

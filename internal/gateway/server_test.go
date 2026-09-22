@@ -200,7 +200,7 @@ func TestGetResultNotFound(t *testing.T) {
 	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
-	req := httptest.NewRequest("GET", "/api/v1/requests/nonexistent", nil)
+	req := httptest.NewRequest("GET", "/api/v1/requests/nonexistent?business_id=biz-1", nil)
 	w := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(w, req)
 
@@ -233,7 +233,7 @@ func TestGetResultFound(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Get result
-	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+submitResp["request_id"], nil)
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+submitResp["request_id"]+"?business_id=biz-1", nil)
 	resultW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resultW, resultReq)
 
@@ -711,8 +711,8 @@ func TestGetResultSameTenantAllowed(t *testing.T) {
 	}
 }
 
-// TEST-SEC-008: Result access without business_id is allowed (backward compat)
-func TestGetResultNoBusinessIDAllowed(t *testing.T) {
+// TEST-SEC-008: Result access without business_id is REJECTED (fail-closed)
+func TestGetResultNoBusinessIDRejected(t *testing.T) {
 	now := time.Now()
 	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	ctx := context.Background()
@@ -735,13 +735,14 @@ func TestGetResultNoBusinessIDAllowed(t *testing.T) {
 	// Wait for processing
 	time.Sleep(100 * time.Millisecond)
 
-	// Get result WITHOUT business_id → allowed (backward compat)
+	// Get result WITHOUT business_id → 400 (fail-closed: scoping cannot be
+	// bypassed by omitting the parameter)
 	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID, nil)
 	resultW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resultW, resultReq)
 
-	if resultW.Code != http.StatusOK {
-		t.Errorf("expected 200 without business_id (backward compat), got %d", resultW.Code)
+	if resultW.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 without business_id (fail-closed), got %d", resultW.Code)
 	}
 }
 
@@ -769,16 +770,62 @@ func TestResponseIncludesBusinessID(t *testing.T) {
 	// Wait for processing
 	time.Sleep(100 * time.Millisecond)
 
-	// Get result
-	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID, nil)
+	// Get result (business_id required — fail-closed)
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID+"?business_id=biz-1", nil)
 	resultW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resultW, resultReq)
+
+	if resultW.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", resultW.Code)
+	}
 
 	var result core.Response
 	json.NewDecoder(resultW.Body).Decode(&result)
 
 	if result.BusinessID != "biz-1" {
 		t.Errorf("expected business_id biz-1 in response, got %q", result.BusinessID)
+	}
+}
+
+// TEST-SEC-011: Empty control API key disables control endpoints (fail-closed)
+func TestHandlerEmptyControlKeyDisabled(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	// No WithControlAPIKey — controlAPIKey is ""
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	handler := srv.Handler()
+
+	// Control endpoint with no key configured → 403 (disabled, not open)
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when control key not configured, got %d", w.Code)
+	}
+
+	// Even supplying a key must not open disabled endpoints
+	req2 := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req2.Header.Set("X-API-Key", "anything")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when control key not configured (with header), got %d", w2.Code)
+	}
+
+	// Public endpoints still work
+	req3 := httptest.NewRequest("GET", "/health", nil)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req3)
+
+	if w3.Code != http.StatusOK {
+		t.Errorf("expected 200 for /health, got %d", w3.Code)
 	}
 }
 
