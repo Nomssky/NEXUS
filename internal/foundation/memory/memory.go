@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -95,6 +96,7 @@ type MemoryStore struct {
 	entries map[string]*MemoryEntry
 	mu      sync.RWMutex
 	now     func() time.Time
+	seq     atomic.Int64 // monotonic sequence for collision-safe entry IDs
 }
 
 // NewMemoryStore creates a new memory store.
@@ -124,7 +126,9 @@ func (ms *MemoryStore) Admit(entry *MemoryEntry) error {
 	}
 
 	now := ms.now()
-	entry.ID = fmt.Sprintf("mem-%d", now.UnixNano())
+	// E-041 fix: monotonic sequence prevents ID collision when the injected
+	// clock is frozen (tests) or multiple admits land in the same nanosecond.
+	entry.ID = fmt.Sprintf("mem-%d-%d", now.UnixNano(), ms.seq.Add(1))
 	entry.Status = StatusAdmitted
 	entry.CreatedAt = now
 	entry.UpdatedAt = now

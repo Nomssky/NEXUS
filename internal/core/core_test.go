@@ -984,3 +984,72 @@ func TestChainGovernanceRetryable(t *testing.T) {
 		t.Error("expected Retryable=false for DENY")
 	}
 }
+
+// TEST-CORE-038: No phantom model/tool audit entries (C-005 fix)
+func TestNoPhantomAuditEntries(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-phantom",
+		Context: NewRequestContext("corr-phantom", "biz-1", "user-1"),
+		Intent:  "test phantom entries",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-phantom")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "model" || entry.Step == "tool" {
+			t.Errorf("phantom audit entry '%s' with fabricated outcome: %s", entry.Step, entry.Outcome)
+		}
+		if strings.Contains(entry.Outcome, "model=executor") || strings.Contains(entry.Outcome, "tool=executor") {
+			t.Errorf("fabricated outcome in audit entry %s: %s", entry.Step, entry.Outcome)
+		}
+	}
+
+	// Verify entry must reflect actual execution status
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "verify" && !strings.Contains(entry.Outcome, "status=") {
+			t.Errorf("verify entry lacks actual status: %s", entry.Outcome)
+		}
+	}
+}
+
+// TEST-CORE-039: Request.Deadline honored (C-026 fix)
+func TestRequestDeadlineEnforced(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Deadline already in the past → fail fast
+	past := now.Add(-1 * time.Minute)
+	req := &Request{
+		ID:       "req-deadline-past",
+		Context:  NewRequestContext("corr-dl", "biz-1", "user-1"),
+		Intent:   "test deadline",
+		Deadline: &past,
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-deadline-past")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.Error == nil {
+		t.Fatal("expected deadline error for expired deadline")
+	}
+	if !strings.Contains(result.Error.Message, "deadline") {
+		t.Errorf("expected deadline error message, got: %s", result.Error.Message)
+	}
+}

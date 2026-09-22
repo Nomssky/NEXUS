@@ -178,7 +178,7 @@ func (e *Executor) Start(_ context.Context) error {
 	e.running = true
 	e.activeMu.Unlock()
 
-	e.emitEvent("executor.started", "", "", nil)
+	e.emitEvent("executor.started", "", "", nil) // system-level event: intentionally unscoped (no BusinessID)
 	return nil
 }
 

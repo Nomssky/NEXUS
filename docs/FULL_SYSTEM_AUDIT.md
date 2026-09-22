@@ -340,6 +340,12 @@ go.mod unchanged (zero deps confirmed)
 | D9 | G-016 | `MaxHeaderBytes: 1 MB` on HTTP server (header DoS limit) | ✅ FIXED + TESTED |
 | D10 | C-024 | `ChainError.Retryable` set for REQUIRE_APPROVAL | ✅ FIXED + TESTED |
 | D11 | C-012 | Memory `Retrieve` filters by `ObjectiveID` when specified | ✅ FIXED + TESTED |
+| D12 | C-005 | Phantom `model`/`tool` audit entries removed; verify reflects actual status | ✅ FIXED + TESTED |
+| D13 | C-011 | Attention errors recorded in audit trail (no longer absorbed) | ✅ FIXED |
+| D14 | C-026 | `Request.Deadline` honored; expired deadline fails fast | ✅ FIXED + TESTED |
+| D15 | E-041 | MemoryStore Admit IDs use monotonic sequence (collision-safe) | ✅ FIXED |
+| D16 | E-003 | Startup event documented as intentionally unscoped | ✅ DOCUMENTED |
+| D17 | — | `Response.Error` populated on execution failure (details were lost) | ✅ FIXED + TESTED |
 
 ---
 
@@ -368,19 +374,19 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 11 FIXES
-Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering.
+### Phase D — Cleanup (P3/P4): 18 FIXES
+Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event/memory IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` populated on execution failure.
 
 ### Final Metrics
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **413** (+22) |
+| **Tests** | 391 | **415** (+24) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **28** |
-| **Files changed** | — | **16** (+1,250 lines) |
+| **Fixes total** | — | **35** |
+| **Files changed** | — | **16** (+1,450 lines) |
