@@ -22,6 +22,7 @@ type ChainStep string
 const (
 	StepValidate   ChainStep = "validate"
 	StepGovernance ChainStep = "governance"
+	StepHardening  ChainStep = "hardening"
 	StepObjective  ChainStep = "objective"
 	StepDecision   ChainStep = "decision"
 	StepPlan       ChainStep = "plan"
@@ -62,7 +63,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Hardening: circuit breaker gate
 	if !e.circuitBreaker.Allow() {
 		err := fmt.Errorf("circuit breaker open: too many recent failures")
-		return e.chainError(req, err, StepValidate, audit, start)
+		return e.chainError(req, err, StepHardening, audit, start)
 	}
 	e.chainEmit(req, "chain.hardening.circuit_breaker.ok", "hardening", e.circuitBreaker.State())
 

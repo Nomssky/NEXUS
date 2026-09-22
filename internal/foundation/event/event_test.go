@@ -164,6 +164,77 @@ func TestMemBusHandlerError(t *testing.T) {
 	}
 }
 
+// TEST-M3-024: Failing handler retries are bounded — event dropped after
+// maxDeliveryAttempts so the dispatch loop cannot spin forever (E-046 fix).
+func TestMemBusBoundedRetry(t *testing.T) {
+	bus := NewMemBus()
+
+	handleCount := 0
+	bus.Subscribe(ConsumerFunc(func(e *Event) error {
+		handleCount++
+		return errors.New("handler failed")
+	}))
+
+	bus.Publish(&Event{ID: "e-fail", Type: EventTypeTaskCreated, Timestamp: time.Now()})
+
+	// Dispatch until the retry budget is exhausted.
+	for i := 0; i < maxDeliveryAttempts; i++ {
+		_, err := bus.Dispatch()
+		if err == nil {
+			t.Fatalf("attempt %d: expected error", i+1)
+		}
+	}
+
+	if handleCount != maxDeliveryAttempts {
+		t.Errorf("expected %d handle attempts, got %d", maxDeliveryAttempts, handleCount)
+	}
+
+	// Event must be dropped now — queue empty, further dispatch is a no-op.
+	if bus.QueueSize() != 0 {
+		t.Errorf("expected queue empty after retry budget exhausted, got %d", bus.QueueSize())
+	}
+	if _, err := bus.Dispatch(); err != nil {
+		t.Errorf("expected no error on empty dispatch, got %v", err)
+	}
+}
+
+// TEST-M3-025: Handler error does not drop remaining events (E-046 fix)
+func TestMemBusHandlerErrorKeepsRemaining(t *testing.T) {
+	bus := NewMemBus()
+
+	// First consumer fails on the first event only; second event must survive.
+	failFirst := true
+	bus.Subscribe(ConsumerFunc(func(e *Event) error {
+		if e.ID == "e-bad" && failFirst {
+			failFirst = false
+			return errors.New("transient failure")
+		}
+		return nil
+	}))
+
+	bus.Publish(&Event{ID: "e-bad", Type: EventTypeTaskCreated, Timestamp: time.Now()})
+	bus.Publish(&Event{ID: "e-good", Type: EventTypeTaskCreated, Timestamp: time.Now()})
+
+	// First dispatch fails on e-bad, re-queues it and e-good.
+	if _, err := bus.Dispatch(); err == nil {
+		t.Fatal("expected error on first dispatch")
+	}
+
+	// Both events must still be queued (nothing silently dropped).
+	if got := bus.QueueSize(); got != 2 {
+		t.Errorf("expected 2 events re-queued, got %d", got)
+	}
+
+	// Second dispatch: transient failure cleared, both deliver.
+	n, err := bus.Dispatch()
+	if err != nil {
+		t.Fatalf("expected success on retry, got %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected 2 dispatched, got %d", n)
+	}
+}
+
 // TEST-M3-022: Queue size
 func TestMemBusQueueSize(t *testing.T) {
 	bus := NewMemBus()

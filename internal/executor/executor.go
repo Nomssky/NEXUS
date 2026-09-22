@@ -87,14 +87,18 @@ type Config struct {
 	TaskTimeout time.Duration
 	// MaxRetries is the maximum number of retries for failed tasks.
 	MaxRetries int
+	// DefaultModelID is the model requested when no specific model is set.
+	// Empty falls back to the router's default routing behavior.
+	DefaultModelID string
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxConcurrent: 10,
-		TaskTimeout:   5 * time.Minute,
-		MaxRetries:    3,
+		MaxConcurrent:  10,
+		TaskTimeout:    5 * time.Minute,
+		MaxRetries:     3,
+		DefaultModelID: "default",
 	}
 }
 
@@ -444,7 +448,7 @@ func (e *Executor) defaultHandler(_ context.Context, req *WorkRequest, ag *agent
 	if e.modelRouter != nil {
 		genReq := &modelrouter.GenerateRequest{
 			RequestID: req.TaskID,
-			ModelID:   "default",
+			ModelID:   e.config.DefaultModelID,
 			Messages: []modelrouter.Message{
 				{Role: "user", Content: req.Intent},
 			},

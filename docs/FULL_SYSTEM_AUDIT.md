@@ -346,6 +346,9 @@ go.mod unchanged (zero deps confirmed)
 | D15 | E-041 | MemoryStore Admit IDs use monotonic sequence (collision-safe) | ✅ FIXED |
 | D16 | E-003 | Startup event documented as intentionally unscoped | ✅ DOCUMENTED |
 | D17 | — | `Response.Error` populated on execution failure (details were lost) | ✅ FIXED + TESTED |
+| D18 | C-007 | Circuit breaker error uses `StepHardening` (was `StepValidate`) | ✅ FIXED |
+| D19 | E-009 | Model ID configurable via `Config.DefaultModelID` (was hardcoded) | ✅ FIXED |
+| D20 | E-046 | MemBus Dispatch: bounded retry (3 attempts) + re-queue on handler error | ✅ FIXED + TESTED |
 
 ---
 
@@ -374,19 +377,19 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 18 FIXES
-Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event/memory IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` populated on execution failure.
+### Phase D — Cleanup (P3/P4): 21 FIXES
+Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event/memory IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` populated on execution failure, circuit breaker step naming, configurable model ID, MemBus bounded retry with re-queue on handler error.
 
 ### Final Metrics
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **415** (+24) |
+| **Tests** | 391 | **417** (+26) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **35** |
-| **Files changed** | — | **16** (+1,450 lines) |
+| **Fixes total** | — | **38** |
+| **Files changed** | — | **18** (+1,600 lines) |
