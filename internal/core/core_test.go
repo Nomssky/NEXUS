@@ -240,13 +240,13 @@ func TestAuditTrailChainSteps(t *testing.T) {
 		steps[entry.Step] = true
 	}
 
-	if !steps["validate"] {
+	if !steps[string(StepValidate)] {
 		t.Error("expected validate step in audit trail")
 	}
-	if !steps["governance"] {
+	if !steps[string(StepGovernance)] {
 		t.Error("expected governance step in audit trail")
 	}
-	if !steps["objective"] {
+	if !steps[string(StepObjective)] {
 		t.Error("expected objective step in audit trail")
 	}
 }
@@ -514,14 +514,14 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 		steps[entry.Step] = true
 	}
 
-	// Verify key steps exist
-	requiredSteps := []string{
-		"validate", "governance", "memory_read", "attention_score",
-		"objective", "decision", "plan", "workflow", "schedule",
-		"agent", "memory_write",
+	// Verify key steps exist (uses ChainStep constants — C-038)
+	requiredSteps := []ChainStep{
+		StepValidate, StepGovernance, StepMemoryRead, StepAttention,
+		StepObjective, StepDecision, StepPlan, StepWorkflow, StepSchedule,
+		StepAgent, StepMemoryWrite,
 	}
 	for _, step := range requiredSteps {
-		if !steps[step] {
+		if !steps[string(step)] {
 			t.Errorf("expected step '%s' in audit trail", step)
 		}
 	}

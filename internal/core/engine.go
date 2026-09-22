@@ -84,6 +84,7 @@ type Engine struct {
 	// Shutdown
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
+	loopDone     chan struct{} // closed when processRequests exits
 }
 
 // EngineOption configures the engine.
@@ -118,6 +119,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		results:     make(map[string]*Response),
 		resultOrder: make([]string, 0, maxResults),
 		shutdownCh:  make(chan struct{}),
+		loopDone:    make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -246,8 +248,13 @@ func (e *Engine) Stop(_ context.Context) error {
 	// Stop the task executor
 	e.taskExec.Stop(context.Background())
 
-	// Give goroutine time to exit
-	time.Sleep(50 * time.Millisecond)
+	// C-021 fix: wait for the processing loop to exit instead of
+	// time.Sleep(50ms). Bounded wait — never hang forever.
+	select {
+	case <-e.loopDone:
+	case <-time.After(5 * time.Second):
+		// Loop did not exit in time; proceed with shutdown anyway.
+	}
 
 	e.mu.Lock()
 	e.status = lifecycle.StateStopped
@@ -266,6 +273,10 @@ func (e *Engine) Resume(ctx context.Context) error {
 	}
 	// Create a fresh shutdown channel (the old one was closed during Stop)
 	e.shutdownCh = make(chan struct{})
+	e.loopDone = make(chan struct{})
+	// Reset Once so the next Stop() closes the fresh shutdownCh —
+	// previously the fired Once made Stop after Resume a no-op (latent bug).
+	e.shutdownOnce = sync.Once{}
 	e.status = lifecycle.StateRunning
 	e.mu.Unlock()
 
@@ -308,6 +319,12 @@ func (e *Engine) GetResult(requestID string) (*Response, bool) {
 
 // processRequests is the main processing loop.
 func (e *Engine) processRequests(ctx context.Context) {
+	// Signal Stop() when this loop exits (C-021: deterministic shutdown).
+	e.mu.RLock()
+	loopDone := e.loopDone
+	e.mu.RUnlock()
+	defer close(loopDone)
+
 	for {
 		// Read shutdown channel under lock to avoid racing with Resume().
 		e.mu.RLock()

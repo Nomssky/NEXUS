@@ -349,6 +349,12 @@ go.mod unchanged (zero deps confirmed)
 | D18 | C-007 | Circuit breaker error uses `StepHardening` (was `StepValidate`) | ✅ FIXED |
 | D19 | E-009 | Model ID configurable via `Config.DefaultModelID` (was hardcoded) | ✅ FIXED |
 | D20 | E-046 | MemBus Dispatch: bounded retry (3 attempts) + re-queue on handler error | ✅ FIXED + TESTED |
+| D21 | C-002 | Objective description/success criteria now semantically distinct | ✅ FIXED |
+| D22 | C-004 | ChainStep constants added: `memory_read`, `attention_score`, `memory_write` | ✅ FIXED |
+| D23 | C-009 | `chainError` emits `chain.failed` event (was silent) | ✅ FIXED |
+| D24 | C-010 | Terminal event reflects status: failures emit `chain.failed` | ✅ FIXED |
+| D25 | C-021 | `Stop()` waits on `loopDone` channel (was `time.Sleep(50ms)`); Resume resets `shutdownOnce` (latent bug) | ✅ FIXED |
+| D26 | C-038 | Tests use `ChainStep` constants instead of string literals | ✅ FIXED |
 
 ---
 
@@ -377,8 +383,8 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 21 FIXES
-Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event/memory IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` populated on execution failure, circuit breaker step naming, configurable model ID, MemBus bounded retry with re-queue on handler error.
+### Phase D — Cleanup (P3/P4): 27 FIXES
+Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe IDs (correlation/event/memory), correct address logging, `MaxHeaderBytes`, `Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` on failure, circuit breaker step naming, configurable model ID, MemBus bounded retry, distinct objective criteria, `chain.failed` events, `Stop()` waits on loop (no sleep), `shutdownOnce` reset on Resume, ChainStep constants + test usage.
 
 ### Final Metrics
 
@@ -391,5 +397,5 @@ Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` a
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **38** |
-| **Files changed** | — | **18** (+1,600 lines) |
+| **Fixes total** | — | **44** |
+| **Files changed** | — | **18** (+1,750 lines) |

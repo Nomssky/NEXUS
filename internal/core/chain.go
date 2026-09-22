@@ -20,18 +20,21 @@ import (
 type ChainStep string
 
 const (
-	StepValidate   ChainStep = "validate"
-	StepGovernance ChainStep = "governance"
-	StepHardening  ChainStep = "hardening"
-	StepObjective  ChainStep = "objective"
-	StepDecision   ChainStep = "decision"
-	StepPlan       ChainStep = "plan"
-	StepWorkflow   ChainStep = "workflow"
-	StepSchedule   ChainStep = "schedule"
-	StepAgent      ChainStep = "agent"
-	StepModel      ChainStep = "model"
-	StepTool       ChainStep = "tool"
-	StepVerify     ChainStep = "verify"
+	StepValidate    ChainStep = "validate"
+	StepGovernance  ChainStep = "governance"
+	StepHardening   ChainStep = "hardening"
+	StepMemoryRead  ChainStep = "memory_read"
+	StepAttention   ChainStep = "attention_score"
+	StepObjective   ChainStep = "objective"
+	StepDecision    ChainStep = "decision"
+	StepPlan        ChainStep = "plan"
+	StepWorkflow    ChainStep = "workflow"
+	StepSchedule    ChainStep = "schedule"
+	StepAgent       ChainStep = "agent"
+	StepModel       ChainStep = "model"
+	StepTool        ChainStep = "tool"
+	StepVerify      ChainStep = "verify"
+	StepMemoryWrite ChainStep = "memory_write"
 )
 
 // executeChain runs the canonical execution chain for a request.
@@ -84,7 +87,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Step 2b: Retrieve relevant context from memory
 	memContext := e.chainMemoryRead(ctx, req)
 	audit = append(audit, AuditEntry{
-		Step:      "memory_read",
+		Step:      string(StepMemoryRead),
 		Action:    "retrieve context",
 		Actor:     "memory",
 		Timestamp: e.now(),
@@ -106,7 +109,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		attOutcome = fmt.Sprintf("score=0.00 suppressed=false attention_error=%v", attErr)
 	}
 	audit = append(audit, AuditEntry{
-		Step:      "attention_score",
+		Step:      string(StepAttention),
 		Action:    "score attention",
 		Actor:     "attention",
 		Timestamp: e.now(),
@@ -267,7 +270,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Step 13: Store outcome in memory
 	e.chainMemoryWrite(ctx, req, status, outcomeResult)
 	audit = append(audit, AuditEntry{
-		Step:      "memory_write",
+		Step:      string(StepMemoryWrite),
 		Action:    "store outcome",
 		Actor:     "memory",
 		Timestamp: e.now(),
@@ -276,7 +279,13 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	})
 	e.chainEmit(req, "chain.memory.written", "memory", status)
 
-	e.chainEmit(req, "chain.completed", "core", status)
+	// C-010 fix: terminal event reflects actual status — failures emit
+	// chain.failed, only successes emit chain.completed.
+	if status == "completed" {
+		e.chainEmit(req, "chain.completed", "core", status)
+	} else {
+		e.chainEmit(req, "chain.failed", "core", fmt.Sprintf("step=%s status=%s", StepAgent, status))
+	}
 
 	return &Response{
 		RequestID:  req.ID,
@@ -334,8 +343,11 @@ func (e *Engine) chainObjective(_ context.Context, req *Request) (*cognition.Obj
 	obj, err := e.objectiveEng.CreateObjective(
 		cognition.ObjectiveTypeOwner,
 		req.Intent,
-		fmt.Sprintf("Fulfill owner intent: %s", req.Intent),
-		fmt.Sprintf("Achieve: %s", req.Intent),
+		// Description explains WHY this objective exists (context for humans).
+		fmt.Sprintf("Owner %s requested: %s", req.Context.ActorID, req.Intent),
+		// Success criteria states the verifiable completion condition —
+		// intentionally distinct from the description (C-002).
+		fmt.Sprintf("Request %s processed with status=completed and audit trail recorded", req.ID),
 		req.Context.ActorID,
 		req.Context.BusinessID,
 	)
@@ -460,6 +472,9 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 		Duration:  e.now().Sub(start),
 		Outcome:   fmt.Sprintf("error=%s", err.Error()),
 	})
+
+	// C-009 fix: chain failures are observable on the event bus (was silent).
+	e.chainEmit(req, "chain.failed", "core", fmt.Sprintf("step=%s error=%s", step, chainErr.Code))
 
 	return &Response{
 		RequestID:  req.ID,
