@@ -53,7 +53,7 @@ func WithClock(now func() time.Time) ServerOption {
 }
 
 // WithControlAPIKey sets the API key required for control endpoints.
-// If empty, control endpoints are unprotected (backward compatible).
+// If empty, control endpoints are disabled (403 fail-closed), not open.
 func WithControlAPIKey(key string) ServerOption {
 	return func(s *Server) { s.controlAPIKey = key }
 }

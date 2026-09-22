@@ -70,16 +70,16 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 
 ## 4. Findings Table
 
-### P0 — Critical (4 findings) — ALL FIXED (fail-closed)
+### P0 — Critical (4 findings)
 
-| ID | Status | File:Line | Finding | Fix |
-|----|--------|-----------|---------|-----|
-| **G-001** | **FIXED** | `gateway/server.go:145-167` | Auth middleware `[:18]` vs 16-char literal — never matched; middleware only installed when key non-empty | `Handler()` always wraps `authMiddleware`; `strings.HasPrefix(..., "/api/v1/control/")`; empty key → 403 `CONTROL_DISABLED`; `ConstantTimeCompare` |
-| **G-002** | **FIXED** | `gateway/server.go:284-313` | `handleGetResult` no authorization — cross-tenant data leakage | `business_id` query param **required** (400 if omitted); scope mismatch → 403; response includes `BusinessID` |
-| **G-003** | **FIXED** | `gateway/server.go:320-371` | SSE no business-scope filtering — all events leaked | `business_id` query param **required** (400 if omitted); consumer drops events where `e.BusinessID != filter` (unscoped events never delivered) |
-| **L-001** | **FIXED** | `launcher/launcher.go:45,61` | `controlAPIKey` never wired to gateway | `ControlAPIKey` in launcher `Options`, wired via `gateway.WithControlAPIKey()` |
+| ID | Status | File:Line | Finding | Fix / Scope |
+|----|--------|-----------|---------|-------------|
+| **G-001** | **FIXED** | `gateway/server.go:145-167` | Auth middleware `[:18]` vs 16-char literal — never matched; middleware only installed when key non-empty | `Handler()` always wraps `authMiddleware`; `strings.HasPrefix(..., "/api/v1/control/")`; empty key → 403 `CONTROL_DISABLED`; `ConstantTimeCompare`; all auth tests exercise `Handler()` |
+| **G-002** | **MITIGATED** (see residual) | `gateway/server.go:284-313` | `handleGetResult` no authorization — cross-tenant data leakage | `business_id` **required** (400 if omitted); mismatch → 403. **Does NOT prove caller identity** — see A6 |
+| **G-003** | **MITIGATED** (see residual) | `gateway/server.go:320-371` | SSE no business-scope filtering — all events leaked | `business_id` **required** (400 if omitted); consumer drops non-matching/unscoped events. **Filter value is client-asserted** — see A6 |
+| **L-001** | **FIXED** | `cmd/nexus/main.go:59-67`, `launcher/launcher.go:45,61` | `controlAPIKey` never wired to gateway | Env `NEXUS_CONTROL_API_KEY` → `launcher.Options.ControlAPIKey` → `gateway.WithControlAPIKey()`; integration tests `TEST-LAUNCH-007/008` |
 
-**Residual (accepted, tracked separately):** `business_id` and `actor_id` are still client-asserted — gateway does not yet bind them to an authenticated identity via `foundation/identity`. Scope checks prevent accidental omission, not a determined caller who knows another tenant's `business_id`.
+**Residual R-001 (explicit, blocks multi-business claim):** `business_id` and `actor_id` remain **client-asserted**. G-002/G-003 close the *omission/mismatch* bypass (fail-closed parameters); they are **not** identity-bound tenant authorization. A caller who knows another tenant's `business_id` can still request that scope. Full closure requires binding request identity → `foundation/identity` membership before opening cross-business access (backlog **A6**, gate before multi-business production).
 
 ### P1 — High (13 findings)
 
@@ -93,11 +93,11 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 | **E-004** | CONFIRMED | `executor/executor.go:372` | `REQUIRE_APPROVAL` and `ESCALATE` governance outcomes are treated as "allow" — executor does not block or submit to ApprovalEngine. | Governance bypass |
 | **M-042** | CONFIRMED | `event/membus.go:177-191` | Wildcard + type-specific subscriber receives duplicate deliveries. | Duplicate event processing |
 | **M-044** | CONFIRMED | `event/membus.go:53-58` | Dedup map grows indefinitely — never cleaned. Unbounded memory leak in long-running processes. | Memory exhaustion |
-| **L-002** | CONFIRMED | `launcher/launcher.go:83-89` | Gateway start error silently logged, not propagated. | Silent failure mode |
-| **L-003** | CONFIRMED | `launcher/launcher.go:98-114` | `Stop()` always returns nil — errors from gateway/engine shutdown are swallowed. | Shutdown errors invisible |
-| **L-004** | CONFIRMed | `launcher/launcher.go:98-114` | `Stop()` does not shut down `health.Server` or `lifecycle.Manager`. | Resource leak |
-| **T-001** | CONFIRMED | `gateway/server_test.go` | Zero test coverage for auth middleware (correct or incorrect). | Security bug undetected |
-| **T-002** | CONFIRMED | `gateway/server_test.go` | Zero test coverage for cross-tenant authorization on result retrieval. | Security bug undetected |
+| **L-002** | PARTIAL | `launcher/launcher.go:86-106` | Gateway start error only detected within 100 ms window — not deterministic full startup barrier. | Silent failure mode (improved, not closed) |
+| **L-003** | FIXED | `launcher/launcher.go:116-139` | `Stop()` always returns nil — errors from gateway/engine shutdown are swallowed. | Shutdown errors now aggregated and returned |
+| **L-004** | CONFIRMED | `launcher/launcher.go:116-139` | `Stop()` does not shut down `health.Server` or `lifecycle.Manager`. | Resource leak — health now `MarkNotReady()` on Stop; lifecycle owns hooks |
+| **T-001** | FIXED | `gateway/server_test.go:504-632` | Zero test coverage for auth middleware (correct or incorrect). | Auth tests now use production `Handler()` |
+| **T-002** | FIXED | `gateway/server_test.go:634-747` | Zero test coverage for cross-tenant authorization on result retrieval. | Cross-tenant + fail-closed tests added |
 
 ### P2 — Medium (22 findings)
 
@@ -289,16 +289,16 @@ go.mod unchanged (zero deps confirmed)
 
 ## 9. Prioritized Remediation Plan
 
-### Phase A: Security — P0 ✅ COMPLETE
+### Phase A: Security — P0 ⚠️ MITIGATED (identity binding A6 still open)
 
 | Order | Finding | Fix | Files | Status |
 |-------|---------|-----|-------|--------|
-| A1 | G-001 | Always-on `Handler()` + `strings.HasPrefix`; empty key → 403 fail-closed | `gateway/server.go:145-167` | ✅ FIXED + TESTED |
-| A2 | L-001 | `ControlAPIKey` in launcher Options, wired to gateway | `launcher/launcher.go:45,61` | ✅ FIXED |
-| A3 | G-002 | Fail-closed `business_id` required on `handleGetResult` (400 omit / 403 mismatch) | `gateway/server.go:284-313` | ✅ FIXED + TESTED |
-| A4 | G-003 | Fail-closed `business_id` required on SSE; filter always active | `gateway/server.go:320-371` | ✅ FIXED + TESTED |
-| A5 | T-001+T-002 | Security regression tests (auth, empty-key 403, cross-tenant, fail-closed, SSE) | `gateway/server_test.go` | ✅ 10+ NEW TESTS |
-| A6 | residual | `business_id`/`actor_id` not bound to authenticated identity — deferred, not P0 | `gateway` + `foundation/identity` | ⚠️ BACKLOG |
+| A1 | G-001 | Always-on `Handler()` + `strings.HasPrefix`; empty key → 403 fail-closed; auth tests via `Handler()` | `gateway/server.go:145-167` | ✅ FIXED + TESTED |
+| A2 | L-001 | Env `NEXUS_CONTROL_API_KEY` → launcher Options → gateway | `cmd/nexus/main.go`, `launcher/launcher.go:45,61` | ✅ FIXED + TESTED |
+| A3 | G-002 | Fail-closed `business_id` required on `handleGetResult` (400 omit / 403 mismatch) | `gateway/server.go:284-313` | ✅ MITIGATED + TESTED |
+| A4 | G-003 | Fail-closed `business_id` required on SSE; filter always active | `gateway/server.go:320-371` | ✅ MITIGATED + TESTED |
+| A5 | T-001+T-002 | Security regression tests via production `Handler()` (auth, empty-key, cross-tenant, fail-closed) | `gateway/server_test.go`, `launcher_test.go` | ✅ TESTS |
+| A6 | R-001 residual | **Trusted identity→business binding** (`foundation/identity` at gateway boundary) — required before claiming multi-tenant authorization or opening cross-business access | `gateway` + `identity` | ⛔ **GATE before multi-business** |
 
 ### Phase B: Correctness — P1 ✅ COMPLETE
 

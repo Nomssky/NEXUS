@@ -116,6 +116,11 @@ func (l *Launcher) Start(ctx context.Context) error {
 func (l *Launcher) Stop(ctx context.Context) error {
 	var errs []error
 
+	// Flip readiness first so load balancers stop routing before drain.
+	if l.health != nil {
+		l.health.MarkNotReady()
+	}
+
 	// Stop gateway first (stop accepting new requests)
 	if err := l.gateway.Stop(ctx); err != nil {
 		l.log.Error("gateway stop error", logging.Fields{

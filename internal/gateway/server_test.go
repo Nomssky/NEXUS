@@ -514,8 +514,8 @@ func TestAuthMiddlewareBlocksNoKey(t *testing.T) {
 		WithControlAPIKey("secret-key-123"),
 	)
 
-	// Use authMiddleware-wrapped handler (not raw Mux)
-	handler := srv.authMiddleware(srv.Mux())
+	// Production path: Handler() as installed by Start()
+	handler := srv.Handler()
 
 	// Control endpoint without API key → 401
 	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
@@ -548,7 +548,7 @@ func TestAuthMiddlewareBlocksWrongKey(t *testing.T) {
 		WithControlAPIKey("secret-key-123"),
 	)
 
-	handler := srv.authMiddleware(srv.Mux())
+	handler := srv.Handler()
 
 	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
 	req.Header.Set("X-API-Key", "wrong-key")
@@ -573,7 +573,7 @@ func TestAuthMiddlewareAllowsCorrectKey(t *testing.T) {
 		WithControlAPIKey("secret-key-123"),
 	)
 
-	handler := srv.authMiddleware(srv.Mux())
+	handler := srv.Handler()
 
 	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
 	req.Header.Set("X-API-Key", "secret-key-123")
@@ -595,7 +595,7 @@ func TestAuthMiddlewareSkipsPublicEndpoints(t *testing.T) {
 		WithControlAPIKey("secret-key-123"),
 	)
 
-	handler := srv.authMiddleware(srv.Mux())
+	handler := srv.Handler()
 
 	// Health endpoint should work without API key even when auth is configured
 	req := httptest.NewRequest("GET", "/health", nil)
@@ -617,7 +617,7 @@ func TestAuthMiddlewareExactPrefix(t *testing.T) {
 		WithControlAPIKey("secret-key-123"),
 	)
 
-	handler := srv.authMiddleware(srv.Mux())
+	handler := srv.Handler()
 
 	// This path starts with "/api/v1/control" but NOT "/api/v1/control/"
 	// It should NOT be protected by auth middleware
