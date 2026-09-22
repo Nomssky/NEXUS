@@ -368,11 +368,13 @@ go.mod unchanged (zero deps confirmed)
 
 **All 4 phases of remediation COMPLETE.**
 
-### Phase A — Security (P0): ALL 4 FIXED
-1. ✅ Auth middleware — `strings.HasPrefix` (was broken `[:18]`)
-2. ✅ Result authorization — optional `business_id` query param
-3. ✅ SSE business-scope filtering
-4. ✅ API key wired from launcher to gateway
+### Phase A — Security (P0): 1 FIXED, 2 MITIGATED, 1 FIXED
+1. ✅ **G-001 FIXED** — Auth middleware `strings.HasPrefix` (was broken `[:18]`)
+2. ⚠️ **G-002 MITIGATED** — Result authorization: `business_id` **required** (400 omit / 403 mismatch); **not identity-bound** (R-001 / A6)
+3. ⚠️ **G-003 MITIGATED** — SSE business-scope filtering: `business_id` **required**, filter always active; **client-asserted scope** (R-001 / A6)
+4. ✅ **L-001 FIXED** — API key wired from launcher Options (`NEXUS_CONTROL_API_KEY`) to gateway
+
+**⛔ A6 gate:** Multi-business production remains blocked until identity binding lands. See issue #43.
 
 ### Phase B — Correctness (P1): ALL 10 FIXED
 1. ✅ Shutdown timeout (`context.WithTimeout`)
