@@ -154,6 +154,10 @@ func (ms *MemoryStore) Retrieve(query *MemoryQuery) []*MemoryEntry {
 		if query.DivisionID != "" && entry.DivisionID != "" && entry.DivisionID != query.DivisionID {
 			continue
 		}
+		// ObjectiveID scope (if specified)
+		if query.ObjectiveID != "" && entry.ObjectiveID != "" && entry.ObjectiveID != query.ObjectiveID {
+			continue
+		}
 		// Type filter
 		if len(query.Types) > 0 {
 			found := false

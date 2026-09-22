@@ -310,6 +310,7 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 			Category:  "POLICY_DENIED",
 			Message:   fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason),
 			ChainStep: string(StepGovernance),
+			Retryable: decision.Outcome == governance.REQUIRE_APPROVAL,
 		}
 	}
 	return nil

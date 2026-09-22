@@ -12,6 +12,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
+	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
@@ -916,5 +917,70 @@ func TestBusinessIDInResponse(t *testing.T) {
 	}
 	if result.BusinessID != "my-business" {
 		t.Errorf("expected business_id 'my-business', got %q", result.BusinessID)
+	}
+}
+
+// TEST-CORE-037: POLICY_DENIED error sets Retryable for REQUIRE_APPROVAL (C-024 fix)
+func TestChainGovernanceRetryable(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &Request{
+		ID:      "req-gov-retry",
+		Context: NewRequestContext("corr-gov", "biz-1", "user-1"),
+		Intent:  "test",
+	}
+
+	// Case 1: REQUIRE_APPROVAL → Retryable = true (caller can retry after approval)
+	e.govEngine = governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok := err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if !ce.Retryable {
+		t.Error("expected Retryable=true for REQUIRE_APPROVAL")
+	}
+
+	// Case 2: DENY → Retryable = false (retry won't help)
+	e.govEngine = governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "deny",
+			Name:       "Deny",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.DENY,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok = err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if ce.Retryable {
+		t.Error("expected Retryable=false for DENY")
 	}
 }

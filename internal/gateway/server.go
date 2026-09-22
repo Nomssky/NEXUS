@@ -91,6 +91,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB limit prevents header-based DoS
 	}
 
 	return s

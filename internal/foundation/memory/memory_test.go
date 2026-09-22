@@ -338,3 +338,23 @@ func TestMemoryClockInjection(t *testing.T) {
 		t.Errorf("expected clock-injected time")
 	}
 }
+
+// TEST-M8-021: Retrieval filters by ObjectiveID when specified (C-012 fix)
+func TestMemoryRetrievalByObjectiveID(t *testing.T) {
+	ms := NewMemoryStore()
+	ms.Admit(&MemoryEntry{Type: MemoryTypeEpisodic, BusinessID: "biz-1", ObjectiveID: "obj-1", Content: "objective 1 memory", Provenance: Provenance{Confidence: 1.0}})
+	ms.Admit(&MemoryEntry{Type: MemoryTypeEpisodic, BusinessID: "biz-1", ObjectiveID: "obj-2", Content: "objective 2 memory", Provenance: Provenance{Confidence: 1.0}})
+	ms.Admit(&MemoryEntry{Type: MemoryTypeEpisodic, BusinessID: "biz-1", Content: "unscoped memory", Provenance: Provenance{Confidence: 1.0}})
+
+	// Filter by obj-1: matches obj-1 entry + unscoped entry (backward compatible)
+	results := ms.Retrieve(&MemoryQuery{BusinessID: "biz-1", ObjectiveID: "obj-1"})
+	if len(results) != 2 {
+		t.Errorf("expected 2 results for obj-1 (incl. unscoped), got %d", len(results))
+	}
+
+	// No ObjectiveID filter: all 3 returned
+	results = ms.Retrieve(&MemoryQuery{BusinessID: "biz-1"})
+	if len(results) != 3 {
+		t.Errorf("expected 3 results without filter, got %d", len(results))
+	}
+}

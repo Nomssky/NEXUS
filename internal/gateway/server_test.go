@@ -781,3 +781,14 @@ func TestResponseIncludesBusinessID(t *testing.T) {
 		t.Errorf("expected business_id biz-1 in response, got %q", result.BusinessID)
 	}
 }
+
+// TEST-SEC-010: Gateway HTTP server has MaxHeaderBytes limit (G-016 fix)
+func TestMaxHeaderBytesConfigured(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	if srv.server.MaxHeaderBytes == 0 {
+		t.Error("expected MaxHeaderBytes to be configured (0 = unlimited, DoS risk)")
+	}
+}

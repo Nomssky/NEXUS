@@ -334,6 +334,12 @@ go.mod unchanged (zero deps confirmed)
 | D3 | E-020 | Add mutex to `ApprovalEngine` | ✅ FIXED |
 | D4 | E-027 | Add mutex to `LocalAuthenticator` | ✅ FIXED |
 | D5 | L-010 | Fix flaky `TestStopWaitsForTasks` (submit task + proper signaling) | ✅ FIXED |
+| D6 | G-013 | API key comparison via `crypto/subtle.ConstantTimeCompare` | ✅ FIXED + TESTED |
+| D7 | G-014 | Correlation/Event IDs use monotonic counter (collision-safe) | ✅ FIXED |
+| D8 | L-007 | Gateway startup log uses actual listen address (was `Health.Host`) | ✅ FIXED |
+| D9 | G-016 | `MaxHeaderBytes: 1 MB` on HTTP server (header DoS limit) | ✅ FIXED + TESTED |
+| D10 | C-024 | `ChainError.Retryable` set for REQUIRE_APPROVAL | ✅ FIXED + TESTED |
+| D11 | C-012 | Memory `Retrieve` filters by `ObjectiveID` when specified | ✅ FIXED + TESTED |
 
 ---
 
@@ -362,18 +368,19 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 5 FIXES
-Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed.
+### Phase D — Cleanup (P3/P4): 11 FIXES
+Dead code removal (`startCtx`, `defaultAddr`), mutex added to `ApprovalEngine` and `LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe correlation/event IDs, correct gateway address logging, HTTP `MaxHeaderBytes` limit, `ChainError.Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering.
 
 ### Final Metrics
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **410** (+19) |
+| **Tests** | 391 | **413** (+22) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Files changed** | — | **10** (+450 lines) |
+| **Fixes total** | — | **28** |
+| **Files changed** | — | **16** (+1,250 lines) |
