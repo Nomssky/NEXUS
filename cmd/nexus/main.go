@@ -14,6 +14,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/foundation/app"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/version"
@@ -58,6 +59,12 @@ func run() int {
 	// Wire the launcher. Control API key is a secret: loaded from the
 	// environment only (never from the config file — config holds SecretRef
 	// references, not raw secrets).
+	//
+	// Identity binding (A6): pass security flags and foundation identity
+	// components so the gateway enforces authenticated actor + membership on
+	// scoped paths when require_authentication / enforce_business_scope are on.
+	// The authenticator starts empty (fail-closed until credentials are
+	// registered); memberships are the process membership set from app.
 	launch := launcher.New(launcher.Options{
 		Config:        cfg,
 		Logger:        log,
@@ -65,6 +72,11 @@ func run() int {
 		Lifecycle:     life,
 		Addr:          addr,
 		ControlAPIKey: os.Getenv(config.EnvControlAPIKey),
+
+		Authenticator:         identity.NewLocalAuthenticator(),
+		Memberships:           a.Memberships(),
+		RequireAuthentication: cfg.Security.RequireAuthentication,
+		EnforceBusinessScope:  cfg.Security.EnforceBusinessScope,
 	})
 
 	return int(launch.Run(context.Background()))
