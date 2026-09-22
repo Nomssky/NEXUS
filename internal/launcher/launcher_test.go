@@ -2,6 +2,8 @@ package launcher
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -200,5 +202,100 @@ func TestLauncherStopIdempotent(t *testing.T) {
 	}
 	if err := l.Stop(ctx); err != nil {
 		t.Fatalf("second stop failed: %v", err)
+	}
+}
+
+// TEST-LAUNCH-007: ControlAPIKey flows Options → gateway (L-001 end-to-end)
+func TestLauncherControlAPIKeyWired(t *testing.T) {
+	cfg := testConfig()
+	log := logging.New(logging.Options{})
+	healthSrv := health.NewServer()
+	life := lifecycle.New(lifecycle.Options{})
+
+	l := New(Options{
+		Config:        cfg,
+		Logger:        log,
+		Health:        healthSrv,
+		Lifecycle:     life,
+		Addr:          ":0",
+		ControlAPIKey: "launcher-secret",
+	})
+
+	if l.Gateway() == nil {
+		t.Fatal("expected non-nil gateway")
+	}
+
+	// Production handler must reject control access without the key.
+	handler := l.Gateway().Handler()
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without key (key was wired), got %d", w.Code)
+	}
+
+	// With the correct key, control is reachable.
+	req2 := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req2.Header.Set("X-API-Key", "launcher-secret")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected 200 with wired key, got %d", w2.Code)
+	}
+}
+
+// TEST-LAUNCH-008: Empty ControlAPIKey fails closed (control disabled)
+func TestLauncherControlAPIKeyEmptyDisabled(t *testing.T) {
+	cfg := testConfig()
+	log := logging.New(logging.Options{})
+	healthSrv := health.NewServer()
+	life := lifecycle.New(lifecycle.Options{})
+
+	l := New(Options{
+		Config:    cfg,
+		Logger:    log,
+		Health:    healthSrv,
+		Lifecycle: life,
+		Addr:      ":0",
+		// ControlAPIKey intentionally empty
+	})
+
+	handler := l.Gateway().Handler()
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req.Header.Set("X-API-Key", "anything")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when no key configured, got %d", w.Code)
+	}
+}
+
+// TEST-LAUNCH-009: Stop marks health not-ready (shutdown signal)
+func TestLauncherStopMarksNotReady(t *testing.T) {
+	cfg := testConfig()
+	log := logging.New(logging.Options{})
+	healthSrv := health.NewServer()
+	life := lifecycle.New(lifecycle.Options{})
+	healthSrv.MarkReady()
+
+	l := New(Options{
+		Config:    cfg,
+		Logger:    log,
+		Health:    healthSrv,
+		Lifecycle: life,
+		Addr:      ":0",
+	})
+
+	ctx := context.Background()
+	l.Start(ctx)
+	if err := l.Stop(ctx); err != nil {
+		t.Fatalf("stop failed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/ready", nil)
+	w := httptest.NewRecorder()
+	healthSrv.ReadyHandler().ServeHTTP(w, req)
+	if w.Code == http.StatusOK {
+		t.Error("expected health not-ready after Stop, got 200")
 	}
 }

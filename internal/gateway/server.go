@@ -8,7 +8,8 @@
 //   - Status endpoints
 //
 // Key invariants:
-//   - All requests require business_id
+//   - All requests require business_id (enforced fail-closed on submit, result
+//     retrieval, and SSE streaming)
 //   - Correlation ID propagated from HTTP headers
 //   - Governance checked at API boundary
 //   - No internal details leaked in error responses
@@ -16,9 +17,12 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/core"
@@ -33,6 +37,7 @@ type Server struct {
 	mux           *http.ServeMux
 	now           func() time.Time
 	controlAPIKey string
+	corrSeq       atomic.Int64 // monotonic sequence for correlation IDs
 
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
@@ -48,7 +53,7 @@ func WithClock(now func() time.Time) ServerOption {
 }
 
 // WithControlAPIKey sets the API key required for control endpoints.
-// If empty, control endpoints are unprotected (backward compatible).
+// If empty, control endpoints are disabled (403 fail-closed), not open.
 func WithControlAPIKey(key string) ServerOption {
 	return func(s *Server) { s.controlAPIKey = key }
 }
@@ -87,6 +92,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB limit prevents header-based DoS
 	}
 
 	return s
@@ -97,17 +103,15 @@ func (s *Server) Start(ctx context.Context) error {
 	// Start event dispatch goroutine (H3 fix: SSE never receives events)
 	go s.dispatchLoop(ctx)
 
-	// Wrap handler with auth middleware for control endpoints (H8 fix)
-	var handler http.Handler = s.mux
-	if s.controlAPIKey != "" {
-		handler = s.authMiddleware(s.mux)
-	}
-
-	s.server.Handler = handler
+	// Install auth middleware unconditionally (fail-closed): control endpoints
+	// are protected even when no API key is configured — see authMiddleware.
+	s.server.Handler = s.Handler()
 
 	go func() {
 		<-ctx.Done()
-		s.server.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		s.server.Shutdown(shutdownCtx)
 	}()
 
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -135,11 +139,26 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 	}
 }
 
+// Handler returns the production HTTP handler: every route wrapped with auth
+// middleware. Start() installs this on the server; security regression tests
+// must exercise this (not raw Mux()) so the real request path is covered.
+func (s *Server) Handler() http.Handler {
+	return s.authMiddleware(s.mux)
+}
+
 // authMiddleware checks X-API-Key on control endpoints.
+// Fail-closed: if no control API key is configured, control endpoints are
+// disabled entirely (403) rather than left unprotected.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(r.URL.Path) >= 18 && r.URL.Path[:18] == "/api/v1/control/" {
-			if r.Header.Get("X-API-Key") != s.controlAPIKey {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
+			if s.controlAPIKey == "" {
+				s.writeError(w, http.StatusForbidden, "CONTROL_DISABLED",
+					"control API key not configured — control endpoints disabled")
+				return
+			}
+			got := r.Header.Get("X-API-Key")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(s.controlAPIKey)) != 1 {
 				s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
 				return
 			}
@@ -153,7 +172,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
-// Mux returns the HTTP handler for testing.
+// Mux returns the raw HTTP handler for testing purposes only.
+// WARNING: This handler does NOT include auth middleware. Use only in tests.
+// Production code must use the handler returned by Start() which includes auth.
 func (s *Server) Mux() http.Handler {
 	return s.mux
 }
@@ -228,7 +249,7 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	// Extract correlation ID from header or generate one
 	corrID := r.Header.Get("X-Correlation-ID")
 	if corrID == "" {
-		corrID = fmt.Sprintf("api-%d", s.now().UnixNano())
+		corrID = fmt.Sprintf("api-%d-%d", s.now().UnixNano(), s.corrSeq.Add(1))
 	}
 
 	// Create core request
@@ -256,7 +277,18 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleGetResult returns the result of a processed request.
+// Fail-closed authorization: the business_id query parameter is REQUIRED.
+// Without it the request is rejected (400) — callers cannot bypass the scope
+// check by omitting the parameter. With it, callers can only retrieve results
+// belonging to their own business scope (403 on mismatch).
 func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
+	// Authorization scope is mandatory — no unscoped result access.
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
 	// Extract request ID from URL path: /api/v1/requests/{id}
 	id := r.PathValue("id")
 	if id == "" {
@@ -270,12 +302,29 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce scope match
+	if result.BusinessID != businessID {
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
 
 // handleSSE streams events via Server-Sent Events.
+// Fail-closed scoping: the business_id query parameter is REQUIRED. Only events
+// matching the business scope are delivered; unscoped events (empty BusinessID)
+// are never streamed to a scoped client. Requests without business_id are
+// rejected (400) — scoping cannot be bypassed by omitting the parameter.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// Authorization scope is mandatory — no unscoped event stream.
+	businessFilter := r.URL.Query().Get("business_id")
+	if businessFilter == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
 	// Acquire SSE client slot (semaphore). Reject with 503 if at capacity.
 	select {
 	case s.sseClients <- struct{}{}:
@@ -300,6 +349,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Subscribe to events
 	bus := s.engine.EventBus()
 	consumer := event.ConsumerFunc(func(e *event.Event) error {
+		// Filter by business scope (always active — businessFilter is required)
+		if e.BusinessID != businessFilter {
+			return nil // skip events from other businesses and unscoped events
+		}
 		data, _ := json.Marshal(e)
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)
 		flusher.Flush()
@@ -334,20 +387,25 @@ func (s *Server) handleControlStatus(w http.ResponseWriter, r *http.Request) {
 		"recovery":        fmt.Sprintf("failures=%d", s.engine.RecoveryManager().RecordCount()),
 	}
 
-	_, _, denied := s.engine.TaskExecutor().Metrics()
+	executed, _, _ := s.engine.TaskExecutor().Metrics()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ControlStatusResponse{
 		Status:       string(s.engine.Status()),
 		Components:   components,
-		RequestCount: int(denied),
+		RequestCount: int(executed),
 	})
 }
 
 // handleControlPause pauses the engine (stops accepting new requests).
 func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
-	if s.engine.Status() != lifecycle.StateRunning {
-		s.writeError(w, http.StatusConflict, "ALREADY_PAUSED", "engine already paused")
+	status := s.engine.Status()
+	if status == lifecycle.StateStopped {
+		s.writeError(w, http.StatusConflict, "ALREADY_PAUSED", "engine is already stopped")
+		return
+	}
+	if status != lifecycle.StateRunning {
+		s.writeError(w, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot pause", status))
 		return
 	}
 
@@ -365,6 +423,16 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 
 // handleControlResume resumes the engine.
 func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
+	status := s.engine.Status()
+	if status == lifecycle.StateRunning {
+		s.writeError(w, http.StatusConflict, "ALREADY_RUNNING", "engine is already running")
+		return
+	}
+	if status != lifecycle.StateStopped {
+		s.writeError(w, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot resume", status))
+		return
+	}
+
 	if err := s.engine.Resume(r.Context()); err != nil {
 		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
 		return

@@ -84,9 +84,7 @@ type Engine struct {
 	// Shutdown
 	shutdownCh   chan struct{}
 	shutdownOnce sync.Once
-
-	// Context saved from Start for Resume
-	startCtx context.Context
+	loopDone     chan struct{} // closed when processRequests exits
 }
 
 // EngineOption configures the engine.
@@ -121,6 +119,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		results:     make(map[string]*Response),
 		resultOrder: make([]string, 0, maxResults),
 		shutdownCh:  make(chan struct{}),
+		loopDone:    make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -210,7 +209,6 @@ func (e *Engine) Start(ctx context.Context) error {
 		return fmt.Errorf("engine already started (status: %s)", e.status)
 	}
 	e.status = lifecycle.StateRunning
-	e.startCtx = ctx
 	e.mu.Unlock()
 
 	// Register health check
@@ -250,8 +248,13 @@ func (e *Engine) Stop(_ context.Context) error {
 	// Stop the task executor
 	e.taskExec.Stop(context.Background())
 
-	// Give goroutine time to exit
-	time.Sleep(50 * time.Millisecond)
+	// C-021 fix: wait for the processing loop to exit instead of
+	// time.Sleep(50ms). Bounded wait — never hang forever.
+	select {
+	case <-e.loopDone:
+	case <-time.After(5 * time.Second):
+		// Loop did not exit in time; proceed with shutdown anyway.
+	}
 
 	e.mu.Lock()
 	e.status = lifecycle.StateStopped
@@ -270,8 +273,11 @@ func (e *Engine) Resume(ctx context.Context) error {
 	}
 	// Create a fresh shutdown channel (the old one was closed during Stop)
 	e.shutdownCh = make(chan struct{})
+	e.loopDone = make(chan struct{})
+	// Reset Once so the next Stop() closes the fresh shutdownCh —
+	// previously the fired Once made Stop after Resume a no-op (latent bug).
+	e.shutdownOnce = sync.Once{}
 	e.status = lifecycle.StateRunning
-	e.startCtx = ctx
 	e.mu.Unlock()
 
 	// Restart request processing loop
@@ -289,7 +295,12 @@ func (e *Engine) SubmitRequest(req *Request) error {
 	}
 	e.mu.RUnlock()
 
-	// Backpressure gate: reject if queue is full
+	// Backpressure gate: reject if queue is full.
+	// Semantics (C-018): Accept() counts accepted-but-not-yet-dequeued requests.
+	// The count briefly includes requests between Accept and channel enqueue —
+	// intentional: they represent real incoming load. Exactly one Release()
+	// follows per Accept (on dequeue or shutdown-reject), so the count cannot
+	// leak. Over-counting under concurrency errs on the safe (rejecting) side.
 	if !e.backpressure.Accept() {
 		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
 	}
@@ -313,6 +324,12 @@ func (e *Engine) GetResult(requestID string) (*Response, bool) {
 
 // processRequests is the main processing loop.
 func (e *Engine) processRequests(ctx context.Context) {
+	// Signal Stop() when this loop exits (C-021: deterministic shutdown).
+	e.mu.RLock()
+	loopDone := e.loopDone
+	e.mu.RUnlock()
+	defer close(loopDone)
+
 	for {
 		// Read shutdown channel under lock to avoid racing with Resume().
 		e.mu.RLock()
@@ -378,6 +395,16 @@ func (e *Engine) Store() store.Store {
 // ToolRegistry returns the engine's tool registry.
 func (e *Engine) ToolRegistry() *tool.ToolRegistry {
 	return e.toolRegistry
+}
+
+// ModelRegistry returns the engine's model registry (C-020: was unexported).
+func (e *Engine) ModelRegistry() *modelrouter.ModelRegistry {
+	return e.modelRegistry
+}
+
+// ModelRouter returns the engine's model router (C-020: was unexported).
+func (e *Engine) ModelRouter() *modelrouter.ModelRouter {
+	return e.modelRouter
 }
 
 // AgentRuntime returns the engine's agent runtime.

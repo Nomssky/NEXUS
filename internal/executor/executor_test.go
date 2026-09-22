@@ -539,6 +539,16 @@ func TestStopWaitsForTasks(t *testing.T) {
 	ctx := context.Background()
 	e.Start(ctx)
 
+	// Submit a slow task
+	block := make(chan struct{})
+	req := testRequest("task-stop-wait")
+	req.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		<-block
+		return &Outcome{Status: "completed", Output: "done"}, nil
+	}
+	e.Submit(req)
+	time.Sleep(50 * time.Millisecond) // let goroutine start
+
 	done := make(chan bool)
 	go func() {
 		e.Stop(context.Background())
@@ -549,15 +559,153 @@ func TestStopWaitsForTasks(t *testing.T) {
 	select {
 	case <-done:
 		// Stopped quickly — task may have completed already
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(200 * time.Millisecond):
 		// Expected — still waiting for task
 	}
 
+	// Release the blocked task
+	close(block)
+
 	// Wait for everything to finish
-	time.Sleep(500 * time.Millisecond)
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Error("stop did not complete within timeout")
+	}
+}
+
+// =====================================================================
+// P2 TEST COVERAGE GAPS
+// =====================================================================
+
+// TEST-EXEC-010: Provider failure path — model router returns error
+func TestProviderFailurePath(t *testing.T) {
+	now := time.Now()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{PolicyID: "allow", Name: "Allow", Status: governance.PolicyStatusActive, Effect: governance.ALLOW,
+			Subject: governance.Subject{SubjectType: "all"}, Action: governance.Action{ActionType: "custom"},
+			Resource: governance.Resource{ResourceType: "all"}},
+	})
+
+	// nil model router — causes provider error path
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil, // nil model router
+		DefaultConfig(),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := testRequest("exec-provider-fail")
+	req.Handler = nil // use default handler which calls model router
+	e.Submit(req)
+
+	time.Sleep(300 * time.Millisecond)
+
+	e.metricsMu.Lock()
+	executed := e.totalExecuted
+	failed := e.totalFailed
+	e.metricsMu.Unlock()
+
+	// With nil model router, default handler should fail
+	if executed+failed == 0 {
+		t.Error("expected at least one execution attempt")
+	}
+}
+
+// TEST-EXEC-011: REQUIRE_APPROVAL governance outcome
+func TestGovernanceRequiresApproval(t *testing.T) {
+	now := time.Now()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil,
+		DefaultConfig(),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := testRequest("exec-req-approval")
+	req.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		return &Outcome{Status: "completed", Output: "should not reach"}, nil
+	}
+	e.Submit(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetOutcome("exec-req-approval")
+	if !ok {
+		t.Fatal("expected outcome")
+	}
+	if result.Status != "pending_approval" {
+		t.Errorf("expected pending_approval, got %s", result.Status)
+	}
+}
+
+// TEST-EXEC-012: ESCALATE governance outcome
+func TestGovernanceEscalate(t *testing.T) {
+	now := time.Now()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "escalate",
+			Name:       "Escalate",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ESCALATE,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil,
+		DefaultConfig(),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := testRequest("exec-escalate")
+	req.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		return &Outcome{Status: "completed", Output: "should not reach"}, nil
+	}
+	e.Submit(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetOutcome("exec-escalate")
+	if !ok {
+		t.Fatal("expected outcome")
+	}
+	if result.Status != "escalated" {
+		t.Errorf("expected escalated, got %s", result.Status)
 	}
 }

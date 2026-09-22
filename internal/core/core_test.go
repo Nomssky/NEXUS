@@ -2,14 +2,17 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
-	"sync"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
+	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
@@ -237,13 +240,13 @@ func TestAuditTrailChainSteps(t *testing.T) {
 		steps[entry.Step] = true
 	}
 
-	if !steps["validate"] {
+	if !steps[string(StepValidate)] {
 		t.Error("expected validate step in audit trail")
 	}
-	if !steps["governance"] {
+	if !steps[string(StepGovernance)] {
 		t.Error("expected governance step in audit trail")
 	}
-	if !steps["objective"] {
+	if !steps[string(StepObjective)] {
 		t.Error("expected objective step in audit trail")
 	}
 }
@@ -511,14 +514,14 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 		steps[entry.Step] = true
 	}
 
-	// Verify key steps exist
-	requiredSteps := []string{
-		"validate", "governance", "memory_read", "attention_score",
-		"objective", "decision", "plan", "workflow", "schedule",
-		"agent", "memory_write",
+	// Verify key steps exist (uses ChainStep constants — C-038)
+	requiredSteps := []ChainStep{
+		StepValidate, StepGovernance, StepMemoryRead, StepAttention,
+		StepObjective, StepDecision, StepPlan, StepWorkflow, StepSchedule,
+		StepAgent, StepMemoryWrite,
 	}
 	for _, step := range requiredSteps {
-		if !steps[step] {
+		if !steps[string(step)] {
 			t.Errorf("expected step '%s' in audit trail", step)
 		}
 	}
@@ -692,5 +695,452 @@ func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	}
 	if e.RecoveryManager().RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", e.RecoveryManager().RecordCount())
+	}
+}
+
+// =====================================================================
+// P2 TEST COVERAGE GAPS
+// =====================================================================
+
+// TEST-CORE-030: WithPersistence error path — invalid directory
+func TestPersistenceErrorPath(t *testing.T) {
+	// Create engine with persistence pointing to an invalid path (file, not dir)
+	f, err := os.CreateTemp("", "not-a-dir-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	defer os.Remove(f.Name())
+
+	_, err = NewEngine(nil, WithPersistence(f.Name()))
+	if err == nil {
+		t.Fatal("expected error for invalid persistence directory")
+	}
+	// Error should indicate the directory issue
+	if !strings.Contains(err.Error(), "not a directory") && !strings.Contains(err.Error(), "filestore") {
+		t.Errorf("expected filestore/dir error, got: %v", err)
+	}
+}
+
+// TEST-CORE-031: WithPersistence success path
+func TestPersistenceSuccessPath(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	e, err := NewEngine(nil,
+		WithPersistence(dir),
+		WithClock(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if e == nil {
+		t.Fatal("expected engine")
+	}
+}
+
+// TEST-CORE-032: Resume lifecycle — start, stop, resume, submit
+func TestResumeLifecycle(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+
+	// Start
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if e.Status() != lifecycle.StateRunning {
+		t.Fatalf("expected RUNNING, got %s", e.Status())
+	}
+
+	// Stop
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if e.Status() != lifecycle.StateStopped {
+		t.Fatalf("expected STOPPED, got %s", e.Status())
+	}
+
+	// Resume
+	if err := e.Resume(ctx); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if e.Status() != lifecycle.StateRunning {
+		t.Fatalf("expected RUNNING after resume, got %s", e.Status())
+	}
+
+	// Submit after resume — should work
+	req := &Request{
+		ID:      "req-resume-1",
+		Context: NewRequestContext("corr-1", "biz-1", "user-1"),
+		Intent:  "test resume",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit after resume: %v", err)
+	}
+
+	// Wait and verify result
+	time.Sleep(200 * time.Millisecond)
+	result, ok := e.GetResult("req-resume-1")
+	if !ok {
+		t.Fatal("expected result after resume")
+	}
+	if result.BusinessID != "biz-1" {
+		t.Errorf("expected business_id biz-1, got %s", result.BusinessID)
+	}
+}
+
+// TEST-CORE-033: Resume fails on non-stopped engine
+func TestResumeFailsOnRunning(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	if err := e.Resume(ctx); err == nil {
+		t.Fatal("expected error resuming running engine")
+	}
+}
+
+// TEST-CORE-034: Concurrent request submissions
+func TestConcurrentSubmissions(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errors := make(chan error, n)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req := &Request{
+				ID:      fmt.Sprintf("req-concurrent-%d", idx),
+				Context: NewRequestContext(fmt.Sprintf("corr-%d", idx), "biz-1", "user-1"),
+				Intent:  fmt.Sprintf("concurrent test %d", idx),
+			}
+			if err := e.SubmitRequest(req); err != nil {
+				errors <- fmt.Errorf("submit %d: %w", idx, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Wait for all to process (poll for completion)
+	deadline := time.After(5 * time.Second)
+	allDone := false
+	for !allDone {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for concurrent results")
+		default:
+		}
+		allDone = true
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("req-concurrent-%d", i)
+			if _, ok := e.GetResult(id); !ok {
+				allDone = false
+				time.Sleep(50 * time.Millisecond)
+				break
+			}
+		}
+	}
+}
+
+// TEST-CORE-035: ChainError includes CorrelationID and Timestamp
+func TestChainErrorFields(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Submit with empty intent to trigger validation error
+	req := &Request{
+		ID:      "req-error-fields",
+		Context: NewRequestContext("corr-err", "biz-err", "user-err"),
+		Intent:  "", // empty intent triggers validation failure
+	}
+	_ = e.SubmitRequest(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-error-fields")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	if result.Error == nil {
+		t.Fatal("expected error in result")
+	}
+	if result.Error.CorrelationID == "" {
+		t.Error("expected CorrelationID in error")
+	}
+	if result.Error.Timestamp.IsZero() {
+		t.Error("expected Timestamp in error")
+	}
+	if result.BusinessID != "biz-err" {
+		t.Errorf("expected business_id 'biz-err', got %q", result.BusinessID)
+	}
+}
+
+// TEST-CORE-036: BusinessID propagated through chain
+func TestBusinessIDInResponse(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-biz-id",
+		Context: NewRequestContext("corr-biz", "my-business", "user-1"),
+		Intent:  "test business id",
+	}
+	_ = e.SubmitRequest(req)
+
+	time.Sleep(200 * time.Millisecond)
+
+	result, ok := e.GetResult("req-biz-id")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.BusinessID != "my-business" {
+		t.Errorf("expected business_id 'my-business', got %q", result.BusinessID)
+	}
+}
+
+// TEST-CORE-037: POLICY_DENIED error sets Retryable for REQUIRE_APPROVAL (C-024 fix)
+func TestChainGovernanceRetryable(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := &Request{
+		ID:      "req-gov-retry",
+		Context: NewRequestContext("corr-gov", "biz-1", "user-1"),
+		Intent:  "test",
+	}
+
+	// Case 1: REQUIRE_APPROVAL → Retryable = true (caller can retry after approval)
+	e.govEngine = governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok := err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if !ce.Retryable {
+		t.Error("expected Retryable=true for REQUIRE_APPROVAL")
+	}
+
+	// Case 2: DENY → Retryable = false (retry won't help)
+	e.govEngine = governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "deny",
+			Name:       "Deny",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.DENY,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok = err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if ce.Retryable {
+		t.Error("expected Retryable=false for DENY")
+	}
+}
+
+// TEST-CORE-038: No phantom model/tool audit entries (C-005 fix)
+func TestNoPhantomAuditEntries(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-phantom",
+		Context: NewRequestContext("corr-phantom", "biz-1", "user-1"),
+		Intent:  "test phantom entries",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-phantom")
+	if !ok {
+		t.Fatal("expected result")
+	}
+
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "model" || entry.Step == "tool" {
+			t.Errorf("phantom audit entry '%s' with fabricated outcome: %s", entry.Step, entry.Outcome)
+		}
+		if strings.Contains(entry.Outcome, "model=executor") || strings.Contains(entry.Outcome, "tool=executor") {
+			t.Errorf("fabricated outcome in audit entry %s: %s", entry.Step, entry.Outcome)
+		}
+	}
+
+	// Verify entry must reflect actual execution status
+	for _, entry := range result.AuditTrail {
+		if entry.Step == "verify" && !strings.Contains(entry.Outcome, "status=") {
+			t.Errorf("verify entry lacks actual status: %s", entry.Outcome)
+		}
+	}
+}
+
+// TEST-CORE-039: Request.Deadline honored (C-026 fix)
+func TestRequestDeadlineEnforced(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Deadline already in the past → fail fast
+	past := now.Add(-1 * time.Minute)
+	req := &Request{
+		ID:       "req-deadline-past",
+		Context:  NewRequestContext("corr-dl", "biz-1", "user-1"),
+		Intent:   "test deadline",
+		Deadline: &past,
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-deadline-past")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.Error == nil {
+		t.Fatal("expected deadline error for expired deadline")
+	}
+	if !strings.Contains(result.Error.Message, "deadline") {
+		t.Errorf("expected deadline error message, got: %s", result.Error.Message)
+	}
+}
+
+// TEST-CORE-040: ModelRegistry/ModelRouter public accessors (C-020 fix)
+func TestModelAccessors(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.ModelRegistry() == nil {
+		t.Error("expected non-nil ModelRegistry accessor")
+	}
+	if e.ModelRouter() == nil {
+		t.Error("expected non-nil ModelRouter accessor")
+	}
+}
+
+// TEST-CORE-041: Outcome.Metrics populated on success (C-025 fix)
+func TestOutcomeMetricsPopulated(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-metrics",
+		Context: NewRequestContext("corr-metrics", "biz-1", "user-1"),
+		Intent:  "test metrics",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-metrics")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s", result.Status)
+	}
+	if result.Outcome == nil {
+		t.Fatal("expected outcome")
+	}
+	if result.Outcome.Metrics == nil {
+		t.Fatal("expected Metrics map populated (C-025)")
+	}
+	if _, hasDuration := result.Outcome.Metrics["duration_ms"]; !hasDuration {
+		t.Error("expected duration_ms in metrics")
+	}
+	if _, hasStatus := result.Outcome.Metrics["executor_status"]; !hasStatus {
+		t.Error("expected executor_status in metrics")
+	}
+}
+
+// TEST-CORE-042: Failure emits chain.failed event on event bus (C-009/C-010)
+func TestFailureEmitsChainFailedEvent(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Subscribe before triggering failure
+	var received []string
+	consumer := event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	})
+	if _, err := e.EventBus().Subscribe(consumer); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger validation failure (empty intent)
+	req := &Request{
+		ID:      "req-fail-event",
+		Context: NewRequestContext("corr-fail", "biz-1", "user-1"),
+		Intent:  "",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	e.EventBus().Dispatch()
+
+	found := false
+	for _, typ := range received {
+		if typ == "chain.failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected chain.failed event, got: %v", received)
 	}
 }

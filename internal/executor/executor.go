@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
@@ -86,14 +87,18 @@ type Config struct {
 	TaskTimeout time.Duration
 	// MaxRetries is the maximum number of retries for failed tasks.
 	MaxRetries int
+	// DefaultModelID is the model requested when no specific model is set.
+	// Empty falls back to the router's default routing behavior.
+	DefaultModelID string
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxConcurrent: 10,
-		TaskTimeout:   5 * time.Minute,
-		MaxRetries:    3,
+		MaxConcurrent:  10,
+		TaskTimeout:    5 * time.Minute,
+		MaxRetries:     3,
+		DefaultModelID: "default",
 	}
 }
 
@@ -124,6 +129,9 @@ type Executor struct {
 	totalFailed   int64
 	totalDenied   int64
 	metricsMu     sync.RWMutex
+
+	// Event sequence for unique IDs
+	evtSeq atomic.Int64
 }
 
 // Option configures the executor.
@@ -174,7 +182,7 @@ func (e *Executor) Start(_ context.Context) error {
 	e.running = true
 	e.activeMu.Unlock()
 
-	e.emitEvent("executor.started", "", "", nil)
+	e.emitEvent("executor.started", "", "", nil) // system-level event: intentionally unscoped (no BusinessID)
 	return nil
 }
 
@@ -306,9 +314,28 @@ func (e *Executor) executeWork(req *WorkRequest) {
 	}()
 
 	// Step 1: Governance check
-	if !e.checkGovernance(req) {
+	decision := e.checkGovernance(req)
+	switch decision.Outcome {
+	case governance.DENY:
 		outcome.Status = "denied"
-		outcome.Error = "governance denied execution"
+		outcome.Error = fmt.Sprintf("governance denied: %s", decision.Reason)
+		e.emitEvent("executor.denied", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.REQUIRE_APPROVAL:
+		outcome.Status = "pending_approval"
+		outcome.Error = fmt.Sprintf("governance requires approval: %s", decision.Reason)
+		e.emitEvent("executor.pending_approval", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.ESCALATE:
+		outcome.Status = "escalated"
+		outcome.Error = fmt.Sprintf("governance escalated: %s", decision.Reason)
+		e.emitEvent("executor.escalated", req.TaskID, req.CorrelationID, outcome)
+		return
+	case governance.ALLOW, governance.ALLOW_WITH_CONSTRAINTS:
+		// proceed
+	default:
+		outcome.Status = "denied"
+		outcome.Error = fmt.Sprintf("governance unknown outcome: %s", decision.Outcome)
 		e.emitEvent("executor.denied", req.TaskID, req.CorrelationID, outcome)
 		return
 	}
@@ -362,14 +389,14 @@ func (e *Executor) executeWork(req *WorkRequest) {
 }
 
 // checkGovernance evaluates governance for the work request.
-func (e *Executor) checkGovernance(req *WorkRequest) bool {
-	decision := e.governance.Evaluate(governance.Request{
+// Returns the governance decision for the caller to handle.
+func (e *Executor) checkGovernance(req *WorkRequest) governance.Decision {
+	return e.governance.Evaluate(governance.Request{
 		Actor:      req.ActorID,
 		Action:     "execute_task",
 		Resource:   "workflow",
 		BusinessID: req.BusinessID,
 	})
-	return decision.Outcome != governance.DENY
 }
 
 // findAgent finds or provisions an agent for the work request.
@@ -421,7 +448,7 @@ func (e *Executor) defaultHandler(_ context.Context, req *WorkRequest, ag *agent
 	if e.modelRouter != nil {
 		genReq := &modelrouter.GenerateRequest{
 			RequestID: req.TaskID,
-			ModelID:   "default",
+			ModelID:   e.config.DefaultModelID,
 			Messages: []modelrouter.Message{
 				{Role: "user", Content: req.Intent},
 			},
@@ -526,7 +553,7 @@ func (e *Executor) emitEvent(eventType string, taskID, corrID string, data inter
 	}
 
 	evt := &event.Event{
-		ID:            fmt.Sprintf("exec-%d", e.now().UnixNano()),
+		ID:            fmt.Sprintf("exec-%d-%d", e.now().UnixNano(), e.evtSeq.Add(1)),
 		Type:          event.EventType(eventType),
 		Source:        "executor",
 		Timestamp:     e.now(),

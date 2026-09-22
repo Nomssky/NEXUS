@@ -20,17 +20,21 @@ import (
 type ChainStep string
 
 const (
-	StepValidate   ChainStep = "validate"
-	StepGovernance ChainStep = "governance"
-	StepObjective  ChainStep = "objective"
-	StepDecision   ChainStep = "decision"
-	StepPlan       ChainStep = "plan"
-	StepWorkflow   ChainStep = "workflow"
-	StepSchedule   ChainStep = "schedule"
-	StepAgent      ChainStep = "agent"
-	StepModel      ChainStep = "model"
-	StepTool       ChainStep = "tool"
-	StepVerify     ChainStep = "verify"
+	StepValidate    ChainStep = "validate"
+	StepGovernance  ChainStep = "governance"
+	StepHardening   ChainStep = "hardening"
+	StepMemoryRead  ChainStep = "memory_read"
+	StepAttention   ChainStep = "attention_score"
+	StepObjective   ChainStep = "objective"
+	StepDecision    ChainStep = "decision"
+	StepPlan        ChainStep = "plan"
+	StepWorkflow    ChainStep = "workflow"
+	StepSchedule    ChainStep = "schedule"
+	StepAgent       ChainStep = "agent"
+	StepModel       ChainStep = "model"
+	StepTool        ChainStep = "tool"
+	StepVerify      ChainStep = "verify"
+	StepMemoryWrite ChainStep = "memory_write"
 )
 
 // executeChain runs the canonical execution chain for a request.
@@ -62,7 +66,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Hardening: circuit breaker gate
 	if !e.circuitBreaker.Allow() {
 		err := fmt.Errorf("circuit breaker open: too many recent failures")
-		return e.chainError(req, err, StepValidate, audit, start)
+		return e.chainError(req, err, StepHardening, audit, start)
 	}
 	e.chainEmit(req, "chain.hardening.circuit_breaker.ok", "hardening", e.circuitBreaker.State())
 
@@ -83,7 +87,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Step 2b: Retrieve relevant context from memory
 	memContext := e.chainMemoryRead(ctx, req)
 	audit = append(audit, AuditEntry{
-		Step:      "memory_read",
+		Step:      string(StepMemoryRead),
 		Action:    "retrieve context",
 		Actor:     "memory",
 		Timestamp: e.now(),
@@ -93,18 +97,24 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	e.chainEmit(req, "chain.memory.read", "memory", fmt.Sprintf("found=%d", len(memContext)))
 
 	// Step 2c: Attention scoring
-	attItem := e.chainAttentionScore(ctx, req)
+	attItem, attErr := e.chainAttentionScore(ctx, req)
 	suppressed := false
 	if attItem != nil {
 		suppressed = e.attentionEng.ShouldSuppress(attItem)
 	}
+	attOutcome := fmt.Sprintf("score=%.2f suppressed=%v", attItemScore(attItem), suppressed)
+	if attErr != nil {
+		// C-011 fix: attention failures are recorded in the audit trail,
+		// not silently absorbed. The chain continues (attention is advisory).
+		attOutcome = fmt.Sprintf("score=0.00 suppressed=false attention_error=%v", attErr)
+	}
 	audit = append(audit, AuditEntry{
-		Step:      "attention_score",
+		Step:      string(StepAttention),
 		Action:    "score attention",
 		Actor:     "attention",
 		Timestamp: e.now(),
 		Duration:  e.now().Sub(start),
-		Outcome:   fmt.Sprintf("score=%.2f suppressed=%v", attItemScore(attItem), suppressed),
+		Outcome:   attOutcome,
 	})
 	e.chainEmit(req, "chain.attention.scored", "attention", fmt.Sprintf("score=%.2f", attItemScore(attItem)))
 
@@ -215,22 +225,9 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			Outcome:   fmt.Sprintf("status=%s agent=%s", execOutcome.Status, execOutcome.AgentID),
 		})
 		e.chainEmit(req, "chain.executor.completed", "executor", execOutcome.Status)
-		audit = append(audit, AuditEntry{
-			Step:      string(StepModel),
-			Action:    "model routing",
-			Actor:     "executor",
-			Timestamp: e.now(),
-			Duration:  e.now().Sub(start),
-			Outcome:   "status=completed model=executor",
-		})
-		audit = append(audit, AuditEntry{
-			Step:      string(StepTool),
-			Action:    "tool execution",
-			Actor:     "executor",
-			Timestamp: e.now(),
-			Duration:  e.now().Sub(start),
-			Outcome:   "status=completed tool=executor",
-		})
+		// C-005 fix: model/tool routing happens inside the executor and is
+		// not observable at the chain layer — no phantom audit entries are
+		// fabricated here. The verify entry reflects the actual outcome.
 		audit = append(audit, AuditEntry{
 			Step:      string(StepVerify),
 			Action:    "verify outcome",
@@ -244,18 +241,44 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Step 12: Outcome
 	status := "completed"
 	var outcomeResult *Outcome
+	var respErr *ChainError
 	if execErr != nil {
 		status = "failed"
+		// Preserve execution failure details in the response (was silently lost).
+		chainErr, ok := execErr.(*ChainError)
+		if !ok {
+			chainErr = &ChainError{
+				Code:      "EXECUTION_FAILED",
+				Category:  "INTERNAL_FAILURE",
+				Message:   execErr.Error(),
+				ChainStep: string(StepAgent),
+			}
+		}
+		if req.Context != nil {
+			chainErr.CorrelationID = req.Context.CorrelationID
+		}
+		if chainErr.Timestamp.IsZero() {
+			chainErr.Timestamp = e.now()
+		}
+		respErr = chainErr
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
+			// C-025: populate execution metrics (was always nil).
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
 		}
 	}
 
 	// Step 13: Store outcome in memory
 	e.chainMemoryWrite(ctx, req, status, outcomeResult)
 	audit = append(audit, AuditEntry{
-		Step:      "memory_write",
+		Step:      string(StepMemoryWrite),
 		Action:    "store outcome",
 		Actor:     "memory",
 		Timestamp: e.now(),
@@ -264,12 +287,20 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	})
 	e.chainEmit(req, "chain.memory.written", "memory", status)
 
-	e.chainEmit(req, "chain.completed", "core", status)
+	// C-010 fix: terminal event reflects actual status — failures emit
+	// chain.failed, only successes emit chain.completed.
+	if status == "completed" {
+		e.chainEmit(req, "chain.completed", "core", status)
+	} else {
+		e.chainEmit(req, "chain.failed", "core", fmt.Sprintf("step=%s status=%s", StepAgent, status))
+	}
 
 	return &Response{
 		RequestID:  req.ID,
+		BusinessID: req.Context.BusinessID,
 		Status:     status,
 		Outcome:    outcomeResult,
+		Error:      respErr,
 		AuditTrail: audit,
 		Duration:   e.now().Sub(start),
 	}
@@ -309,6 +340,7 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 			Category:  "POLICY_DENIED",
 			Message:   fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason),
 			ChainStep: string(StepGovernance),
+			Retryable: decision.Outcome == governance.REQUIRE_APPROVAL,
 		}
 	}
 	return nil
@@ -319,8 +351,11 @@ func (e *Engine) chainObjective(_ context.Context, req *Request) (*cognition.Obj
 	obj, err := e.objectiveEng.CreateObjective(
 		cognition.ObjectiveTypeOwner,
 		req.Intent,
-		fmt.Sprintf("Fulfill owner intent: %s", req.Intent),
-		fmt.Sprintf("Achieve: %s", req.Intent),
+		// Description explains WHY this objective exists (context for humans).
+		fmt.Sprintf("Owner %s requested: %s", req.Context.ActorID, req.Intent),
+		// Success criteria states the verifiable completion condition —
+		// intentionally distinct from the description (C-002).
+		fmt.Sprintf("Request %s processed with status=completed and audit trail recorded", req.ID),
 		req.Context.ActorID,
 		req.Context.BusinessID,
 	)
@@ -402,8 +437,17 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 		Constraints:   req.Constraints,
 	}
 
-	// Use a reasonable timeout for execution
-	execCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// C-026 fix: honor caller-owned Deadline when set, else default 60s.
+	timeout := 60 * time.Second
+	if req.Deadline != nil && !req.Deadline.IsZero() {
+		if d := time.Until(*req.Deadline); d > 0 {
+			timeout = d
+		} else {
+			// Deadline already passed — fail fast without executing.
+			return nil, fmt.Errorf("deadline exceeded: %s", req.Deadline.Format(time.RFC3339))
+		}
+	}
+	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	return e.taskExec.SubmitSync(execCtx, workReq)
@@ -437,8 +481,12 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 		Outcome:   fmt.Sprintf("error=%s", err.Error()),
 	})
 
+	// C-009 fix: chain failures are observable on the event bus (was silent).
+	e.chainEmit(req, "chain.failed", "core", fmt.Sprintf("step=%s error=%s", step, chainErr.Code))
+
 	return &Response{
 		RequestID:  req.ID,
+		BusinessID: req.Context.BusinessID,
 		Status:     "failed",
 		Error:      chainErr,
 		AuditTrail: audit,
@@ -482,7 +530,8 @@ func (e *Engine) chainMemoryWrite(_ context.Context, req *Request, status string
 }
 
 // chainAttentionScore submits the request to the attention engine for scoring.
-func (e *Engine) chainAttentionScore(_ context.Context, req *Request) *attention.AttentionItem {
+// Returns the scored item (nil on failure) and any error for audit recording.
+func (e *Engine) chainAttentionScore(_ context.Context, req *Request) (*attention.AttentionItem, error) {
 	urgency := req.Priority
 	if urgency > 10 {
 		urgency = 10
@@ -500,8 +549,9 @@ func (e *Engine) chainAttentionScore(_ context.Context, req *Request) *attention
 	)
 	if attErr != nil {
 		e.chainEmit(req, "chain.error", "attention", fmt.Sprintf("submit failed: %v", attErr))
+		return nil, attErr
 	}
-	return item
+	return item, nil
 }
 
 // attItemScore safely extracts the score from an attention item.

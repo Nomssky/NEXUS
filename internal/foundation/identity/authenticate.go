@@ -17,6 +17,7 @@ package identity
 
 import (
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
@@ -97,6 +98,7 @@ type credentialVerifier struct {
 // stores only verification hashes, never raw credentials, and never grants
 // permission.
 type LocalAuthenticator struct {
+	mu        sync.RWMutex
 	verifiers map[string]credentialVerifier
 	// now is injectable for deterministic tests.
 	now func() time.Time
@@ -113,10 +115,18 @@ func NewLocalAuthenticator() *LocalAuthenticator {
 }
 
 // SetClock injects a clock for deterministic tests.
-func (a *LocalAuthenticator) SetClock(now func() time.Time) { a.now = now }
+func (a *LocalAuthenticator) SetClock(now func() time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.now = now
+}
 
 // SetTTL sets how long a successful authentication remains valid.
-func (a *LocalAuthenticator) SetTTL(d time.Duration) { a.ttl = d }
+func (a *LocalAuthenticator) SetTTL(d time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.ttl = d
+}
 
 // Register records a verification hash for an identity. The raw credential is
 // hashed by the caller via security.HashCredential and is never stored here.
@@ -127,6 +137,8 @@ func (a *LocalAuthenticator) Register(identityID string, credentialHash string, 
 	if strings.TrimSpace(credentialHash) == "" {
 		return nerrors.Validation("auth.credential_hash_required", "credential hash is required")
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.verifiers[identityID] = credentialVerifier{identityID: identityID, hash: credentialHash, method: method}
 	return nil
 }
@@ -135,7 +147,10 @@ func (a *LocalAuthenticator) Register(identityID string, credentialHash string, 
 // empty credentials, and mismatches all return a non-authenticated result with a
 // canonical AUTH error.
 func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) (AuthResult, error) {
+	a.mu.RLock()
 	v, ok := a.verifiers[identityID]
+	nowFn := a.now
+	a.mu.RUnlock()
 	if !ok || len(credential) == 0 {
 		// Uniform failure reason avoids leaking which identities exist.
 		return AuthResult{
@@ -154,7 +169,7 @@ func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) 
 			Reason:        "authentication failed",
 		}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
 	}
-	now := a.now()
+	now := nowFn()
 	res := AuthResult{
 		Authenticated:   true,
 		IdentityID:      identityID,

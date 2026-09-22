@@ -55,13 +55,16 @@ func run() int {
 		addr = defaultAddr(cfg)
 	}
 
-	// Wire the launcher
+	// Wire the launcher. Control API key is a secret: loaded from the
+	// environment only (never from the config file — config holds SecretRef
+	// references, not raw secrets).
 	launch := launcher.New(launcher.Options{
-		Config:    cfg,
-		Logger:    log,
-		Health:    healthSrv,
-		Lifecycle: life,
-		Addr:      addr,
+		Config:        cfg,
+		Logger:        log,
+		Health:        healthSrv,
+		Lifecycle:     life,
+		Addr:          addr,
+		ControlAPIKey: os.Getenv(config.EnvControlAPIKey),
 	})
 
 	return int(launch.Run(context.Background()))

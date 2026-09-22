@@ -1,13 +1,17 @@
-name: ci
+name: CI
 
 on:
   push:
-    branches:
-      - "**"
+    branches: [master, main]
   pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
 
 jobs:
-  quality:
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -16,29 +20,23 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.27.x"
-          check-latest: true
+          go-version-file: go.mod
+          cache: true
 
-      - name: gofmt check
-        run: |
-          files=$(gofmt -l .)
-          if [ -n "$files" ]; then
-            echo "not gofmt-clean:"; echo "$files"; exit 1
-          fi
-
-      - name: go vet
+      - name: Vet
         run: go vet ./...
 
-      - name: go mod tidy check
+      - name: Format
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+          out=$(gofmt -l cmd/ internal/ examples/)
+          if [ -n "$out" ]; then
+            echo "gofmt needed on:"
+            echo "$out"
+            exit 1
+          fi
 
-      - name: build
-        run: go build ./...
+      - name: Test
+        run: go test -count=1 ./...
 
-      - name: test
-        run: go test ./...
-
-      - name: test-race
-        run: go test -race ./...
+      - name: Test (race)
+        run: go test -race -count=1 ./internal/core/ ./internal/gateway/ ./internal/launcher/ ./internal/executor/

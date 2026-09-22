@@ -313,6 +313,12 @@ const (
 	EnvSecurityDevAllowUnsafeOverrides = "NEXUS_SECURITY_DEV_ALLOW_UNSAFE_OVERRIDES"
 	EnvSecurityEgressAllowList         = "NEXUS_SECURITY_EGRESS_ALLOW_LIST"
 	EnvSecuritySandboxEnabled          = "NEXUS_SECURITY_SANDBOX_ENABLED"
+
+	// EnvControlAPIKey is the API key for /api/v1/control/* endpoints.
+	// It is a secret: read from the environment only, never stored in the
+	// config file (config holds SecretRef references, not raw secret values).
+	// Empty disables control endpoints (403 fail-closed).
+	EnvControlAPIKey = "NEXUS_CONTROL_API_KEY"
 )
 
 func applyEnv(cfg *Config, environ []string) error {

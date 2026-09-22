@@ -200,7 +200,7 @@ func TestGetResultNotFound(t *testing.T) {
 	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
 	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
 
-	req := httptest.NewRequest("GET", "/api/v1/requests/nonexistent", nil)
+	req := httptest.NewRequest("GET", "/api/v1/requests/nonexistent?business_id=biz-1", nil)
 	w := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(w, req)
 
@@ -233,7 +233,7 @@ func TestGetResultFound(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Get result
-	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+submitResp["request_id"], nil)
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+submitResp["request_id"]+"?business_id=biz-1", nil)
 	resultW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resultW, resultReq)
 
@@ -494,5 +494,348 @@ func TestControlResumeEndpoint(t *testing.T) {
 
 	if engine.Status() != lifecycle.StateRunning {
 		t.Fatal("expected engine running after resume")
+	}
+}
+
+// =====================================================================
+// P0 SECURITY REGRESSION TESTS
+// =====================================================================
+
+// TEST-SEC-001: Auth middleware blocks control endpoints without correct key
+func TestAuthMiddlewareBlocksNoKey(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithControlAPIKey("secret-key-123"),
+	)
+
+	// Production path: Handler() as installed by Start()
+	handler := srv.Handler()
+
+	// Control endpoint without API key → 401
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without key, got %d", w.Code)
+	}
+
+	var resp map[string]map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if errResp, ok := resp["error"]; ok {
+		if errResp["category"] != "UNAUTHORIZED" {
+			t.Errorf("expected UNAUTHORIZED category, got %v", errResp["category"])
+		}
+	}
+}
+
+// TEST-SEC-002: Auth middleware blocks control endpoints with wrong key
+func TestAuthMiddlewareBlocksWrongKey(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithControlAPIKey("secret-key-123"),
+	)
+
+	handler := srv.Handler()
+
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req.Header.Set("X-API-Key", "wrong-key")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 with wrong key, got %d", w.Code)
+	}
+}
+
+// TEST-SEC-003: Auth middleware allows control endpoints with correct key
+func TestAuthMiddlewareAllowsCorrectKey(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithControlAPIKey("secret-key-123"),
+	)
+
+	handler := srv.Handler()
+
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req.Header.Set("X-API-Key", "secret-key-123")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with correct key, got %d", w.Code)
+	}
+}
+
+// TEST-SEC-004: Auth middleware does NOT protect non-control endpoints
+func TestAuthMiddlewareSkipsPublicEndpoints(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithControlAPIKey("secret-key-123"),
+	)
+
+	handler := srv.Handler()
+
+	// Health endpoint should work without API key even when auth is configured
+	req := httptest.NewRequest("GET", "/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for /health without key, got %d", w.Code)
+	}
+}
+
+// TEST-SEC-005: Auth middleware path prefix — "/api/v1/control" (no trailing slash) should NOT match
+func TestAuthMiddlewareExactPrefix(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithControlAPIKey("secret-key-123"),
+	)
+
+	handler := srv.Handler()
+
+	// This path starts with "/api/v1/control" but NOT "/api/v1/control/"
+	// It should NOT be protected by auth middleware
+	req := httptest.NewRequest("GET", "/api/v1/controlstatus", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Should get 404 (no such route) not 401 (auth failure)
+	if w.Code == http.StatusUnauthorized {
+		t.Error("auth middleware incorrectly matched /api/v1/controlstatus as a control endpoint")
+	}
+}
+
+// TEST-SEC-006: Cross-tenant result access denied
+func TestGetResultCrossTenantDenied(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	// Submit request as biz-1
+	body := `{"intent": "test", "business_id": "biz-1", "actor_id": "user-1"}`
+	submitReq := httptest.NewRequest("POST", "/api/v1/requests", bytes.NewBufferString(body))
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(submitW, submitReq)
+
+	var submitResp map[string]string
+	json.NewDecoder(submitW.Body).Decode(&submitResp)
+	reqID := submitResp["request_id"]
+
+	// Wait for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Try to get result as biz-2 (different business) → should be denied
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID+"?business_id=biz-2", nil)
+	resultW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(resultW, resultReq)
+
+	if resultW.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-tenant access, got %d", resultW.Code)
+	}
+
+	var errResp map[string]map[string]interface{}
+	json.NewDecoder(resultW.Body).Decode(&errResp)
+	if errResp["error"]["category"] != "AUTHORIZATION" {
+		t.Errorf("expected AUTHORIZATION category, got %v", errResp["error"]["category"])
+	}
+}
+
+// TEST-SEC-007: Same-tenant result access allowed
+func TestGetResultSameTenantAllowed(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	// Submit request as biz-1
+	body := `{"intent": "test", "business_id": "biz-1", "actor_id": "user-1"}`
+	submitReq := httptest.NewRequest("POST", "/api/v1/requests", bytes.NewBufferString(body))
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(submitW, submitReq)
+
+	var submitResp map[string]string
+	json.NewDecoder(submitW.Body).Decode(&submitResp)
+	reqID := submitResp["request_id"]
+
+	// Wait for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Get result as biz-1 (same business) → should be allowed
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID+"?business_id=biz-1", nil)
+	resultW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(resultW, resultReq)
+
+	if resultW.Code != http.StatusOK {
+		t.Errorf("expected 200 for same-tenant access, got %d", resultW.Code)
+	}
+
+	var result core.Response
+	json.NewDecoder(resultW.Body).Decode(&result)
+	if result.BusinessID != "biz-1" {
+		t.Errorf("expected business_id biz-1, got %s", result.BusinessID)
+	}
+}
+
+// TEST-SEC-008: Result access without business_id is REJECTED (fail-closed)
+func TestGetResultNoBusinessIDRejected(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	// Submit request
+	body := `{"intent": "test", "business_id": "biz-1", "actor_id": "user-1"}`
+	submitReq := httptest.NewRequest("POST", "/api/v1/requests", bytes.NewBufferString(body))
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(submitW, submitReq)
+
+	var submitResp map[string]string
+	json.NewDecoder(submitW.Body).Decode(&submitResp)
+	reqID := submitResp["request_id"]
+
+	// Wait for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Get result WITHOUT business_id → 400 (fail-closed: scoping cannot be
+	// bypassed by omitting the parameter)
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID, nil)
+	resultW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(resultW, resultReq)
+
+	if resultW.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 without business_id (fail-closed), got %d", resultW.Code)
+	}
+}
+
+// TEST-SEC-009: Response includes BusinessID field
+func TestResponseIncludesBusinessID(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	// Submit request
+	body := `{"intent": "test", "business_id": "biz-1", "actor_id": "user-1"}`
+	submitReq := httptest.NewRequest("POST", "/api/v1/requests", bytes.NewBufferString(body))
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(submitW, submitReq)
+
+	var submitResp map[string]string
+	json.NewDecoder(submitW.Body).Decode(&submitResp)
+	reqID := submitResp["request_id"]
+
+	// Wait for processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Get result (business_id required — fail-closed)
+	resultReq := httptest.NewRequest("GET", "/api/v1/requests/"+reqID+"?business_id=biz-1", nil)
+	resultW := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(resultW, resultReq)
+
+	if resultW.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", resultW.Code)
+	}
+
+	var result core.Response
+	json.NewDecoder(resultW.Body).Decode(&result)
+
+	if result.BusinessID != "biz-1" {
+		t.Errorf("expected business_id biz-1 in response, got %q", result.BusinessID)
+	}
+}
+
+// TEST-SEC-011: Empty control API key disables control endpoints (fail-closed)
+func TestHandlerEmptyControlKeyDisabled(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	// No WithControlAPIKey — controlAPIKey is ""
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	handler := srv.Handler()
+
+	// Control endpoint with no key configured → 403 (disabled, not open)
+	req := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when control key not configured, got %d", w.Code)
+	}
+
+	// Even supplying a key must not open disabled endpoints
+	req2 := httptest.NewRequest("GET", "/api/v1/control/status", nil)
+	req2.Header.Set("X-API-Key", "anything")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusForbidden {
+		t.Errorf("expected 403 when control key not configured (with header), got %d", w2.Code)
+	}
+
+	// Public endpoints still work
+	req3 := httptest.NewRequest("GET", "/health", nil)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req3)
+
+	if w3.Code != http.StatusOK {
+		t.Errorf("expected 200 for /health, got %d", w3.Code)
+	}
+}
+
+// TEST-SEC-010: Gateway HTTP server has MaxHeaderBytes limit (G-016 fix)
+func TestMaxHeaderBytesConfigured(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	srv := NewServer(engine, ":0", WithClock(func() time.Time { return now }))
+
+	if srv.server.MaxHeaderBytes == 0 {
+		t.Error("expected MaxHeaderBytes to be configured (0 = unlimited, DoS risk)")
 	}
 }
