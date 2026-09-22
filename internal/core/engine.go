@@ -295,7 +295,12 @@ func (e *Engine) SubmitRequest(req *Request) error {
 	}
 	e.mu.RUnlock()
 
-	// Backpressure gate: reject if queue is full
+	// Backpressure gate: reject if queue is full.
+	// Semantics (C-018): Accept() counts accepted-but-not-yet-dequeued requests.
+	// The count briefly includes requests between Accept and channel enqueue —
+	// intentional: they represent real incoming load. Exactly one Release()
+	// follows per Accept (on dequeue or shutdown-reject), so the count cannot
+	// leak. Over-counting under concurrency errs on the safe (rejecting) side.
 	if !e.backpressure.Accept() {
 		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
 	}
@@ -390,6 +395,16 @@ func (e *Engine) Store() store.Store {
 // ToolRegistry returns the engine's tool registry.
 func (e *Engine) ToolRegistry() *tool.ToolRegistry {
 	return e.toolRegistry
+}
+
+// ModelRegistry returns the engine's model registry (C-020: was unexported).
+func (e *Engine) ModelRegistry() *modelrouter.ModelRegistry {
+	return e.modelRegistry
+}
+
+// ModelRouter returns the engine's model router (C-020: was unexported).
+func (e *Engine) ModelRouter() *modelrouter.ModelRouter {
+	return e.modelRouter
 }
 
 // AgentRuntime returns the engine's agent runtime.

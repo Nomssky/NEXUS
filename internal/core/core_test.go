@@ -1053,3 +1053,94 @@ func TestRequestDeadlineEnforced(t *testing.T) {
 		t.Errorf("expected deadline error message, got: %s", result.Error.Message)
 	}
 }
+
+// TEST-CORE-040: ModelRegistry/ModelRouter public accessors (C-020 fix)
+func TestModelAccessors(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.ModelRegistry() == nil {
+		t.Error("expected non-nil ModelRegistry accessor")
+	}
+	if e.ModelRouter() == nil {
+		t.Error("expected non-nil ModelRouter accessor")
+	}
+}
+
+// TEST-CORE-041: Outcome.Metrics populated on success (C-025 fix)
+func TestOutcomeMetricsPopulated(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-metrics",
+		Context: NewRequestContext("corr-metrics", "biz-1", "user-1"),
+		Intent:  "test metrics",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	result, ok := e.GetResult("req-metrics")
+	if !ok {
+		t.Fatal("expected result")
+	}
+	if result.Status != "completed" {
+		t.Fatalf("expected completed, got %s", result.Status)
+	}
+	if result.Outcome == nil {
+		t.Fatal("expected outcome")
+	}
+	if result.Outcome.Metrics == nil {
+		t.Fatal("expected Metrics map populated (C-025)")
+	}
+	if _, hasDuration := result.Outcome.Metrics["duration_ms"]; !hasDuration {
+		t.Error("expected duration_ms in metrics")
+	}
+	if _, hasStatus := result.Outcome.Metrics["executor_status"]; !hasStatus {
+		t.Error("expected executor_status in metrics")
+	}
+}
+
+// TEST-CORE-042: Failure emits chain.failed event on event bus (C-009/C-010)
+func TestFailureEmitsChainFailedEvent(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Subscribe before triggering failure
+	var received []string
+	consumer := event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	})
+	if _, err := e.EventBus().Subscribe(consumer); err != nil {
+		t.Fatal(err)
+	}
+
+	// Trigger validation failure (empty intent)
+	req := &Request{
+		ID:      "req-fail-event",
+		Context: NewRequestContext("corr-fail", "biz-1", "user-1"),
+		Intent:  "",
+	}
+	_ = e.SubmitRequest(req)
+	time.Sleep(300 * time.Millisecond)
+
+	e.EventBus().Dispatch()
+
+	found := false
+	for _, typ := range received {
+		if typ == "chain.failed" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected chain.failed event, got: %v", received)
+	}
+}

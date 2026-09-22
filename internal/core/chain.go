@@ -264,6 +264,14 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
+			// C-025: populate execution metrics (was always nil).
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
 		}
 	}
 

@@ -355,6 +355,9 @@ go.mod unchanged (zero deps confirmed)
 | D24 | C-010 | Terminal event reflects status: failures emit `chain.failed` | ✅ FIXED |
 | D25 | C-021 | `Stop()` waits on `loopDone` channel (was `time.Sleep(50ms)`); Resume resets `shutdownOnce` (latent bug) | ✅ FIXED |
 | D26 | C-038 | Tests use `ChainStep` constants instead of string literals | ✅ FIXED |
+| D27 | C-020 | `ModelRegistry()`/`ModelRouter()` public accessors added | ✅ FIXED + TESTED |
+| D28 | C-025 | `Outcome.Metrics` populated (duration, executor status, agent) | ✅ FIXED + TESTED |
+| D29 | C-018 | Backpressure Accept/Release semantics documented (no leak, errs safe) | ✅ DOCUMENTED |
 
 ---
 
@@ -383,19 +386,19 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 27 FIXES
-Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe IDs (correlation/event/memory), correct address logging, `MaxHeaderBytes`, `Retryable` for REQUIRE_APPROVAL, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` on failure, circuit breaker step naming, configurable model ID, MemBus bounded retry, distinct objective criteria, `chain.failed` events, `Stop()` waits on loop (no sleep), `shutdownOnce` reset on Resume, ChainStep constants + test usage.
+### Phase D — Cleanup (P3/P4): 30 FIXES
+Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe IDs, correct address logging, `MaxHeaderBytes`, `Retryable`, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` on failure, circuit breaker step naming, configurable model ID, MemBus bounded retry, distinct objective criteria, `chain.failed` events, `Stop()` loop sync, `shutdownOnce` reset, ChainStep constants, model accessors, `Outcome.Metrics`, backpressure semantics documented.
 
 ### Final Metrics
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **417** (+26) |
+| **Tests** | 391 | **420** (+29) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **44** |
-| **Files changed** | — | **18** (+1,750 lines) |
+| **Fixes total** | — | **47** |
+| **Files changed** | — | **19** (+1,850 lines) |
