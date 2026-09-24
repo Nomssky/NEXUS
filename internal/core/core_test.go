@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,31 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 )
+
+// waitForResult polls the engine until it records a result for requestID and
+// returns it, failing the test if the bounded deadline elapses first (C-032).
+// Tests wait for the observable state they assert on instead of sleeping a
+// fixed duration and hoping asynchronous processing finished. The poll
+// interval is short so successful waits return promptly; the deadline only
+// bounds genuinely stuck behavior.
+func waitForResult(t *testing.T, e *Engine, requestID string) *Response {
+	t.Helper()
+
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(10 * time.Second)
+
+	for {
+		if result, ok := e.GetResult(requestID); ok {
+			return result
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for result %q", requestID)
+		case <-tick.C:
+		}
+	}
+}
 
 // TEST-CORE-001: RequestContext creation
 func TestRequestContextCreation(t *testing.T) {
@@ -127,13 +153,8 @@ func TestSubmitRequest(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	// Wait for processing
-	time.Sleep(100 * time.Millisecond)
-
-	result, ok := e.GetResult("req-1")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	// Wait until the engine records the result (deterministic — C-032).
+	result := waitForResult(t, e, "req-1")
 	if result.Status != "completed" {
 		t.Errorf("expected completed, got %s (error: %v)", result.Status, result.Error)
 	}
@@ -198,12 +219,7 @@ func TestFullChainExecution(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	result, ok := e.GetResult("req-full")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-full")
 	if result.Status != "completed" {
 		t.Errorf("expected completed, got %s (error: %v)", result.Status, result.Error)
 	}
@@ -227,12 +243,7 @@ func TestAuditTrailChainSteps(t *testing.T) {
 	}
 
 	e.SubmitRequest(req)
-	time.Sleep(100 * time.Millisecond)
-
-	result, _ := e.GetResult("req-audit")
-	if result == nil {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-audit")
 
 	// Check that key steps are in the audit trail
 	steps := make(map[string]bool)
@@ -376,12 +387,7 @@ func TestMemoryReadInChain(t *testing.T) {
 	if err := e.SubmitRequest(req); err != nil {
 		t.Fatalf("failed to submit: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetResult("req-mem")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-mem")
 
 	// Check that memory_read step is in audit trail
 	found := false
@@ -416,12 +422,7 @@ func TestAttentionScoreInChain(t *testing.T) {
 	if err := e.SubmitRequest(req); err != nil {
 		t.Fatalf("failed to submit: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetResult("req-att")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-att")
 
 	// Check that attention_score step is in audit trail
 	found := false
@@ -456,12 +457,7 @@ func TestMemoryWriteInChain(t *testing.T) {
 	if err := e.SubmitRequest(req); err != nil {
 		t.Fatalf("failed to submit: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetResult("req-memwrite")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-memwrite")
 
 	// Check that memory_write step is in audit trail
 	found := false
@@ -501,12 +497,7 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 	}
 
 	e.SubmitRequest(req)
-	time.Sleep(200 * time.Millisecond)
-
-	result, _ := e.GetResult("req-full-steps")
-	if result == nil {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-full-steps")
 
 	// Collect all steps
 	steps := make(map[string]bool)
@@ -555,12 +546,16 @@ func TestChainEmitsEvents(t *testing.T) {
 	if err := e.SubmitRequest(req); err != nil {
 		t.Fatalf("failed to submit: %v", err)
 	}
-	time.Sleep(100 * time.Millisecond)
-	e.EventBus().Dispatch()
-	e.EventBus().Dispatch()
-	time.Sleep(50 * time.Millisecond)
-	e.EventBus().Dispatch()
-	e.EventBus().Dispatch()
+
+	// Every chain event is published synchronously while the chain executes,
+	// and the result is recorded only after executeChain returns — so once the
+	// result is visible the queue already holds all of them. One Dispatch
+	// delivers the full batch. (C-032/C-034: replaced sleeps and arbitrary
+	// repeated Dispatch calls with this deterministic ordering.)
+	waitForResult(t, e, "req-events")
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
 
 	eventsMu.Lock()
 	defer eventsMu.Unlock()
@@ -649,12 +644,8 @@ func TestCircuitBreakerTrips(t *testing.T) {
 		Priority: 5,
 	}
 	e.SubmitRequest(req)
-	time.Sleep(200 * time.Millisecond)
+	result := waitForResult(t, e, "req-cb-open")
 
-	result, ok := e.GetResult("req-cb-open")
-	if !ok {
-		t.Fatal("expected result (error response)")
-	}
 	if result.Status != "failed" {
 		t.Errorf("expected failed status, got %s", result.Status)
 	}
@@ -666,7 +657,10 @@ func TestCircuitBreakerTrips(t *testing.T) {
 	}
 }
 
-// TEST-CORE-028: RecoveryManager records failures on execution errors
+// TEST-CORE-028: RecoveryManager records failures on execution errors.
+// Direct unit coverage of Detect() bookkeeping. Chain-integration coverage —
+// recovery triggered through SubmitRequest → executeChain → chainExecute —
+// lives in TestRecoveryRecordsFailureThroughChain (C-035).
 func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
@@ -674,9 +668,6 @@ func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	e.Start(ctx)
 	defer e.Stop(ctx)
 
-	// Force a chain error by submitting to a stopped engine after start
-	// Actually, let's trigger via the chain by using a bad request that passes validation
-	// but fails at execution. We can trigger via hardening detection directly.
 	rec := e.RecoveryManager().Detect(
 		hardening.FailureTaskUnknown,
 		"executor",
@@ -695,6 +686,96 @@ func TestRecoveryManagerRecordsFailure(t *testing.T) {
 	}
 	if e.RecoveryManager().RecordCount() != 1 {
 		t.Errorf("expected 1 record, got %d", e.RecoveryManager().RecordCount())
+	}
+}
+
+// TEST-CORE-045: RecoveryManager records failures through the real chain
+// (C-035). Unlike TestRecoveryManagerRecordsFailure, this test never calls
+// Detect() itself: an expired deadline drives Step 8 (chainExecute) to fail
+// through SubmitRequest → executeChain, which is the production call site of
+// RecoveryManager.Detect (chain.go) — the record and the
+// chain.hardening.failure_detected event must both appear as a result.
+func TestRecoveryRecordsFailureThroughChain(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Capture the chain's failure-detection event; its outcome carries the
+	// FailureRecord ID created by Detect (chain.go chainEmit payload).
+	var eventsMu sync.Mutex
+	var failureIDs []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		if string(ev.Type) != "chain.hardening.failure_detected" {
+			return nil
+		}
+		var payload struct {
+			Outcome string `json:"outcome"`
+		}
+		if err := json.Unmarshal(ev.Data, &payload); err != nil || payload.Outcome == "" {
+			return nil
+		}
+		eventsMu.Lock()
+		failureIDs = append(failureIDs, payload.Outcome)
+		eventsMu.Unlock()
+		return nil
+	}))
+
+	// An expired deadline makes chainExecute fail through the production path.
+	past := now.Add(-time.Minute)
+	req := &Request{
+		ID:       "req-recovery-chain",
+		Context:  NewRequestContext("corr-recovery", "biz-1", "user-1"),
+		Intent:   "trigger execution failure",
+		Deadline: &past,
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	result := waitForResult(t, e, "req-recovery-chain")
+	if result.Status != "failed" {
+		t.Fatalf("expected failed status, got %s", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error in result")
+	}
+	if !strings.Contains(result.Error.Message, "deadline") {
+		t.Errorf("expected deadline execution error, got: %s", result.Error.Message)
+	}
+
+	// The chain must have recorded exactly one failure — this test never
+	// called Detect() directly, so the record proves the chain path ran.
+	if got := e.RecoveryManager().RecordCount(); got != 1 {
+		t.Fatalf("expected 1 recovery record from chain execution, got %d", got)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	eventsMu.Lock()
+	ids := append([]string(nil), failureIDs...)
+	eventsMu.Unlock()
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 chain.hardening.failure_detected event, got %d", len(ids))
+	}
+
+	rec, ok := e.RecoveryManager().GetRecord(ids[0])
+	if !ok {
+		t.Fatalf("expected failure record %q to be retrievable", ids[0])
+	}
+	if rec.Mode != hardening.FailureTaskUnknown {
+		t.Errorf("expected task_unknown mode, got %s", rec.Mode)
+	}
+	if rec.Component != "executor" {
+		t.Errorf("expected executor component, got %s", rec.Component)
+	}
+	if rec.BusinessID != "biz-1" {
+		t.Errorf("expected business id biz-1, got %s", rec.BusinessID)
+	}
+	if !strings.Contains(rec.Description, "execution failed") {
+		t.Errorf("expected execution failure description, got %q", rec.Description)
 	}
 }
 
@@ -778,12 +859,8 @@ func TestResumeLifecycle(t *testing.T) {
 		t.Fatalf("submit after resume: %v", err)
 	}
 
-	// Wait and verify result
-	time.Sleep(200 * time.Millisecond)
-	result, ok := e.GetResult("req-resume-1")
-	if !ok {
-		t.Fatal("expected result after resume")
-	}
+	// Wait for the post-resume request to be processed (deterministic).
+	result := waitForResult(t, e, "req-resume-1")
 	if result.BusinessID != "biz-1" {
 		t.Errorf("expected business_id biz-1, got %s", result.BusinessID)
 	}
@@ -836,24 +913,9 @@ func TestConcurrentSubmissions(t *testing.T) {
 		t.Error(err)
 	}
 
-	// Wait for all to process (poll for completion)
-	deadline := time.After(5 * time.Second)
-	allDone := false
-	for !allDone {
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for concurrent results")
-		default:
-		}
-		allDone = true
-		for i := 0; i < n; i++ {
-			id := fmt.Sprintf("req-concurrent-%d", i)
-			if _, ok := e.GetResult(id); !ok {
-				allDone = false
-				time.Sleep(50 * time.Millisecond)
-				break
-			}
-		}
+	// Wait for all requests to be processed (deterministic — C-032).
+	for i := 0; i < n; i++ {
+		waitForResult(t, e, fmt.Sprintf("req-concurrent-%d", i))
 	}
 }
 
@@ -873,12 +935,7 @@ func TestChainErrorFields(t *testing.T) {
 	}
 	_ = e.SubmitRequest(req)
 
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetResult("req-error-fields")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-error-fields")
 
 	if result.Error == nil {
 		t.Fatal("expected error in result")
@@ -909,12 +966,7 @@ func TestBusinessIDInResponse(t *testing.T) {
 	}
 	_ = e.SubmitRequest(req)
 
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetResult("req-biz-id")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-biz-id")
 	if result.BusinessID != "my-business" {
 		t.Errorf("expected business_id 'my-business', got %q", result.BusinessID)
 	}
@@ -999,12 +1051,7 @@ func TestNoPhantomAuditEntries(t *testing.T) {
 		Intent:  "test phantom entries",
 	}
 	_ = e.SubmitRequest(req)
-	time.Sleep(300 * time.Millisecond)
-
-	result, ok := e.GetResult("req-phantom")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-phantom")
 
 	for _, entry := range result.AuditTrail {
 		if entry.Step == "model" || entry.Step == "tool" {
@@ -1040,12 +1087,8 @@ func TestRequestDeadlineEnforced(t *testing.T) {
 		Deadline: &past,
 	}
 	_ = e.SubmitRequest(req)
-	time.Sleep(300 * time.Millisecond)
+	result := waitForResult(t, e, "req-deadline-past")
 
-	result, ok := e.GetResult("req-deadline-past")
-	if !ok {
-		t.Fatal("expected result")
-	}
 	if result.Error == nil {
 		t.Fatal("expected deadline error for expired deadline")
 	}
@@ -1082,12 +1125,7 @@ func TestOutcomeMetricsPopulated(t *testing.T) {
 		Intent:  "test metrics",
 	}
 	_ = e.SubmitRequest(req)
-	time.Sleep(300 * time.Millisecond)
-
-	result, ok := e.GetResult("req-metrics")
-	if !ok {
-		t.Fatal("expected result")
-	}
+	result := waitForResult(t, e, "req-metrics")
 	if result.Status != "completed" {
 		t.Fatalf("expected completed, got %s", result.Status)
 	}
@@ -1130,9 +1168,14 @@ func TestFailureEmitsChainFailedEvent(t *testing.T) {
 		Intent:  "",
 	}
 	_ = e.SubmitRequest(req)
-	time.Sleep(300 * time.Millisecond)
 
-	e.EventBus().Dispatch()
+	// chain.failed is published by chainError before the Response is
+	// returned, so it is queued by the time the result is recorded —
+	// wait for that observable state, then deliver (C-032: no timing).
+	waitForResult(t, e, "req-fail-event")
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
 
 	found := false
 	for _, typ := range received {
