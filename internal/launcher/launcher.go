@@ -97,6 +97,10 @@ func New(opts Options) *Launcher {
 // the gateway HTTP listener is established (gateway.Ready closed) or a
 // definitive startup failure is observed. There is no timing window during
 // which a gateway startup error can be silently lost.
+//
+// L-004: on any startup failure (gateway error, not-ready exit, cancellation)
+// Start aborts cleanly — it stops partially started owned components so no
+// engine/gateway is left running after Start returns an error.
 func (l *Launcher) Start(ctx context.Context) error {
 	if l.initErr != nil {
 		return fmt.Errorf("initialization failed: %w", l.initErr)
@@ -126,6 +130,7 @@ func (l *Launcher) Start(ctx context.Context) error {
 	select {
 	case err := <-gwErr:
 		if err != nil {
+			l.abortStart(ctx)
 			return fmt.Errorf("gateway start: %w", err)
 		}
 		// Start exited without error — check whether ready was established
@@ -134,14 +139,19 @@ func (l *Launcher) Start(ctx context.Context) error {
 		case <-l.gateway.Ready():
 			// Ready won the race; treat as success.
 		default:
+			l.abortStart(ctx)
 			return fmt.Errorf("gateway start: exited before ready")
 		}
 	case <-l.gateway.Ready():
 		// Listener bound — startup barrier satisfied.
 	case <-ctx.Done():
 		// Cancellation during startup: wait for gateway goroutine cleanup,
-		// then report cancellation. No goroutine is left blocked here.
+		// then abort owned components and report cancellation.
 		<-gwErr
+		// Use a fresh context — ctx is already cancelled.
+		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		l.abortStart(abortCtx)
 		return ctx.Err()
 	}
 
@@ -152,7 +162,28 @@ func (l *Launcher) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the gateway and core engine.
+// abortStart cleans up partially started owned components when Start fails.
+// It stops gateway then engine (same order as Stop) but does NOT touch
+// lifecycle state — lifecycle owns its own transitions via life.Shutdown.
+// Safe to call when components were never started (Stop is idempotent/nil-safe).
+func (l *Launcher) abortStart(ctx context.Context) {
+	// Best-effort cleanup; errors during abort are non-fatal (Start already
+	// returning the primary startup failure).
+	_ = l.Stop(ctx)
+}
+
+// Stop gracefully shuts down the components owned by the launcher: the HTTP
+// gateway and the core engine. Readiness is cleared first so load balancers
+// stop routing before drain.
+//
+// L-004 ownership: Stop terminates only launcher-owned resources (gateway,
+// engine). It does NOT call life.Shutdown() — lifecycle owns its own state
+// transitions and hook execution; calling Shutdown from here would recurse
+// (life.Shutdown → Close hook → Stop → life.Shutdown). The health HTTP
+// server is owned by the app lifecycle hook, not by launcher. health.Server
+// itself is pure readiness state — MarkNotReady is the correct action.
+//
+// Stop is idempotent and nil-safe (initErr path leaves engine/gateway nil).
 func (l *Launcher) Stop(ctx context.Context) error {
 	var errs []error
 
@@ -161,20 +192,25 @@ func (l *Launcher) Stop(ctx context.Context) error {
 		l.health.MarkNotReady()
 	}
 
-	// Stop gateway first (stop accepting new requests)
-	if err := l.gateway.Stop(ctx); err != nil {
-		l.log.Error("gateway stop error", logging.Fields{
-			Context: map[string]any{"err": err.Error()},
-		})
-		errs = append(errs, fmt.Errorf("gateway: %w", err))
+	// Stop gateway first (stop accepting new requests). Nil-safe: initErr
+	// path never constructed a gateway.
+	if l.gateway != nil {
+		if err := l.gateway.Stop(ctx); err != nil {
+			l.log.Error("gateway stop error", logging.Fields{
+				Context: map[string]any{"err": err.Error()},
+			})
+			errs = append(errs, fmt.Errorf("gateway: %w", err))
+		}
 	}
 
-	// Then stop the core engine (drain in-flight)
-	if err := l.engine.Stop(ctx); err != nil {
-		l.log.Error("engine stop error", logging.Fields{
-			Context: map[string]any{"err": err.Error()},
-		})
-		errs = append(errs, fmt.Errorf("engine: %w", err))
+	// Then stop the core engine (drain in-flight). Nil-safe on initErr path.
+	if l.engine != nil {
+		if err := l.engine.Stop(ctx); err != nil {
+			l.log.Error("engine stop error", logging.Fields{
+				Context: map[string]any{"err": err.Error()},
+			})
+			errs = append(errs, fmt.Errorf("engine: %w", err))
+		}
 	}
 
 	if len(errs) > 0 {
