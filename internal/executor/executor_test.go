@@ -51,6 +51,64 @@ func testRequest(id string) *WorkRequest {
 	}
 }
 
+// waitForOutcome polls the executor until it records an outcome for taskID and
+// returns it, failing the test if the bounded deadline elapses first (E-015).
+// Tests wait for the observable completion state they assert on instead of
+// sleeping a fixed duration and hoping asynchronous execution finished.
+func waitForOutcome(t *testing.T, e *Executor, taskID string) *Outcome {
+	t.Helper()
+
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(10 * time.Second)
+
+	for {
+		if outcome, ok := e.GetOutcome(taskID); ok {
+			return outcome
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for outcome %q", taskID)
+		case <-tick.C:
+		}
+	}
+}
+
+// waitUntil polls cond until it holds, failing the test if the bounded
+// deadline elapses first (E-015). Used for conditions that are not a single
+// outcome lookup, such as metrics counters.
+func waitUntil(t *testing.T, desc string, cond func() bool) {
+	t.Helper()
+
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(10 * time.Second)
+
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", desc)
+		case <-tick.C:
+		}
+	}
+}
+
+// waitSignal waits for one value on ch with a bounded deadline (E-015). Used
+// where the observable condition is a handler lifecycle signal rather than a
+// recorded outcome.
+func waitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
 // TEST-EXEC-001: Executor creation
 func TestExecutorCreation(t *testing.T) {
 	e := testExecutor(t)
@@ -110,13 +168,8 @@ func TestSubmitAndExecute(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	// Wait for execution
-	time.Sleep(100 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("task-1")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	// Wait for execution to be recorded (deterministic — E-015).
+	outcome := waitForOutcome(t, e, "task-1")
 	if outcome.Status != "completed" {
 		t.Errorf("expected completed, got %s", outcome.Status)
 	}
@@ -147,12 +200,7 @@ func TestSubmitWithCustomHandler(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("task-custom")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "task-custom")
 	if outcome.Output != "custom result" {
 		t.Errorf("expected 'custom result', got '%s'", outcome.Output)
 	}
@@ -177,12 +225,7 @@ func TestHandlerError(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("task-fail")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "task-fail")
 	if outcome.Status != "failed" {
 		t.Errorf("expected failed, got %s", outcome.Status)
 	}
@@ -226,12 +269,7 @@ func TestGovernanceDenied(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("task-denied")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "task-denied")
 	if outcome.Status != "denied" {
 		t.Errorf("expected denied, got %s", outcome.Status)
 	}
@@ -262,8 +300,15 @@ func TestSubmitSyncTimeout(t *testing.T) {
 	defer e.Stop(ctx)
 
 	req := testRequest("task-timeout")
+	// The handler blocks until the test releases it, so it is guaranteed to
+	// still be running when SubmitSync's 100ms context deadline expires —
+	// no fixed sleep needed to simulate a long-running task (E-015).
+	// defer close runs before the earlier defer e.Stop (LIFO): the handler is
+	// released before Stop waits for active tasks.
+	release := make(chan struct{})
+	defer close(release)
 	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
-		time.Sleep(5 * time.Second)
+		<-release
 		return &Outcome{Status: "completed"}, nil
 	}
 
@@ -288,7 +333,13 @@ func TestMetrics(t *testing.T) {
 		req := testRequest(fmt.Sprintf("task-%d", i))
 		e.Submit(req)
 	}
-	time.Sleep(200 * time.Millisecond)
+	// Metrics are incremented after each outcome is recorded (executeWork's
+	// deferred bookkeeping) — wait for the third execution to land, then
+	// assert the exact counters (E-015).
+	waitUntil(t, "3 executed tasks", func() bool {
+		executed, _, _ := e.Metrics()
+		return executed == 3
+	})
 
 	executed, failed, denied := e.Metrics()
 	if executed != 3 {
@@ -313,16 +364,29 @@ func TestActiveCount(t *testing.T) {
 		t.Errorf("expected 0 active initially, got %d", e.ActiveCount())
 	}
 
-	// Submit a slow task
+	// Submit a task that stays in flight until the test releases it.
+	started := make(chan struct{})
+	release := make(chan struct{})
 	req := testRequest("task-slow")
 	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
-		time.Sleep(200 * time.Millisecond)
+		close(started)
+		<-release
 		return &Outcome{Status: "completed"}, nil
 	}
 	e.Submit(req)
 
-	time.Sleep(50 * time.Millisecond)
-	// May or may not be active depending on goroutine scheduling
+	// The handler is provably running, so the task is provably active — the
+	// active slot is only released after the handler returns (E-015).
+	waitSignal(t, started, "handler start")
+	if e.ActiveCount() != 1 {
+		t.Errorf("expected 1 active while handler runs, got %d", e.ActiveCount())
+	}
+
+	close(release)
+	waitForOutcome(t, e, "task-slow") // completion also releases the active slot
+	if e.ActiveCount() != 0 {
+		t.Errorf("expected 0 active after completion, got %d", e.ActiveCount())
+	}
 }
 
 // TEST-EXEC-013: Event emission
@@ -363,10 +427,16 @@ func TestEventEmission(t *testing.T) {
 
 	req := testRequest("task-events")
 	e.Submit(req)
-	time.Sleep(200 * time.Millisecond)
+
+	// Every executor event (started/received/assigned/completed) is published
+	// before the outcome is recorded, so a visible outcome means the queue
+	// already holds them — one Dispatch delivers the batch (E-015).
+	waitForOutcome(t, e, "task-events")
 
 	// Dispatch queued events
-	bus.Dispatch()
+	if _, err := bus.Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
 
 	// Should have received started, received, assigned, completed events
 	if len(received) < 4 {
@@ -384,12 +454,8 @@ func TestCorrelationIDPreserved(t *testing.T) {
 	req := testRequest("task-corr")
 	req.CorrelationID = "my-custom-corr-id"
 	e.Submit(req)
-	time.Sleep(100 * time.Millisecond)
 
-	outcome, ok := e.GetOutcome("task-corr")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "task-corr")
 	if outcome.CorrelationID != "my-custom-corr-id" {
 		t.Errorf("expected my-custom-corr-id, got %s", outcome.CorrelationID)
 	}
@@ -405,12 +471,8 @@ func TestBusinessIDPreserved(t *testing.T) {
 	req := testRequest("task-biz")
 	req.BusinessID = "acme-corp"
 	e.Submit(req)
-	time.Sleep(100 * time.Millisecond)
 
-	outcome, ok := e.GetOutcome("task-biz")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "task-biz")
 	if outcome.BusinessID != "acme-corp" {
 		t.Errorf("expected acme-corp, got %s", outcome.BusinessID)
 	}
@@ -465,14 +527,9 @@ func TestConcurrentExecution(t *testing.T) {
 		}
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	// All should complete
+	// All should complete — wait for each outcome (deterministic — E-015).
 	for i := 0; i < 5; i++ {
-		_, ok := e.GetOutcome(fmt.Sprintf("task-concurrent-%d", i))
-		if !ok {
-			t.Errorf("expected outcome for task-concurrent-%d", i)
-		}
+		waitForOutcome(t, e, fmt.Sprintf("task-concurrent-%d", i))
 	}
 }
 
@@ -509,9 +566,11 @@ func TestCapacityLimit(t *testing.T) {
 
 	// Use a channel to block handlers
 	block := make(chan struct{})
+	started := make(chan struct{}, 2)
 
 	slowHandler := func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
-		<-block // block until we release
+		started <- struct{}{} // signal that the handler is running
+		<-block               // block until we release
 		return &Outcome{Status: "completed"}, nil
 	}
 
@@ -522,7 +581,11 @@ func TestCapacityLimit(t *testing.T) {
 		e.Submit(req)
 	}
 
-	time.Sleep(50 * time.Millisecond) // let goroutines start
+	// Wait until both handlers are actually running: their active slots are
+	// held and cannot be freed until block closes, so the overflow submission
+	// below deterministically faces a full executor (E-015 — no sleep).
+	waitSignal(t, started, "first handler start")
+	waitSignal(t, started, "second handler start")
 
 	// Third should fail — capacity full
 	req := testRequest("task-cap-overflow")
@@ -542,13 +605,18 @@ func TestStopWaitsForTasks(t *testing.T) {
 
 	// Submit a slow task
 	block := make(chan struct{})
+	started := make(chan struct{})
 	req := testRequest("task-stop-wait")
 	req.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		close(started)
 		<-block
 		return &Outcome{Status: "completed", Output: "done"}, nil
 	}
 	e.Submit(req)
-	time.Sleep(50 * time.Millisecond) // let goroutine start
+	// The handler is provably running before Stop is called, so Stop must wait
+	// on a genuinely active task — deterministic instead of hoping the
+	// goroutine started within a fixed window (E-015).
+	waitSignal(t, started, "handler start")
 
 	done := make(chan bool)
 	go func() {
@@ -614,12 +682,7 @@ func TestProviderFailurePath(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("exec-provider-fail")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "exec-provider-fail")
 	// E-008 invariant: provider failure must not be reported as completed.
 	if outcome.Status == "completed" {
 		t.Errorf("provider failure must not be completed, got %q", outcome.Status)
@@ -686,12 +749,7 @@ func TestProviderSuccessPath(t *testing.T) {
 		t.Fatalf("failed to submit: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
-
-	outcome, ok := e.GetOutcome("exec-provider-ok")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	outcome := waitForOutcome(t, e, "exec-provider-ok")
 	if outcome.Status != "completed" {
 		t.Errorf("expected completed for successful provider, got %q", outcome.Status)
 	}
@@ -742,12 +800,7 @@ func TestGovernanceRequiresApproval(t *testing.T) {
 	}
 	e.Submit(req)
 
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetOutcome("exec-req-approval")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	result := waitForOutcome(t, e, "exec-req-approval")
 	if result.Status != "pending_approval" {
 		t.Errorf("expected pending_approval, got %s", result.Status)
 	}
@@ -788,12 +841,7 @@ func TestGovernanceEscalate(t *testing.T) {
 	}
 	e.Submit(req)
 
-	time.Sleep(200 * time.Millisecond)
-
-	result, ok := e.GetOutcome("exec-escalate")
-	if !ok {
-		t.Fatal("expected outcome")
-	}
+	result := waitForOutcome(t, e, "exec-escalate")
 	if result.Status != "escalated" {
 		t.Errorf("expected escalated, got %s", result.Status)
 	}
