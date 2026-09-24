@@ -14,7 +14,7 @@ Full audit of NEXUS repository at HEAD `91bb3da`. The system has 31 Go packages,
 
 **New findings from this audit: 68 total** (4 P0, 13 P1, 22 P2, 18 P3, 11 P4).
 
-The most critical issues are in the **gateway layer**: broken auth middleware (off-by-2 string comparison), no authorization on result retrieval, and no business-scope filtering on SSE. The foundation packages (identity, governance, security) are well-implemented but **not wired into any runtime gate** — the gateway is effectively unauthenticated for all public endpoints.
+The most critical issues found were in the **gateway layer**: broken auth middleware (off-by-2 string comparison), no authorization on result retrieval, and no business-scope filtering on SSE. The foundation packages (identity, governance, security) were well-implemented but **not wired into any runtime gate** — the gateway was effectively unauthenticated for all public endpoints. **(Original audit-time state — since remediated:** G-001/G-002/G-003 fixed in Phase A; `Handler()` always applies `authMiddleware` + `identityMiddleware`; governance evaluated in executor; identity binding active on scoped paths when enforcement on.)**
 
 ---
 
@@ -85,17 +85,17 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 
 | ID | Status | File:Line | Finding | Impact |
 |----|--------|-----------|---------|--------|
-| **G-004** | CONFIRMED | `gateway/server.go:337-344` | `handleControlStatus` populates `RequestCount` from `denied` counter (not `executed`). Metrics are misleading. | Operational blindness |
-| **G-005** | CONFIRMED | `gateway/server.go:348-352` | Pause returns 409 "ALREADY_PAUSED" for CREATED state (never started). Misleading error. | Operational confusion |
-| **G-006** | CONFIRMED | `gateway/server.go:367-378` | Resume does not pre-check engine state. Inconsistent with pause handler. | Inconsistent API |
+| **G-004** | FIXED | `gateway/server.go:337-344` | `handleControlStatus` populates `RequestCount` from `denied` counter (not `executed`). Metrics are misleading. | `RequestCount` now uses `executed` from `TaskExecutor().Metrics()` (Phase B5); operational blindness closed |
+| **G-005** | FIXED | `gateway/server.go:348-352` | Pause returns 409 "ALREADY_PAUSED" for CREATED state (never started). Misleading error. | Pause handler now returns 400 `INVALID_STATE` for non-running/non-stopped states (Phase B6); covered by TEST-GW-019/020 |
+| **G-006** | FIXED | `gateway/server.go:367-378` | Resume does not pre-check engine state. Inconsistent with pause handler. | Resume now pre-checks state: 409 `ALREADY_RUNNING` if running, 400 `INVALID_STATE` if not stopped (Phase B7) |
 | **G-007** | FIXED | `gateway/server.go:157-159` | `Mux()` returns raw mux without auth middleware. Exported function can bypass auth if misused. Production path safe: Start() installs Handler() (identity+auth); no production Mux() callers; Mux() formally deprecated (`// Deprecated:`). Covered by TestG007HandlerEnforcesControlAuth/TestG007MuxIsRawTestOnlyBypass/TestG007HandlerDiffersFromMuxForControl. | Auth bypass vector closed (test-only residual API, formally deprecated) |
-| **G-008** | CONFIRMED | `gateway/server.go:108-111` | `Shutdown(context.Background())` has no timeout. SSE handlers can hang indefinitely. | Hang on shutdown |
+| **G-008** | FIXED | `gateway/server.go:108-111` | `Shutdown(context.Background())` has no timeout. SSE handlers can hang indefinitely. | Shutdown goroutine uses `context.WithTimeout(…, 5*time.Second)` (Phase B1); hang on shutdown closed |
 | **E-004** | FIXED | `executor/executor.go:318-341` | `REQUIRE_APPROVAL` returns `pending_approval` and `ESCALATE` returns `escalated` before handler dispatch — no silent allow. Covered by TEST-EXEC-011/012. Residual: ApprovalEngine not wired (no approval-request creation / re-execution path) — deferred with full admission pipeline. | Governance bypass closed; approval workflow integration residual |
-| **M-042** | CONFIRMED | `event/membus.go:177-191` | Wildcard + type-specific subscriber receives duplicate deliveries. | Duplicate event processing |
-| **M-044** | CONFIRMED | `event/membus.go:53-58` | Dedup map grows indefinitely — never cleaned. Unbounded memory leak in long-running processes. | Memory exhaustion |
-| **L-002** | PARTIAL | `launcher/launcher.go:86-106` | Gateway start error only detected within 100 ms window — not deterministic full startup barrier. | Silent failure mode (improved, not closed) |
+| **M-042** | FIXED | `event/membus.go:177-191` | Wildcard + type-specific subscriber receives duplicate deliveries. | `getMatchingConsumers` deduplicates by subscriber ID `seen` map (Phase B3); duplicate delivery closed |
+| **M-044** | FIXED | `event/membus.go:53-58` | Dedup map grows indefinitely — never cleaned. Unbounded memory leak in long-running processes. | FIFO eviction at `maxDedupSize = 10000` (Phase B4); unbounded growth closed |
+| **L-002** | FIXED | `launcher/launcher.go:86-106` | Gateway start error only detected within 100 ms window — not deterministic full startup barrier. | Deterministic `Ready()` barrier after `net.Listen` (no timing window); `WithListenFunc` test seam; covered by `l002_test.go` (commit 94dd2f0) |
 | **L-003** | FIXED | `launcher/launcher.go:116-139` | `Stop()` always returns nil — errors from gateway/engine shutdown are swallowed. | Shutdown errors now aggregated and returned |
-| **L-004** | CONFIRMED | `launcher/launcher.go:116-139` | `Stop()` does not shut down `health.Server` or `lifecycle.Manager`. | Resource leak — health now `MarkNotReady()` on Stop; lifecycle owns hooks |
+| **L-004** | FIXED | `launcher/launcher.go:116-139` | `Stop()` does not shut down `health.Server` or `lifecycle.Manager`. | Ownership clarified: Stop owns gateway+engine only, `health.MarkNotReady()` on Stop, lifecycle owns its hooks via `life.Shutdown`; idempotent/nil-safe with `abortStart`; covered by `l004_test.go` (commit 4af59ca) |
 | **T-001** | FIXED | `gateway/server_test.go:504-632` | Zero test coverage for auth middleware (correct or incorrect). | Auth tests now use production `Handler()` |
 | **T-002** | FIXED | `gateway/server_test.go:634-747` | Zero test coverage for cross-tenant authorization on result retrieval. | Cross-tenant + fail-closed tests added |
 
@@ -103,28 +103,28 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 
 | ID | Status | File:Line | Finding |
 |----|--------|-----------|---------|
-| **C-004** | CONFIRMED | `core/chain.go:22-34` | ChainStep constants missing for `memory_read`, `attention_score`, `memory_write` steps |
-| **C-005** | CONFIRMED | `core/chain.go:218-241` | StepModel/StepTool/StepVerify are phantom audit entries with fabricated outcomes |
-| **C-009** | CONFIRMED | `core/chain.go:412-447` | `chainError` never emits failure event to event bus |
-| **C-010** | CONFIRMED | `core/chain.go:267` | `chain.completed` emitted on execution failure but not on pre-execution failure |
-| **C-018** | CONFIRMED | `core/engine.go:292-303` | Backpressure Accept/channel send not atomic; count temporarily inflated |
-| **C-019** | CONFIRMED | `core/engine.go:42,137-138` | Store initialized but never used internally (dead code) |
-| **C-021** | CONFIRMED | `core/engine.go:254` | `Stop()` uses `time.Sleep(50ms)` instead of proper synchronization |
-| **C-028** | CONFIRMED | `core/core_test.go` | No test for `WithPersistence` error path (C6 fix untested) |
-| **C-029** | CONFIRMED | `core/core_test.go` | No test for `Resume()` (H2 fix untested) |
-| **C-030** | CONFIRMED | `core/core_test.go` | No test for concurrent request submission |
-| **C-031** | CONFIRMED | `core/core_test.go:252-262` | No test for ChainError CorrelationID/Timestamp (M10 fix untested) |
-| **G-009** | CONFIRMED | `gateway/server.go:196-256` | `actor_id` taken from JSON body without authentication — identity spoofing |
-| **G-010** | CONFIRMED | `gateway/server.go:258-318` | No response body size limit on GET/SSE |
-| **G-011** | CONFIRMED | `gateway/server.go:302-306` | SSE write errors silently ignored; consumer always returns nil |
-| **G-012** | CONFIRMED | `gateway/server.go:445-464` | Component statuses hardcoded "active" |
-| **G-013** | CONFIRMED | `gateway/server.go:141-142` | Non-constant-time API key comparison |
-| **E-008** | CONFIRMED | `executor/executor.go:443-456` | Provider failure silently masked as "completed" outcome |
-| **E-011** | CONFIRMED | `executor/executor_test.go` | No test for provider failure path |
-| **A-019** | CONFIRMED | `governance/approval.go:60-61` | Self-approval check is weak at RequestApproval stage |
-| **I-032** | CONFIRMED | `identity/` + `gateway/` | Identity primitives not wired into any runtime gate |
-| **M-038** | CONFIRMED | `memory/memory.go:141-189` | Retrieve() holds write lock for read path (performance concern) |
-| **M-043** | CONFIRMED | `event/membus.go:131-158` | TOCTOU race on unsubscribe during dispatch |
+| **C-004** | FIXED | `core/chain.go:22-34` | ChainStep constants missing for `memory_read`, `attention_score`, `memory_write` steps | `StepMemoryRead`/`StepAttention`/`StepMemoryWrite` added (Phase D22) |
+| **C-005** | FIXED | `core/chain.go:218-241` | StepModel/StepTool/StepVerify are phantom audit entries with fabricated outcomes | Phantom model/tool entries no longer fabricated; verify reflects actual outcome (Phase D12); TEST-CORE-038 |
+| **C-009** | FIXED | `core/chain.go:412-447` | `chainError` never emits failure event to event bus | `chainError` emits `chain.failed` (Phase D23); TEST-CORE-042 |
+| **C-010** | FIXED | `core/chain.go:267` | `chain.completed` emitted on execution failure but not on pre-execution failure | Terminal event reflects status: failures emit `chain.failed` (Phase D24) |
+| **C-018** | CONFIRMED | `core/engine.go:292-303` | Backpressure Accept/channel send not atomic; count temporarily inflated | Semantics documented as intentional (over-count errs safe); Phase D29 DOCUMENTED — code still non-atomic |
+| **C-019** | FIXED | `core/engine.go:42,137-138` | Store initialized but never used internally (dead code) | Resolved as intentional external API: `Store()`/`WithPersistence` documented as external surface, never engine-internal state; covered by `c019_test.go` (commit b7f1c33) |
+| **C-021** | FIXED | `core/engine.go:254` | `Stop()` uses `time.Sleep(50ms)` instead of proper synchronization | `Stop()` waits on `loopDone` channel (Phase D25); Resume resets `shutdownOnce` |
+| **C-028** | FIXED | `core/core_test.go` | No test for `WithPersistence` error path (C6 fix untested) | TEST-CORE-030/031 error + success paths (Phase C1) |
+| **C-029** | FIXED | `core/core_test.go` | No test for `Resume()` (H2 fix untested) | TEST-CORE-032/033 Resume lifecycle (Phase C2) |
+| **C-030** | FIXED | `core/core_test.go` | No test for concurrent request submission | TEST-CORE concurrent 20-goroutine submission (Phase C3) |
+| **C-031** | FIXED | `core/core_test.go:252-262` | No test for ChainError CorrelationID/Timestamp (M10 fix untested) | TEST-CORE-035 ChainError fields (Phase C4) |
+| **G-009** | FIXED | `gateway/server.go:196-256` | `actor_id` taken from JSON body without authentication — identity spoofing | When enforcement off, client `actor_id` discarded; fixed `unauthenticatedActorID` marker bound (commit f1cf593); covered by `g009_test.go` |
+| **G-010** | FIXED | `gateway/server.go:258-318` | No response body size limit on GET/SSE | One-shot GET bounded by `maxResponseBytes` (413 on overflow); each SSE event frame bounded by `maxSSEEventBytes` (commit 612a18c); covered by `g010_test.go` |
+| **G-011** | FIXED | `gateway/server.go:302-306` | SSE write errors silently ignored; consumer always returns nil | Write/flush failures cancel stream cleanly (return nil intentionally so event bus does not re-queue); commit 069049d; covered by `g011_test.go` |
+| **G-012** | FIXED | `gateway/server.go:445-464` | Component statuses hardcoded "active" | Statuses derived from authoritative runtime state (`Status()`/`State()`/`IsRunning()`); no-lifecycle components report `"configured"` (commit 44e73a4); covered by `g012_test.go` |
+| **G-013** | FIXED | `gateway/server.go:141-142` | Non-constant-time API key comparison | `crypto/subtle.ConstantTimeCompare` (Phase D6) |
+| **E-008** | FIXED | `executor/executor.go:443-456` | Provider failure silently masked as "completed" outcome | Provider failure propagates as handler error → status `failed`, `executor.failed` emitted (commit 0c2a94b); covered by `TestProviderFailurePath` |
+| **E-011** | FIXED | `executor/executor_test.go` | No test for provider failure path | `TestProviderFailurePath` + `TestProviderSuccessPath` (Phase C5) |
+| **A-019** | FIXED | `governance/approval.go:60-61` | Self-approval check is weak at RequestApproval stage | Invariant lives in `Approve()` (`SelfApprovalProhibited && approver == requester`); `RequestApproval` is identity prerequisite only; docs clarified + `a019_test.go` (commit 8a5c1d1) |
+| **I-032** | FIXED | `identity/` + `gateway/` | Identity primitives not wired into any runtime gate | CLOSED by A6: `identityMiddleware` in production `Handler()`, membership checks on scoped paths when enforcement on (matches Section 6) |
+| **M-038** | CONFIRMED | `memory/memory.go:141-189` | Retrieve() holds write lock for read path (performance concern) | Still true (Lock used); accepted risk in Section 6 — performance concern, correctness fine |
+| **M-043** | FIXED | `event/membus.go:131-158` | TOCTOU race on unsubscribe during dispatch | Unsubscribe marks closed before removal; Dispatch re-checks `begin()` immediately before invoke; covered by `m043_test.go` (commit ba28e72) |
 
 ### P3 — Low (18 findings)
 
@@ -222,8 +222,8 @@ These are features from later milestones that are not yet implemented, correctly
 4. **External task cancellation** mechanism
 5. **Full identity entity** with provenance, metadata, status tracking
 6. **Model selection intelligence** (currently hardcoded "default")
-7. **Response body size limits**
-8. **Approval workflow wiring** into executor (REQUIRE_APPROVAL outcome handling)
+7. ~~**Response body size limits**~~ — **DONE** (G-010: `maxResponseBytes` on GET, `maxSSEEventBytes` per SSE frame)
+8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); residual: ApprovalEngine request-creation/re-execution path still deferred with full admission pipeline
 
 ---
 
@@ -398,12 +398,12 @@ Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test 
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **420** (+29) |
+| **Tests** | 391 | **498** (+107, current incl. post-phase remediation tests) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **47** |
-| **Files changed** | — | **19** (+1,850 lines) |
+| **Fixes total** | — | **47** (Phases A–D) + subsequent remediation commits (E-008, G-009/010/011/012, M-043, L-002, L-004, C-019, A-019, G-007) |
+| **Files changed** | — | **19** (+1,850 lines) for Phases A–D; subsequent commits tracked in git |
