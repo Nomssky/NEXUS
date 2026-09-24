@@ -18,6 +18,12 @@ import (
 // authenticated actor who is an active member of memberBusiness.
 func a6Fixture(t *testing.T, actorID, credential string, memberBusiness string, extraMemberships ...identity.Membership) *Server {
 	t.Helper()
+	return a6FixtureFlags(t, actorID, credential, memberBusiness, true, true, extraMemberships...)
+}
+
+// a6FixtureFlags is a6Fixture with explicit security flag combinations.
+func a6FixtureFlags(t *testing.T, actorID, credential string, memberBusiness string, requireAuth, enforceBiz bool, extraMemberships ...identity.Membership) *Server {
+	t.Helper()
 
 	now := time.Now()
 	engine, err := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
@@ -57,8 +63,8 @@ func a6Fixture(t *testing.T, actorID, credential string, memberBusiness string, 
 	return NewServer(engine, ":0",
 		WithClock(func() time.Time { return now }),
 		WithIdentity(auth, members),
-		WithRequireAuthentication(true),
-		WithEnforceBusinessScope(true),
+		WithRequireAuthentication(requireAuth),
+		WithEnforceBusinessScope(enforceBiz),
 	)
 }
 
@@ -194,6 +200,28 @@ func TestA6SubmitActorMismatchDenied(t *testing.T) {
 	}
 }
 
+// A6: submit with matching actor_id but foreign business_id (knows biz-B) → 403.
+func TestA6SubmitForeignBusinessDenied(t *testing.T) {
+	srv := a6Fixture(t, "nx:human:hank", "hank-secret", "biz-A")
+
+	// Correct authenticated actor, but claims membership in biz-B.
+	body := `{"intent": "cross", "business_id": "biz-B", "actor_id": "nx:human:hank"}`
+	req := httptest.NewRequest("POST", "/api/v1/requests", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	a6AuthHeaders(req, "nx:human:hank", "hank-secret")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for foreign business submit, got %d", w.Code)
+	}
+	var errResp map[string]map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&errResp)
+	if errResp["error"]["category"] != "AUTHORIZATION" {
+		t.Errorf("expected AUTHORIZATION, got %v", errResp["error"]["category"])
+	}
+}
+
 // A6-06: empty membership store → fail-closed deny (403) even with valid credentials.
 func TestA6EmptyMembershipStoreDenied(t *testing.T) {
 	srv := a6Fixture(t, "nx:human:frank", "frank-secret", "" /* no memberships */)
@@ -295,5 +323,101 @@ func TestA6EnforcedWithoutAuthenticatorDenied(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when enforced without authenticator, got %d", w.Code)
+	}
+}
+
+// A6 flag matrix: require_authentication ONLY (enforce_business_scope off).
+// Either flag alone enables full auth + membership on result and SSE.
+func TestA6RequireAuthOnlyResultAndSSE(t *testing.T) {
+	srv := a6FixtureFlags(t, "nx:human:iris", "iris-secret", "biz-A", true, false)
+
+	// Foreign result → 403 (membership still enforced when require_auth alone)
+	req := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-B", nil)
+	a6AuthHeaders(req, "nx:human:iris", "iris-secret")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("require_auth only + foreign result: expected 403, got %d", w.Code)
+	}
+
+	// Foreign SSE → 403
+	sse := httptest.NewRequest("GET", "/events?business_id=biz-B", nil)
+	a6AuthHeaders(sse, "nx:human:iris", "iris-secret")
+	sw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(sw, sse)
+	if sw.Code != http.StatusForbidden {
+		t.Fatalf("require_auth only + foreign SSE: expected 403, got %d", sw.Code)
+	}
+
+	// Missing credential → 401
+	noCred := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-A", nil)
+	nw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(nw, noCred)
+	if nw.Code != http.StatusUnauthorized {
+		t.Fatalf("require_auth only + no cred: expected 401, got %d", nw.Code)
+	}
+
+	// Member of A, own business → passes auth+membership (404 for missing id is fine)
+	ok := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-A", nil)
+	a6AuthHeaders(ok, "nx:human:iris", "iris-secret")
+	ow := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(ow, ok)
+	if ow.Code == http.StatusUnauthorized || ow.Code == http.StatusForbidden {
+		t.Fatalf("require_auth only + member: expected pass auth/membership, got %d", ow.Code)
+	}
+}
+
+// A6 flag matrix: enforce_business_scope ONLY (require_authentication off).
+// Either flag alone enables full auth + membership on result and SSE.
+func TestA6EnforceBizOnlyResultAndSSE(t *testing.T) {
+	srv := a6FixtureFlags(t, "nx:human:jack", "jack-secret", "biz-A", false, true)
+
+	// Foreign result → 403
+	req := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-B", nil)
+	a6AuthHeaders(req, "nx:human:jack", "jack-secret")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("enforce_biz only + foreign result: expected 403, got %d", w.Code)
+	}
+
+	// Foreign SSE → 403
+	sse := httptest.NewRequest("GET", "/events?business_id=biz-B", nil)
+	a6AuthHeaders(sse, "nx:human:jack", "jack-secret")
+	sw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(sw, sse)
+	if sw.Code != http.StatusForbidden {
+		t.Fatalf("enforce_biz only + foreign SSE: expected 403, got %d", sw.Code)
+	}
+
+	// Missing credential → 401 (auth still required: membership needs trusted actor)
+	noCred := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-A", nil)
+	nw := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(nw, noCred)
+	if nw.Code != http.StatusUnauthorized {
+		t.Fatalf("enforce_biz only + no cred: expected 401, got %d", nw.Code)
+	}
+}
+
+// A6 flag matrix: enforce_business_scope ONLY, no authenticator → fail-closed 401.
+func TestA6EnforceBizOnlyWithoutAuthenticatorDenied(t *testing.T) {
+	now := time.Now()
+	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	engine.Start(ctx)
+	defer engine.Stop(ctx)
+
+	srv := NewServer(engine, ":0",
+		WithClock(func() time.Time { return now }),
+		WithEnforceBusinessScope(true),
+		// No WithIdentity — authenticator nil
+	)
+
+	req := httptest.NewRequest("GET", "/api/v1/requests/x?business_id=biz-1", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when enforce_biz only without authenticator, got %d", w.Code)
 	}
 }
