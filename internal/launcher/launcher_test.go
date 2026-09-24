@@ -10,8 +10,10 @@ import (
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
+	"github.com/Nomssky/NEXUS/internal/foundation/security"
 )
 
 func testConfig() config.Config {
@@ -297,5 +299,58 @@ func TestLauncherStopMarksNotReady(t *testing.T) {
 	healthSrv.ReadyHandler().ServeHTTP(w, req)
 	if w.Code == http.StatusOK {
 		t.Error("expected health not-ready after Stop, got 200")
+	}
+}
+
+// TEST-LAUNCH-010: Identity options flow Options → gateway (A6 wiring)
+func TestLauncherIdentityWired(t *testing.T) {
+	cfg := testConfig()
+	log := logging.New(logging.Options{})
+	healthSrv := health.NewServer()
+	life := lifecycle.New(lifecycle.Options{})
+
+	auth := identity.NewLocalAuthenticator()
+	_ = auth.Register("nx:human:alice", security.HashCredential([]byte("secret")), identity.AuthMethodToken)
+	members := identity.NewMembershipSet()
+	_ = members.Add(identity.Membership{
+		IdentityID: "nx:human:alice",
+		BusinessID: "biz-1",
+		Role:       identity.RoleMember,
+		Status:     identity.StatusActive,
+	})
+
+	l := New(Options{
+		Config:                cfg,
+		Logger:                log,
+		Health:                healthSrv,
+		Lifecycle:             life,
+		Addr:                  ":0",
+		Authenticator:         auth,
+		Memberships:           members,
+		RequireAuthentication: true,
+		EnforceBusinessScope:  true,
+	})
+
+	handler := l.Gateway().Handler()
+
+	// Without credentials → 401 (identity enforced)
+	req := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-1", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without credentials, got %d", w.Code)
+	}
+
+	// With valid credentials + membership → passes auth (404 for missing id is fine)
+	req2 := httptest.NewRequest("GET", "/api/v1/requests/any?business_id=biz-1", nil)
+	req2.Header.Set("X-Actor-ID", "nx:human:alice")
+	req2.Header.Set("X-Actor-Credential", "secret")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+	if w2.Code == http.StatusUnauthorized {
+		t.Errorf("expected auth to pass for member, got 401")
+	}
+	if w2.Code == http.StatusForbidden {
+		t.Errorf("expected member to pass membership check, got 403")
 	}
 }

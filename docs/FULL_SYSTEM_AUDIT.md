@@ -75,11 +75,11 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 | ID | Status | File:Line | Finding | Fix / Scope |
 |----|--------|-----------|---------|-------------|
 | **G-001** | **FIXED** | `gateway/server.go:145-167` | Auth middleware `[:18]` vs 16-char literal — never matched; middleware only installed when key non-empty | `Handler()` always wraps `authMiddleware`; `strings.HasPrefix(..., "/api/v1/control/")`; empty key → 403 `CONTROL_DISABLED`; `ConstantTimeCompare`; all auth tests exercise `Handler()` |
-| **G-002** | **MITIGATED** (see residual) | `gateway/server.go:284-313` | `handleGetResult` no authorization — cross-tenant data leakage | `business_id` **required** (400 if omitted); mismatch → 403. **Does NOT prove caller identity** — see A6 |
-| **G-003** | **MITIGATED** (see residual) | `gateway/server.go:320-371` | SSE no business-scope filtering — all events leaked | `business_id` **required** (400 if omitted); consumer drops non-matching/unscoped events. **Filter value is client-asserted** — see A6 |
+| **G-002** | **FIXED** (identity-bound) | `gateway/server.go` `handleGetResult` + `identity.go` | `handleGetResult` no authorization — cross-tenant data leakage | `business_id` **required** (400 if omitted); mismatch → 403; when enforcement on, authenticated actor must be active member of `business_id` via `MembershipSet` (A6) |
+| **G-003** | **FIXED** (identity-bound) | `gateway/server.go` `handleSSE` + `identity.go` | SSE no business-scope filtering — all events leaked | `business_id` **required** (400 if omitted); consumer drops non-matching/unscoped events; when enforcement on, subscriber must be member before stream opens (A6) |
 | **L-001** | **FIXED** | `cmd/nexus/main.go:59-67`, `launcher/launcher.go:45,61` | `controlAPIKey` never wired to gateway | Env `NEXUS_CONTROL_API_KEY` → `launcher.Options.ControlAPIKey` → `gateway.WithControlAPIKey()`; integration tests `TEST-LAUNCH-007/008` |
 
-**Residual R-001 (explicit, blocks multi-business claim):** `business_id` and `actor_id` remain **client-asserted**. G-002/G-003 close the *omission/mismatch* bypass (fail-closed parameters); they are **not** identity-bound tenant authorization. A caller who knows another tenant's `business_id` can still request that scope. Full closure requires binding request identity → `foundation/identity` membership before opening cross-business access (backlog **A6**, gate before multi-business production).
+**Residual R-001 — CLOSED by A6:** `business_id` / `actor_id` are no longer trusted solely as client claims when identity enforcement is on (`security.require_authentication` or `security.enforce_business_scope`). The gateway authenticates the actor (`X-Actor-ID` + `X-Actor-Credential` or Basic auth), validates membership via `foundation/identity.MembershipSet.IsMember`, requires submit `actor_id` to match the authenticated identity, and fails closed on empty/missing membership stores. Multi-business production may open only after credentials and memberships are provisioned (empty authenticator/membership → deny).
 
 ### P1 — High (13 findings)
 
@@ -196,8 +196,8 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 ## 6. Risks and Deferred Items
 
 ### Cannot Prove Safe
-- **G-002/G-003**: Cross-tenant data leakage via results and SSE. No authorization enforcement anywhere in the gateway.
-- **I-032**: Identity/authentication/authorization packages are fully implemented but **zero enforcement** at any runtime entry point.
+- ~~**G-002/G-003**: Cross-tenant data leakage via results and SSE.~~ **CLOSED by A6** — identity-bound membership at gateway when enforcement is on.
+- ~~**I-032**: Identity/authentication/authorization packages are fully implemented but **zero enforcement** at any runtime entry point.~~ **CLOSED by A6** — enforced on scoped gateway paths via `Handler()`.
 - **E-004**: REQUIRE_APPROVAL and ESCALATE governance outcomes silently allow execution.
 
 ### Deferred (Requires Architecture Decision)
@@ -289,16 +289,16 @@ go.mod unchanged (zero deps confirmed)
 
 ## 9. Prioritized Remediation Plan
 
-### Phase A: Security — P0 ⚠️ MITIGATED (identity binding A6 still open)
+### Phase A: Security — P0 ✅ COMPLETE (identity binding A6 done)
 
 | Order | Finding | Fix | Files | Status |
 |-------|---------|-----|-------|--------|
-| A1 | G-001 | Always-on `Handler()` + `strings.HasPrefix`; empty key → 403 fail-closed; auth tests via `Handler()` | `gateway/server.go:145-167` | ✅ FIXED + TESTED |
-| A2 | L-001 | Env `NEXUS_CONTROL_API_KEY` → launcher Options → gateway | `cmd/nexus/main.go`, `launcher/launcher.go:45,61` | ✅ FIXED + TESTED |
-| A3 | G-002 | Fail-closed `business_id` required on `handleGetResult` (400 omit / 403 mismatch) | `gateway/server.go:284-313` | ✅ MITIGATED + TESTED |
-| A4 | G-003 | Fail-closed `business_id` required on SSE; filter always active | `gateway/server.go:320-371` | ✅ MITIGATED + TESTED |
+| A1 | G-001 | Always-on `Handler()` + `strings.HasPrefix`; empty key → 403 fail-closed; auth tests via `Handler()` | `gateway/server.go` | ✅ FIXED + TESTED |
+| A2 | L-001 | Env `NEXUS_CONTROL_API_KEY` → launcher Options → gateway | `cmd/nexus/main.go`, `launcher/launcher.go` | ✅ FIXED + TESTED |
+| A3 | G-002 | Fail-closed `business_id` required on `handleGetResult` (400 omit / 403 mismatch) + A6 membership | `gateway/server.go`, `gateway/identity.go` | ✅ FIXED + TESTED |
+| A4 | G-003 | Fail-closed `business_id` required on SSE; filter always active + A6 membership at subscribe | `gateway/server.go`, `gateway/identity.go` | ✅ FIXED + TESTED |
 | A5 | T-001+T-002 | Security regression tests via production `Handler()` (auth, empty-key, cross-tenant, fail-closed) | `gateway/server_test.go`, `launcher_test.go` | ✅ TESTS |
-| A6 | R-001 residual | **Trusted identity→business binding** (`foundation/identity` at gateway boundary) — required before claiming multi-tenant authorization or opening cross-business access | `gateway` + `identity` | ⛔ **GATE before multi-business** |
+| A6 | R-001 residual | **Trusted identity→business binding** (`foundation/identity` at gateway boundary) — auth middleware, membership checks, submit actor match, empty-store deny; wired launcher/main from security flags | `gateway/identity.go`, `launcher`, `cmd/nexus` | ✅ FIXED + TESTED (A6-01..07) |
 
 ### Phase B: Correctness — P1 ✅ COMPLETE
 
@@ -368,13 +368,13 @@ go.mod unchanged (zero deps confirmed)
 
 **All 4 phases of remediation COMPLETE.**
 
-### Phase A — Security (P0): 1 FIXED, 2 MITIGATED, 1 FIXED
+### Phase A — Security (P0): ALL 4 FIXED (identity-bound)
 1. ✅ **G-001 FIXED** — Auth middleware `strings.HasPrefix` (was broken `[:18]`)
-2. ⚠️ **G-002 MITIGATED** — Result authorization: `business_id` **required** (400 omit / 403 mismatch); **not identity-bound** (R-001 / A6)
-3. ⚠️ **G-003 MITIGATED** — SSE business-scope filtering: `business_id` **required**, filter always active; **client-asserted scope** (R-001 / A6)
+2. ✅ **G-002 FIXED** — Result authorization: `business_id` required + A6 identity→membership binding when enforcement on
+3. ✅ **G-003 FIXED** — SSE business-scope filtering: `business_id` required + A6 membership check at subscribe
 4. ✅ **L-001 FIXED** — API key wired from launcher Options (`NEXUS_CONTROL_API_KEY`) to gateway
 
-**⛔ A6 gate:** Multi-business production remains blocked until identity binding lands. See issue #43.
+**A6 (issue #43):** Identity binding implemented on scoped gateway paths (`submit`, `result`, `SSE`). Multi-business production still requires provisioning credentials + memberships — empty authenticator/membership fails closed.
 
 ### Phase B — Correctness (P1): ALL 10 FIXED
 1. ✅ Shutdown timeout (`context.WithTimeout`)

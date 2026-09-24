@@ -27,6 +27,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 )
 
@@ -38,6 +39,14 @@ type Server struct {
 	now           func() time.Time
 	controlAPIKey string
 	corrSeq       atomic.Int64 // monotonic sequence for correlation IDs
+
+	// Identity-bound authorization (A6). Enforcement is active when either
+	// requireAuth or enforceBusinessScope is set; both fail closed if the
+	// corresponding component is missing at request time.
+	authenticator        identity.Authenticator
+	memberships          *identity.MembershipSet
+	requireAuth          bool
+	enforceBusinessScope bool
 
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
@@ -139,11 +148,12 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 	}
 }
 
-// Handler returns the production HTTP handler: every route wrapped with auth
-// middleware. Start() installs this on the server; security regression tests
-// must exercise this (not raw Mux()) so the real request path is covered.
+// Handler returns the production HTTP handler: every route wrapped with
+// identity binding (when enforced) and auth middleware. Start() installs this
+// on the server; security regression tests must exercise this (not raw Mux())
+// so the real request path is covered.
 func (s *Server) Handler() http.Handler {
-	return s.authMiddleware(s.mux)
+	return s.identityMiddleware(s.authMiddleware(s.mux))
 }
 
 // authMiddleware checks X-API-Key on control endpoints.
@@ -246,6 +256,26 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Identity-bound submit path (A6): actor_id must match the authenticated
+	// identity, and that identity must be an active member of business_id.
+	if s.identityEnforced() {
+		res, ok := actorFromContext(r.Context())
+		if !ok {
+			s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			return
+		}
+		if req.ActorID != res.IdentityID {
+			s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+				"access denied: actor_id does not match authenticated identity")
+			return
+		}
+		if err := s.authorizeMembership(res.IdentityID, req.BusinessID); err != nil {
+			s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+				"access denied: actor is not a member of the requested business")
+			return
+		}
+	}
+
 	// Extract correlation ID from header or generate one
 	corrID := r.Header.Get("X-Correlation-ID")
 	if corrID == "" {
@@ -281,11 +311,18 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 // Without it the request is rejected (400) — callers cannot bypass the scope
 // check by omitting the parameter. With it, callers can only retrieve results
 // belonging to their own business scope (403 on mismatch).
+// When identity enforcement is on, the authenticated actor must also be an
+// active member of business_id (A6) — client-asserted scope alone is not enough.
 func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	// Authorization scope is mandatory — no unscoped result access.
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
+	// Identity-bound membership check (A6): authenticated actor ∈ business_id.
+	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
 		return
 	}
 
@@ -317,11 +354,18 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 // matching the business scope are delivered; unscoped events (empty BusinessID)
 // are never streamed to a scoped client. Requests without business_id are
 // rejected (400) — scoping cannot be bypassed by omitting the parameter.
+// When identity enforcement is on, the subscriber must be an active member of
+// business_id before the stream opens (A6); foreign scopes are denied at subscribe.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Authorization scope is mandatory — no unscoped event stream.
 	businessFilter := r.URL.Query().Get("business_id")
 	if businessFilter == "" {
 		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
+	// Identity-bound membership check (A6) before opening the stream.
+	if _, stopped := s.requireActorMembership(w, r, businessFilter); stopped {
 		return
 	}
 

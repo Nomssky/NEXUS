@@ -16,6 +16,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
 	"github.com/Nomssky/NEXUS/internal/gateway"
@@ -43,6 +44,14 @@ type Options struct {
 	// ControlAPIKey is the API key required for /api/v1/control/* endpoints.
 	// If empty, control endpoints are disabled (403 fail-closed), not open.
 	ControlAPIKey string
+
+	// Identity-bound authorization (A6). When RequireAuthentication or
+	// EnforceBusinessScope is true, Authenticator and Memberships must be set;
+	// the gateway fails closed at request time if they are missing.
+	Authenticator         identity.Authenticator
+	Memberships           *identity.MembershipSet
+	RequireAuthentication bool
+	EnforceBusinessScope  bool
 }
 
 // New creates a new launcher with all components wired.
@@ -58,7 +67,12 @@ func New(opts Options) *Launcher {
 			initErr: err,
 		}
 	}
-	gw := gateway.NewServer(engine, opts.Addr, gateway.WithControlAPIKey(opts.ControlAPIKey))
+	gw := gateway.NewServer(engine, opts.Addr,
+		gateway.WithControlAPIKey(opts.ControlAPIKey),
+		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
+		gateway.WithRequireAuthentication(opts.RequireAuthentication),
+		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
+	)
 
 	return &Launcher{
 		cfg:     opts.Config,
