@@ -123,7 +123,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | **E-011** | FIXED | `executor/executor_test.go` | No test for provider failure path | `TestProviderFailurePath` + `TestProviderSuccessPath` (Phase C5) |
 | **A-019** | FIXED | `governance/approval.go:60-61` | Self-approval check is weak at RequestApproval stage | Invariant lives in `Approve()` (`SelfApprovalProhibited && approver == requester`); `RequestApproval` is identity prerequisite only; docs clarified + `a019_test.go` (commit 8a5c1d1) |
 | **I-032** | FIXED | `identity/` + `gateway/` | Identity primitives not wired into any runtime gate | CLOSED by A6: `identityMiddleware` in production `Handler()`, membership checks on scoped paths when enforcement on (matches Section 6) |
-| **M-038** | CONFIRMED | `memory/memory.go:141-189` | Retrieve() holds write lock for read path (performance concern) | Still true (Lock used); accepted risk in Section 6 — performance concern, correctness fine |
+| **M-038** | CONFIRMED | `memory/memory.go:141-189` | Retrieve() holds write lock for read path (performance concern) | Accepted risk (Section 6): exclusive lock retained intentionally — Retrieve() mutates AccessCount/LastAccessed (`memory.go:196-197`); counterfactual RLock() produced data races + lost updates and was reverted. Remaining concern is serialized read-path performance only; correctness covered by `m038_test.go` (TEST-M8-022/023, commit c7dfe65) |
 | **M-043** | FIXED | `event/membus.go:131-158` | TOCTOU race on unsubscribe during dispatch | Unsubscribe marks closed before removal; Dispatch re-checks `begin()` immediately before invoke; covered by `m043_test.go` (commit ba28e72) |
 
 ### P3 — Low (18 findings)
@@ -206,7 +206,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 - Condition evaluation in governance (currently a no-op) — documented deferral
 
 ### Accepted Risks
-- Memory write lock for reads (performance concern, correctness is fine)
+- Memory write lock for reads (performance concern, correctness is fine) — verified accepted risk: exclusive lock retained to protect Retrieve()'s AccessCount/LastAccessed mutations (counterfactual RLock() raced and lost updates, reverted); remaining concern is serialized read-path performance; covered by `m038_test.go`
 - SHA-256 for credential hashing (documented limitation, not for human passwords)
 - Deterministic model routing (intentional failover, not load balancing)
 
