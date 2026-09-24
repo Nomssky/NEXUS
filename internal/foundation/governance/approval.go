@@ -54,11 +54,16 @@ func NewApprovalEngineWithClock(now func() time.Time) *ApprovalEngine {
 }
 
 // RequestApproval creates an approval request for a governance decision.
-// Returns an error if self-approval is attempted.
+// When SelfApprovalProhibited is set, a non-empty requester identity is
+// required so Approve() can later enforce approver != requester (A-019:
+// this stage is an identity prerequisite, not the self-approval gate —
+// the actual invariant lives in Approve).
 func (ae *ApprovalEngine) RequestApproval(decision Decision, req Request, config ApprovalConfig) (*ApprovalRequest, error) {
 	now := ae.now()
 
-	// No self-approval: the requester cannot approve their own action
+	// Identity prerequisite for self-approval prevention (A-019): when
+	// SelfApprovalProhibited is set, Approve() compares approver to this
+	// requester — empty identity would make that comparison meaningless.
 	if config.SelfApprovalProhibited && req.Actor == "" {
 		return nil, fmt.Errorf("self-approval prohibited: requester identity required")
 	}
