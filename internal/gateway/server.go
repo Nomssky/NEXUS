@@ -14,9 +14,12 @@
 //   - Governance checked at API boundary
 //   - No internal details leaked in error responses
 //   - Unverified client actor_id is never trusted as request identity (G-009)
+//   - One-shot responses and each SSE event frame are size-bounded (G-010);
+//     SSE streams remain long-lived (no duration/cumulative byte cap)
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -30,6 +33,16 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
+)
+
+// G-010 response bounds. Defaults match the gateway's existing 1 MB
+// request-body (MaxBytesReader) and MaxHeaderBytes limits so one size
+// convention applies across the edge. SSE connection duration and cumulative
+// stream bytes are intentionally unbounded — only each individual event frame
+// is capped, because the architecture intends long-lived streams.
+const (
+	defaultMaxResponseBytes = 1 << 20
+	defaultMaxSSEEventBytes = 1 << 20
 )
 
 // Server is the HTTP Gateway server.
@@ -48,6 +61,12 @@ type Server struct {
 	memberships          *identity.MembershipSet
 	requireAuth          bool
 	enforceBusinessScope bool
+
+	// G-010: maxResponseBytes caps one-shot JSON response bodies (GET result).
+	// maxSSEEventBytes caps each individual SSE event frame; it does not bound
+	// stream duration or cumulative stream size.
+	maxResponseBytes int
+	maxSSEEventBytes int
 
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
@@ -68,13 +87,36 @@ func WithControlAPIKey(key string) ServerOption {
 	return func(s *Server) { s.controlAPIKey = key }
 }
 
+// WithMaxResponseBytes overrides the one-shot JSON response size cap (G-010).
+// n <= 0 is ignored and keeps the default.
+func WithMaxResponseBytes(n int) ServerOption {
+	return func(s *Server) {
+		if n > 0 {
+			s.maxResponseBytes = n
+		}
+	}
+}
+
+// WithMaxSSEEventBytes overrides the per-event SSE frame cap (G-010).
+// It does not bound stream duration or cumulative stream bytes.
+// n <= 0 is ignored and keeps the default.
+func WithMaxSSEEventBytes(n int) ServerOption {
+	return func(s *Server) {
+		if n > 0 {
+			s.maxSSEEventBytes = n
+		}
+	}
+}
+
 // NewServer creates a new HTTP Gateway server.
 func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s := &Server{
-		engine:     engine,
-		mux:        http.NewServeMux(),
-		now:        time.Now,
-		sseClients: make(chan struct{}, 10),
+		engine:           engine,
+		mux:              http.NewServeMux(),
+		now:              time.Now,
+		maxResponseBytes: defaultMaxResponseBytes,
+		maxSSEEventBytes: defaultMaxSSEEventBytes,
+		sseClients:       make(chan struct{}, 10),
 	}
 
 	for _, opt := range opts {
@@ -351,8 +393,22 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// G-010: bound one-shot response size. Encode to a buffer first so an
+	// oversized result is rejected before any body bytes are written (no
+	// truncated JSON). Default cap matches the 1 MB request-body limit.
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(result); err != nil {
+		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "failed to encode result")
+		return
+	}
+	if buf.Len() > s.maxResponseBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge, "RESOURCE_LIMIT",
+			fmt.Sprintf("response exceeds size limit of %d bytes", s.maxResponseBytes))
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	w.Write(buf.Bytes())
 }
 
 // handleSSE streams events via Server-Sent Events.
@@ -404,6 +460,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			return nil // skip events from other businesses and unscoped events
 		}
 		data, _ := json.Marshal(e)
+		// G-010: bound each SSE event frame before writing. Oversized events
+		// are dropped without tearing down the stream — connection lifetime
+		// and cumulative stream bytes remain unbounded (long-lived by design).
+		// Frame layout: "event: " + type + "\ndata: " + json + "\n\n".
+		const frameOverhead = len("event: \ndata: \n\n")
+		if frameOverhead+len(e.Type)+len(data) > s.maxSSEEventBytes {
+			return nil
+		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)
 		flusher.Flush()
 		return nil
