@@ -13,6 +13,7 @@
 //   - Correlation ID propagated from HTTP headers
 //   - Governance checked at API boundary
 //   - No internal details leaked in error responses
+//   - Unverified client actor_id is never trusted as request identity (G-009)
 package gateway
 
 import (
@@ -282,10 +283,14 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 		corrID = fmt.Sprintf("api-%d-%d", s.now().UnixNano(), s.corrSeq.Add(1))
 	}
 
+	// G-009: bind only a trusted actor identity. When enforcement is off the
+	// client-asserted actor_id above is unauthenticated and is discarded.
+	actorID := s.submitActorID(req.ActorID)
+
 	// Create core request
 	coreReq := &core.Request{
 		ID:          corrID,
-		Context:     core.NewRequestContext(corrID, req.BusinessID, req.ActorID),
+		Context:     core.NewRequestContext(corrID, req.BusinessID, actorID),
 		Intent:      req.Intent,
 		Priority:    req.Priority,
 		Constraints: req.Constraints,
@@ -303,6 +308,7 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 		"request_id":     corrID,
 		"correlation_id": corrID,
 		"status":         "accepted",
+		"actor_id":       actorID,
 	})
 }
 

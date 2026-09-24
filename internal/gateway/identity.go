@@ -11,6 +11,7 @@
 //   - Enforcement on + actor not an active member of business_id → 403
 //   - Enforcement on + empty/missing membership store → 403
 //   - Submit actor_id must equal the authenticated identity → 403
+//   - Enforcement off + client actor_id → untrusted; fixed marker bound (G-009)
 package gateway
 
 import (
@@ -21,6 +22,11 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 )
+
+// unauthenticatedActorID is the fixed identity bound to gateway requests when
+// identity enforcement is off (G-009). Client-asserted actor_id is never
+// trusted as a verified identity without authentication.
+const unauthenticatedActorID = "unauthenticated"
 
 // requestActorKey stores the AuthResult for an authenticated request.
 type requestActorKey struct{}
@@ -50,6 +56,22 @@ func WithEnforceBusinessScope(v bool) ServerOption {
 // identityEnforced reports whether identity-bound authorization is active.
 func (s *Server) identityEnforced() bool {
 	return s.requireAuth || s.enforceBusinessScope
+}
+
+// submitActorID resolves the actor identity bound to a submit request (G-009).
+//
+// When enforcement is on, handleSubmitRequest has already verified the
+// client-supplied actor_id against the authenticated AuthResult (A6); that
+// verified value is bound. When enforcement is off there is no trusted
+// identity (identity middleware is inert, AuthResult is never set), so the
+// claimed value is discarded and a fixed marker is bound — unauthenticated
+// callers cannot spoof governance Actor, objective Owner, or executor
+// attribution.
+func (s *Server) submitActorID(claimedActorID string) string {
+	if s.identityEnforced() {
+		return claimedActorID
+	}
+	return unauthenticatedActorID
 }
 
 // isScopedAPIPath reports whether the path carries business-scoped data
