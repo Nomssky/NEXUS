@@ -38,7 +38,13 @@ type Engine struct {
 	now    func() time.Time
 
 	// Foundation components
-	eventBus     *event.MemBus
+	eventBus *event.MemBus
+	// store is the externally exposed persistent store (C-019).
+	// It is intentionally NOT consumed by engine runtime: request results
+	// use the bounded in-memory results map, and knowledge/memory uses
+	// memoryStore. External consumers access it via Store(); configure
+	// durable FileStore via WithPersistence, default MemStore otherwise.
+	// Ownership: external API surface only — never engine-internal state.
 	store        store.Store
 	healthServer *health.Server
 
@@ -97,7 +103,8 @@ func WithClock(now func() time.Time) EngineOption {
 
 // WithPersistence configures the engine to use a FileStore rooted at dir.
 // Records survive engine restarts. Returns an error if the directory
-// cannot be created or loaded.
+// cannot be created or loaded. This configures the external Store()
+// surface only — engine runtime does not auto-persist to it (C-019).
 func WithPersistence(dir string) EngineOption {
 	return func(e *Engine) {
 		fs, err := store.NewFileStoreWithClock(dir, e.now)
@@ -387,7 +394,10 @@ func (e *Engine) EventBus() *event.MemBus {
 	return e.eventBus
 }
 
-// Store returns the engine's persistent store.
+// Store returns the engine's persistent store for external consumers.
+// Engine runtime does not read or write this store — it is an
+// external-facing API (C-019), configured by WithPersistence or
+// defaulting to MemStore. Never nil after NewEngine succeeds.
 func (e *Engine) Store() store.Store {
 	return e.store
 }
