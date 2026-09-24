@@ -271,8 +271,11 @@ func (s *Server) Stop(ctx context.Context) error {
 }
 
 // Mux returns the raw HTTP handler for testing purposes only.
-// WARNING: This handler does NOT include auth middleware. Use only in tests.
-// Production code must use the handler returned by Start() which includes auth.
+//
+// Deprecated: Use Handler() instead. Mux() excludes auth/identity middleware;
+// production code must never serve it. Start() installs Handler() on the HTTP
+// server; security tests must exercise Handler() to cover the real request path.
+// Calling Mux().ServeHTTP in production would bypass control-plane auth.
 func (s *Server) Mux() http.Handler {
 	return s.mux
 }
