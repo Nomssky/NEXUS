@@ -295,12 +295,19 @@ func (e *Engine) Resume(ctx context.Context) error {
 
 // SubmitRequest submits a new request to the engine for processing.
 func (e *Engine) SubmitRequest(req *Request) error {
+	// Capture lifecycle state under the lock (C-018): e.status is written
+	// by Stop()/Resume() under e.mu, and e.shutdownCh is rewritten by
+	// Resume() under e.mu — reading either after RUnlock races with those
+	// writers (processRequests uses the same capture pattern for
+	// shutdownCh). The admission sequence status-check → Accept → send
+	// remains a documented non-atomic window (see below).
 	e.mu.RLock()
-	if e.status != lifecycle.StateRunning {
-		e.mu.RUnlock()
-		return fmt.Errorf("engine not running (status: %s)", e.status)
-	}
+	status := e.status
+	shutdownCh := e.shutdownCh
 	e.mu.RUnlock()
+	if status != lifecycle.StateRunning {
+		return fmt.Errorf("engine not running (status: %s)", status)
+	}
 
 	// Backpressure gate: reject if queue is full.
 	// Semantics (C-018): Accept() counts accepted-but-not-yet-dequeued requests.
@@ -315,7 +322,7 @@ func (e *Engine) SubmitRequest(req *Request) error {
 	select {
 	case e.requests <- req:
 		return nil
-	case <-e.shutdownCh:
+	case <-shutdownCh:
 		e.backpressure.Release()
 		return fmt.Errorf("engine shutting down")
 	}
