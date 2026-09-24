@@ -8,9 +8,30 @@ import (
 )
 
 // subscriber wraps a Consumer with a unique ID for comparison.
+// The closed flag gates callback entry so Dispatch never begins Handle after
+// Unsubscribe has returned for this subscriber (M-043).
 type subscriber struct {
 	id       int
 	consumer Consumer
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// begin reports whether a new Handle invocation may start.
+// Returns false once Unsubscribe has marked this subscriber closed.
+func (s *subscriber) begin() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.closed
+}
+
+// markClosed prevents any future begin() from succeeding.
+// Must not be called while holding s.mu from another path that could deadlock.
+func (s *subscriber) markClosed() {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 // MemBus is an in-memory event bus with priority queue and dedup.
@@ -124,6 +145,15 @@ func (b *MemBus) Unsubscribe(subscriptionID string) error {
 		return nil // not found
 	}
 
+	// Mark closed first so any Dispatch that already snapshotted this
+	// subscriber will fail begin() and skip the callback (M-043).
+	for _, s := range b.allSubs {
+		if s.id == subID {
+			s.markClosed()
+			break
+		}
+	}
+
 	// Remove from all type subscriptions
 	for et, subs := range b.consumers {
 		for i, s := range subs {
@@ -165,6 +195,11 @@ func (b *MemBus) Dispatch() (int, error) {
 		b.mu.RUnlock()
 
 		for _, sub := range consumers {
+			// M-043: re-check lifecycle immediately before invoking; skip if
+			// Unsubscribe completed after this snapshot was taken.
+			if !sub.begin() {
+				continue
+			}
 			if err := sub.consumer.Handle(event); err != nil {
 				b.mu.Lock()
 				b.attempts[event.ID]++
