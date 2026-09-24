@@ -26,8 +26,10 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -55,6 +57,16 @@ type Server struct {
 	now           func() time.Time
 	controlAPIKey string
 	corrSeq       atomic.Int64 // monotonic sequence for correlation IDs
+
+	// L-002: deterministic startup barrier. readyCh is closed once the HTTP
+	// listener is successfully bound (net.Listen succeeded), before Serve
+	// begins accepting. Callers must not treat startup as successful until
+	// Ready() fires or Start returns a definitive error.
+	readyCh   chan struct{}
+	readyOnce sync.Once
+	// listenFunc allows tests to inject deterministic listen behavior
+	// (delayed failure). nil means net.Listen.
+	listenFunc func(network, addr string) (net.Listener, error)
 
 	// Identity-bound authorization (A6). Enforcement is active when either
 	// requireAuth or enforceBusinessScope is set; both fail closed if the
@@ -110,6 +122,12 @@ func WithMaxSSEEventBytes(n int) ServerOption {
 	}
 }
 
+// WithListenFunc injects a custom listener factory (L-002 test seam).
+// Production code leaves this nil and uses net.Listen.
+func WithListenFunc(fn func(network, addr string) (net.Listener, error)) ServerOption {
+	return func(s *Server) { s.listenFunc = fn }
+}
+
 // NewServer creates a new HTTP Gateway server.
 func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s := &Server{
@@ -119,6 +137,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		maxResponseBytes: defaultMaxResponseBytes,
 		maxSSEEventBytes: defaultMaxSSEEventBytes,
 		sseClients:       make(chan struct{}, 10),
+		readyCh:          make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -152,7 +171,12 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	return s
 }
 
-// Start starts the HTTP server.
+// Start starts the HTTP server. It blocks until the server stops.
+//
+// L-002 deterministic startup barrier: Start binds the listener via net.Listen
+// (or an injected listenFunc) before serving. On successful bind it closes
+// Ready(); on bind failure it returns the error without closing Ready().
+// Callers must wait for Ready() or a non-nil error — never a timing window.
 func (s *Server) Start(ctx context.Context) error {
 	// Start event dispatch goroutine (H3 fix: SSE never receives events)
 	go s.dispatchLoop(ctx)
@@ -168,10 +192,28 @@ func (s *Server) Start(ctx context.Context) error {
 		s.server.Shutdown(shutdownCtx)
 	}()
 
-	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listen := s.listenFunc
+	if listen == nil {
+		listen = net.Listen
+	}
+	ln, err := listen("tcp", s.server.Addr)
+	if err != nil {
+		return fmt.Errorf("gateway listen: %w", err)
+	}
+	// Listener established — signal ready before Serve (app.go pattern).
+	s.readyOnce.Do(func() { close(s.readyCh) })
+
+	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("gateway server error: %w", err)
 	}
 	return nil
+}
+
+// Ready returns a channel closed once the HTTP listener is successfully
+// bound. It is the deterministic startup signal for L-002; callers must not
+// treat startup as successful until Ready fires or Start returns an error.
+func (s *Server) Ready() <-chan struct{} {
+	return s.readyCh
 }
 
 // dispatchLoop periodically dispatches events from the MemBus so that

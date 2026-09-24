@@ -52,6 +52,10 @@ type Options struct {
 	Memberships           *identity.MembershipSet
 	RequireAuthentication bool
 	EnforceBusinessScope  bool
+
+	// GatewayOptions are passed through to the gateway server (L-002 test
+	// seam for deterministic listen behavior). Nil/empty in production.
+	GatewayOptions []gateway.ServerOption
 }
 
 // New creates a new launcher with all components wired.
@@ -67,12 +71,14 @@ func New(opts Options) *Launcher {
 			initErr: err,
 		}
 	}
-	gw := gateway.NewServer(engine, opts.Addr,
+	gwOpts := []gateway.ServerOption{
 		gateway.WithControlAPIKey(opts.ControlAPIKey),
 		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
-	)
+	}
+	gwOpts = append(gwOpts, opts.GatewayOptions...)
+	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)
 
 	return &Launcher{
 		cfg:     opts.Config,
@@ -86,6 +92,11 @@ func New(opts Options) *Launcher {
 }
 
 // Start starts the Core Runtime and HTTP Gateway.
+//
+// L-002 deterministic startup barrier: Start does not return success until
+// the gateway HTTP listener is established (gateway.Ready closed) or a
+// definitive startup failure is observed. There is no timing window during
+// which a gateway startup error can be silently lost.
 func (l *Launcher) Start(ctx context.Context) error {
 	if l.initErr != nil {
 		return fmt.Errorf("initialization failed: %w", l.initErr)
@@ -97,7 +108,8 @@ func (l *Launcher) Start(ctx context.Context) error {
 	}
 	l.log.Info("core engine started", logging.Fields{})
 
-	// Start the HTTP gateway — capture error for propagation
+	// Start the HTTP gateway — capture error for propagation. The goroutine
+	// outlives this function so post-startup runtime errors are still logged.
 	gwErr := make(chan error, 1)
 	go func() {
 		if err := l.gateway.Start(ctx); err != nil && err != http.ErrServerClosed {
@@ -109,14 +121,28 @@ func (l *Launcher) Start(ctx context.Context) error {
 		close(gwErr)
 	}()
 
-	// Brief wait to detect immediate startup failures (e.g., port in use)
+	// Deterministic barrier: wait for listener established (Ready) or a
+	// definitive startup failure — never an arbitrary timer.
 	select {
 	case err := <-gwErr:
 		if err != nil {
 			return fmt.Errorf("gateway start: %w", err)
 		}
-	case <-time.After(100 * time.Millisecond):
-		// Gateway started successfully (or is still starting)
+		// Start exited without error — check whether ready was established
+		// (race with close) before treating as success.
+		select {
+		case <-l.gateway.Ready():
+			// Ready won the race; treat as success.
+		default:
+			return fmt.Errorf("gateway start: exited before ready")
+		}
+	case <-l.gateway.Ready():
+		// Listener bound — startup barrier satisfied.
+	case <-ctx.Done():
+		// Cancellation during startup: wait for gateway goroutine cleanup,
+		// then report cancellation. No goroutine is left blocked here.
+		<-gwErr
+		return ctx.Err()
 	}
 
 	l.log.Info("gateway started", logging.Fields{
