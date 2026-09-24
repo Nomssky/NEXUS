@@ -90,7 +90,7 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 | **G-006** | CONFIRMED | `gateway/server.go:367-378` | Resume does not pre-check engine state. Inconsistent with pause handler. | Inconsistent API |
 | **G-007** | CONFIRMED | `gateway/server.go:157-159` | `Mux()` returns raw mux without auth middleware. Exported function can bypass auth if misused. | Auth bypass vector |
 | **G-008** | CONFIRMED | `gateway/server.go:108-111` | `Shutdown(context.Background())` has no timeout. SSE handlers can hang indefinitely. | Hang on shutdown |
-| **E-004** | CONFIRMED | `executor/executor.go:372` | `REQUIRE_APPROVAL` and `ESCALATE` governance outcomes are treated as "allow" — executor does not block or submit to ApprovalEngine. | Governance bypass |
+| **E-004** | FIXED | `executor/executor.go:318-341` | `REQUIRE_APPROVAL` returns `pending_approval` and `ESCALATE` returns `escalated` before handler dispatch — no silent allow. Covered by TEST-EXEC-011/012. Residual: ApprovalEngine not wired (no approval-request creation / re-execution path) — deferred with full admission pipeline. | Governance bypass closed; approval workflow integration residual |
 | **M-042** | CONFIRMED | `event/membus.go:177-191` | Wildcard + type-specific subscriber receives duplicate deliveries. | Duplicate event processing |
 | **M-044** | CONFIRMED | `event/membus.go:53-58` | Dedup map grows indefinitely — never cleaned. Unbounded memory leak in long-running processes. | Memory exhaustion |
 | **L-002** | PARTIAL | `launcher/launcher.go:86-106` | Gateway start error only detected within 100 ms window — not deterministic full startup barrier. | Silent failure mode (improved, not closed) |
@@ -198,7 +198,7 @@ The most critical issues are in the **gateway layer**: broken auth middleware (o
 ### Cannot Prove Safe
 - ~~**G-002/G-003**: Cross-tenant data leakage via results and SSE.~~ **CLOSED by A6** — identity-bound membership at gateway when enforcement is on.
 - ~~**I-032**: Identity/authentication/authorization packages are fully implemented but **zero enforcement** at any runtime entry point.~~ **CLOSED by A6** — enforced on scoped gateway paths via `Handler()`.
-- **E-004**: REQUIRE_APPROVAL and ESCALATE governance outcomes silently allow execution.
+- ~~**E-004**: REQUIRE_APPROVAL and ESCALATE governance outcomes silently allow execution.~~ **CLOSED** — executor blocks both outcomes pre-dispatch (TEST-EXEC-011/012); ApprovalEngine wiring remains a deferred admission-pipeline item.
 
 ### Deferred (Requires Architecture Decision)
 - Identity entity schema (contract defines, code doesn't materialize) — needs milestone planning
@@ -305,7 +305,7 @@ go.mod unchanged (zero deps confirmed)
 | Order | Finding | Fix | Files | Status |
 |-------|---------|-----|-------|--------|
 | B1 | G-008 | Use `context.WithTimeout` in shutdown goroutine | `gateway/server.go:108` | ✅ FIXED |
-| B2 | E-004 | Handle REQUIRE_APPROVAL/ESCALATE in executor | `executor/executor.go:364` | ✅ FIXED + TESTED |
+| B2 | E-004 | Handle REQUIRE_APPROVAL/ESCALATE in executor (block before handler; status `pending_approval`/`escalated`) | `executor/executor.go:318-341` | ✅ FIXED + TESTED (TEST-EXEC-011/012) |
 | B3 | M-042 | Deduplicate wildcard + type-specific consumers in MemBus | `event/membus.go:177` | ✅ FIXED |
 | B4 | M-044 | Add FIFO eviction to dedup map (max 10K) | `event/membus.go:23,53` | ✅ FIXED |
 | B5 | G-004 | Fix `RequestCount` to use `executed` counter | `gateway/server.go:337` | ✅ FIXED |
