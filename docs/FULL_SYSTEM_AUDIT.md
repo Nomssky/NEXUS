@@ -107,7 +107,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | **C-005** | FIXED | `core/chain.go:218-241` | StepModel/StepTool/StepVerify are phantom audit entries with fabricated outcomes | Phantom model/tool entries no longer fabricated; verify reflects actual outcome (Phase D12); TEST-CORE-038 |
 | **C-009** | FIXED | `core/chain.go:412-447` | `chainError` never emits failure event to event bus | `chainError` emits `chain.failed` (Phase D23); TEST-CORE-042 |
 | **C-010** | FIXED | `core/chain.go:267` | `chain.completed` emitted on execution failure but not on pre-execution failure | Terminal event reflects status: failures emit `chain.failed` (Phase D24) |
-| **C-018** | CONFIRMED | `core/engine.go:292-303` | Backpressure Accept/channel send not atomic; count temporarily inflated | Semantics documented as intentional (over-count errs safe); Phase D29 DOCUMENTED — code still non-atomic |
+| **C-018** | CONFIRMED | `core/engine.go:292-303` | Backpressure Accept/channel send not atomic; count temporarily inflated | Semantics documented as intentional (over-count errs safe); Phase D29 DOCUMENTED — Accept→send window still non-atomic, so C-018 stays CONFIRMED. A separate lifecycle data race found later (Stop/Resume writes racing SubmitRequest's `status` read) was fixed in `71ea4145c2850cebb60521309d9eddf691c3c6da` (`fix(core): synchronize request admission lifecycle reads`), covered by `c018_test.go` (TEST-CORE-043/044) |
 | **C-019** | FIXED | `core/engine.go:42,137-138` | Store initialized but never used internally (dead code) | Resolved as intentional external API: `Store()`/`WithPersistence` documented as external surface, never engine-internal state; covered by `c019_test.go` (commit b7f1c33) |
 | **C-021** | FIXED | `core/engine.go:254` | `Stop()` uses `time.Sleep(50ms)` instead of proper synchronization | `Stop()` waits on `loopDone` channel (Phase D25); Resume resets `shutdownOnce` |
 | **C-028** | FIXED | `core/core_test.go` | No test for `WithPersistence` error path (C6 fix untested) | TEST-CORE-030/031 error + success paths (Phase C1) |
@@ -142,7 +142,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | C-034 | core_test.go:556-559 | Event test uses arbitrary Dispatch() count |
 | C-035 | core_test.go:667-696 | RecoveryManager test does not test chain integration |
 | E-003 | executor.go:177 | Startup event lacks BusinessID |
-| E-005 | executor.go:331 | No external cancellation mechanism for in-flight tasks |
+| E-005 | executor.go:358 | No external cancellation mechanism for in-flight tasks |
 | E-020 | approval.go:33-36 | ApprovalEngine has no mutex |
 | E-027 | authenticate.go:99-105 | LocalAuthenticator has no mutex |
 | E-041 | memory.go:127 | Admit generates time-based IDs (collision possible) |
@@ -171,7 +171,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 
 | Fix | Claim | Verification | Evidence |
 |-----|-------|-------------|----------|
-| C1 | memory Retrieve uses Lock | **VERIFIED** | `memory.go:141` — `ms.mu.Lock()` |
+| C1 | memory Retrieve uses Lock | **VERIFIED** | `memory.go:145` — `ms.mu.Lock()` |
 | C2 | governance has RWMutex | **VERIFIED** | `engine.go:23,46,74` — Lock/RLock correct |
 | C3 | cognition engines have mutexes | **VERIFIED** | All 4 engines: objective, decision, planner, executive |
 | C4 | workflow has RWMutex | **VERIFIED** | `workflow.go:135` |
@@ -182,14 +182,14 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | H3 | SSE dispatch loop | **VERIFIED** | `server.go:122-136` |
 | H4 | objective.ID in chainWorkflow | **VERIFIED** | `chain.go:365` |
 | H5 | workflow.ID (not Name) | **VERIFIED** | `chain.go:381` |
-| H7 | backpressure release after dequeue | **VERIFIED** | `engine.go:331` |
-| H8 | authMiddleware on control endpoints | **VERIFIED** (but broken — G-001) | `server.go:139-149` — string comparison bug |
+| H7 | backpressure release after dequeue | **VERIFIED** | `engine.go:362` — `e.backpressure.Release()` immediately after dequeue |
+| H8 | authMiddleware on control endpoints | **VERIFIED** (G-001 string-comparison bug found during verification — since **FIXED in Phase A1**) | `server.go:139-149` — `[:18]` comparison bug (audit-time state) |
 | M1 | keyword matching in memory | **VERIFIED** | `memory.go:180-184` |
 | M8 | body size limit | **VERIFIED** | `server.go:207` |
 | M10 | ChainError fields | **VERIFIED** | `context.go:177,180` |
 | M12 | CI race detector | **VERIFIED** | `ci.yml:43-44` |
 
-**16/17 fully verified. 1 partial (H1). 1 broken despite verification (H8 — auth middleware has off-by-2 bug).**
+**16/17 fully verified. 1 partial (H1). 1 broken at verification time (H8 — auth middleware had off-by-2 bug; root cause G-001 since FIXED in Phase A1, see §9 A1).**
 
 ---
 
@@ -328,7 +328,7 @@ go.mod unchanged (zero deps confirmed)
 | C7 | — | Test BusinessID in response | ✅ 1 NEW TEST |
 | C8 | — | Test REQUIRE_APPROVAL + ESCALATE outcomes | ✅ 2 NEW TESTS |
 
-### Phase D: Cleanup — P3/P4 ✅ COMPLETE
+### Phase D: Cleanup — P3/P4: 22 of 29 findings handled ✅ (scoped COMPLETE — 7 residual P3/P4 findings remain OPEN)
 
 | Order | Finding | Fix | Status |
 |-------|---------|-----|--------|
@@ -366,7 +366,7 @@ go.mod unchanged (zero deps confirmed)
 
 ## 10. Conclusion
 
-**All 4 phases of remediation COMPLETE.**
+**All 4 phases of remediation COMPLETE as scoped** (Phases A–D covered their assigned P0/P1/P2 scope in full and the P3/P4 subset they addressed; residual P3/P4 findings remain OPEN — see Phase D note below).
 
 ### Phase A — Security (P0): ALL 4 FIXED (identity-bound)
 1. ✅ **G-001 FIXED** — Auth middleware `strings.HasPrefix` (was broken `[:18]`)
@@ -391,8 +391,10 @@ go.mod unchanged (zero deps confirmed)
 ### Phase C — Test Coverage (P2): 10 NEW TESTS
 Persistence error/success, Resume lifecycle, concurrent submissions, ChainError fields, BusinessID propagation, provider failure, governance outcomes (REQUIRE_APPROVAL, ESCALATE).
 
-### Phase D — Cleanup (P3/P4): 30 FIXES
+### Phase D — Cleanup (P3/P4): 30 FIXES (scoped)
 Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe IDs, correct address logging, `MaxHeaderBytes`, `Retryable`, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` on failure, circuit breaker step naming, configurable model ID, MemBus bounded retry, distinct objective criteria, `chain.failed` events, `Stop()` loop sync, `shutdownOnce` reset, ChainStep constants, model accessors, `Outcome.Metrics`, backpressure semantics documented.
+
+**Phase D scope note:** the Phase D table records remediation for the P3/P4 findings it covered — 22 of the 29 total P3/P4 findings (E-002 was addressed by the same D7 collision-safe ID change, commit `98752fa`, though the D7 row cites G-014) — it is *not* a claim that all P3/P4 findings are resolved. Residual P3/P4 findings remain **OPEN**: **C-032, C-034, C-035, E-005** (P3) and **E-015, G-017, E-036** (P4). All seven are still listed in §4 (the P3/P4 tables carry no status column) and none is marked FIXED anywhere in this document.
 
 ### Final Metrics
 
@@ -405,5 +407,5 @@ Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test 
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **47** (Phases A–D) + subsequent remediation commits (E-008, G-009/010/011/012, M-043, L-002, L-004, C-019, A-019, G-007) |
+| **Fixes total** | — | **47** (Phases A–D) + subsequent remediation commits (E-008, G-009/010/011/012, M-043, L-002, L-004, C-019, A-019, G-007, C-018 lifecycle race fix — `71ea4145c2850cebb60521309d9eddf691c3c6da` `fix(core): synchronize request admission lifecycle reads`) |
 | **Files changed** | — | **19** (+1,850 lines) for Phases A–D; subsequent commits tracked in git |
