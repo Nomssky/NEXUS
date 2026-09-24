@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/core"
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
@@ -686,19 +687,37 @@ type ComponentInfo struct {
 	Type   string `json:"type"`
 }
 
+// componentStatusConfigured is the truthful status for components that are
+// intentionally always constructed with the engine and have no start/stop
+// lifecycle. It asserts presence/configuration only — never "active"/running
+// (G-012: constructed ≠ ready ≠ running ≠ active).
+const componentStatusConfigured = "configured"
+
+// executorComponentStatus returns the executor's authoritative runtime state.
+func executorComponentStatus(ex *executor.Executor) string {
+	if ex.IsRunning() {
+		return "running"
+	}
+	return "stopped"
+}
+
 // handleControlComponents lists all engine components and their states.
+//
+// G-012: status is derived from authoritative runtime state where one exists;
+// components without a lifecycle API report "configured" (present, wired)
+// rather than a false "active"/running claim.
 func (s *Server) handleControlComponents(w http.ResponseWriter, r *http.Request) {
 	components := []ComponentInfo{
 		{Name: "engine", Status: string(s.engine.Status()), Type: "core"},
 		{Name: "circuit_breaker", Status: s.engine.CircuitBreaker().State(), Type: "hardening"},
-		{Name: "backpressure", Status: "active", Type: "hardening"},
-		{Name: "recovery_manager", Status: "active", Type: "hardening"},
-		{Name: "event_bus", Status: "active", Type: "foundation"},
-		{Name: "memory_store", Status: "active", Type: "foundation"},
-		{Name: "attention_engine", Status: "active", Type: "foundation"},
-		{Name: "governance", Status: "active", Type: "foundation"},
-		{Name: "task_executor", Status: "active", Type: "execution"},
-		{Name: "model_router", Status: "active", Type: "intelligence"},
+		{Name: "backpressure", Status: componentStatusConfigured, Type: "hardening"},
+		{Name: "recovery_manager", Status: componentStatusConfigured, Type: "hardening"},
+		{Name: "event_bus", Status: componentStatusConfigured, Type: "foundation"},
+		{Name: "memory_store", Status: componentStatusConfigured, Type: "foundation"},
+		{Name: "attention_engine", Status: componentStatusConfigured, Type: "foundation"},
+		{Name: "governance", Status: componentStatusConfigured, Type: "foundation"},
+		{Name: "task_executor", Status: executorComponentStatus(s.engine.TaskExecutor()), Type: "execution"},
+		{Name: "model_router", Status: componentStatusConfigured, Type: "intelligence"},
 	}
 
 	w.Header().Set("Content-Type", "application/json")

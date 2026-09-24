@@ -529,6 +529,16 @@ func (e *Executor) ActiveCount() int {
 	return len(e.active)
 }
 
+// IsRunning reports whether the executor is accepting work (Start has been
+// called and Stop has not completed). This is the authoritative runtime state
+// used by the control-components endpoint (G-012) — never infer "active" from
+// construction alone.
+func (e *Executor) IsRunning() bool {
+	e.activeMu.RLock()
+	defer e.activeMu.RUnlock()
+	return e.running
+}
+
 // Metrics returns execution metrics.
 func (e *Executor) Metrics() (executed, failed, denied int64) {
 	e.metricsMu.RLock()
