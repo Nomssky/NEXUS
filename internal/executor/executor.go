@@ -467,20 +467,10 @@ func (e *Executor) defaultHandler(_ context.Context, req *WorkRequest, ag *agent
 
 		resp, decision, err := e.modelRouter.Invoke(routingReq, genReq)
 		if err != nil {
-			// Fall back to synthetic response
-			return &Outcome{
-				TaskID:  req.TaskID,
-				AgentID: ag.ID,
-				Status:  "completed",
-				Output:  fmt.Sprintf("task '%s' executed by agent %s (provider error: %v)", req.Intent, ag.ID, err),
-				Evidence: []string{
-					fmt.Sprintf("task_id=%s", req.TaskID),
-					fmt.Sprintf("agent_id=%s", ag.ID),
-					fmt.Sprintf("business_id=%s", req.BusinessID),
-					fmt.Sprintf("provider_error=%v", err),
-					fmt.Sprintf("executed_at=%s", e.now().Format(time.RFC3339)),
-				},
-			}, nil
+			// E-008: provider failure must not be reported as completed.
+			// Propagate as a handler error so executeWork records status=failed,
+			// increments totalFailed, and emits executor.failed.
+			return nil, fmt.Errorf("provider invocation failed: %w", err)
 		}
 
 		output := resp.Content

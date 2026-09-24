@@ -9,6 +9,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
@@ -578,7 +579,8 @@ func TestStopWaitsForTasks(t *testing.T) {
 // P2 TEST COVERAGE GAPS
 // =====================================================================
 
-// TEST-EXEC-010: Provider failure path — model router returns error
+// TEST-EXEC-010: Provider failure path — model router Invoke returns error.
+// E-008: provider failure must not be represented as completed.
 func TestProviderFailurePath(t *testing.T) {
 	now := time.Now()
 	govEngine := governance.NewEngine([]*governance.Policy{
@@ -587,13 +589,18 @@ func TestProviderFailurePath(t *testing.T) {
 			Resource: governance.Resource{ResourceType: "all"}},
 	})
 
-	// nil model router — causes provider error path
+	// Non-nil router with empty registry: Route fails → Invoke returns error.
+	// This hits defaultHandler's provider-error branch (not the nil-router
+	// synthetic-success path).
+	emptyRegistry := modelrouter.NewModelRegistry()
+	failingRouter := modelrouter.NewModelRouter(emptyRegistry, modelrouter.RoutingPolicyLocalFirst)
+
 	e := New(
 		agent.NewAgentRuntime(),
 		tool.NewToolRegistry(),
 		govEngine,
 		event.NewMemBus(),
-		nil, // nil model router
+		failingRouter,
 		DefaultConfig(),
 		WithClock(func() time.Time { return now }),
 	)
@@ -603,18 +610,100 @@ func TestProviderFailurePath(t *testing.T) {
 
 	req := testRequest("exec-provider-fail")
 	req.Handler = nil // use default handler which calls model router
-	e.Submit(req)
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
 
 	time.Sleep(300 * time.Millisecond)
+
+	outcome, ok := e.GetOutcome("exec-provider-fail")
+	if !ok {
+		t.Fatal("expected outcome")
+	}
+	// E-008 invariant: provider failure must not be reported as completed.
+	if outcome.Status == "completed" {
+		t.Errorf("provider failure must not be completed, got %q", outcome.Status)
+	}
+	if outcome.Status != "failed" {
+		t.Errorf("expected failed, got %q", outcome.Status)
+	}
+	if outcome.Error == "" {
+		t.Error("expected provider error message on outcome")
+	}
 
 	e.metricsMu.Lock()
 	executed := e.totalExecuted
 	failed := e.totalFailed
 	e.metricsMu.Unlock()
 
-	// With nil model router, default handler should fail
-	if executed+failed == 0 {
+	if executed == 0 {
 		t.Error("expected at least one execution attempt")
+	}
+	if failed == 0 {
+		t.Errorf("expected totalFailed > 0 for provider failure, got %d", failed)
+	}
+}
+
+// TEST-EXEC-010b: Successful provider path still returns completed.
+func TestProviderSuccessPath(t *testing.T) {
+	now := time.Now()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{PolicyID: "allow", Name: "Allow", Status: governance.PolicyStatusActive, Effect: governance.ALLOW,
+			Subject: governance.Subject{SubjectType: "all"}, Action: governance.Action{ActionType: "custom"},
+			Resource: governance.Resource{ResourceType: "all"}},
+	})
+
+	registry := modelrouter.NewModelRegistry()
+	err := registry.RegisterModel(&modelrouter.ModelDefinition{
+		ID:           "ok-model",
+		ProviderID:   "ok-provider",
+		Capabilities: []modelrouter.ModelCapability{modelrouter.CapabilityReasoning, modelrouter.CapabilityToolCalling},
+		Runtime:      modelrouter.RuntimeLocal,
+		Status:       modelrouter.ModelStatusActive,
+	})
+	if err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	router := modelrouter.NewModelRouter(registry, modelrouter.RoutingPolicyLocalFirst)
+	router.RegisterProvider(modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: "ok-provider"}))
+
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		router,
+		DefaultConfig(),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := testRequest("exec-provider-ok")
+	req.Handler = nil
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("failed to submit: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	outcome, ok := e.GetOutcome("exec-provider-ok")
+	if !ok {
+		t.Fatal("expected outcome")
+	}
+	if outcome.Status != "completed" {
+		t.Errorf("expected completed for successful provider, got %q", outcome.Status)
+	}
+	if outcome.Error != "" {
+		t.Errorf("expected no error on success, got %q", outcome.Error)
+	}
+
+	e.metricsMu.Lock()
+	failed := e.totalFailed
+	e.metricsMu.Unlock()
+	if failed != 0 {
+		t.Errorf("expected totalFailed=0 on success, got %d", failed)
 	}
 }
 
