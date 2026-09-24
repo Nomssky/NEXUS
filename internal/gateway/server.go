@@ -16,6 +16,8 @@
 //   - Unverified client actor_id is never trusted as request identity (G-009)
 //   - One-shot responses and each SSE event frame are size-bounded (G-010);
 //     SSE streams remain long-lived (no duration/cumulative byte cap)
+//   - SSE write/flush failures terminate the stream cleanly (G-011); they are
+//     never silently ignored as successful delivery
 package gateway
 
 import (
@@ -440,8 +442,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "streaming not supported")
 		return
 	}
@@ -451,10 +452,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 
 	ctx := r.Context()
+	// streamCtx ends when the request context ends (normal client disconnect)
+	// OR when a write/flush fails (stream no longer writable). Both are clean
+	// termination paths for the handler — neither is an internal HTTP error
+	// after SSE headers are sent (G-011).
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	rc := http.NewResponseController(w)
 
 	// Subscribe to events
 	bus := s.engine.EventBus()
 	consumer := event.ConsumerFunc(func(e *event.Event) error {
+		// Stream already unwritable or cancelled: do not write further frames.
+		if streamCtx.Err() != nil {
+			return nil
+		}
 		// Filter by business scope (always active — businessFilter is required)
 		if e.BusinessID != businessFilter {
 			return nil // skip events from other businesses and unscoped events
@@ -468,8 +480,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		if frameOverhead+len(e.Type)+len(data) > s.maxSSEEventBytes {
 			return nil
 		}
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data)
-		flusher.Flush()
+		// G-011: surface write/flush failures. Return nil (not error) so the
+		// event bus does not re-queue a doomed write or abort the dispatch
+		// batch; cancelStream wakes the handler to unsubscribe and exit.
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data); err != nil {
+			cancelStream()
+			return nil
+		}
+		if err := rc.Flush(); err != nil {
+			cancelStream()
+			return nil
+		}
 		return nil
 	})
 
@@ -480,8 +501,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	defer bus.Unsubscribe(subID)
 
-	// Keep connection open until client disconnects
-	<-ctx.Done()
+	// Keep connection open until client disconnect or stream write failure.
+	<-streamCtx.Done()
 }
 
 // ControlStatusResponse is the detailed engine status.
