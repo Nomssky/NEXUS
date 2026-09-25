@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -151,6 +152,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /status", s.handleStatus)
 	s.mux.HandleFunc("POST /api/v1/requests", s.handleSubmitRequest)
 	s.mux.HandleFunc("GET /api/v1/requests/{id}", s.handleGetResult)
+	s.mux.HandleFunc("POST /api/v1/requests/{id}/cancel", s.handleCancelRequest)
 	s.mux.HandleFunc("GET /events", s.handleSSE)
 
 	// Control surface endpoints
@@ -459,6 +461,73 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	w.Write(buf.Bytes())
 }
 
+// handleCancelRequest cancels an in-flight request (E-005).
+// Fail-closed authorization mirrors handleGetResult: mandatory business_id
+// (400) → identity-bound membership when enforcement is on (401/403) → core
+// ownership check (403 on foreign scope, 404 when unknown). No control API key
+// and no governance re-evaluation at this boundary — same trust model as GET
+// result retrieval.
+//
+// Success is 202 Accepted: cancellation is accepted, the final state
+// (cancelled, or a terminal state that raced the cancel) is observed via
+// GET /api/v1/requests/{id}. Repeat cancels are idempotent; already-terminal
+// requests conflict with 409.
+func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
+	// Authorization scope is mandatory — no unscoped cancellation.
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
+	// Identity-bound membership check (A6): authenticated actor ∈ business_id.
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "request ID required")
+		return
+	}
+
+	// G-009: only a verified identity is attributed; without enforcement there
+	// is no trusted identity and the fixed marker is bound.
+	actorID := unauthenticatedActorID
+	if res.IdentityID != "" {
+		actorID = res.IdentityID
+	}
+
+	err := s.engine.CancelRequest(id, businessID, actorID)
+	switch {
+	case err == nil:
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", id)
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"request_id":     id,
+			"correlation_id": id,
+			"status":         "cancelling",
+		})
+	case errors.Is(err, core.ErrRequestNotFound):
+		s.writeError(w, http.StatusNotFound, "VALIDATION", "request not found")
+	case errors.Is(err, core.ErrScopeMismatch):
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: business scope mismatch")
+	case errors.Is(err, core.ErrAlreadyCompleted):
+		msg := "request already in a non-cancellable terminal state"
+		var terminal *core.TerminalStateError
+		if errors.As(err, &terminal) {
+			msg = fmt.Sprintf("request already in terminal state: %s", terminal.Status)
+		}
+		s.writeError(w, http.StatusConflict, "CONFLICT", msg)
+	default:
+		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			fmt.Sprintf("cancellation failed: %v", err))
+	}
+}
+
 // handleSSE streams events via Server-Sent Events.
 // Fail-closed scoping: the business_id query parameter is REQUIRED. Only events
 // matching the business scope are delivered; unscoped events (empty BusinessID)
@@ -636,10 +705,11 @@ type MetricsResponse struct {
 
 // ExecutorMetrics holds executor statistics.
 type ExecutorMetrics struct {
-	Executed int64 `json:"executed"`
-	Failed   int64 `json:"failed"`
-	Denied   int64 `json:"denied"`
-	Active   int   `json:"active"`
+	Executed  int64 `json:"executed"`
+	Failed    int64 `json:"failed"`
+	Denied    int64 `json:"denied"`
+	Cancelled int64 `json:"cancelled"`
+	Active    int   `json:"active"`
 }
 
 // BackpressureMetrics holds backpressure statistics.
@@ -665,10 +735,11 @@ func (s *Server) handleControlMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(MetricsResponse{
 		Executor: ExecutorMetrics{
-			Executed: executed,
-			Failed:   failed,
-			Denied:   denied,
-			Active:   s.engine.TaskExecutor().ActiveCount(),
+			Executed:  executed,
+			Failed:    failed,
+			Denied:    denied,
+			Cancelled: s.engine.TaskExecutor().CancelledCount(),
+			Active:    s.engine.TaskExecutor().ActiveCount(),
 		},
 		Backpressure: BackpressureMetrics{
 			QueueSize:     s.engine.Backpressure().QueueSize(),
