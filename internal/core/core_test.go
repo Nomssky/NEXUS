@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/workflow"
 )
 
 // waitForResult polls the engine until it records a result for requestID and
@@ -1185,5 +1188,594 @@ func TestFailureEmitsChainFailedEvent(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected chain.failed event, got: %v", received)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E-005: external cancellation of in-flight requests (core scope).
+// ---------------------------------------------------------------------------
+
+// waitUntil polls cond until it holds, failing the test if the bounded
+// deadline elapses first (E-015 pattern: wait for observable state, never sleep).
+func waitUntil(t *testing.T, desc string, cond func() bool) {
+	t.Helper()
+
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	deadline := time.After(10 * time.Second)
+
+	for {
+		if cond() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", desc)
+		case <-tick.C:
+		}
+	}
+}
+
+// waitSignal waits for one value on ch with a bounded deadline.
+func waitSignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// blockingProvider is a cooperative model provider that blocks until its
+// context is cancelled (or the test releases it), giving cancellation tests a
+// deterministic in-flight window. It records whether cancellation reached it —
+// end-to-end proof of provider context threading (E-005 decision 9).
+type blockingProvider struct {
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	sawCtx  bool
+}
+
+func newBlockingProvider() *blockingProvider {
+	return &blockingProvider{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (p *blockingProvider) Identify() string              { return "blocking-provider" }
+func (p *blockingProvider) HealthCheck() error            { return nil }
+func (p *blockingProvider) ListModels() ([]string, error) { return nil, nil }
+
+func (p *blockingProvider) Invoke(ctx context.Context, req *modelrouter.GenerateRequest) (*modelrouter.GenerateResponse, error) {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		p.mu.Lock()
+		p.sawCtx = true
+		p.mu.Unlock()
+		return nil, ctx.Err()
+	case <-p.release:
+		return &modelrouter.GenerateResponse{
+			RequestID:    req.RequestID,
+			ModelID:      req.ModelID,
+			Content:      "released",
+			FinishReason: "stop",
+		}, nil
+	}
+}
+
+// cancelled reports whether the provider observed context cancellation.
+func (p *blockingProvider) cancelled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sawCtx
+}
+
+// registerBlockingProvider wires the cooperative blocking provider into the
+// engine so a submitted request deterministically parks inside the executor's
+// default handler (model invocation).
+func registerBlockingProvider(t *testing.T, e *Engine) *blockingProvider {
+	t.Helper()
+	p := newBlockingProvider()
+	if err := e.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+		ID:         "cancel-model",
+		ProviderID: p.Identify(),
+		Capabilities: []modelrouter.ModelCapability{
+			modelrouter.CapabilityReasoning,
+			modelrouter.CapabilityToolCalling,
+		},
+		Runtime: modelrouter.RuntimeLocal,
+		Status:  modelrouter.ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	e.ModelRouter().RegisterProvider(p)
+	return p
+}
+
+// TEST-E005-CORE-01: unknown request → ErrRequestNotFound (gateway 404).
+func TestCancelRequestUnknown(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	err := e.CancelRequest("req-nope", "biz-1", "user-1")
+	if !errors.Is(err, ErrRequestNotFound) {
+		t.Fatalf("expected ErrRequestNotFound, got %v", err)
+	}
+}
+
+// TEST-E005-CORE-02: empty business scope fails closed → ErrScopeMismatch
+// (gateway 403) — an empty scope can never match a recorded owner.
+func TestCancelRequestEmptyScopeFailClosed(t *testing.T) {
+	e, _ := NewEngine(nil)
+
+	err := e.CancelRequest("req-any", "", "user-1")
+	if !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("expected ErrScopeMismatch, got %v", err)
+	}
+}
+
+// TEST-E005-CORE-03: another business's request → ErrScopeMismatch (403) even
+// when the request is already terminal (403 precedes 409, mirroring GET result).
+func TestCancelRequestScopeMismatch(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-scope",
+		Context: NewRequestContext("corr-scope", "biz-1", "user-1"),
+		Intent:  "scope check",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitForResult(t, e, req.ID)
+
+	err := e.CancelRequest(req.ID, "biz-2", "user-1")
+	if !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("expected ErrScopeMismatch, got %v", err)
+	}
+}
+
+// TEST-E005-CORE-04: queued cancel — the request never executes. Terminal
+// cancelled response with the contract ChainError; no objective/workflow/
+// executor audit steps; chain.cancelled emitted, never chain.failed or
+// chain.completed; no workflow created; inflight deregistered after the result.
+func TestCancelQueuedRequestNeverExecutes(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+
+	// Mark the engine running WITHOUT starting the processing loop: the
+	// submitted request stays queued until the test starts the loop — a fully
+	// deterministic queued-cancel window (no timing race with a live chain).
+	e.mu.Lock()
+	e.status = lifecycle.StateRunning
+	e.mu.Unlock()
+
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+
+	req := &Request{
+		ID:      "req-queued-cancel",
+		Context: NewRequestContext("corr-q", "biz-1", "user-1"),
+		Intent:  "queued work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("cancel queued: %v", err)
+	}
+
+	// Start the loop — the cancelled request must terminate without executing.
+	go e.processRequests(ctx)
+	defer e.Stop(ctx)
+
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "cancelled" {
+		t.Fatalf("expected cancelled, got %s (err=%v)", result.Status, result.Error)
+	}
+	if result.Error == nil {
+		t.Fatal("expected contract ChainError on cancelled response")
+	}
+	if result.Error.Code != "CANCELLED" || result.Error.Category != "CANCELLATION" || result.Error.Retryable {
+		t.Errorf("expected CANCELLED/CANCELLATION non-retryable, got %+v", result.Error)
+	}
+	if result.Error.CorrelationID != "corr-q" {
+		t.Errorf("expected correlation id propagated, got %q", result.Error.CorrelationID)
+	}
+
+	for _, entry := range result.AuditTrail {
+		switch entry.Step {
+		case string(StepObjective), string(StepDecision), string(StepPlan),
+			string(StepWorkflow), string(StepSchedule):
+			t.Errorf("cancelled queued request must not reach step %q", entry.Step)
+		}
+	}
+	if e.workflowEng.WorkflowCount() != 0 {
+		t.Errorf("expected no workflow created, got %d", e.workflowEng.WorkflowCount())
+	}
+
+	// Result stored → inflight entry deregistered (no registry leak).
+	waitUntil(t, "inflight deregistration", func() bool {
+		e.inflightMu.RLock()
+		defer e.inflightMu.RUnlock()
+		_, ok := e.inflight[req.ID]
+		return !ok
+	})
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	wantPresent := []string{"chain.started", "chain.validate.passed", "chain.cancelled"}
+	wantAbsent := []string{"chain.failed", "chain.completed", "chain.objective.created", "chain.executor.completed"}
+	got := make(map[string]bool, len(received))
+	for _, typ := range received {
+		got[typ] = true
+	}
+	for _, typ := range wantPresent {
+		if !got[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+	for _, typ := range wantAbsent {
+		if got[typ] {
+			t.Errorf("event %s must not fire for a cancelled queued request", typ)
+		}
+	}
+}
+
+// TEST-E005-CORE-05: executing cancel — end to end: executor task cancelled,
+// response carries the contract ChainError, task.cancelled + chain.cancelled
+// events fire, the provider observed context cancellation (decision 9), and
+// no failure is recorded (circuit breaker/recovery untouched).
+func TestCancelExecutingRequestCancelsTask(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	p := registerBlockingProvider(t, e)
+	// LIFO: release a still-blocked provider before Stop waits on it.
+	defer e.Stop(ctx)
+	defer close(p.release)
+
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+
+	req := &Request{
+		ID:      "req-exec-cancel",
+		Context: NewRequestContext("corr-e", "biz-1", "user-1"),
+		Intent:  "long running work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, p.started, "provider invocation")
+
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("cancel executing: %v", err)
+	}
+
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "cancelled" {
+		t.Fatalf("expected cancelled, got %s (err=%v)", result.Status, result.Error)
+	}
+	if result.Error == nil || result.Error.Code != "CANCELLED" ||
+		result.Error.Category != "CANCELLATION" || result.Error.Retryable {
+		t.Fatalf("expected CANCELLED/CANCELLATION non-retryable, got %+v", result.Error)
+	}
+	if result.Outcome == nil || result.Outcome.Metrics["executor_status"] != "cancelled" {
+		t.Errorf("expected executor_status cancelled in metrics, got %+v", result.Outcome)
+	}
+
+	if !p.cancelled() {
+		t.Error("provider must observe context cancellation (ctx threading)")
+	}
+	if got := e.TaskExecutor().CancelledCount(); got != 1 {
+		t.Errorf("expected CancelledCount 1, got %d", got)
+	}
+	if state := e.CircuitBreaker().State(); state != "closed" {
+		t.Errorf("cancellation must not record a circuit-breaker failure, state=%s", state)
+	}
+	if got := e.RecoveryManager().RecordCount(); got != 0 {
+		t.Errorf("cancellation must not record a recovery failure, got %d", got)
+	}
+
+	waitUntil(t, "inflight deregistration", func() bool {
+		e.inflightMu.RLock()
+		defer e.inflightMu.RUnlock()
+		_, ok := e.inflight[req.ID]
+		return !ok
+	})
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool, len(received))
+	for _, typ := range received {
+		got[typ] = true
+	}
+	for _, typ := range []string{"task.cancelled", "chain.cancelled"} {
+		if !got[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+	for _, typ := range []string{"chain.failed", "executor.failed", "executor.completed"} {
+		if got[typ] {
+			t.Errorf("event %s must not fire for a cancelled execution", typ)
+		}
+	}
+}
+
+// TEST-E005-CORE-06: completed request → ErrAlreadyCompleted with the terminal
+// status (gateway 409 CONFLICT).
+func TestCancelRequestCompletedConflict(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-done",
+		Context: NewRequestContext("corr-done", "biz-1", "user-1"),
+		Intent:  "already done",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitForResult(t, e, req.ID)
+
+	err := e.CancelRequest(req.ID, "biz-1", "user-1")
+	if !errors.Is(err, ErrAlreadyCompleted) {
+		t.Fatalf("expected ErrAlreadyCompleted, got %v", err)
+	}
+	var terminal *TerminalStateError
+	if !errors.As(err, &terminal) || terminal.Status != "completed" {
+		t.Errorf("expected terminal status completed, got %#v", terminal)
+	}
+}
+
+// TEST-E005-CORE-07: repeat cancellation is idempotent — flagged while queued
+// (twice) and again against the terminal cancelled result: all return nil.
+func TestCancelRequestCancelledIdempotent(t *testing.T) {
+	e, _ := NewEngine(nil)
+
+	// (a) Terminal cancelled result → nil.
+	e.resultsMu.Lock()
+	e.results["req-already-cancelled"] = &Response{
+		RequestID:  "req-already-cancelled",
+		BusinessID: "biz-1",
+		Status:     "cancelled",
+	}
+	e.resultsMu.Unlock()
+	if err := e.CancelRequest("req-already-cancelled", "biz-1", "user-1"); err != nil {
+		t.Fatalf("cancel against terminal cancelled result: %v", err)
+	}
+
+	// (b) Queued request cancelled twice before it ever executes → nil both times.
+	e.mu.Lock()
+	e.status = lifecycle.StateRunning
+	e.mu.Unlock()
+	req := &Request{
+		ID:      "req-queued-twice",
+		Context: NewRequestContext("corr-qt", "biz-1", "user-1"),
+		Intent:  "queued twice",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("first queued cancel: %v", err)
+	}
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("second queued cancel: %v", err)
+	}
+	e.inflightMu.RLock()
+	inf := e.inflight[req.ID]
+	e.inflightMu.RUnlock()
+	if inf == nil || !inf.cancelRequested || inf.cancelActor != "user-1" {
+		t.Errorf("expected a single flagged inflight entry attributed to user-1, got %+v", inf)
+	}
+}
+
+// TEST-E005-CORE-08: pending_approval is terminal → 409-class conflict.
+// Category C 5d must revisit approval-state cancellation when pending_approval
+// becomes a first-class response status.
+func TestCancelPendingApprovalResultConflict(t *testing.T) {
+	e, _ := NewEngine(nil)
+
+	e.resultsMu.Lock()
+	e.results["req-approval"] = &Response{
+		RequestID:  "req-approval",
+		BusinessID: "biz-1",
+		Status:     "pending_approval",
+	}
+	e.resultsMu.Unlock()
+
+	err := e.CancelRequest("req-approval", "biz-1", "user-1")
+	if !errors.Is(err, ErrAlreadyCompleted) {
+		t.Fatalf("expected ErrAlreadyCompleted for pending_approval, got %v", err)
+	}
+	var terminal *TerminalStateError
+	if !errors.As(err, &terminal) || terminal.Status != "pending_approval" {
+		t.Errorf("expected terminal status pending_approval, got %#v", terminal)
+	}
+}
+
+// TEST-E005-CORE-09: admission send failure (shutdown during enqueue) drops
+// the inflight registration — no leak, and the request is subsequently 404.
+func TestCancelRequestSendFailureDeregisters(t *testing.T) {
+	e, _ := NewEngine(nil)
+
+	e.mu.Lock()
+	e.status = lifecycle.StateRunning
+	e.mu.Unlock()
+
+	// Fill the processing channel directly (no admission bookkeeping), so the
+	// channel — not the backpressure gate — is what blocks the next send.
+	// Capacity is 100; no loop is running, so nothing dequeues.
+	for i := 0; i < 100; i++ {
+		e.requests <- &Request{ID: fmt.Sprintf("fill-%d", i)}
+	}
+
+	// Close the shutdown channel exactly as Stop would.
+	e.shutdownOnce.Do(func() { close(e.shutdownCh) })
+
+	req := &Request{
+		ID:      "req-send-fail",
+		Context: NewRequestContext("corr-f", "biz-1", "user-1"),
+		Intent:  "never enqueued",
+	}
+	err := e.SubmitRequest(req)
+	if err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Fatalf("expected shutdown error, got %v", err)
+	}
+
+	e.inflightMu.RLock()
+	_, ok := e.inflight[req.ID]
+	e.inflightMu.RUnlock()
+	if ok {
+		t.Fatal("inflight entry must be deregistered when the channel send fails")
+	}
+	if cancelErr := e.CancelRequest(req.ID, "biz-1", "user-1"); !errors.Is(cancelErr, ErrRequestNotFound) {
+		t.Fatalf("expected ErrRequestNotFound after send failure, got %v", cancelErr)
+	}
+}
+
+// TEST-E005-CORE-10: inflight entries are deregistered after a normal terminal
+// result — the registry does not leak on the success path.
+func TestInflightDeregisteredAfterNormalResult(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-normal-dereg",
+		Context: NewRequestContext("corr-nd", "biz-1", "user-1"),
+		Intent:  "normal completion",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitForResult(t, e, req.ID)
+
+	waitUntil(t, "inflight deregistration after normal result", func() bool {
+		e.inflightMu.RLock()
+		defer e.inflightMu.RUnlock()
+		_, ok := e.inflight[req.ID]
+		return !ok
+	})
+}
+
+// TEST-E005-CORE-11: cancelling an executing request also cancels the workflow
+// bookkeeping status (decision H — executor context remains authoritative).
+func TestCancelExecutingCancelsWorkflowBookkeeping(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	p := registerBlockingProvider(t, e)
+	defer e.Stop(ctx)
+	defer close(p.release)
+
+	req := &Request{
+		ID:      "req-wf-cancel",
+		Context: NewRequestContext("corr-wf", "biz-1", "user-1"),
+		Intent:  "workflow bookkeeping",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, p.started, "provider invocation")
+
+	// Wait until chainExecute registered the executor task (wf.ID).
+	waitUntil(t, "task registration", func() bool {
+		e.inflightMu.RLock()
+		defer e.inflightMu.RUnlock()
+		inf := e.inflight[req.ID]
+		return inf != nil && inf.taskID != ""
+	})
+	e.inflightMu.RLock()
+	taskID := e.inflight[req.ID].taskID
+	e.inflightMu.RUnlock()
+
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "cancelled" {
+		t.Fatalf("expected cancelled, got %s", result.Status)
+	}
+
+	wf, ok := e.workflowEng.GetWorkflow(taskID)
+	if !ok {
+		t.Fatalf("workflow %s not found", taskID)
+	}
+	if wf.Status != workflow.WorkflowStatusCancelled {
+		t.Errorf("expected workflow status cancelled, got %s", wf.Status)
+	}
+}
+
+// TEST-E005-CORE-12: cancellation racing completion keeps its invariants —
+// CancelRequest returns nil or ErrAlreadyCompleted (never not-found, never an
+// unexpected error) and the request always terminates completed or cancelled.
+func TestCancelRaceWithCompletionInvariants(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("req-race-%d", i)
+		req := &Request{
+			ID:      id,
+			Context: NewRequestContext(fmt.Sprintf("corr-race-%d", i), "biz-1", "user-1"),
+			Intent:  "race cancellation",
+		}
+		if err := e.SubmitRequest(req); err != nil {
+			t.Fatalf("%s: submit: %v", id, err)
+		}
+
+		err := e.CancelRequest(id, "biz-1", "user-1")
+		switch {
+		case err == nil:
+			// Accepted (queued flag or executor cancellation).
+		case errors.Is(err, ErrAlreadyCompleted):
+			var terminal *TerminalStateError
+			if !errors.As(err, &terminal) {
+				t.Fatalf("%s: expected TerminalStateError, got %v", id, err)
+			}
+		default:
+			t.Fatalf("%s: unexpected cancel error: %v", id, err)
+		}
+
+		result := waitForResult(t, e, id)
+		if result.Status != "completed" && result.Status != "cancelled" {
+			t.Fatalf("%s: terminal status must be completed or cancelled, got %s (err=%v)",
+				id, result.Status, result.Error)
+		}
 	}
 }

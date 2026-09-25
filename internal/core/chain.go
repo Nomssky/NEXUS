@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -62,6 +63,12 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Outcome:   "passed",
 	})
 	e.chainEmit(req, "chain.validate.passed", "core", "passed")
+
+	// E-005: cancelled while queued — the request never executes beyond this
+	// point (objective/workflow creation and executor submission are skipped).
+	if e.isCancelRequested(req.ID) {
+		return e.chainCancelled(ctx, req, audit, start, "request cancelled before execution")
+	}
 
 	// Hardening: circuit breaker gate
 	if !e.circuitBreaker.Allow() {
@@ -195,6 +202,14 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 
 	// Step 8: Execute via task executor
 	execOutcome, execErr := e.chainExecute(ctx, req, wf)
+	// E-005: a cancellation that landed after dequeue but before the executor
+	// submit — cancelled, not failed. No failure audit entry, no circuit-breaker
+	// failure, no recovery record; workflow bookkeeping is cancelled (the task
+	// never ran, so no executor-side context cancellation happened).
+	if errors.Is(execErr, errCancelledBeforeSubmit) {
+		_ = e.workflowEng.Cancel(wf.ID)
+		return e.chainCancelled(ctx, req, audit, start, "request cancelled before execution")
+	}
 	if execErr != nil {
 		audit = append(audit, AuditEntry{
 			Step:      string(StepAgent),
@@ -261,6 +276,34 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			chainErr.Timestamp = e.now()
 		}
 		respErr = chainErr
+	} else if execOutcome != nil && execOutcome.Status == "cancelled" {
+		// E-005: explicit cancellation is terminal but not a failure. The
+		// executor already emitted task.cancelled; the chain records the
+		// contract ChainError (CANCELLED/CANCELLATION, non-retryable) and
+		// cancels the workflow bookkeeping status.
+		status = "cancelled"
+		_ = e.workflowEng.Cancel(wf.ID)
+		outcomeResult = &Outcome{
+			Summary: "cancelled before completion",
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
+		}
+		respErr = &ChainError{
+			Code:      "CANCELLED",
+			Category:  "CANCELLATION",
+			Message:   "request cancelled before completion",
+			ChainStep: string(StepAgent),
+			Retryable: false,
+		}
+		if req.Context != nil {
+			respErr.CorrelationID = req.Context.CorrelationID
+		}
+		respErr.Timestamp = e.now()
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
@@ -288,10 +331,14 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	e.chainEmit(req, "chain.memory.written", "memory", status)
 
 	// C-010 fix: terminal event reflects actual status — failures emit
-	// chain.failed, only successes emit chain.completed.
-	if status == "completed" {
+	// chain.failed, cancellations emit chain.cancelled (E-005), only successes
+	// emit chain.completed.
+	switch status {
+	case "completed":
 		e.chainEmit(req, "chain.completed", "core", status)
-	} else {
+	case "cancelled":
+		e.chainEmit(req, "chain.cancelled", "core", fmt.Sprintf("step=%s status=%s", StepAgent, status))
+	default:
 		e.chainEmit(req, "chain.failed", "core", fmt.Sprintf("step=%s status=%s", StepAgent, status))
 	}
 
@@ -447,10 +494,95 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 			return nil, fmt.Errorf("deadline exceeded: %s", req.Deadline.Format(time.RFC3339))
 		}
 	}
+
+	// E-005 submit-time check: cancellation landed after dequeue but before
+	// the executor submit — never submit.
+	e.inflightMu.RLock()
+	inf := e.inflight[req.ID]
+	cancelledEarly := inf != nil && inf.cancelRequested
+	e.inflightMu.RUnlock()
+	if cancelledEarly {
+		return nil, errCancelledBeforeSubmit
+	}
+
 	execCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return e.taskExec.SubmitSync(execCtx, workReq)
+	// Submit outside inflightMu (leaf lock — no nesting in either direction).
+	if err := e.taskExec.Submit(workReq); err != nil {
+		return nil, err
+	}
+
+	// Register the task and re-check the cancel flag under one critical
+	// section: a cancel that arrived while Submit was in flight either already
+	// flagged the request (caught here) or saw state=executing with this taskID
+	// and called the executor itself — both paths are idempotent.
+	e.inflightMu.Lock()
+	inf = e.inflight[req.ID]
+	applyCancel := false
+	var reason, actor string
+	if inf != nil {
+		inf.taskID = wf.ID
+		inf.state = inflightExecuting
+		applyCancel = inf.cancelRequested
+		reason, actor = inf.cancelReason, inf.cancelActor
+	}
+	e.inflightMu.Unlock()
+	if applyCancel {
+		// Best effort: WaitOutcome below remains authoritative for the outcome.
+		_ = e.taskExec.CancelTask(wf.ID, reason, actor)
+	}
+
+	return e.taskExec.WaitOutcome(execCtx, workReq.TaskID)
+}
+
+// chainCancelled builds the terminal cancelled response for a request that was
+// cancelled before (or instead of) executing (E-005). Cancellation is not a
+// failure: no circuit-breaker failure, no recovery record, and the terminal
+// event is chain.cancelled.
+func (e *Engine) chainCancelled(ctx context.Context, req *Request, audit []AuditEntry, start time.Time, message string) *Response {
+	audit = append(audit, AuditEntry{
+		Step:      string(StepAgent),
+		Action:    "cancel request",
+		Actor:     "core",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   "cancelled",
+	})
+
+	// Terminal outcome recorded like any other terminal status.
+	e.chainMemoryWrite(ctx, req, "cancelled", nil)
+	audit = append(audit, AuditEntry{
+		Step:      string(StepMemoryWrite),
+		Action:    "store outcome",
+		Actor:     "memory",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   "status=cancelled",
+	})
+	e.chainEmit(req, "chain.memory.written", "memory", "cancelled")
+	e.chainEmit(req, "chain.cancelled", "core", fmt.Sprintf("step=%s status=cancelled", StepAgent))
+
+	chainErr := &ChainError{
+		Code:      "CANCELLED",
+		Category:  "CANCELLATION",
+		Message:   message,
+		ChainStep: string(StepAgent),
+		Retryable: false,
+	}
+	if req.Context != nil {
+		chainErr.CorrelationID = req.Context.CorrelationID
+	}
+	chainErr.Timestamp = e.now()
+
+	return &Response{
+		RequestID:  req.ID,
+		BusinessID: req.Context.BusinessID,
+		Status:     "cancelled",
+		Error:      chainErr,
+		AuditTrail: audit,
+		Duration:   e.now().Sub(start),
+	}
 }
 
 // chainError creates an error response with audit trail.

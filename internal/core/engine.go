@@ -84,6 +84,11 @@ type Engine struct {
 	resultOrder []string // FIFO order for eviction
 	resultsMu   sync.RWMutex
 
+	// In-flight registry (E-005): requestID -> admission/cancellation state.
+	// Leaf lock — see cancel.go for the locking rules.
+	inflightMu sync.RWMutex
+	inflight   map[string]*inflightRequest
+
 	// Persistence
 	persistErr error
 
@@ -125,6 +130,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		requests:    make(chan *Request, 100),
 		results:     make(map[string]*Response),
 		resultOrder: make([]string, 0, maxResults),
+		inflight:    make(map[string]*inflightRequest),
 		shutdownCh:  make(chan struct{}),
 		loopDone:    make(chan struct{}),
 	}
@@ -319,11 +325,18 @@ func (e *Engine) SubmitRequest(req *Request) error {
 		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
 	}
 
+	// E-005: register before the channel send so a cancellation can always
+	// find the request (queued or executing) from the moment it is admitted.
+	e.registerInflight(req)
+
 	select {
 	case e.requests <- req:
 		return nil
 	case <-shutdownCh:
 		e.backpressure.Release()
+		// Send never happened — drop the registration; exactly one Release
+		// follows the Accept above, none is skipped or duplicated.
+		e.deregisterInflight(req.ID)
 		return fmt.Errorf("engine shutting down")
 	}
 }
@@ -373,6 +386,11 @@ func (e *Engine) processRequests(ctx context.Context) {
 				e.resultOrder = e.resultOrder[1:]
 			}
 			e.resultsMu.Unlock()
+
+			// E-005: deregister only after the terminal result is stored, so
+			// CancelRequest always finds either the registration or the result
+			// (no window where neither exists).
+			e.deregisterInflight(req.ID)
 
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{
