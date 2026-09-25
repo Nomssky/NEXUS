@@ -2,7 +2,11 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,6 +297,7 @@ func TestSubmitSync(t *testing.T) {
 }
 
 // TEST-EXEC-010: SubmitSync timeout
+// TEST-EXEC-010a: SubmitSync wait-context expiry stops the handler (OQ8, E-005).
 func TestSubmitSyncTimeout(t *testing.T) {
 	e := testExecutor(t)
 	ctx := context.Background()
@@ -300,24 +305,47 @@ func TestSubmitSyncTimeout(t *testing.T) {
 	defer e.Stop(ctx)
 
 	req := testRequest("task-timeout")
-	// The handler blocks until the test releases it, so it is guaranteed to
-	// still be running when SubmitSync's 100ms context deadline expires —
-	// no fixed sleep needed to simulate a long-running task (E-015).
+	// The handler blocks until released OR its context is cancelled, so it is
+	// guaranteed to still be running when SubmitSync's 100ms context deadline
+	// expires — no fixed sleep needed to simulate a long-running task (E-015).
 	// defer close runs before the earlier defer e.Stop (LIFO): the handler is
 	// released before Stop waits for active tasks.
 	release := make(chan struct{})
 	defer close(release)
-	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
-		<-release
-		return &Outcome{Status: "completed"}, nil
+	handlerStopped := make(chan struct{}, 1)
+	req.Handler = func(hctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		select {
+		case <-release:
+			return &Outcome{Status: "completed"}, nil
+		case <-hctx.Done():
+			// OQ8: wait expiry must reach the handler so it can stop.
+			handlerStopped <- struct{}{}
+			return nil, hctx.Err()
+		}
 	}
 
 	shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
 	_, err := e.SubmitSync(shortCtx, req)
-	if err == nil {
-		t.Error("expected timeout error")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected DeadlineExceeded, got %v", err)
+	}
+
+	// The handler must observe cancellation and stop — not run to completion.
+	waitSignal(t, handlerStopped, "handler to observe wait-context cancellation")
+
+	// Existing timeout semantics: wait expiry records failed (not cancelled,
+	// not a user cancellation) with the wait-expiry reason.
+	outcome := waitForOutcome(t, e, "task-timeout")
+	if outcome.Status != "failed" {
+		t.Errorf("expected failed outcome, got %s", outcome.Status)
+	}
+	if !strings.Contains(outcome.Error, "wait context expired") {
+		t.Errorf("expected wait-expiry error, got %q", outcome.Error)
+	}
+	if e.CancelledCount() != 0 {
+		t.Errorf("wait expiry must not count as cancellation, got %d", e.CancelledCount())
 	}
 }
 
@@ -845,4 +873,543 @@ func TestGovernanceEscalate(t *testing.T) {
 	if result.Status != "escalated" {
 		t.Errorf("expected escalated, got %s", result.Status)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// E-005: external cancellation of in-flight tasks (executor scope).
+// ---------------------------------------------------------------------------
+
+// cancellationExecutor builds a running executor with a retained event bus for
+// cancellation tests. Governance is default-allow so submitted tasks execute.
+func cancellationExecutor(t *testing.T) (*Executor, *event.MemBus) {
+	t.Helper()
+	bus := event.NewMemBus()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		bus,
+		nil, // no model router in cancellation tests
+		DefaultConfig(),
+	)
+	if err := e.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Stop(context.Background()) })
+	return e, bus
+}
+
+// eventsAfterDispatch subscribes once and delivers every queued event in a
+// single synchronous dispatch, returning the delivered events (E-015 pattern:
+// events are published before the outcome is recorded, so a visible outcome
+// means one Dispatch delivers the full batch).
+func eventsAfterDispatch(t *testing.T, bus *event.MemBus) []*event.Event {
+	t.Helper()
+	var got []*event.Event
+	_, _ = bus.Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		got = append(got, ev)
+		return nil
+	}))
+	if _, err := bus.Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	return got
+}
+
+// findEvent returns the first event of the given type, or nil.
+func findEvent(events []*event.Event, typ event.EventType) *event.Event {
+	for _, ev := range events {
+		if ev.Type == typ {
+			return ev
+		}
+	}
+	return nil
+}
+
+// TEST-E005-EXEC-01: cancel a running (cooperative) task → status cancelled,
+// task.cancelled event, cancelled metric; Metrics() keeps its 3-value shape.
+func TestCancelRunningTask(t *testing.T) {
+	e, bus := cancellationExecutor(t)
+
+	started := make(chan struct{})
+	req := testRequest("task-cancel-running")
+	req.Handler = func(ctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-ctx.Done() // cooperative: stops when cancelled
+		return nil, ctx.Err()
+	}
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, started, "handler start")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	outcome := waitForOutcome(t, e, req.TaskID)
+	if outcome.Status != "cancelled" {
+		t.Errorf("expected cancelled outcome, got %s (err=%q)", outcome.Status, outcome.Error)
+	}
+	if outcome.Error != "" {
+		t.Errorf("cancelled outcome must not carry a failure error, got %q", outcome.Error)
+	}
+
+	if got := e.CancelledCount(); got != 1 {
+		t.Errorf("expected CancelledCount 1, got %d", got)
+	}
+	executed, failed, denied := e.Metrics()
+	if executed != 1 || failed != 0 || denied != 0 {
+		t.Errorf("expected metrics (1,0,0), got (%d,%d,%d)", executed, failed, denied)
+	}
+
+	events := eventsAfterDispatch(t, bus)
+	if findEvent(events, event.EventTypeTaskCancelled) == nil {
+		t.Errorf("expected task.cancelled event, got types: %v", eventTypes(events))
+	}
+	if findEvent(events, "executor.failed") != nil {
+		t.Error("cancellation must not emit executor.failed")
+	}
+	if findEvent(events, "executor.completed") != nil {
+		t.Error("cancellation must not emit executor.completed")
+	}
+}
+
+// TEST-E005-EXEC-02: cancellation recorded before the handler starts → the
+// handler never runs; outcome cancelled with task.cancelled.
+func TestCancelBeforeHandlerSkipsExecution(t *testing.T) {
+	var once sync.Once
+	frozen := make(chan struct{})  // closed to enable the freeze
+	blocked := make(chan struct{}) // closed when executeWork reaches its first clock call
+	release := make(chan struct{}) // closed to let the clock proceed
+	clock := func() time.Time {
+		select {
+		case <-frozen:
+			once.Do(func() {
+				close(blocked)
+				<-release
+			})
+		default:
+		}
+		return time.Now()
+	}
+
+	bus := event.NewMemBus()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		bus,
+		nil,
+		DefaultConfig(),
+		WithClock(clock),
+	)
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	handlerRan := make(chan struct{}, 1)
+	req := testRequest("task-cancel-before")
+	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		handlerRan <- struct{}{}
+		return &Outcome{Status: "completed"}, nil
+	}
+
+	// Freeze the clock so executeWork parks at its first e.now() call — before
+	// governance, agent provisioning, and the handler. Deterministic window:
+	// Submit's goroutine cannot advance until the test releases it.
+	close(frozen)
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, blocked, "executeWork to reach its start clock call")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	close(release)
+
+	outcome := waitForOutcome(t, e, req.TaskID)
+	if outcome.Status != "cancelled" {
+		t.Errorf("expected cancelled, got %s", outcome.Status)
+	}
+	select {
+	case <-handlerRan:
+		t.Error("handler must never run for a task cancelled before execution")
+	default:
+	}
+	if outcome.AgentID != "" {
+		t.Errorf("expected no agent assignment, got %q", outcome.AgentID)
+	}
+
+	events := eventsAfterDispatch(t, bus)
+	if findEvent(events, event.EventTypeTaskCancelled) == nil {
+		t.Errorf("expected task.cancelled event, got types: %v", eventTypes(events))
+	}
+}
+
+// TEST-E005-EXEC-03: cancelling a completed task returns ErrTaskCompleted with status.
+func TestCancelCompletedTaskConflict(t *testing.T) {
+	e, _ := cancellationExecutor(t)
+
+	req := testRequest("task-cancel-completed")
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitForOutcome(t, e, req.TaskID)
+
+	err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1")
+	if !errors.Is(err, ErrTaskCompleted) {
+		t.Fatalf("expected ErrTaskCompleted, got %v", err)
+	}
+	var terminal *TaskTerminalError
+	if !errors.As(err, &terminal) || terminal.Status != "completed" {
+		t.Errorf("expected terminal status completed, got %#v", terminal)
+	}
+	if got := e.CancelledCount(); got != 0 {
+		t.Errorf("expected CancelledCount 0, got %d", got)
+	}
+}
+
+// TEST-E005-EXEC-04: cancelling an unknown task returns ErrTaskNotFound.
+func TestCancelUnknownTaskNotFound(t *testing.T) {
+	e, _ := cancellationExecutor(t)
+
+	err := e.CancelTask("task-does-not-exist", "operator requested cancellation", "user-1")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+// TEST-E005-EXEC-05: repeat cancellation is idempotent — running and
+// already-cancelled both return nil.
+func TestCancelIdempotentRepeat(t *testing.T) {
+	e, _ := cancellationExecutor(t)
+
+	started := make(chan struct{})
+	req := testRequest("task-cancel-repeat")
+	req.Handler = func(ctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, started, "handler start")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("first cancel: %v", err)
+	}
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("repeat cancel while running: %v", err)
+	}
+
+	waitForOutcome(t, e, req.TaskID)
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("repeat cancel after terminal cancelled: %v", err)
+	}
+	if got := e.CancelledCount(); got != 1 {
+		t.Errorf("expected CancelledCount 1 after idempotent cancels, got %d", got)
+	}
+}
+
+// TEST-E005-EXEC-06: non-cooperative handler (ignores ctx) runs to completion —
+// completion wins; no task.cancelled, no cancelled metric (documented limitation).
+func TestCancelNonCooperativeHandlerCompletes(t *testing.T) {
+	e, bus := cancellationExecutor(t)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	req := testRequest("task-cancel-noncoop")
+	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-release // ignores ctx entirely
+		return &Outcome{Status: "completed"}, nil
+	}
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, started, "handler start")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	close(release)
+
+	outcome := waitForOutcome(t, e, req.TaskID)
+	if outcome.Status != "completed" {
+		t.Errorf("non-cooperative completion must win, got %s", outcome.Status)
+	}
+	if got := e.CancelledCount(); got != 0 {
+		t.Errorf("expected CancelledCount 0, got %d", got)
+	}
+
+	events := eventsAfterDispatch(t, bus)
+	if findEvent(events, event.EventTypeTaskCancelled) != nil {
+		t.Error("completed task must not emit task.cancelled")
+	}
+}
+
+// TEST-E005-EXEC-07: a SubmitSync waiter receives the cancelled outcome with a
+// nil error — cancellation is a result, not a wait failure (chain contract).
+func TestCancelDeliversOutcomeToWaiter(t *testing.T) {
+	e, _ := cancellationExecutor(t)
+
+	started := make(chan struct{})
+	req := testRequest("task-cancel-waiter")
+	req.Handler = func(ctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	type waitResult struct {
+		outcome *Outcome
+		err     error
+	}
+	done := make(chan waitResult, 1)
+	go func() {
+		o, err := e.SubmitSync(context.Background(), req)
+		done <- waitResult{o, err}
+	}()
+	waitSignal(t, started, "handler start")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("waiter must receive the outcome without error, got %v", res.err)
+		}
+		if res.outcome == nil || res.outcome.Status != "cancelled" {
+			t.Fatalf("expected cancelled outcome, got %#v", res.outcome)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for SubmitSync result")
+	}
+}
+
+// TEST-E005-EXEC-08: WaitOutcome returns an already-recorded outcome.
+func TestWaitOutcomeReturnsRecordedOutcome(t *testing.T) {
+	e, _ := cancellationExecutor(t)
+
+	req := testRequest("task-wait-outcome")
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	want := waitForOutcome(t, e, req.TaskID)
+
+	got, err := e.WaitOutcome(context.Background(), req.TaskID)
+	if err != nil {
+		t.Fatalf("WaitOutcome: %v", err)
+	}
+	if got != want {
+		t.Errorf("expected recorded outcome %v, got %v", want, got)
+	}
+}
+
+// TEST-E005-EXEC-09: task.cancelled payload carries contract fields plus attribution.
+func TestCancelEmitsTaskCancelledPayload(t *testing.T) {
+	e, bus := cancellationExecutor(t)
+
+	started := make(chan struct{})
+	req := testRequest("task-cancel-payload")
+	req.Handler = func(ctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, started, "handler start")
+
+	if err := e.CancelTask(req.TaskID, "operator requested cancellation", "nx:human:alice"); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	waitForOutcome(t, e, req.TaskID)
+
+	events := eventsAfterDispatch(t, bus)
+	ev := findEvent(events, event.EventTypeTaskCancelled)
+	if ev == nil {
+		t.Fatal("expected task.cancelled event")
+	}
+	var payload struct {
+		TaskID             string `json:"task_id"`
+		CancellationReason string `json:"cancellation_reason"`
+		Actor              string `json:"actor"`
+	}
+	if err := json.Unmarshal(ev.Data, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.TaskID != req.TaskID {
+		t.Errorf("expected task_id %s, got %q", req.TaskID, payload.TaskID)
+	}
+	if payload.CancellationReason != "operator requested cancellation" {
+		t.Errorf("expected cancellation_reason, got %q", payload.CancellationReason)
+	}
+	if payload.Actor != "nx:human:alice" {
+		t.Errorf("expected actor nx:human:alice, got %q", payload.Actor)
+	}
+	if ev.BusinessID != "biz-1" {
+		t.Errorf("expected event business_id biz-1, got %q", ev.BusinessID)
+	}
+	if ev.CorrelationID != "corr-task-cancel-payload" {
+		t.Errorf("expected correlation id, got %q", ev.CorrelationID)
+	}
+}
+
+// TEST-E005-EXEC-10: cancelling a running task releases its capacity slot.
+func TestCancelReleasesCapacitySlot(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxConcurrent = 1
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil,
+		cfg,
+	)
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	started := make(chan struct{})
+	reqA := testRequest("task-slot-a")
+	reqA.Handler = func(ctx context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := e.Submit(reqA); err != nil {
+		t.Fatalf("submit A: %v", err)
+	}
+	waitSignal(t, started, "handler A start")
+
+	// Capacity is full while A runs.
+	if err := e.Submit(testRequest("task-slot-overflow")); err == nil {
+		t.Error("expected capacity error while A occupies the only slot")
+	}
+
+	if err := e.CancelTask(reqA.TaskID, "operator requested cancellation", "user-1"); err != nil {
+		t.Fatalf("cancel A: %v", err)
+	}
+	waitForOutcome(t, e, reqA.TaskID)
+	waitUntil(t, "slot release after cancel", func() bool { return e.ActiveCount() == 0 })
+
+	// Slot is free again — B submits and completes normally.
+	reqB := testRequest("task-slot-b")
+	if err := e.Submit(reqB); err != nil {
+		t.Fatalf("submit B after cancel: %v", err)
+	}
+	outcomeB := waitForOutcome(t, e, reqB.TaskID)
+	if outcomeB.Status != "completed" {
+		t.Errorf("expected B completed, got %s", outcomeB.Status)
+	}
+}
+
+// TEST-E005-EXEC-11: cancelling a terminal pending_approval task conflicts.
+// Category C 5d must revisit approval-state cancellation end to end; at the
+// executor the task is already terminal, so cancellation is a 409-class conflict.
+func TestCancelPendingApprovalTaskConflict(t *testing.T) {
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil,
+		DefaultConfig(),
+	)
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := testRequest("task-cancel-approval")
+	req.Handler = func(_ context.Context, _ *WorkRequest, _ *agent.Agent) (*Outcome, error) {
+		return &Outcome{Status: "completed"}, nil
+	}
+	if err := e.Submit(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	outcome := waitForOutcome(t, e, req.TaskID)
+	if outcome.Status != "pending_approval" {
+		t.Fatalf("expected pending_approval, got %s", outcome.Status)
+	}
+
+	err := e.CancelTask(req.TaskID, "operator requested cancellation", "user-1")
+	if !errors.Is(err, ErrTaskCompleted) {
+		t.Fatalf("expected ErrTaskCompleted, got %v", err)
+	}
+	var terminal *TaskTerminalError
+	if !errors.As(err, &terminal) || terminal.Status != "pending_approval" {
+		t.Errorf("expected terminal status pending_approval, got %#v", terminal)
+	}
+}
+
+// eventTypes renders event types for failure messages.
+func eventTypes(events []*event.Event) []string {
+	types := make([]string, 0, len(events))
+	for _, ev := range events {
+		types = append(types, string(ev.Type))
+	}
+	return types
 }

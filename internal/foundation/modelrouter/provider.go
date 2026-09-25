@@ -1,6 +1,7 @@
 package modelrouter
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -37,7 +38,9 @@ type Provider interface {
 	// ListModels returns the models available from this provider.
 	ListModels() ([]string, error)
 	// Invoke sends a generation request and returns the response.
-	Invoke(req *GenerateRequest) (*GenerateResponse, error)
+	// The context propagates the caller's cancellation/deadline to the
+	// provider call (E-005): implementations must honor ctx.
+	Invoke(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error)
 }
 
 // GenerateRequest is a normalized request to a model provider.
@@ -107,7 +110,10 @@ func (lp *LocalProvider) ListModels() ([]string, error) {
 	return nil, nil // implemented by concrete runtime
 }
 
-func (lp *LocalProvider) Invoke(req *GenerateRequest) (*GenerateResponse, error) {
+func (lp *LocalProvider) Invoke(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	lp.mu.RLock()
 	if lp.status == ProviderStatusOffline {
 		lp.mu.RUnlock()
@@ -153,7 +159,10 @@ func (rp *RemoteProvider) ListModels() ([]string, error) {
 	return nil, nil // implemented by concrete runtime
 }
 
-func (rp *RemoteProvider) Invoke(req *GenerateRequest) (*GenerateResponse, error) {
+func (rp *RemoteProvider) Invoke(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	rp.mu.RLock()
 	if rp.status == ProviderStatusOffline {
 		rp.mu.RUnlock()

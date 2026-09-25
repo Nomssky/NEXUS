@@ -28,6 +28,7 @@ const (
 	EventTypeTaskAssigned      EventType = "task.assigned"
 	EventTypeTaskCompleted     EventType = "task.completed"
 	EventTypeTaskFailed        EventType = "task.failed"
+	EventTypeTaskCancelled     EventType = "task.cancelled"
 	EventTypeAgentSpawned      EventType = "agent.spawned"
 	EventTypeAgentHeartbeat    EventType = "agent.heartbeat"
 	EventTypeAgentStopped      EventType = "agent.stopped"

@@ -1,6 +1,7 @@
 package modelrouter
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -145,14 +146,20 @@ func (mr *ModelRouter) Route(req *RoutingRequest) (*RoutingDecision, error) {
 }
 
 // Invoke routes and invokes a model. It implements failover without unsafe duplicates.
-func (mr *ModelRouter) Invoke(req *RoutingRequest, genReq *GenerateRequest) (*GenerateResponse, *RoutingDecision, error) {
+// ctx propagates the caller's cancellation/deadline (E-005/OQ8): an already-cancelled
+// context fails fast, and cancellation during invocation reaches the provider call.
+func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *GenerateRequest) (*GenerateResponse, *RoutingDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
 	decision, err := mr.Route(req)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// Try the selected provider first
-	resp, invokeErr := mr.invokeProvider(decision.ProviderID, genReq)
+	resp, invokeErr := mr.invokeProvider(ctx, decision.ProviderID, genReq)
 	if invokeErr == nil {
 		// Record successful invocation
 		mr.accounting.Record(&InvocationRecord{
@@ -179,7 +186,7 @@ func (mr *ModelRouter) Invoke(req *RoutingRequest, genReq *GenerateRequest) (*Ge
 				continue
 			}
 			genReq.ModelID = modelID
-			resp, err := mr.invokeProvider(mdl.ProviderID, genReq)
+			resp, err := mr.invokeProvider(ctx, mdl.ProviderID, genReq)
 			if err == nil {
 				mr.accounting.Record(&InvocationRecord{
 					RequestID:    genReq.RequestID,
@@ -217,7 +224,7 @@ func (mr *ModelRouter) Invoke(req *RoutingRequest, genReq *GenerateRequest) (*Ge
 	return nil, decision, fmt.Errorf("all providers failed: %w", invokeErr)
 }
 
-func (mr *ModelRouter) invokeProvider(providerID string, req *GenerateRequest) (*GenerateResponse, error) {
+func (mr *ModelRouter) invokeProvider(ctx context.Context, providerID string, req *GenerateRequest) (*GenerateResponse, error) {
 	provider, ok := mr.providers[providerID]
 	if !ok {
 		return nil, fmt.Errorf("provider %s not found", providerID)
@@ -227,7 +234,7 @@ func (mr *ModelRouter) invokeProvider(providerID string, req *GenerateRequest) (
 		return nil, fmt.Errorf("provider %s unhealthy: %w", providerID, err)
 	}
 
-	return provider.Invoke(req)
+	return provider.Invoke(ctx, req)
 }
 
 func (mr *ModelRouter) filterCandidates(candidates []*ModelDefinition, req *RoutingRequest) []*ModelDefinition {
