@@ -381,16 +381,26 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		Resource:   "core",
 		BusinessID: req.Context.BusinessID,
 	})
-	if !decision.IsAllowing() {
-		return &ChainError{
-			Code:      "POLICY_DENIED",
-			Category:  "POLICY_DENIED",
-			Message:   fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason),
-			ChainStep: string(StepGovernance),
-			Retryable: decision.Outcome == governance.REQUIRE_APPROVAL,
-		}
+	if decision.IsAllowing() {
+		return nil
 	}
-	return nil
+	// CORE_INTERFACE_CONTRACTS §3: POLICY_DENIED covers governance outcome
+	// DENY only; a governance REQUIRE_APPROVAL surfaces as category
+	// APPROVAL_REQUIRED ("Wait for approval") — a distinct machine-readable
+	// code/category so callers can tell approval-gated work from a denial.
+	code, category := "POLICY_DENIED", "POLICY_DENIED"
+	message := fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason)
+	if decision.Outcome == governance.REQUIRE_APPROVAL {
+		code, category = "APPROVAL_REQUIRED", "APPROVAL_REQUIRED"
+		message = fmt.Sprintf("governance requires approval (outcome=%s): %s", decision.Outcome, decision.Reason)
+	}
+	return &ChainError{
+		Code:      code,
+		Category:  category,
+		Message:   message,
+		ChainStep: string(StepGovernance),
+		Retryable: decision.Outcome == governance.REQUIRE_APPROVAL,
+	}
 }
 
 // chainObjective creates an objective from the request intent.

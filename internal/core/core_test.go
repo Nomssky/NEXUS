@@ -1040,6 +1040,120 @@ func TestChainGovernanceRetryable(t *testing.T) {
 	}
 }
 
+// TEST-CORE-046: REQUIRE_APPROVAL surfaces as category APPROVAL_REQUIRED.
+// CORE_INTERFACE_CONTRACTS §3: POLICY_DENIED covers governance outcome DENY
+// only; "a governance REQUIRE_APPROVAL surfaces as category APPROVAL_REQUIRED"
+// (same in SCHEMA_GOVERNANCE_ATTENTION.md). Retryable stays true for
+// REQUIRE_APPROVAL per D10/C-024 — this test pins both at unit and
+// end-to-end (stored result) level.
+func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
+	requireApproval := []*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	}
+	denyAll := []*governance.Policy{
+		{
+			PolicyID:   "deny",
+			Name:       "Deny",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.DENY,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	}
+
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &Request{
+		ID:      "req-appr-cat",
+		Context: NewRequestContext("corr-appr-cat", "biz-1", "user-1"),
+		Intent:  "test",
+	}
+
+	// Unit: REQUIRE_APPROVAL → APPROVAL_REQUIRED category/code.
+	e.govEngine = governance.NewEngine(requireApproval)
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok := err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if ce.Category != "APPROVAL_REQUIRED" {
+		t.Errorf("expected category APPROVAL_REQUIRED for REQUIRE_APPROVAL, got %q", ce.Category)
+	}
+	if ce.Code != "APPROVAL_REQUIRED" {
+		t.Errorf("expected code APPROVAL_REQUIRED for REQUIRE_APPROVAL, got %q", ce.Code)
+	}
+	if !ce.Retryable {
+		t.Error("expected Retryable=true for REQUIRE_APPROVAL (D10/C-024)")
+	}
+
+	// Unit: DENY keeps POLICY_DENIED category (contract: DENY outcome only).
+	e.govEngine = governance.NewEngine(denyAll)
+	err = e.chainGovernance(context.Background(), req)
+	if err == nil {
+		t.Fatal("expected governance error")
+	}
+	ce, ok = err.(*ChainError)
+	if !ok {
+		t.Fatalf("expected *ChainError, got %T", err)
+	}
+	if ce.Category != "POLICY_DENIED" {
+		t.Errorf("expected category POLICY_DENIED for DENY, got %q", ce.Category)
+	}
+	if ce.Code != "POLICY_DENIED" {
+		t.Errorf("expected code POLICY_DENIED for DENY, got %q", ce.Code)
+	}
+	if ce.Retryable {
+		t.Error("expected Retryable=false for DENY")
+	}
+
+	// End-to-end: the stored result carries the approval-required category.
+	e.govEngine = governance.NewEngine(requireApproval)
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+	e2e := &Request{
+		ID:      "req-appr-e2e",
+		Context: NewRequestContext("corr-appr-e2e", "biz-1", "user-1"),
+		Intent:  "approval gated work",
+	}
+	if err := e.SubmitRequest(e2e); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, "req-appr-e2e")
+	if result.Status != "failed" {
+		t.Errorf("expected status failed at the approval gate, got %q", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error on approval-gated result")
+	}
+	if result.Error.Category != "APPROVAL_REQUIRED" || result.Error.Code != "APPROVAL_REQUIRED" {
+		t.Errorf("expected APPROVAL_REQUIRED category/code, got code=%q category=%q",
+			result.Error.Code, result.Error.Category)
+	}
+	if !result.Error.Retryable {
+		t.Error("expected Retryable=true on approval-gated result (D10/C-024)")
+	}
+}
+
 // TEST-CORE-038: No phantom model/tool audit entries (C-005 fix)
 func TestNoPhantomAuditEntries(t *testing.T) {
 	now := time.Now()
