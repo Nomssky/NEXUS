@@ -1154,6 +1154,139 @@ func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 	}
 }
 
+// TEST-CORE-047: executor-level governance DENY surfaces as a failed response
+// with POLICY_DENIED (D1). CORE_INTERFACE_CONTRACTS §3 requires the same
+// denied outcome the chain-level gate produces: Status failed, Error
+// category/code POLICY_DENIED, terminal chain.failed event. The deny policy
+// is scoped to action execute_task so the chain gate (execute_request)
+// passes and the executor's Step-1 gate is the one that denies — before the
+// fix the "denied" outcome (execErr == nil) fell through Step-12's default
+// branch and stored a "completed" response with a nil error.
+func TestExecutorDeniedSurfacesPolicyDenied(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SetPolicies mutates the shared engine in place: the executor holds the
+	// same *governance.Engine pointer captured at construction (engine.go:186),
+	// so the executor gate sees this policy set too. Default-allow keeps the
+	// chain gate (execute_request) passing; the DENY is scoped to the
+	// executor's action (execute_task) so only the executor gate denies.
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+		{
+			PolicyID: "deny-execute-task",
+			Name:     "Deny Execute Task",
+			Status:   governance.PolicyStatusActive,
+			Effect:   governance.DENY,
+			Subject:  governance.Subject{SubjectType: "all"},
+			// matchesAction treats an empty ActionIDs list as "all actions",
+			// so the ID list is what actually scopes the deny to the
+			// executor's action (execute_task) and spares the chain gate
+			// (execute_request).
+			Action:     governance.Action{ActionType: "execute_task", ActionIDs: []string{"execute_task"}},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-exec-denied",
+		Context: NewRequestContext("corr-exec-denied", "biz-1", "user-1"),
+		Intent:  "denied work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Errorf("executor DENY must store status failed, got %q", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("executor DENY must store a contract ChainError, got nil")
+	}
+	if result.Error.Category != "POLICY_DENIED" {
+		t.Errorf("expected category POLICY_DENIED, got %q", result.Error.Category)
+	}
+	if result.Error.Code != "POLICY_DENIED" {
+		t.Errorf("expected code POLICY_DENIED, got %q", result.Error.Code)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false for POLICY_DENIED (parity with chain gate)")
+	}
+	// The governance denial reason must not be lost — the contract stores a
+	// human-readable message on the error.
+	if !strings.Contains(result.Error.Message, "governance denied") {
+		t.Errorf("expected executor governance reason preserved in message, got %q", result.Error.Message)
+	}
+	if result.Error.ChainStep != string(StepAgent) {
+		t.Errorf("expected chain step %q (executor gate, not the chain gate), got %q",
+			string(StepAgent), result.Error.ChainStep)
+	}
+	if result.Error.CorrelationID != "corr-exec-denied" {
+		t.Errorf("expected correlation id propagated, got %q", result.Error.CorrelationID)
+	}
+
+	// Proof the chain gate PASSED and the executor gate is the one that
+	// denied: the governance audit entry records "allowed" and the executor
+	// outcome carries status=denied.
+	govAllowed := false
+	for _, entry := range result.AuditTrail {
+		if entry.Step == string(StepGovernance) && entry.Outcome == "allowed" {
+			govAllowed = true
+		}
+	}
+	if !govAllowed {
+		t.Error("expected chain governance audit entry allowed (chain gate must pass)")
+	}
+	if result.Outcome == nil || result.Outcome.Metrics["executor_status"] != "denied" {
+		t.Errorf("expected executor_status denied in metrics, got %+v", result.Outcome)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool, len(received))
+	for _, typ := range received {
+		got[typ] = true
+	}
+	for _, typ := range []string{"chain.governance.passed", "executor.denied", "chain.failed"} {
+		if !got[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+	// The handler must never run past the gate: no executor.received /
+	// executor.assigned, and no chain.completed terminal event.
+	for _, typ := range []string{"executor.received", "executor.assigned", "chain.completed"} {
+		if got[typ] {
+			t.Errorf("event %s must not fire when the executor gate denies, got %v", typ, received)
+		}
+	}
+}
+
 // TEST-CORE-038: No phantom model/tool audit entries (C-005 fix)
 func TestNoPhantomAuditEntries(t *testing.T) {
 	now := time.Now()

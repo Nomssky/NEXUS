@@ -304,6 +304,40 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			respErr.CorrelationID = req.Context.CorrelationID
 		}
 		respErr.Timestamp = e.now()
+	} else if execOutcome != nil && execOutcome.Status == "denied" {
+		// D1: executor-level governance DENY must surface exactly like the
+		// chain-level gate — failed with POLICY_DENIED (CORE_INTERFACE_CONTRACTS
+		// §3). The executor records DENY as an outcome with execErr == nil,
+		// which would otherwise fall through to the default "completed" status.
+		// REQUIRE_APPROVAL (pending_approval) and ESCALATE (escalated) keep
+		// their current behavior until their own contract decision.
+		status = "failed"
+		outcomeResult = &Outcome{
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
+		}
+		// Preserve the executor's governance denial reason ("governance
+		// denied: <reason>") in the contract message field.
+		message := execOutcome.Error
+		if message == "" {
+			message = "governance denied"
+		}
+		respErr = &ChainError{
+			Code:      "POLICY_DENIED",
+			Category:  "POLICY_DENIED",
+			Message:   message,
+			ChainStep: string(StepAgent),
+			Retryable: false,
+		}
+		if req.Context != nil {
+			respErr.CorrelationID = req.Context.CorrelationID
+		}
+		respErr.Timestamp = e.now()
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
