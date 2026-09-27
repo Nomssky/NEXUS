@@ -338,6 +338,40 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			respErr.CorrelationID = req.Context.CorrelationID
 		}
 		respErr.Timestamp = e.now()
+	} else if execOutcome != nil && execOutcome.Status == "pending_approval" {
+		// D2: executor-level governance REQUIRE_APPROVAL surfaces through the
+		// same error envelope as the chain-level gate — failed with
+		// APPROVAL_REQUIRED (CORE_INTERFACE_CONTRACTS §3). No contract defines
+		// pending_approval as a Response.Status; first-class approval states
+		// wait for the ApprovalEngine/admission-pipeline milestone. D4:
+		// Retryable is false — "wait for approval", not "retry now".
+		status = "failed"
+		outcomeResult = &Outcome{
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
+		}
+		// Preserve the executor's governance reason ("governance requires
+		// approval: <reason>") in the contract message field.
+		message := execOutcome.Error
+		if message == "" {
+			message = "governance requires approval"
+		}
+		respErr = &ChainError{
+			Code:      "APPROVAL_REQUIRED",
+			Category:  "APPROVAL_REQUIRED",
+			Message:   message,
+			ChainStep: string(StepAgent),
+			Retryable: false,
+		}
+		if req.Context != nil {
+			respErr.CorrelationID = req.Context.CorrelationID
+		}
+		respErr.Timestamp = e.now()
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
@@ -422,6 +456,9 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 	// DENY only; a governance REQUIRE_APPROVAL surfaces as category
 	// APPROVAL_REQUIRED ("Wait for approval") — a distinct machine-readable
 	// code/category so callers can tell approval-gated work from a denial.
+	// D4: Retryable is false for both — the contract category tables say
+	// No ("wait for approval"); retrying now cannot succeed for DENY and
+	// cannot succeed before approval for REQUIRE_APPROVAL.
 	code, category := "POLICY_DENIED", "POLICY_DENIED"
 	message := fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason)
 	if decision.Outcome == governance.REQUIRE_APPROVAL {
@@ -433,7 +470,7 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		Category:  category,
 		Message:   message,
 		ChainStep: string(StepGovernance),
-		Retryable: decision.Outcome == governance.REQUIRE_APPROVAL,
+		Retryable: false,
 	}
 }
 

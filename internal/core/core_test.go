@@ -975,7 +975,11 @@ func TestBusinessIDInResponse(t *testing.T) {
 	}
 }
 
-// TEST-CORE-037: POLICY_DENIED error sets Retryable for REQUIRE_APPROVAL (C-024 fix)
+// TEST-CORE-037: REQUIRE_APPROVAL → Retryable=false (D4: contract tables
+// CORE_INTERFACE_CONTRACTS.md §3 / SCHEMA_GOVERNANCE_ATTENTION.md §5.3 /
+// RUNTIME_EXECUTION_CONTRACTS.md §3.3 all say Retryable No — "wait for
+// approval"; "retry after approval" is a future state transition, not an
+// instruction to retry now). DENY → Retryable=false as well.
 func TestChainGovernanceRetryable(t *testing.T) {
 	now := time.Now()
 	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
@@ -989,7 +993,8 @@ func TestChainGovernanceRetryable(t *testing.T) {
 		Intent:  "test",
 	}
 
-	// Case 1: REQUIRE_APPROVAL → Retryable = true (caller can retry after approval)
+	// Case 1: REQUIRE_APPROVAL → Retryable = false (D4: contract No — wait
+	// for approval; retrying now cannot succeed)
 	e.govEngine = governance.NewEngine([]*governance.Policy{
 		{
 			PolicyID:   "require-approval",
@@ -1010,8 +1015,8 @@ func TestChainGovernanceRetryable(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *ChainError, got %T", err)
 	}
-	if !ce.Retryable {
-		t.Error("expected Retryable=true for REQUIRE_APPROVAL")
+	if ce.Retryable {
+		t.Error("expected Retryable=false for REQUIRE_APPROVAL (D4: contract = No, wait for approval)")
 	}
 
 	// Case 2: DENY → Retryable = false (retry won't help)
@@ -1043,9 +1048,10 @@ func TestChainGovernanceRetryable(t *testing.T) {
 // TEST-CORE-046: REQUIRE_APPROVAL surfaces as category APPROVAL_REQUIRED.
 // CORE_INTERFACE_CONTRACTS §3: POLICY_DENIED covers governance outcome DENY
 // only; "a governance REQUIRE_APPROVAL surfaces as category APPROVAL_REQUIRED"
-// (same in SCHEMA_GOVERNANCE_ATTENTION.md). Retryable stays true for
-// REQUIRE_APPROVAL per D10/C-024 — this test pins both at unit and
-// end-to-end (stored result) level.
+// (same in SCHEMA_GOVERNANCE_ATTENTION.md). Retryable is false for
+// REQUIRE_APPROVAL per D4 — the authoritative contract tables say No
+// ("wait for approval"), so retrying now is not a valid caller action —
+// this test pins both at unit and end-to-end (stored result) level.
 func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 	requireApproval := []*governance.Policy{
 		{
@@ -1099,8 +1105,8 @@ func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 	if ce.Code != "APPROVAL_REQUIRED" {
 		t.Errorf("expected code APPROVAL_REQUIRED for REQUIRE_APPROVAL, got %q", ce.Code)
 	}
-	if !ce.Retryable {
-		t.Error("expected Retryable=true for REQUIRE_APPROVAL (D10/C-024)")
+	if ce.Retryable {
+		t.Error("expected Retryable=false for REQUIRE_APPROVAL (D4: contract = No, wait for approval)")
 	}
 
 	// Unit: DENY keeps POLICY_DENIED category (contract: DENY outcome only).
@@ -1149,8 +1155,8 @@ func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 		t.Errorf("expected APPROVAL_REQUIRED category/code, got code=%q category=%q",
 			result.Error.Code, result.Error.Category)
 	}
-	if !result.Error.Retryable {
-		t.Error("expected Retryable=true on approval-gated result (D10/C-024)")
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false on approval-gated result (D4: contract = No, wait for approval)")
 	}
 }
 
@@ -1283,6 +1289,139 @@ func TestExecutorDeniedSurfacesPolicyDenied(t *testing.T) {
 	for _, typ := range []string{"executor.received", "executor.assigned", "chain.completed"} {
 		if got[typ] {
 			t.Errorf("event %s must not fire when the executor gate denies, got %v", typ, received)
+		}
+	}
+}
+
+// TEST-CORE-048: executor-level governance REQUIRE_APPROVAL surfaces through
+// the same error envelope as the chain-level gate (D2): Status failed, Error
+// code/category APPROVAL_REQUIRED, Retryable false (D4: contract table says
+// No — "wait for approval", not "retry now"), ChainStep agent, governance
+// reason preserved, terminal chain.failed. No contract defines
+// pending_approval as a Response.Status — the executor Outcome keeps its
+// pending_approval value, the stored Response must not. The deny/require
+// policy is scoped to action execute_task so the chain gate (execute_request)
+// passes and the executor's Step-1 gate is the one that requires approval.
+func TestExecutorRequiresApprovalSurfacesApprovalRequired(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// SetPolicies mutates the shared engine in place: the executor holds the
+	// same *governance.Engine pointer captured at construction (engine.go:186).
+	// Default-allow keeps the chain gate passing; the REQUIRE_APPROVAL is
+	// scoped to the executor's action (execute_task) via ActionIDs — an empty
+	// ActionIDs list would match every action (matchesIDList = all).
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+		{
+			PolicyID:   "require-approval-execute-task",
+			Name:       "Require Approval For Execute Task",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "execute_task", ActionIDs: []string{"execute_task"}},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-exec-appr",
+		Context: NewRequestContext("corr-exec-appr", "biz-1", "user-1"),
+		Intent:  "approval gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Errorf("executor REQUIRE_APPROVAL must store status failed, got %q", result.Status)
+	}
+	if result.Status == "pending_approval" {
+		t.Error("pending_approval must not become a Response.Status (D2)")
+	}
+	if result.Error == nil {
+		t.Fatal("executor REQUIRE_APPROVAL must store a contract ChainError, got nil")
+	}
+	if result.Error.Code != "APPROVAL_REQUIRED" {
+		t.Errorf("expected code APPROVAL_REQUIRED, got %q", result.Error.Code)
+	}
+	if result.Error.Category != "APPROVAL_REQUIRED" {
+		t.Errorf("expected category APPROVAL_REQUIRED, got %q", result.Error.Category)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false for APPROVAL_REQUIRED (D4: contract table = No, wait for approval)")
+	}
+	if result.Error.ChainStep != string(StepAgent) {
+		t.Errorf("expected chain step %q (executor gate, not the chain gate), got %q",
+			string(StepAgent), result.Error.ChainStep)
+	}
+	// The governance reason must survive the mapping (executor formats
+	// "governance requires approval: <reason>").
+	if !strings.Contains(result.Error.Message, "governance requires approval") {
+		t.Errorf("expected executor governance reason preserved in message, got %q", result.Error.Message)
+	}
+	if result.Error.CorrelationID != "corr-exec-appr" {
+		t.Errorf("expected correlation id propagated, got %q", result.Error.CorrelationID)
+	}
+
+	// Proof the chain gate PASSED and the executor gate is the one that
+	// required approval: the governance audit entry records "allowed" and the
+	// executor outcome carries its own pending_approval value.
+	govAllowed := false
+	for _, entry := range result.AuditTrail {
+		if entry.Step == string(StepGovernance) && entry.Outcome == "allowed" {
+			govAllowed = true
+		}
+	}
+	if !govAllowed {
+		t.Error("expected chain governance audit entry allowed (chain gate must pass)")
+	}
+	if result.Outcome == nil || result.Outcome.Metrics["executor_status"] != "pending_approval" {
+		t.Errorf("expected executor_status pending_approval in metrics, got %+v", result.Outcome)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool, len(received))
+	for _, typ := range received {
+		got[typ] = true
+	}
+	for _, typ := range []string{"chain.governance.passed", "executor.pending_approval", "chain.failed"} {
+		if !got[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+	// The handler must never run past the gate: no executor.received /
+	// executor.assigned, and no chain.completed terminal event.
+	for _, typ := range []string{"executor.received", "executor.assigned", "chain.completed"} {
+		if got[typ] {
+			t.Errorf("event %s must not fire when the executor gate requires approval, got %v", typ, received)
 		}
 	}
 }
