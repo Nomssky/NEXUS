@@ -202,8 +202,8 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 
 ### Deferred (Requires Architecture Decision)
 - Identity entity schema (contract defines, code doesn't materialize) — needs milestone planning
-- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — chain now covers POLICY (governance) + APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution); identity resolution and resource check stages remain unwired
-- Condition evaluation in governance (currently a no-op) — documented deferral
+- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — **all five chain stages now wired**: identity/authorization (A, opt-in via `--require-authentication`/`--enforce-business-scope`, default unenforced), POLICY (governance), APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution), resource check (A: executor `Capacity()` gate pre-schedule)
+- ~~Condition evaluation in governance (currently a no-op)~~ **CLOSED (B)** — all five contract types (`time`/`scope`/`attribute`/`count`/`composite`, SCHEMA_GOVERNANCE_ATTENTION §2.6) evaluated in `governance/conditions.go` with documented key=value expression grammar; unevaluable conditions fail safe to DENY (never silent pass); TEST-GOV-COND-01..07
 
 ### Accepted Risks
 - Memory write lock for reads (performance concern, correctness is fine) — verified accepted risk: exclusive lock retained to protect Retrieve()'s AccessCount/LastAccessed mutations (counterfactual RLock() raced and lost updates, reverted); remaining concern is serialized read-path performance; covered by `m038_test.go`
@@ -216,8 +216,8 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 
 These are features from later milestones that are not yet implemented, correctly identified as gaps rather than bugs:
 
-1. **Full admission pipeline** — identity resolution step in chain (planned, not yet milestone-gated)
-2. **Condition evaluation** in governance policies (documented deferral in governance/engine.go:212-216)
+1. ~~**Full admission pipeline** — identity resolution step in chain~~ **DONE (A)** — `identity`/`authorization`/`resource_check` chain stages (TEST-CORE-056..060); identity entity schema still a separate deferral (item 5)
+2. ~~**Condition evaluation** in governance policies (documented deferral in governance/engine.go)~~ **DONE (B)** — five condition types evaluated fail-safe, `governance/conditions.go`
 3. **AGENT/WORKFLOW/TASK scope levels** in governance (policy.go:176-183)
 4. ~~**External task cancellation** mechanism~~ — **DONE** (E-005: cooperative executor cancellation `e976562`, core `CancelRequest` `d4f6821`, gateway POST `/requests/{id}/cancel` `04f213e`; TEST-E005-*)
 5. **Full identity entity** with provenance, metadata, status tracking
