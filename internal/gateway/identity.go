@@ -75,13 +75,18 @@ func (s *Server) submitActorID(claimedActorID string) string {
 }
 
 // isScopedAPIPath reports whether the path carries business-scoped data
-// (submit, result retrieval, SSE) and must be identity-bound when enforcement
-// is on. Health/status and control paths are excluded (control has API-key auth).
+// (submit, result retrieval, SSE, approvals) and must be identity-bound when
+// enforcement is on. Health/status and control paths are excluded (control
+// has API-key auth).
 func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/requests" || strings.HasPrefix(path, "/api/v1/requests/") {
 		return true
 	}
-	return path == "/events"
+	if path == "/events" {
+		return true
+	}
+	// Approval records and decisions are business-scoped governance data.
+	return path == "/api/v1/approvals" || strings.HasPrefix(path, "/api/v1/approvals/")
 }
 
 // identityMiddleware authenticates scoped requests when enforcement is on and

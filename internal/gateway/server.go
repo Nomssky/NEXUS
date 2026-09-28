@@ -153,6 +153,12 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("POST /api/v1/requests", s.handleSubmitRequest)
 	s.mux.HandleFunc("GET /api/v1/requests/{id}", s.handleGetResult)
 	s.mux.HandleFunc("POST /api/v1/requests/{id}/cancel", s.handleCancelRequest)
+
+	// Approval endpoints (P1 approval wiring): list pending, decide.
+	s.mux.HandleFunc("GET /api/v1/approvals", s.handleListApprovals)
+	s.mux.HandleFunc("POST /api/v1/approvals/{id}/approve", s.handleApproveApproval)
+	s.mux.HandleFunc("POST /api/v1/approvals/{id}/deny", s.handleDenyApproval)
+
 	s.mux.HandleFunc("GET /events", s.handleSSE)
 
 	// Control surface endpoints
@@ -525,6 +531,118 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 	default:
 		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
 			fmt.Sprintf("cancellation failed: %v", err))
+	}
+}
+
+// handleListApprovals lists pending approvals for a business scope
+// (fail-closed: business_id mandatory, identity-bound when enforcement is on).
+func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"approvals": s.engine.ListApprovals(businessID),
+	})
+}
+
+// approvalDecisionBody is the POST body for approve/deny decisions.
+// reason maps to SCHEMA_WORK §6.2 decision_rationale (required once a
+// decision is made).
+type approvalDecisionBody struct {
+	Reason string `json:"reason"`
+}
+
+// handleApproveApproval approves a pending approval and resumes its request.
+func (s *Server) handleApproveApproval(w http.ResponseWriter, r *http.Request) {
+	s.decideApproval(w, r, true)
+}
+
+// handleDenyApproval denies a pending approval (no resume; the stored
+// response stays failed/APPROVAL_REQUIRED).
+func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request) {
+	s.decideApproval(w, r, false)
+}
+
+// decideApproval is the shared approve/deny handler. Ordering: 400 scope →
+// 401/403 identity → 400 body → core decision (404/403/409) → 202/200.
+func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve bool) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "approval ID required")
+		return
+	}
+
+	var body approvalDecisionBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(body.Reason) == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION",
+			"reason required (decision_rationale)")
+		return
+	}
+
+	// G-009 posture: only a verified identity is attributed (same rule as
+	// cancel); without enforcement the fixed marker is bound.
+	actorID := unauthenticatedActorID
+	if res.IdentityID != "" {
+		actorID = res.IdentityID
+	}
+
+	var err error
+	if approve {
+		err = s.engine.ApproveRequest(id, businessID, actorID, body.Reason)
+	} else {
+		err = s.engine.DenyRequest(id, businessID, actorID, body.Reason)
+	}
+
+	switch {
+	case err == nil:
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", id)
+		status, code := "denied", http.StatusOK
+		if approve {
+			// Approval triggers an async resume run — accept, then observe
+			// the final state via GET (same posture as cancel: 202).
+			status, code = "approved", http.StatusAccepted
+		}
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"approval_id": id,
+			"status":      status,
+		})
+	case errors.Is(err, core.ErrApprovalNotFound):
+		s.writeError(w, http.StatusNotFound, "VALIDATION", "approval not found")
+	case errors.Is(err, core.ErrScopeMismatch):
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: business scope mismatch")
+	case errors.Is(err, core.ErrApprovalNotPending):
+		s.writeError(w, http.StatusConflict, "CONFLICT", "approval not pending")
+	case errors.Is(err, core.ErrSelfApprovalProhibited),
+		errors.Is(err, core.ErrApproverUnauthorized):
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION", err.Error())
+	case errors.Is(err, core.ErrApprovalNotResumable):
+		s.writeError(w, http.StatusConflict, "CONFLICT", err.Error())
+	default:
+		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			fmt.Sprintf("approval decision failed: %v", err))
 	}
 }
 
