@@ -10,7 +10,7 @@
 
 ## 1. Executive Summary
 
-Full audit of NEXUS repository at HEAD `91bb3da`. The system has 31 Go packages, 391 tests, zero third-party dependencies, and passes race detector. M13 claimed 33 issues fixed — **16 of 17 checked fixes are fully verified**, one partially verified (H1: taskID not embedded in Event struct).
+Full audit of NEXUS repository at HEAD `91bb3da`. The system has 31 Go packages, 391 tests, zero third-party dependencies, and passes race detector. M13 claimed 33 issues fixed — **17 of 17 checked fixes are fully verified** (H1 partial fixed in `6d193a9`: `Event.TaskID` field added, `emitEvent` no longer drops it).
 
 **New findings from this audit: 68 total** (4 P0, 13 P1, 22 P2, 18 P3, 11 P4).
 
@@ -177,7 +177,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | C4 | workflow has RWMutex | **VERIFIED** | `workflow.go:135` |
 | C5 | agent has RWMutex | **VERIFIED** | `agent.go:195` |
 | C6 | persistErr propagated | **VERIFIED** | `engine.go:131-133` |
-| H1 | emitEvent includes data | **PARTIAL** | corrID + data included; taskID not in Event struct (no field) |
+| H1 | emitEvent includes data | **FIXED** (`6d193a9`) | corrID + data included; taskID now embedded via `Event.TaskID` (SCHEMA_EVENTS_TRIGGERS §2.2, was silently dropped by `emitEvent`) — TEST-E005-EXEC-09 envelope assertion |
 | H2 | Resume() method exists | **VERIFIED** | `engine.go:265-281` |
 | H3 | SSE dispatch loop | **VERIFIED** | `server.go:122-136` |
 | H4 | objective.ID in chainWorkflow | **VERIFIED** | `chain.go:365` |
@@ -189,7 +189,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | M10 | ChainError fields | **VERIFIED** | `context.go:177,180` |
 | M12 | CI race detector | **VERIFIED** | `ci.yml:43-44` |
 
-**16/17 fully verified. 1 partial (H1). 1 broken at verification time (H8 — auth middleware had off-by-2 bug; root cause G-001 since FIXED in Phase A1, see §9 A1).**
+**17/17 fully verified (H1 closed by `6d193a9`). 1 broken at verification time (H8 — auth middleware had off-by-2 bug; root cause G-001 since FIXED in Phase A1, see §9 A1).**
 
 ---
 
@@ -202,6 +202,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 
 ### Deferred (Requires Architecture Decision)
 - Identity entity schema (contract defines, code doesn't materialize) — needs milestone planning
+- Event envelope alignment with an external wire format — **DISPOSITIONED (user decision: internal transport)** — `event.Event` is the in-process transport; the `/events` SSE wire format is not bound by any contract (§2.2 covers `TaskID` for in-process propagation, now implemented in `6d193a9`); alignment deferred to the external-consumer milestone alongside the `nexus_id` envelope decision — no fabrication
 - Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — **all five chain stages now wired**: identity/authorization (A, opt-in via `--require-authentication`/`--enforce-business-scope`, default unenforced), POLICY (governance), APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution), resource check (A: executor `Capacity()` gate pre-schedule)
 - ~~Condition evaluation in governance (currently a no-op)~~ **CLOSED (B)** — all five contract types (`time`/`scope`/`attribute`/`count`/`composite`, SCHEMA_GOVERNANCE_ATTENTION §2.6) evaluated in `governance/conditions.go` with documented key=value expression grammar; unevaluable conditions fail safe to DENY (never silent pass); TEST-GOV-COND-01..07
 
@@ -223,7 +224,7 @@ These are features from later milestones that are not yet implemented, correctly
 5. **Full identity entity** with provenance, metadata, status tracking
 6. ~~**Model selection intelligence** (currently hardcoded "default")~~ **DONE (D2, `3a15a2e`)** — primary invoke stamps the routed model, `RoutingDecision` mirrors SCHEMA §3.3 (strategy/candidates/selected_reason/constraints_applied), cost/latency/privacy constraints live (m6 privacy-aware routing), cheapest policy sorts by price, health registry wired with demotion-not-removal and consecutive strikes (TEST-M6-023..028)
 7. ~~**Response body size limits**~~ — **DONE** (G-010: `maxResponseBytes` on GET, `maxSSEEventBytes` per SSE frame)
-8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); ~~ApprovalEngine request-creation/re-execution path~~ **DONE (P1)**: approval records created at both gates with `approval.requested`/`approved`/`denied`/`expired` events, `GET /api/v1/approvals` + approve/deny endpoints, approve → auto resume re-execution; ESCALATE surfaced as `ESCALATION_REQUIRED` + `escalation_ref` (D3), and the handoff now completes: escalation queue + attention intake consumer on `governance.escalated` implementing CTR-GOV-002 full input `{escalation_id, reason, context, urgency, deadline}` with ack, idempotent redelivery, pending → acknowledged → resolved → expired lifecycle, and the contract's logged/retry-once failure rule (C, TEST-CORE-061..065)
+8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); ~~ApprovalEngine request-creation/re-execution path~~ **DONE (P1)**: approval records created at both gates with `approval.requested`/`approved`/`denied`/`expired` events, `GET /api/v1/approvals` + approve/deny endpoints, approve → auto resume re-execution; ESCALATE surfaced as `ESCALATION_REQUIRED` + `escalation_ref` (D3), and the handoff now completes: escalation queue + attention intake consumer on `governance.escalated` implementing CTR-GOV-002 full input `{escalation_id, reason, context, urgency, deadline}` with ack, idempotent redelivery, pending → acknowledged → resolved → expired lifecycle, and the contract's logged/retry-once failure rule (C, TEST-CORE-061..065); **CTR-ATT human surface DONE (`6d193a9`)**: `GET /api/v1/escalations` scoped list (CTR-ATT-001 pull) + `POST /api/v1/escalations/{id}/ack|resolve` (CTR-ATT-002 `{reasoning}`, `{accepted}` output, 404/403-scope/409-state mapping), records carry `business_id` + actor attribution (`acknowledged_by`/`ack_reason`/`resolved_by`/`resolution`), notification options `[acknowledge, resolve]`, identity middleware scoped-path extended, TEST-CORE-068/069 + TEST-GW-ESC-01..05
 
 ---
 
