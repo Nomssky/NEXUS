@@ -1,9 +1,24 @@
 package governance
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
+)
+
+// Typed approval errors so callers (core resume path, gateway handlers)
+// can classify failures without string matching. Additive: all methods keep
+// returning non-nil errors in the same situations as before.
+var (
+	// ErrApprovalNotFound: no approval request with that decision ID.
+	ErrApprovalNotFound = errors.New("approval request not found")
+	// ErrApprovalNotPending: approval already resolved (approved/denied).
+	ErrApprovalNotPending = errors.New("approval request not pending")
+	// ErrSelfApprovalProhibited: requester tried to decide own request.
+	ErrSelfApprovalProhibited = errors.New("self-approval prohibited")
+	// ErrApproverUnauthorized: approver not in the policy's approver list.
+	ErrApproverUnauthorized = errors.New("approver not authorized")
 )
 
 // ApprovalRequest represents a pending approval for a governance decision.
@@ -65,7 +80,7 @@ func (ae *ApprovalEngine) RequestApproval(decision Decision, req Request, config
 	// SelfApprovalProhibited is set, Approve() compares approver to this
 	// requester — empty identity would make that comparison meaningless.
 	if config.SelfApprovalProhibited && req.Actor == "" {
-		return nil, fmt.Errorf("self-approval prohibited: requester identity required")
+		return nil, fmt.Errorf("%w: requester identity required", ErrSelfApprovalProhibited)
 	}
 
 	ar := &ApprovalRequest{
@@ -91,21 +106,21 @@ func (ae *ApprovalEngine) Approve(decisionID, approver, reason string) error {
 	defer ae.mu.Unlock()
 	ar, ok := ae.pending[decisionID]
 	if !ok {
-		return fmt.Errorf("approval request %s not found", decisionID)
+		return fmt.Errorf("%w: %s", ErrApprovalNotFound, decisionID)
 	}
 
 	if ar.Status != ApprovalStatePending {
-		return fmt.Errorf("approval request %s is not pending (status: %s)", decisionID, ar.Status)
+		return fmt.Errorf("%w: %s (status: %s)", ErrApprovalNotPending, decisionID, ar.Status)
 	}
 
 	// No self-approval
 	if ar.Config.SelfApprovalProhibited && approver == ar.Requester {
-		return fmt.Errorf("self-approval prohibited: approver %s is the requester", approver)
+		return fmt.Errorf("%w: approver %s is the requester", ErrSelfApprovalProhibited, approver)
 	}
 
 	// Check if approver is authorized
 	if !ae.isAuthorizedApprover(ar.Config, approver) {
-		return fmt.Errorf("approver %s is not authorized for this approval", approver)
+		return fmt.Errorf("%w: %s for approval %s", ErrApproverUnauthorized, approver, decisionID)
 	}
 
 	now := ae.now()
@@ -124,11 +139,11 @@ func (ae *ApprovalEngine) Deny(decisionID, approver, reason string) error {
 	defer ae.mu.Unlock()
 	ar, ok := ae.pending[decisionID]
 	if !ok {
-		return fmt.Errorf("approval request %s not found", decisionID)
+		return fmt.Errorf("%w: %s", ErrApprovalNotFound, decisionID)
 	}
 
 	if ar.Status != ApprovalStatePending {
-		return fmt.Errorf("approval request %s is not pending (status: %s)", decisionID, ar.Status)
+		return fmt.Errorf("%w: %s (status: %s)", ErrApprovalNotPending, decisionID, ar.Status)
 	}
 
 	now := ae.now()

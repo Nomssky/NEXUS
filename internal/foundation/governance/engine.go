@@ -93,7 +93,21 @@ func (e *Engine) Evaluate(req Request) Decision {
 	evaluated := e.evaluateConditions(matching, req)
 
 	// Step 6: Apply precedence (more-restrictive-wins)
-	return e.applyPrecedence(evaluated, req, now)
+	decision := e.applyPrecedence(evaluated, req, now)
+
+	// Approval wiring: an explicit APPROVED approval record satisfies a
+	// REQUIRE_APPROVAL gate — the caller passes Request.ApprovalState only
+	// after the ApprovalEngine confirmed an approved record for this exact
+	// request (INV-10: approval requires an explicit record, not an event;
+	// INV-16 does not apply here — approval is affirmative, not silence).
+	// DENY and default-deny are deliberately NOT overridden: only the
+	// approval gate converts. With ApprovalState unset (every pre-wiring
+	// caller) this is a no-op.
+	if decision.Outcome == REQUIRE_APPROVAL && req.ApprovalState != nil && *req.ApprovalState == ApprovalStateApproved {
+		decision.Outcome = ALLOW
+		decision.Reason = "governance requires approval; existing approval granted"
+	}
+	return decision
 }
 
 // findMatchingPolicies returns all policies that match the request scope
