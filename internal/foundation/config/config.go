@@ -41,6 +41,17 @@ type Config struct {
 	Health    HealthConfig    `json:"health"`
 	Lifecycle LifecycleConfig `json:"lifecycle"`
 	Security  SecurityConfig  `json:"security"`
+	Storage   StorageConfig   `json:"storage"`
+}
+
+// StorageConfig configures durable storage (C05). The default is empty:
+// records stay in-memory and do not survive restart (the historical
+// posture). Setting data_dir enables the file-backed store; boot fails
+// closed if the directory cannot be created or loaded.
+type StorageConfig struct {
+	// DataDir is the root directory for durable JSON records. Empty disables
+	// persistence entirely (no partial durability — nothing is written).
+	DataDir string `json:"data_dir"`
 }
 
 // SecurityConfig configures the security primitives foundation (component C04
@@ -142,6 +153,9 @@ func Defaults() Config {
 			EgressAllowList:         nil, // deny-by-default
 			SandboxEnabled:          true,
 		},
+		Storage: StorageConfig{
+			DataDir: "", // in-memory records (no durability)
+		},
 	}
 }
 
@@ -215,6 +229,9 @@ type fileConfig struct {
 		EgressAllowList         []string `json:"egress_allow_list"`
 		SandboxEnabled          *bool    `json:"sandbox_enabled"`
 	} `json:"security"`
+	Storage *struct {
+		DataDir *string `json:"data_dir"`
+	} `json:"storage"`
 }
 
 func loadFile(path string) (fileConfig, error) {
@@ -270,6 +287,9 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	if fc.Lifecycle != nil && fc.Lifecycle.ShutdownTimeoutSeconds != nil {
 		cfg.Lifecycle.ShutdownTimeoutSeconds = *fc.Lifecycle.ShutdownTimeoutSeconds
 	}
+	if fc.Storage != nil && fc.Storage.DataDir != nil {
+		cfg.Storage.DataDir = *fc.Storage.DataDir
+	}
 	if fc.Security != nil {
 		s := fc.Security
 		if s.AuditEnabled != nil {
@@ -305,6 +325,10 @@ const (
 	EnvHealthHost       = "NEXUS_HEALTH_HOST"
 	EnvHealthPort       = "NEXUS_HEALTH_PORT"
 	EnvShutdownTimeoutS = "NEXUS_SHUTDOWN_TIMEOUT_SECONDS"
+
+	// EnvDataDir overrides storage.data_dir. Non-secret operational setting:
+	// the root directory for durable records (empty = in-memory).
+	EnvDataDir = "NEXUS_DATA_DIR"
 
 	// M1 security keys. These can only tighten or enable defensive behavior.
 	EnvSecurityAuditEnabled            = "NEXUS_SECURITY_AUDIT_ENABLED"
@@ -357,6 +381,9 @@ func applyEnv(cfg *Config, environ []string) error {
 				fmt.Sprintf("%s must be an integer", EnvShutdownTimeoutS)).WithDetail("env", EnvShutdownTimeoutS)
 		}
 		cfg.Lifecycle.ShutdownTimeoutSeconds = s
+	}
+	if v, ok := envMap[EnvDataDir]; ok {
+		cfg.Storage.DataDir = v
 	}
 
 	// Security-sensitive environment values fail closed on malformed input: a
@@ -469,6 +496,10 @@ func (c Config) Validate() error {
 		return nerrors.Configuration("config.invalid",
 			fmt.Sprintf("logging.format must be one of %s", keys(validLogFormats))).
 			WithDetail("value", c.Logging.Format)
+	}
+	if c.Storage.DataDir != "" && strings.TrimSpace(c.Storage.DataDir) == "" {
+		return nerrors.Configuration("config.invalid", "storage.data_dir must not be blank").
+			WithDetail("value", c.Storage.DataDir)
 	}
 	if c.Health.Enabled {
 		if strings.TrimSpace(c.Health.Host) == "" {

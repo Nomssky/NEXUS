@@ -34,6 +34,9 @@ const (
 	RecordTypeConfig    RecordType = "config"
 	RecordTypeIdentity  RecordType = "identity"
 	RecordTypeArtifact  RecordType = "artifact"
+	// Organization records (SCHEMA_IDENTITIES_ORG §3/§4).
+	RecordTypeBusiness RecordType = "business"
+	RecordTypeDivision RecordType = "division"
 )
 
 // RecordStatus tracks the lifecycle state of a stored record.

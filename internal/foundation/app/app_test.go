@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 )
@@ -218,5 +219,67 @@ func TestAppLoadsConfigFile(t *testing.T) {
 	}
 	if a.Config().Nexus.Environment != "staging" {
 		t.Fatalf("expected staging, got %s", a.Config().Nexus.Environment)
+	}
+}
+
+// TEST-APP-PERSIST-01: with storage.data_dir set, registry mutations write
+// through to the file store and are restored on the next boot.
+func TestAppRegistryDurability(t *testing.T) {
+	dir := t.TempDir()
+	env := func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+			"NEXUS_DATA_DIR=" + dir,
+		}
+	}
+	a, err := New(Options{Environ: env})
+	if err != nil {
+		t.Fatalf("first boot: %v", err)
+	}
+	ident, err := identity.New("nx:nexus:test", identity.TypeHuman, "Owner", identity.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := a.Registry().CreateIdentity(ident, "test")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	a2, err := New(Options{Environ: env})
+	if err != nil {
+		t.Fatalf("second boot: %v", err)
+	}
+	got, ok := a2.Registry().GetIdentity(created.ID)
+	if !ok {
+		t.Fatal("identity must survive a restart when data_dir is configured")
+	}
+	if got.DisplayName != "Owner" {
+		t.Errorf("restored identity: %+v", got)
+	}
+}
+
+// TEST-APP-PERSIST-02: fail-closed boot — a data_dir that cannot be opened
+// (here: an existing file) aborts construction instead of silently degrading
+// to in-memory records.
+func TestAppDataDirFailureFailsClosed(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(file, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(Options{Environ: func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+			"NEXUS_DATA_DIR=" + file,
+		}
+	}})
+	if err == nil {
+		t.Fatal("expected boot to fail closed when data_dir cannot be opened")
+	}
+	if nerrors.CategoryOf(err) != nerrors.CategoryInternalFailure {
+		t.Errorf("expected INTERNAL_FAILURE, got %s", nerrors.CategoryOf(err))
 	}
 }

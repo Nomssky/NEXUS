@@ -5,9 +5,13 @@ package identity
 // records, their lifecycle transitions, and the audit trail §9 requires.
 //
 // Design notes (recorded decisions):
-//   - In-memory only: durability is a later milestone (consistent with every
-//     other runtime record — approvals, escalations, policies). The engine
-//     Store() surface stays external-only (C-019).
+//   - Durability is opt-in (write-through): NewRegistry keeps the historical
+//     in-memory-only posture; OpenRegistry additionally persists every
+//     mutation to a store.Store and hydrates from it before serving. The
+//     engine Store() surface stays external-only (C-019).
+//   - Write-through order is persist → memory insert → publish: a store
+//     failure leaves the registry untouched (no partial state) and emits no
+//     event (the audit trail only records facts that actually happened).
 //   - Records are created here only — nothing else materializes contract
 //     entities. Cross-record rules (§8: business/division/owner references)
 //     fail closed with VALIDATION errors.
@@ -29,6 +33,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
 // Registry result sentinels (gateway maps them to 404/409).
@@ -83,11 +88,14 @@ type Registry struct {
 	identities map[string]Identity
 	businesses map[string]Business
 	divisions  map[string]Division
-	pub        Publisher
-	now        func() time.Time
+	// st is the optional write-through store (nil = in-memory only).
+	st  store.Store
+	pub Publisher
+	now func() time.Time
 }
 
 // NewRegistry constructs an empty registry stamped with the installation ID.
+// The registry is in-memory only: records do not survive restart.
 func NewRegistry(nexusID string) *Registry {
 	return &Registry{
 		nexusID:    nexusID,
@@ -96,6 +104,128 @@ func NewRegistry(nexusID string) *Registry {
 		divisions:  map[string]Division{},
 		now:        func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// OpenRegistry constructs a write-through registry: every mutation is
+// persisted to st (and loaded back on the next open), and the maps are
+// hydrated from st before OpenRegistry returns. Hydration fails closed — a
+// record that cannot be decoded or validated aborts the call with an error so
+// boot never continues on a partially hydrated registry. A nil st degrades to
+// NewRegistry. Hydration publishes no events (restoring state is not a new
+// audit fact).
+func OpenRegistry(nexusID string, st store.Store) (*Registry, error) {
+	r := NewRegistry(nexusID)
+	if st == nil {
+		return r, nil
+	}
+	r.st = st
+	if err := r.hydrate(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// hydrate loads every stored record into memory. Soft-deleted records are
+// already excluded by the store's List. Call with a fresh registry (no lock
+// needed — nothing else holds a reference yet).
+func (r *Registry) hydrate() error {
+	identities, err := r.st.List(store.Filter{Type: store.RecordTypeIdentity})
+	if err != nil {
+		return fmt.Errorf("registry: hydrate identities: %w", err)
+	}
+	for _, rec := range identities {
+		var ident Identity
+		if err := json.Unmarshal(rec.Data, &ident); err != nil {
+			return fmt.Errorf("registry: corrupt identity record %q: %w", rec.ID, err)
+		}
+		if ident.ID != rec.ID {
+			return fmt.Errorf("registry: identity record %q carries id %q", rec.ID, ident.ID)
+		}
+		if err := ident.Validate(); err != nil {
+			return fmt.Errorf("registry: invalid identity record %q: %w", rec.ID, err)
+		}
+		r.identities[ident.ID] = ident
+	}
+
+	businesses, err := r.st.List(store.Filter{Type: store.RecordTypeBusiness})
+	if err != nil {
+		return fmt.Errorf("registry: hydrate businesses: %w", err)
+	}
+	for _, rec := range businesses {
+		var b Business
+		if err := json.Unmarshal(rec.Data, &b); err != nil {
+			return fmt.Errorf("registry: corrupt business record %q: %w", rec.ID, err)
+		}
+		if b.EntityID != rec.ID {
+			return fmt.Errorf("registry: business record %q carries entity_id %q", rec.ID, b.EntityID)
+		}
+		if err := b.Validate(); err != nil {
+			return fmt.Errorf("registry: invalid business record %q: %w", rec.ID, err)
+		}
+		r.businesses[b.EntityID] = b
+	}
+
+	divisions, err := r.st.List(store.Filter{Type: store.RecordTypeDivision})
+	if err != nil {
+		return fmt.Errorf("registry: hydrate divisions: %w", err)
+	}
+	for _, rec := range divisions {
+		var d Division
+		if err := json.Unmarshal(rec.Data, &d); err != nil {
+			return fmt.Errorf("registry: corrupt division record %q: %w", rec.ID, err)
+		}
+		if d.EntityID != rec.ID {
+			return fmt.Errorf("registry: division record %q carries entity_id %q", rec.ID, d.EntityID)
+		}
+		if err := d.Validate(); err != nil {
+			return fmt.Errorf("registry: invalid division record %q: %w", rec.ID, err)
+		}
+		r.divisions[d.EntityID] = d
+	}
+	return nil
+}
+
+// marshalRecord wraps an entity as a store.Record envelope.
+func marshalRecord(typ store.RecordType, id, businessID, divisionID string, entity any) (*store.Record, error) {
+	data, err := json.Marshal(entity)
+	if err != nil {
+		return nil, fmt.Errorf("registry: marshal %s %q: %w", typ, id, err)
+	}
+	return &store.Record{
+		ID:         id,
+		Type:       typ,
+		Status:     store.RecordStatusActive,
+		BusinessID: businessID,
+		DivisionID: divisionID,
+		Data:       data,
+	}, nil
+}
+
+// persistLocked writes one record through to the backing store. Call with
+// r.mu held. The stored version of an existing record is carried over so both
+// store implementations accept the write (MemStore requires an exact version
+// match; FileStore rejects a mismatched non-zero version). A nil store makes
+// this a no-op. Errors are wrapped, preserving store sentinels for callers
+// that check with errors.Is.
+//
+// Note: MemStore soft-deletes, so a Put after a Delete of the same id reports
+// a version conflict. Identity ids are random and never reused, so this only
+// matters for a re-create of a removed id — which callers never do.
+func (r *Registry) persistLocked(record *store.Record) error {
+	if r.st == nil {
+		return nil
+	}
+	prev, err := r.st.Get(record.ID)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("registry: read before persist %q: %w", record.ID, err)
+	}
+	if prev != nil {
+		record.Version = prev.Version
+	}
+	if err := r.st.Put(record); err != nil {
+		return fmt.Errorf("registry: persist %q: %w", record.ID, err)
+	}
+	return nil
 }
 
 // SetPublisher wires the audit-event sink (nil disables publishing).
@@ -208,6 +338,13 @@ func (r *Registry) CreateIdentity(ident Identity, actor string) (Identity, error
 		}
 	}
 
+	rec, err := marshalRecord(store.RecordTypeIdentity, ident.ID, ident.BusinessID, ident.DivisionID, ident)
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := r.persistLocked(rec); err != nil {
+		return Identity{}, err
+	}
 	r.identities[ident.ID] = ident
 	r.publishLocked(ident.ID, event.EventTypeIdentityCreated, ident.BusinessID, map[string]string{
 		"identity_type": string(ident.Type),
@@ -265,6 +402,13 @@ func (r *Registry) SetIdentityStatus(id string, to Status, actor string) (Identi
 	ident.Status = to
 	now := r.now()
 	ident.UpdatedAt = &now
+	rec, err := marshalRecord(store.RecordTypeIdentity, ident.ID, ident.BusinessID, ident.DivisionID, ident)
+	if err != nil {
+		return Identity{}, err
+	}
+	if err := r.persistLocked(rec); err != nil {
+		return Identity{}, err
+	}
 	r.identities[id] = ident
 	r.publishLocked(id, event.EventTypeIdentityStatusChanged, ident.BusinessID, map[string]string{
 		"from":   string(from),
@@ -279,10 +423,16 @@ func (r *Registry) SetIdentityStatus(id string, to Status, actor string) (Identi
 // credential registration during create; the public surface has no delete
 // (the contract defines no identity delete — status revoked is the lifecycle
 // end). Removing an unknown id is a no-op error-free success (idempotent).
+// When a store is wired the persisted record is soft-deleted best effort: the
+// rollback must never fail on I/O, and a leftover soft-deleted record is
+// invisible to hydration anyway.
 func (r *Registry) RemoveIdentity(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.identities, id)
+	if r.st != nil {
+		_ = r.st.Delete(id)
+	}
 }
 
 // ---------- Business ----------
@@ -346,6 +496,13 @@ func (r *Registry) CreateBusiness(b Business, actor string) (Business, error) {
 			fmt.Sprintf("owner identity %q is %s (must be active)", owner.ID, owner.Status))
 	}
 
+	rec, err := marshalRecord(store.RecordTypeBusiness, b.EntityID, b.BusinessID, "", b)
+	if err != nil {
+		return Business{}, err
+	}
+	if err := r.persistLocked(rec); err != nil {
+		return Business{}, err
+	}
 	r.businesses[b.EntityID] = b
 	r.publishLocked(b.EntityID, event.EventTypeBusinessOnboarded, b.BusinessID, map[string]string{
 		"name":              b.Name,
@@ -396,6 +553,13 @@ func (r *Registry) SetBusinessStatus(id string, to BusinessStatus, actor string)
 	b.Status = to
 	now := r.now()
 	b.UpdatedAt = &now
+	rec, err := marshalRecord(store.RecordTypeBusiness, b.EntityID, b.BusinessID, "", b)
+	if err != nil {
+		return Business{}, err
+	}
+	if err := r.persistLocked(rec); err != nil {
+		return Business{}, err
+	}
 	r.businesses[id] = b
 	r.publishLocked(id, event.EventTypeBusinessStatusChanged, b.BusinessID, map[string]string{
 		"from":   string(from),
@@ -478,9 +642,36 @@ func (r *Registry) CreateDivision(d Division, actor string) (Division, error) {
 			"division owner belongs to a different business")
 	}
 
-	r.divisions[d.EntityID] = d
+	// Two records change (the division and its business's membership list).
+	// Persist division first: a crash between the two writes then leaves the
+	// membership one step behind rather than a business referencing a
+	// division that does not exist. On any store failure the already
+	// persisted division is rolled back best effort, so disk never grows a
+	// division its business does not list, and memory stays untouched.
+	rollbackDivision := func() {
+		if r.st != nil {
+			_ = r.st.Delete(d.EntityID)
+		}
+	}
+	divRec, err := marshalRecord(store.RecordTypeDivision, d.EntityID, d.BusinessID, d.EntityID, d)
+	if err != nil {
+		return Division{}, err
+	}
+	if err := r.persistLocked(divRec); err != nil {
+		return Division{}, err
+	}
 	b.Divisions = append(b.Divisions, d.EntityID)
 	b.UpdatedAt = &now
+	bizRec, err := marshalRecord(store.RecordTypeBusiness, b.EntityID, b.BusinessID, "", b)
+	if err != nil {
+		rollbackDivision()
+		return Division{}, err
+	}
+	if err := r.persistLocked(bizRec); err != nil {
+		rollbackDivision()
+		return Division{}, err
+	}
+	r.divisions[d.EntityID] = d
 	r.businesses[b.EntityID] = b
 	r.publishLocked(d.EntityID, event.EventTypeDivisionCreated, d.BusinessID, map[string]string{
 		"business_id": d.BusinessID,
@@ -534,6 +725,13 @@ func (r *Registry) SetDivisionStatus(id string, to DivisionStatus, actor string)
 	d.Status = to
 	now := r.now()
 	d.UpdatedAt = &now
+	rec, err := marshalRecord(store.RecordTypeDivision, d.EntityID, d.BusinessID, d.EntityID, d)
+	if err != nil {
+		return Division{}, err
+	}
+	if err := r.persistLocked(rec); err != nil {
+		return Division{}, err
+	}
 	r.divisions[id] = d
 	r.publishLocked(id, event.EventTypeDivisionStatusChanged, d.BusinessID, map[string]string{
 		"business_id": d.BusinessID,

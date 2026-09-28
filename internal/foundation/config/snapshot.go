@@ -137,6 +137,7 @@ func fingerprint(c Config) string {
 		DevUnsafe   bool     `json:"security_dev_allow_unsafe_overrides"`
 		Egress      []string `json:"security_egress_allow_list"`
 		Sandbox     bool     `json:"security_sandbox_enabled"`
+		DataDir     string   `json:"storage_data_dir"`
 	}{
 		NexusID:     c.Nexus.ID,
 		Environment: c.Nexus.Environment,
@@ -152,6 +153,7 @@ func fingerprint(c Config) string {
 		DevUnsafe:   c.Security.DevAllowUnsafeOverrides,
 		Egress:      egress,
 		Sandbox:     c.Security.SandboxEnabled,
+		DataDir:     c.Storage.DataDir,
 	}
 
 	data, err := json.Marshal(canonical)
@@ -214,6 +216,9 @@ func markSources(sources map[string]Source, fc fileConfig, src Source) {
 	if fc.Security != nil {
 		sources["security"] = src
 	}
+	if fc.Storage != nil {
+		sources["storage"] = src
+	}
 }
 
 // markEnvSources records which sections the environment explicitly supplied.
@@ -243,6 +248,9 @@ func markEnvSources(sources map[string]Source, environ []string) {
 		EnvSecurityEnforceBusinessScope, EnvSecurityDevAllowUnsafeOverrides,
 		EnvSecurityEgressAllowList, EnvSecuritySandboxEnabled) {
 		sources["security"] = SourceEnvironment
+	}
+	if mark(EnvDataDir) {
+		sources["storage"] = SourceEnvironment
 	}
 }
 

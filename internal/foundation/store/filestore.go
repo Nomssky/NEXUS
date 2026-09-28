@@ -200,7 +200,10 @@ func (fs *FileStore) CountAll() int {
 
 // --- internal helpers ---
 
-// writeRecord writes a single record as a JSON file.
+// writeRecord writes a single record as a JSON file atomically: a temp file
+// in the same directory is written, fsynced, then renamed over the target.
+// A crash mid-write can therefore never leave a truncated or partial record
+// behind — readers see either the old bytes or the new ones.
 func (fs *FileStore) writeRecord(record *Record) error {
 	typeDir := filepath.Join(fs.dir, string(record.Type))
 	if err := os.MkdirAll(typeDir, 0o755); err != nil {
@@ -213,10 +216,34 @@ func (fs *FileStore) writeRecord(record *Record) error {
 		return &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("marshal: %v", err)}
 	}
 
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	tmp, err := os.CreateTemp(typeDir, "."+record.ID+"-*.tmp")
+	if err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create temp: %v", err)}
+	}
+	tmpName := tmp.Name()
+	// Remove the temp file on any failure path; after a successful rename the
+	// name no longer exists (remove of a missing path is a no-op).
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("write: %v", err)}
 	}
-
+	// Durability: flush file contents before the rename publishes them.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync: %v", err)}
+	}
+	if err := tmp.Close(); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("close: %v", err)}
+	}
+	// Match the historical permissions of direct writes (os.WriteFile 0644).
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("chmod: %v", err)}
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("rename: %v", err)}
+	}
 	return nil
 }
 

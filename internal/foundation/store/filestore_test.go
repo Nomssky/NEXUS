@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -279,5 +280,55 @@ func TestFileStoreCorruptFileSkipped(t *testing.T) {
 	count, _ := fs.Count(Filter{})
 	if count != 1 {
 		t.Errorf("expected 1 valid record, got %d", count)
+	}
+}
+
+// TEST-FS-01: writes are atomic — a temp file + rename is used, so the type
+// directory only ever contains complete .json records (no partial writes, no
+// leftover temp files after successful puts), and contents round-trip.
+func TestFileStoreAtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	rec := &Record{
+		ID:   "nx:identity:atomic",
+		Type: RecordTypeIdentity,
+		Data: []byte(`{"entity_id":"nx:identity:atomic"}`),
+	}
+	if err := fs.Put(rec); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	// Update in place (Put mutates Version; a second Put with the current
+	// version satisfies optimistic concurrency in both stores).
+	rec.Data = []byte(`{"entity_id":"nx:identity:atomic","status":"suspended"}`)
+	if err := fs.Put(rec); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, string(RecordTypeIdentity)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly one record file, got %d", len(entries))
+	}
+	if name := entries[0].Name(); name != "nx:identity:atomic.json" {
+		t.Errorf("unexpected file %q (temp remnants?)", name)
+	}
+
+	// Contents are the complete updated record.
+	reopened, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	got, err := reopened.Get("nx:identity:atomic")
+	if err != nil || got == nil {
+		t.Fatalf("get: %v %v", got, err)
+	}
+	if !strings.Contains(string(got.Data), "suspended") {
+		t.Errorf("update not durable: %s", got.Data)
 	}
 }

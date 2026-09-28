@@ -26,6 +26,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/version"
 )
 
@@ -80,6 +81,11 @@ func New(opts Options) (*App, error) {
 		NexusID:  cfg.Nexus.ID,
 	})
 
+	reg, err := openRegistry(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	a := &App{
 		cfg:     cfg,
 		snap:    snap,
@@ -87,7 +93,7 @@ func New(opts Options) (*App, error) {
 		health:  health.NewServer(),
 		egress:  security.NewEgressPolicy(cfg.Security.EgressAllowList),
 		members: identity.NewMembershipSet(),
-		reg:     identity.NewRegistry(cfg.Nexus.ID),
+		reg:     reg,
 		life: lifecycle.New(lifecycle.Options{
 			ShutdownTimeout: time.Duration(cfg.Lifecycle.ShutdownTimeoutSeconds) * time.Second,
 		}),
@@ -95,6 +101,30 @@ func New(opts Options) (*App, error) {
 	}
 	a.registerHooks()
 	return a, nil
+}
+
+// openRegistry builds the organization entity registry. Without
+// storage.data_dir it is in-memory only (the historical default). With a
+// data_dir, records persist to a file store and hydrate on boot; any store or
+// hydration failure aborts startup (fail closed — never serve an App whose
+// registry is only partially restored).
+func openRegistry(cfg config.Config) (*identity.Registry, error) {
+	if cfg.Storage.DataDir == "" {
+		return identity.NewRegistry(cfg.Nexus.ID), nil
+	}
+	st, err := store.NewFileStore(cfg.Storage.DataDir)
+	if err != nil {
+		return nil, nerrors.Internal("app.store_open_failed",
+			fmt.Sprintf("cannot open record store in %s: %v", cfg.Storage.DataDir, err)).
+			WithDetail("data_dir", cfg.Storage.DataDir)
+	}
+	reg, err := identity.OpenRegistry(cfg.Nexus.ID, st)
+	if err != nil {
+		return nil, nerrors.Internal("app.registry_hydration_failed",
+			fmt.Sprintf("cannot hydrate registry from %s: %v", cfg.Storage.DataDir, err)).
+			WithDetail("data_dir", cfg.Storage.DataDir)
+	}
+	return reg, nil
 }
 
 // Config returns the effective configuration.
@@ -110,9 +140,10 @@ func (a *App) Egress() *security.EgressPolicy { return a.egress }
 // milestones can populate it; M1 does not persist memberships.
 func (a *App) Memberships() *identity.MembershipSet { return a.members }
 
-// Registry returns the in-memory organization entity registry
-// (Identity/Business/Division, SCHEMA_IDENTITIES_ORG §2–§4), stamped with the
-// installation's nexus_id. Durability is a later milestone.
+// Registry returns the organization entity registry (Identity/Business/
+// Division, SCHEMA_IDENTITIES_ORG §2–§4), stamped with the installation's
+// nexus_id. It is in-memory only unless storage.data_dir is configured, in
+// which case mutations write through to the file store and hydrate on boot.
 func (a *App) Registry() *identity.Registry { return a.reg }
 
 // Logger returns the structured logger.

@@ -140,3 +140,79 @@ func TestValidateDeterministic(t *testing.T) {
 		t.Fatalf("validation must be deterministic: %q vs %q", first, second)
 	}
 }
+
+// TEST-CONF-STOR-01: durability is opt-in — default data_dir is empty
+// (in-memory records, the historical posture).
+func TestStorageDataDirDefaultEmpty(t *testing.T) {
+	cfg, err := Load(LoadOptions{Environ: func() []string { return nil }})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Storage.DataDir != "" {
+		t.Fatalf("expected empty data_dir (in-memory default), got %q", cfg.Storage.DataDir)
+	}
+}
+
+// TEST-CONF-STOR-02: storage.data_dir loads from the config file.
+func TestStorageDataDirFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"storage":{"data_dir":"/var/lib/nexus"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(LoadOptions{FilePath: path, Environ: func() []string { return nil }})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Storage.DataDir != "/var/lib/nexus" {
+		t.Fatalf("expected file data_dir, got %q", cfg.Storage.DataDir)
+	}
+}
+
+// TEST-CONF-STOR-03: NEXUS_DATA_DIR overrides the file (defaults < file < env).
+func TestStorageDataDirEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"storage":{"data_dir":"/from/file"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(LoadOptions{
+		FilePath: path,
+		Environ:  func() []string { return []string{"NEXUS_DATA_DIR=/from/env"} },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Storage.DataDir != "/from/env" {
+		t.Fatalf("expected env to beat file, got %q", cfg.Storage.DataDir)
+	}
+}
+
+// TEST-CONF-STOR-04: a blank (whitespace-only) data_dir fails validation
+// rather than silently producing a confusing directory name.
+func TestStorageDataDirBlankRejected(t *testing.T) {
+	_, err := Load(LoadOptions{
+		Environ: func() []string { return []string{"NEXUS_DATA_DIR=  "} },
+	})
+	if err == nil {
+		t.Fatal("expected validation error for blank data_dir")
+	}
+	if nerrors.CategoryOf(err) != nerrors.CategoryValidation {
+		t.Fatalf("expected VALIDATION category, got %s", nerrors.CategoryOf(err))
+	}
+}
+
+// TEST-CONF-STOR-05: snapshot source metadata records where storage came from.
+func TestStorageSnapshotSources(t *testing.T) {
+	_, snap, err := LoadSnapshot(LoadOptions{
+		Environ: func() []string { return []string{"NEXUS_DATA_DIR=/data"} },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if src := snap.Source("storage"); src != SourceEnvironment {
+		t.Fatalf("expected storage source=environment, got %v", src)
+	}
+}
