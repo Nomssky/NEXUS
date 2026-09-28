@@ -23,21 +23,30 @@ type Engine struct {
 	mu       sync.RWMutex
 	policies []*Policy
 	now      func() time.Time // injectable clock for testing
+
+	// condMu is a leaf lock guarding the count-condition histograms.
+	// Evaluate holds e.mu.RLock while evaluating conditions, so the
+	// mutable counters must live behind their own lock (never take e.mu
+	// while holding condMu).
+	condMu     sync.Mutex
+	condCounts map[string][]time.Time
 }
 
 // NewEngine creates a new governance engine with the given policies.
 func NewEngine(policies []*Policy) *Engine {
 	return &Engine{
-		policies: policies,
-		now:      time.Now,
+		policies:   policies,
+		now:        time.Now,
+		condCounts: make(map[string][]time.Time),
 	}
 }
 
 // NewEngineWithClock creates a new governance engine with an injectable clock.
 func NewEngineWithClock(policies []*Policy, now func() time.Time) *Engine {
 	return &Engine{
-		policies: policies,
-		now:      now,
+		policies:   policies,
+		now:        now,
+		condCounts: make(map[string][]time.Time),
 	}
 }
 
@@ -89,8 +98,26 @@ func (e *Engine) Evaluate(req Request) Decision {
 		}
 	}
 
-	// Step 4-5: Evaluate conditions on each matching policy
-	evaluated := e.evaluateConditions(matching, req)
+	// Step 4-5: Evaluate conditions on each matching policy. A condition
+	// that is not evaluable fails the whole evaluation safe to DENY —
+	// never a silent "condition passes" (see conditions.go).
+	evaluated, condErr := e.evaluateConditions(matching, req, now)
+	if condErr != nil {
+		return Decision{
+			Outcome:    DENY,
+			Reason:     fmt.Sprintf("condition evaluation failed (fail-safe): %v", condErr),
+			ScopeLevel: ScopeLevelGlobal,
+			Timestamp:  now,
+		}
+	}
+	if len(evaluated) == 0 {
+		return Decision{
+			Outcome:    DENY,
+			Reason:     "no matching policies with conditions holding (default deny)",
+			ScopeLevel: ScopeLevelGlobal,
+			Timestamp:  now,
+		}
+	}
 
 	// Step 6: Apply precedence (more-restrictive-wins)
 	decision := e.applyPrecedence(evaluated, req, now)
@@ -218,15 +245,6 @@ func (e *Engine) matchesIDList(ids []string, target string) bool {
 		}
 	}
 	return false
-}
-
-// evaluateConditions evaluates conditions on each matching policy.
-// For now, all conditions are considered satisfied (condition evaluation
-// will be extended in M3+ when the full condition engine is built).
-func (e *Engine) evaluateConditions(policies []*Policy, req Request) []*Policy {
-	// All matching policies pass condition evaluation for now.
-	// Future: evaluate time, scope, attribute, count, composite conditions.
-	return policies
 }
 
 // applyPrecedence applies precedence rules to produce the final decision.
