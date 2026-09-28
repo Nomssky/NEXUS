@@ -60,7 +60,12 @@ type Options struct {
 
 // New creates a new launcher with all components wired.
 func New(opts Options) *Launcher {
-	engine, err := core.NewEngine(&opts.Config)
+	// Identity-bound admission stages (A: chain IDENTITY/AUTHORIZATION)
+	// share the A6 flags and membership store — one posture for both
+	// boundaries (gateway edge, chain defense in depth).
+	engine, err := core.NewEngine(&opts.Config,
+		core.WithIdentity(opts.Memberships, opts.RequireAuthentication, opts.EnforceBusinessScope),
+	)
 	if err != nil {
 		// Store error; will be returned by Start
 		return &Launcher{

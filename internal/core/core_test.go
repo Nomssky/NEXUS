@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
@@ -2823,5 +2825,290 @@ func TestEscalationExecutorGateEnvelope(t *testing.T) {
 	}
 	if !sawEscalated {
 		t.Errorf("expected governance.escalated event, got %v", received)
+	}
+}
+
+// activeMembership is a shared fixture helper for the admission-pipeline
+// tests (A): an active member of biz-1.
+func activeMembership(t *testing.T, identityID, businessID string) *identity.MembershipSet {
+	t.Helper()
+	members := identity.NewMembershipSet()
+	if err := members.Add(identity.Membership{
+		IdentityID: identityID,
+		BusinessID: businessID,
+		Role:       identity.RoleMember,
+		Status:     identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add membership: %v", err)
+	}
+	return members
+}
+
+// TEST-CORE-056 (A): admission IDENTITY stage (RUNTIME §3.1 stage 3) —
+// enforcement on, actor unknown to the membership store → failed / AUTH,
+// ChainStep identity, Retryable false (RT-01 admission rejection with
+// reason code).
+func TestAdmissionIdentityUnknownActor(t *testing.T) {
+	now := time.Now()
+	members := activeMembership(t, "alice", "biz-1")
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithIdentity(members, true, false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-idn-unknown",
+		Context: NewRequestContext("corr-idn-unknown", "biz-1", "ghost"),
+		Intent:  "work by an unknown actor",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error envelope")
+	}
+	if result.Error.Code != "AUTH" || result.Error.Category != "AUTH" {
+		t.Errorf("expected AUTH/AUTH, got %s/%s", result.Error.Code, result.Error.Category)
+	}
+	if result.Error.ChainStep != string(StepIdentity) {
+		t.Errorf("expected chain_step identity, got %q", result.Error.ChainStep)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false (§3 AUTH = No)")
+	}
+	if !strings.Contains(result.Error.Message, "actor not found: ghost") {
+		t.Errorf("message should name the actor, got %q", result.Error.Message)
+	}
+}
+
+// TEST-CORE-057 (A): admission AUTHORIZATION stage (RUNTIME §3.1 stage 4) —
+// known actor without active membership in the request's business → failed /
+// AUTHORIZATION, ChainStep authorization.
+func TestAdmissionAuthorizationForeignBusiness(t *testing.T) {
+	now := time.Now()
+	members := activeMembership(t, "alice", "biz-1")
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithIdentity(members, true, true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-authz-foreign",
+		Context: NewRequestContext("corr-authz-foreign", "biz-2", "alice"),
+		Intent:  "work for a foreign business",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Fatalf("expected failed, got %s", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error envelope")
+	}
+	if result.Error.Code != "AUTHORIZATION" || result.Error.Category != "AUTHORIZATION" {
+		t.Errorf("expected AUTHORIZATION/AUTHORIZATION, got %s/%s",
+			result.Error.Code, result.Error.Category)
+	}
+	if result.Error.ChainStep != string(StepAuthorization) {
+		t.Errorf("expected chain_step authorization, got %q", result.Error.ChainStep)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false (§3 AUTHORIZATION = No)")
+	}
+	if !strings.Contains(result.Error.Message, "not an active member of business biz-2") {
+		t.Errorf("message should name the business, got %q", result.Error.Message)
+	}
+}
+
+// TEST-CORE-058 (A): enforcement on + missing store → fail closed
+// (RT-02 default deny) at the IDENTITY stage with AUTH.
+func TestAdmissionIdentityStoreMissing(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithIdentity(nil, true, true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-idn-nostore",
+		Context: NewRequestContext("corr-idn-nostore", "biz-1", "alice"),
+		Intent:  "work with no identity store",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" || result.Error == nil {
+		t.Fatalf("expected failed with error, got %+v", result)
+	}
+	if result.Error.Code != "AUTH" || result.Error.ChainStep != string(StepIdentity) {
+		t.Errorf("expected AUTH at identity, got %s@%s", result.Error.Code, result.Error.ChainStep)
+	}
+	if !strings.Contains(result.Error.Message, "identity store unavailable") {
+		t.Errorf("expected fail-closed message, got %q", result.Error.Message)
+	}
+}
+
+// TEST-CORE-059 (A): full admission pass-through — enforcement on, valid
+// member → completed, and every stage leaves an auditable record with its
+// decision (RT-01: no stage skipped, every admission decision auditable).
+func TestAdmissionPipelinePassThrough(t *testing.T) {
+	now := time.Now()
+	members := activeMembership(t, "alice", "biz-1")
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithIdentity(members, true, true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-admission-pass",
+		Context: NewRequestContext("corr-admission-pass", "biz-1", "alice"),
+		Intent:  "gated-by-identity work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "completed" {
+		t.Fatalf("expected completed for a valid member, got %s (err=%+v)", result.Status, result.Error)
+	}
+	steps := make(map[string]string, len(result.AuditTrail))
+	for _, entry := range result.AuditTrail {
+		steps[entry.Step] = entry.Outcome
+	}
+	if steps[string(StepIdentity)] != "verified actor=alice" {
+		t.Errorf("expected identity audit record, got %q", steps[string(StepIdentity)])
+	}
+	if steps[string(StepAuthorization)] != "authorized business=biz-1" {
+		t.Errorf("expected authorization audit record, got %q", steps[string(StepAuthorization)])
+	}
+	if !strings.HasPrefix(steps[string(StepResourceCheck)], "available active=") {
+		t.Errorf("expected resource_check audit record, got %q", steps[string(StepResourceCheck)])
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	seen := make(map[string]bool, len(received))
+	for _, typ := range received {
+		seen[typ] = true
+	}
+	for _, typ := range []string{"chain.identity.checked", "chain.authorization.checked", "chain.resource.checked"} {
+		if !seen[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+}
+
+// TEST-CORE-060 (A): admission RESOURCE CHECK stage (RUNTIME §3.1 stage 7)
+// — executor at MaxConcurrent → failed / RESOURCE_UNAVAILABLE with
+// Retryable=true (RUNTIME rejection table ADM_RESOURCES: yes, queue),
+// ChainStep resource_check. The slot is occupied by a direct executor
+// submission so the chain's single processing loop is never blocked.
+func TestAdmissionResourceCheckCapacity(t *testing.T) {
+	now := time.Now()
+	cfg := executor.DefaultConfig()
+	cfg.MaxConcurrent = 1
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithExecutorConfig(cfg),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Occupier parks inside the handler (release stays open until cleanup).
+	p := registerBlockingProvider(t, e)
+
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+	// LIFO: release before Stop so teardown never waits on the parked
+	// occupier (Stop would otherwise drain against an open handler).
+	defer close(p.release)
+
+	if err := e.TaskExecutor().Submit(&executor.WorkRequest{
+		TaskID:        "occupier-1",
+		CorrelationID: "corr-occupier-1",
+		BusinessID:    "biz-1",
+		ActorID:       "system",
+		Intent:        "hold the only slot",
+	}); err != nil {
+		t.Fatalf("submit occupier: %v", err)
+	}
+	waitUntil(t, "occupier active", func() bool {
+		active, _ := e.TaskExecutor().Capacity()
+		return active >= 1
+	})
+
+	req := &Request{
+		ID:      "req-res-full",
+		Context: NewRequestContext("corr-res-full", "biz-1", "user-1"),
+		Intent:  "work with no dispatch capacity",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" || result.Error == nil {
+		t.Fatalf("expected failed with error, got %+v", result)
+	}
+	if result.Error.Code != "RESOURCE_UNAVAILABLE" || result.Error.Category != "RESOURCE_UNAVAILABLE" {
+		t.Errorf("expected RESOURCE_UNAVAILABLE, got %s/%s", result.Error.Code, result.Error.Category)
+	}
+	if !result.Error.Retryable {
+		t.Error("expected Retryable=true (§3 RESOURCE_UNAVAILABLE = Yes)")
+	}
+	if result.Error.ChainStep != string(StepResourceCheck) {
+		t.Errorf("expected chain_step resource_check, got %q", result.Error.ChainStep)
 	}
 }

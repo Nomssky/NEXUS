@@ -15,6 +15,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/hardening"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
+	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
@@ -51,6 +52,17 @@ type Engine struct {
 	// Governance
 	govEngine *governance.Engine
 
+	// Admission pipeline identity stages (A: RUNTIME §3.1 stages 3-4).
+	// Enforcement mirrors the A6 gateway posture: both flags off = stages
+	// record a not-enforced pass (process-boundary trust); either flag on =
+	// fail closed on a missing store or unknown actor (RT-02 default deny).
+	// The chain never verifies credentials (that is the gateway's A6
+	// boundary) — it re-checks the already-bound actor against
+	// foundation/identity as defense in depth.
+	identityMemberships  *identity.MembershipSet
+	identityRequireAuth  bool
+	identityEnforceScope bool
+
 	// Approval wiring (P1): validator + core-side resume index.
 	// approvalMu is a leaf lock — it may call into approvalEngine (which
 	// has its own lock) but is never held while acquiring e.mu/resultsMu/
@@ -71,6 +83,9 @@ type Engine struct {
 	agentRuntime *agent.AgentRuntime
 	toolRegistry *tool.ToolRegistry
 	taskExec     *executor.Executor
+	// execConfig feeds executor construction; MaxConcurrent backs the
+	// RESOURCE CHECK admission stage (A: RUNTIME §3.1 stage 7).
+	execConfig executor.Config
 
 	// Intelligence
 	modelRegistry *modelrouter.ModelRegistry
@@ -130,6 +145,29 @@ func WithPersistence(dir string) EngineOption {
 	}
 }
 
+// WithIdentity wires the membership store and enforcement posture for the
+// chain's IDENTITY and AUTHORIZATION admission stages (RUNTIME §3.1 stages
+// 3-4). requireAuth verifies the bound actor is a known identity;
+// enforceScope requires an active membership in the request's business.
+// Both false = not-enforced pass (A6 enforcement-off posture); either true =
+// fail closed (AUTH / AUTHORIZATION) on a missing store or unknown actor
+// (RT-02 default deny). Credentials are never verified here — that is the
+// gateway's A6 boundary; the chain re-checks the already-bound actor.
+func WithIdentity(members *identity.MembershipSet, requireAuth, enforceScope bool) EngineOption {
+	return func(e *Engine) {
+		e.identityMemberships = members
+		e.identityRequireAuth = requireAuth
+		e.identityEnforceScope = enforceScope
+	}
+}
+
+// WithExecutorConfig overrides the task executor configuration (defaults to
+// executor.DefaultConfig()). Its MaxConcurrent feeds the RESOURCE CHECK
+// admission stage (RUNTIME §3.1 stage 7).
+func WithExecutorConfig(cfg executor.Config) EngineOption {
+	return func(e *Engine) { e.execConfig = cfg }
+}
+
 // NewEngine creates a new Core Runtime engine with all foundation components wired.
 func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e := &Engine{
@@ -144,6 +182,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		approvalByReq: make(map[string]string),
 		shutdownCh:    make(chan struct{}),
 		loopDone:      make(chan struct{}),
+		execConfig:    executor.DefaultConfig(),
 	}
 
 	for _, opt := range opts {
@@ -200,7 +239,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		e.govEngine,
 		e.eventBus,
 		e.modelRouter,
-		executor.DefaultConfig(),
+		e.execConfig,
 	)
 
 	// Memory & Knowledge

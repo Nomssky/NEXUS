@@ -21,21 +21,27 @@ import (
 type ChainStep string
 
 const (
-	StepValidate    ChainStep = "validate"
-	StepGovernance  ChainStep = "governance"
-	StepHardening   ChainStep = "hardening"
-	StepMemoryRead  ChainStep = "memory_read"
-	StepAttention   ChainStep = "attention_score"
-	StepObjective   ChainStep = "objective"
-	StepDecision    ChainStep = "decision"
-	StepPlan        ChainStep = "plan"
-	StepWorkflow    ChainStep = "workflow"
-	StepSchedule    ChainStep = "schedule"
-	StepAgent       ChainStep = "agent"
-	StepModel       ChainStep = "model"
-	StepTool        ChainStep = "tool"
-	StepVerify      ChainStep = "verify"
-	StepMemoryWrite ChainStep = "memory_write"
+	// Admission pipeline stages (RUNTIME §3.1): validate (2), identity (3),
+	// authorization (4) run as a block before governance (5); resource_check
+	// (7) runs before schedule (8).
+	StepValidate      ChainStep = "validate"
+	StepIdentity      ChainStep = "identity"
+	StepAuthorization ChainStep = "authorization"
+	StepGovernance    ChainStep = "governance"
+	StepHardening     ChainStep = "hardening"
+	StepMemoryRead    ChainStep = "memory_read"
+	StepAttention     ChainStep = "attention_score"
+	StepObjective     ChainStep = "objective"
+	StepDecision      ChainStep = "decision"
+	StepPlan          ChainStep = "plan"
+	StepWorkflow      ChainStep = "workflow"
+	StepResourceCheck ChainStep = "resource_check"
+	StepSchedule      ChainStep = "schedule"
+	StepAgent         ChainStep = "agent"
+	StepModel         ChainStep = "model"
+	StepTool          ChainStep = "tool"
+	StepVerify        ChainStep = "verify"
+	StepMemoryWrite   ChainStep = "memory_write"
 )
 
 // executeChain runs the canonical execution chain for a request.
@@ -63,6 +69,38 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Outcome:   "passed",
 	})
 	e.chainEmit(req, "chain.validate.passed", "core", "passed")
+
+	// Admission stages 3-4 (RUNTIME §3.1): IDENTITY then AUTHORIZATION,
+	// immediately after VALIDATE and before every later stage — no stage
+	// may be skipped (RT-01), so both always append an audit entry even
+	// when enforcement is off (outcome records the not-enforced posture).
+	idOutcome, err := e.chainIdentity(ctx, req)
+	if err != nil {
+		return e.chainError(req, err, StepIdentity, audit, start)
+	}
+	audit = append(audit, AuditEntry{
+		Step:      string(StepIdentity),
+		Action:    "verify identity",
+		Actor:     "identity",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   idOutcome,
+	})
+	e.chainEmit(req, "chain.identity.checked", "identity", idOutcome)
+
+	authzOutcome, err := e.chainAuthorization(ctx, req)
+	if err != nil {
+		return e.chainError(req, err, StepAuthorization, audit, start)
+	}
+	audit = append(audit, AuditEntry{
+		Step:      string(StepAuthorization),
+		Action:    "authorize business scope",
+		Actor:     "governance",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   authzOutcome,
+	})
+	e.chainEmit(req, "chain.authorization.checked", "governance", authzOutcome)
 
 	// E-005: cancelled while queued — the request never executes beyond this
 	// point (objective/workflow creation and executor submission are skipped).
@@ -184,6 +222,23 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		Outcome:   fmt.Sprintf("workflow=%s", wf.ID),
 	})
 	e.chainEmit(req, "chain.workflow.created", "workflow-engine", wf.ID)
+
+	// Admission stage 7 (RUNTIME §3.1): RESOURCE CHECK before SCHEDULE.
+	// Pre-check only — admission never guarantees capacity at execution
+	// time (RUNTIME §3.2); a capacity race still surfaces at Submit.
+	resOutcome, err := e.chainResourceCheck(ctx, req)
+	if err != nil {
+		return e.chainError(req, err, StepResourceCheck, audit, start)
+	}
+	audit = append(audit, AuditEntry{
+		Step:      string(StepResourceCheck),
+		Action:    "check resource availability",
+		Actor:     "scheduler",
+		Timestamp: e.now(),
+		Duration:  e.now().Sub(start),
+		Outcome:   resOutcome,
+	})
+	e.chainEmit(req, "chain.resource.checked", "scheduler", resOutcome)
 
 	// Step 7: Schedule
 	job, err := e.chainSchedule(ctx, req, wf)
@@ -498,6 +553,108 @@ func (e *Engine) chainValidate(_ context.Context, req *Request) error {
 		return &ChainError{Code: "VALIDATION", Category: "VALIDATION", Message: "intent required", ChainStep: string(StepValidate)}
 	}
 	return nil
+}
+
+// identityEnforced reports whether identity-bound admission is active
+// (A6 posture: either security flag enables it).
+func (e *Engine) identityEnforced() bool {
+	return e.identityRequireAuth || e.identityEnforceScope
+}
+
+// chainIdentity implements admission stage 3 (RUNTIME §3.1): actor identity
+// verification. Failure is category AUTH ("actor not found" / "identity
+// store unavailable"), Retryable false.
+//
+// Credentials are never verified here — no token reaches core; credential
+// verification is the gateway's A6 boundary. The chain re-checks the
+// already-bound actor against foundation/identity as defense in depth:
+// "known identity" means the actor holds a membership record in the store
+// (the authoritative record A6 binds).
+//
+// When enforcement is off the stage passes with outcome not_enforced
+// (process-boundary trust — the A6 enforcement-off posture). When either
+// flag is on, a missing store or unknown actor fails closed (RT-02).
+func (e *Engine) chainIdentity(_ context.Context, req *Request) (string, error) {
+	if !e.identityEnforced() {
+		return "not_enforced", nil
+	}
+	if e.identityMemberships == nil {
+		return "", &ChainError{
+			Code:      "AUTH",
+			Category:  "AUTH",
+			Message:   "identity store unavailable (fail closed)",
+			ChainStep: string(StepIdentity),
+			Retryable: false,
+		}
+	}
+	actor := req.Context.ActorID
+	if len(e.identityMemberships.For(actor)) == 0 {
+		return "", &ChainError{
+			Code:      "AUTH",
+			Category:  "AUTH",
+			Message:   fmt.Sprintf("actor not found: %s", actor),
+			ChainStep: string(StepIdentity),
+			Retryable: false,
+		}
+	}
+	return "verified actor=" + actor, nil
+}
+
+// chainAuthorization implements admission stage 4 (RUNTIME §3.1): authority
+// resolution at business scope. Failure is category AUTHORIZATION, Retryable
+// false. The check is scope authority via foundation/identity membership
+// (INV-01 / A6 semantics: active membership in the request's business,
+// division-aware); full action authority remains with Governance stage 5 —
+// MEMBERSHIP != AUTHORITY (membership.go).
+//
+// Runs only when enforce_scope is on (scope enforcement is what this stage
+// resolves); otherwise outcome not_enforced. A missing store while enforced
+// fails closed (RT-02).
+func (e *Engine) chainAuthorization(_ context.Context, req *Request) (string, error) {
+	if !e.identityEnforceScope {
+		return "not_enforced", nil
+	}
+	if e.identityMemberships == nil {
+		return "", &ChainError{
+			Code:      "AUTHORIZATION",
+			Category:  "AUTHORIZATION",
+			Message:   "membership store unavailable (fail closed)",
+			ChainStep: string(StepAuthorization),
+			Retryable: false,
+		}
+	}
+	actor, business := req.Context.ActorID, req.Context.BusinessID
+	if !e.identityMemberships.IsMember(actor, business, req.Context.DivisionID) {
+		return "", &ChainError{
+			Code:      "AUTHORIZATION",
+			Category:  "AUTHORIZATION",
+			Message:   fmt.Sprintf("actor %s is not an active member of business %s", actor, business),
+			ChainStep: string(StepAuthorization),
+			Retryable: false,
+		}
+	}
+	return "authorized business=" + business, nil
+}
+
+// chainResourceCheck implements admission stage 7 (RUNTIME §3.1): resource
+// availability before SCHEDULE. The tracked dispatch resource is executor
+// worker capacity (MaxConcurrent). Failure is category RESOURCE_UNAVAILABLE
+// with Retryable true (RUNTIME admission rejection table: ADM_RESOURCES,
+// retry after queueing). This is a pre-check only — admission never
+// guarantees capacity at execution time (RUNTIME §3.2); a race still
+// surfaces at executor Submit.
+func (e *Engine) chainResourceCheck(_ context.Context, _ *Request) (string, error) {
+	active, max := e.taskExec.Capacity()
+	if max > 0 && active >= max {
+		return "", &ChainError{
+			Code:      "RESOURCE_UNAVAILABLE",
+			Category:  "RESOURCE_UNAVAILABLE",
+			Message:   fmt.Sprintf("executor at capacity (%d/%d)", active, max),
+			ChainStep: string(StepResourceCheck),
+			Retryable: true,
+		}
+	}
+	return fmt.Sprintf("available active=%d/%d", active, max), nil
 }
 
 // chainGovernance checks governance policies.
