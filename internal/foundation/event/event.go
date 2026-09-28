@@ -39,6 +39,12 @@ const (
 	EventTypeGovernanceDecided EventType = "governance.decided"
 	EventTypeApprovalRequested EventType = "approval.requested"
 	EventTypeApprovalResolved  EventType = "approval.resolved"
+	// Contract-canonical decision events (SCHEMA_EVENTS_TRIGGERS approval
+	// domain; RUNTIME §16.2). approval.resolved predates them and is kept
+	// for compatibility, but new emissions use approved/denied/expired.
+	EventTypeApprovalApproved  EventType = "approval.approved"
+	EventTypeApprovalDenied    EventType = "approval.denied"
+	EventTypeApprovalExpired   EventType = "approval.expired"
 	EventTypeSecurityViolation EventType = "security.violation"
 	EventTypeCustom            EventType = "custom"
 )

@@ -174,6 +174,12 @@ type ChainError struct {
 	// Retryable indicates if the caller should retry.
 	Retryable bool `json:"retryable"`
 
+	// Details carries optional structured error details (CORE_INTERFACE_
+	// CONTRACTS §3 error envelope: details: object, optional). Used to pass
+	// machine-readable companions such as approval_id for
+	// APPROVAL_REQUIRED failures. Absent when empty.
+	Details map[string]string `json:"details,omitempty"`
+
 	// ChainStep identifies where in the chain the error occurred.
 	ChainStep string `json:"chain_step"`
 

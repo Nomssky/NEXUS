@@ -2165,3 +2165,487 @@ func TestCancelRaceWithCompletionInvariants(t *testing.T) {
 		}
 	}
 }
+
+// TEST-CORE-049: P1 approval wiring — chain-gate REQUIRE_APPROVAL opens the
+// approval loop end to end: approval record + approval.requested event +
+// error.details.approval_id (CORE_INTERFACE_CONTRACTS §3 envelope), the
+// contract-shaped pending record (SCHEMA_WORK §6.2), self-approval refused
+// (SCHEMA_WORK §6.1), then approve → approval.approved + resume
+// re-execution that satisfies both governance gates via the approved record
+// → completed (Response.Status stays failed/APPROVAL_REQUIRED while gated —
+// D2 pin unchanged).
+func TestApprovalWiringChainGateResume(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// All-action REQUIRE_APPROVAL: the chain gate gates the first run; on
+	// the resume run BOTH the chain gate and the executor gate must be
+	// satisfied by the approved record (ApprovalState pass-through).
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+			ApprovalConfig: &governance.ApprovalConfig{
+				TimeoutSeconds:         3600,
+				AutoDenyOnTimeout:      true,
+				SelfApprovalProhibited: true,
+			},
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-apr-resume",
+		Context: NewRequestContext("corr-apr-resume", "biz-1", "user-1"),
+		Intent:  "gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	// Gated result: D2 envelope unchanged, approval_id surfaced in details.
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "failed" {
+		t.Fatalf("expected failed while gated, got %q", result.Status)
+	}
+	if result.Error == nil || result.Error.Category != "APPROVAL_REQUIRED" || result.Error.Retryable {
+		t.Fatalf("expected APPROVAL_REQUIRED/Retryable=false, got %+v", result.Error)
+	}
+	approvalID := result.Error.Details["approval_id"]
+	if approvalID == "" {
+		t.Fatal("expected error.details.approval_id on APPROVAL_REQUIRED")
+	}
+
+	// Contract-shaped pending record (SCHEMA_WORK §6.2/§6.3).
+	records := e.ListApprovals("biz-1")
+	if len(records) != 1 {
+		t.Fatalf("expected 1 pending approval, got %d", len(records))
+	}
+	rec := records[0]
+	if rec.EntityID != approvalID || rec.Status != "PENDING" {
+		t.Errorf("unexpected record identity/status: %+v", rec)
+	}
+	if rec.RequesterID != "user-1" || rec.BusinessID != "biz-1" {
+		t.Errorf("unexpected requester/business: %+v", rec)
+	}
+	if rec.EntityType != "approval" || rec.SchemaVersion != "1.0.0" {
+		t.Errorf("expected contract entity_type/schema_version, got %+v", rec)
+	}
+	if rec.AuditRef != req.ID || rec.CorrelationID != "corr-apr-resume" {
+		t.Errorf("expected audit_ref/correlation_id links, got %+v", rec)
+	}
+	if rec.ExpiresAt == nil {
+		t.Error("expected expires_at from the policy approval timeout (INV-16)")
+	}
+	if rec.PolicyRef != "require-approval" || rec.Scope != "core" {
+		t.Errorf("expected policy_ref/scope wired, got %+v", rec)
+	}
+
+	// SCHEMA_WORK §6.1: the requester must not decide their own request.
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-1", "self"); !errors.Is(err, ErrSelfApprovalProhibited) {
+		t.Fatalf("expected ErrSelfApprovalProhibited, got %v", err)
+	}
+	// Still pending, stored result untouched by the refused decision.
+	if got := e.ListApprovals("biz-1"); len(got) != 1 {
+		t.Fatalf("self-approval refusal must leave the record pending, got %d", len(got))
+	}
+	if r, _ := e.GetResult(req.ID); r == nil || r.Status != "failed" {
+		t.Fatal("refused decision must not touch the stored result")
+	}
+
+	// Approve by another identity → resume re-execution.
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-2", "approved for test"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// ApproveRequest drops the stale result before re-admission, so
+	// waitForResult here observes the resume's own terminal result.
+	resumed := waitForResult(t, e, req.ID)
+	if resumed.Status != "completed" {
+		t.Fatalf("resume must re-execute to completed, got %q (err=%v)", resumed.Status, resumed.Error)
+	}
+	if resumed.Error != nil {
+		t.Fatalf("resumed result must carry no error, got %+v", resumed.Error)
+	}
+	// Approved record is consumed: not listed, index cleaned after the run.
+	if got := e.ListApprovals("biz-1"); len(got) != 0 {
+		t.Errorf("expected no pending approvals after resume, got %d", len(got))
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool, len(received))
+	for _, typ := range received {
+		got[typ] = true
+	}
+	for _, typ := range []string{
+		"approval.requested", "approval.approved",
+		"chain.failed", "chain.completed",
+		// Resume proof at the executor gate: the first run never reached
+		// the executor (chain gate), so received/assigned firing now means
+		// the approved ApprovalState satisfied the executor's own gate.
+		"executor.received", "executor.assigned",
+	} {
+		if !got[typ] {
+			t.Errorf("expected event %s, got %v", typ, received)
+		}
+	}
+	for _, typ := range []string{"approval.denied", "approval.expired"} {
+		if got[typ] {
+			t.Errorf("event %s must not fire on the approve path, got %v", typ, received)
+		}
+	}
+}
+
+// TEST-CORE-050: deny closes the approval loop without resume — the stored
+// response stays failed/APPROVAL_REQUIRED (D2 pin), approval.denied is
+// emitted, the record is removed, and any later decision is 404-class.
+func TestApprovalDenyKeepsApprovalRequiredResult(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+			ApprovalConfig: &governance.ApprovalConfig{
+				TimeoutSeconds:    3600,
+				AutoDenyOnTimeout: true,
+			},
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-apr-deny",
+		Context: NewRequestContext("corr-apr-deny", "biz-1", "user-1"),
+		Intent:  "gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+	if result.Error == nil || result.Error.Details["approval_id"] == "" {
+		t.Fatalf("expected approval_id in details, got %+v", result.Error)
+	}
+	approvalID := result.Error.Details["approval_id"]
+
+	if err := e.DenyRequest(approvalID, "biz-1", "user-2", "not safe"); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+
+	// No resume: stored result remains the D2 gate failure.
+	stored, ok := e.GetResult(req.ID)
+	if !ok || stored.Status != "failed" {
+		t.Fatalf("deny must not change the stored result, got ok=%v %+v", ok, stored)
+	}
+	if stored.Error == nil || stored.Error.Category != "APPROVAL_REQUIRED" {
+		t.Fatalf("expected APPROVAL_REQUIRED to remain, got %+v", stored.Error)
+	}
+	// Record resolved and removed from the index.
+	if got := e.ListApprovals("biz-1"); len(got) != 0 {
+		t.Errorf("expected no pending approvals after deny, got %d", len(got))
+	}
+	// Second decision → not found (already resolved).
+	if err := e.DenyRequest(approvalID, "biz-1", "user-2", "again"); !errors.Is(err, ErrApprovalNotFound) {
+		t.Errorf("expected ErrApprovalNotFound on repeat deny, got %v", err)
+	}
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-2", "reverse"); !errors.Is(err, ErrApprovalNotFound) {
+		t.Errorf("expected ErrApprovalNotFound on approve-after-deny, got %v", err)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, typ := range received {
+		got[typ] = true
+	}
+	if !got["approval.denied"] {
+		t.Errorf("expected approval.denied, got %v", received)
+	}
+	if got["approval.approved"] || got["chain.completed"] {
+		t.Errorf("deny must not approve/resume: %v", received)
+	}
+}
+
+// TEST-CORE-051: executor-gate REQUIRE_APPROVAL (D2 chain-step agent) opens
+// the approval loop from Step-12 — the record is created with the executor's
+// exact governance inputs (Scope workflow / Action execute_task, single
+// source executor.ActionExecuteTask/ResourceWorkflow), and approve resumes
+// through the executor-gate ApprovalState pass-through to a real execution.
+func TestApprovalWiringExecutorGateResume(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Working (non-blocking) provider so the resumed handler actually
+	// completes: model-less runs record executor_status=failed at the
+	// executor layer — pre-existing routing behavior, presence-only pinned
+	// by TEST-CORE-041. Release is closed up front → Invoke returns at once.
+	p := registerBlockingProvider(t, e)
+	close(p.release)
+	// Default-allow keeps the chain gate passing; REQUIRE_APPROVAL is
+	// scoped to the executor's action (TEST-CORE-047 pattern).
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+		{
+			PolicyID:   "require-approval-exec",
+			Name:       "Require Approval On Execute Task",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "execute_task", ActionIDs: []string{"execute_task"}},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+			ApprovalConfig: &governance.ApprovalConfig{
+				TimeoutSeconds:    3600,
+				AutoDenyOnTimeout: true,
+			},
+		},
+	})
+
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-apr-exec",
+		Context: NewRequestContext("corr-apr-exec", "biz-1", "user-1"),
+		Intent:  "executor gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "failed" || result.Error == nil ||
+		result.Error.Category != "APPROVAL_REQUIRED" {
+		t.Fatalf("expected failed/APPROVAL_REQUIRED, got %+v", result)
+	}
+	if result.Error.ChainStep != string(StepAgent) {
+		t.Errorf("expected executor gate (agent), got chain step %q", result.Error.ChainStep)
+	}
+	approvalID := result.Error.Details["approval_id"]
+	if approvalID == "" {
+		t.Fatal("expected Step-12 to surface approval_id")
+	}
+
+	// Record created from the executor's governance inputs.
+	records := e.ListApprovals("biz-1")
+	if len(records) != 1 {
+		t.Fatalf("expected 1 pending approval, got %d", len(records))
+	}
+	rec := records[0]
+	if rec.Scope != "workflow" || rec.RequestedAction != "execute_task" {
+		t.Errorf("record must carry executor governance inputs, got scope=%q action=%q",
+			rec.Scope, rec.RequestedAction)
+	}
+	if rec.PolicyRef != "require-approval-exec" {
+		t.Errorf("expected policy_ref from the executor-gate decision, got %q", rec.PolicyRef)
+	}
+
+	// Approve → resume must pass the executor gate and actually execute.
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-1", "approved"); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	resumed := waitForResult(t, e, req.ID)
+	if resumed.Status != "completed" {
+		t.Fatalf("resume must complete, got %q (err=%v)", resumed.Status, resumed.Error)
+	}
+	if resumed.Outcome == nil || resumed.Outcome.Metrics["executor_status"] != "completed" {
+		t.Errorf("expected executor to run the handler on resume, got %+v", resumed.Outcome)
+	}
+	if got := e.ListApprovals("biz-1"); len(got) != 0 {
+		t.Errorf("expected approval index cleaned after resume, got %d", len(got))
+	}
+}
+
+// TEST-CORE-052: INV-16 — silence ≠ approval: a timed-out approval auto-denies
+// (policy config), emits approval.expired, disappears from the list, and can
+// no longer be decided. Clock is advanced only after the engine stops, so no
+// core-path reader races the mutation.
+func TestApprovalTimeoutExpires(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+			ApprovalConfig: &governance.ApprovalConfig{
+				TimeoutSeconds:    60,
+				AutoDenyOnTimeout: true,
+			},
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-apr-timeout",
+		Context: NewRequestContext("corr-apr-timeout", "biz-1", "user-1"),
+		Intent:  "gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+	approvalID := result.Error.Details["approval_id"]
+	if approvalID == "" {
+		t.Fatal("expected approval_id")
+	}
+
+	// Stop the engine so no core path can read the clock while we advance
+	// it (Stop waits for the processing loop — happens-before edge).
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	now = now.Add(61 * time.Second)
+
+	// Lazy sweep on the next approval touch (ListApprovals).
+	if got := e.ListApprovals("biz-1"); len(got) != 0 {
+		t.Fatalf("timed-out approval must be swept from the list, got %d", len(got))
+	}
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-2", "late"); !errors.Is(err, ErrApprovalNotFound) {
+		t.Errorf("expired approval must not be approvable, got %v", err)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	got := make(map[string]bool)
+	for _, typ := range received {
+		got[typ] = true
+	}
+	if !got["approval.expired"] {
+		t.Errorf("expected approval.expired, got %v", received)
+	}
+	if got["approval.approved"] {
+		t.Errorf("expired approval must not be approved: %v", received)
+	}
+}
+
+// TEST-CORE-053: approval decisions require a live processing loop — when
+// the engine is stopped, approve is refused BEFORE mutating the approval
+// state (no decided record without a resume run); the record stays pending
+// and the stored result is untouched.
+func TestApprovalApproveRequiresRunningEngine(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "require-approval",
+			Name:       "Require Approval",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.REQUIRE_APPROVAL,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-apr-stopped",
+		Context: NewRequestContext("corr-apr-stopped", "biz-1", "user-1"),
+		Intent:  "gated work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+	approvalID := result.Error.Details["approval_id"]
+	if approvalID == "" {
+		t.Fatal("expected approval_id")
+	}
+
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-2", "while stopped"); !errors.Is(err, ErrApprovalNotResumable) {
+		t.Fatalf("expected ErrApprovalNotResumable, got %v", err)
+	}
+	// Refused before mutation: still pending, result untouched.
+	if got := e.ListApprovals("biz-1"); len(got) != 1 {
+		t.Errorf("record must stay pending after refused approve, got %d", len(got))
+	}
+	if r, _ := e.GetResult(req.ID); r == nil || r.Status != "failed" {
+		t.Error("refused approve must not touch the stored result")
+	}
+}

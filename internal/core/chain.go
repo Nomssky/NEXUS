@@ -370,6 +370,31 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		}
 		if req.Context != nil {
 			respErr.CorrelationID = req.Context.CorrelationID
+			// P1 wiring: the executor gate produced REQUIRE_APPROVAL — open
+			// the approval loop from core. The executor's Decision payload
+			// is not carried on the Outcome, so re-evaluate with the
+			// executor's exact governance inputs (single source of truth:
+			// executor.ActionExecuteTask/executor.ResourceWorkflow). Falls
+			// back to the outcome reason when governance no longer yields
+			// REQUIRE_APPROVAL (policy changed mid-run) — the record must
+			// exist either way for the approval flow to be reachable.
+			govReq := governance.Request{
+				Actor:      req.Context.ActorID,
+				Action:     executor.ActionExecuteTask,
+				Resource:   executor.ResourceWorkflow,
+				BusinessID: req.Context.BusinessID,
+			}
+			decision := e.govEngine.Evaluate(govReq)
+			if decision.Outcome != governance.REQUIRE_APPROVAL {
+				decision = governance.Decision{
+					Outcome:   governance.REQUIRE_APPROVAL,
+					Reason:    message,
+					Timestamp: e.now(),
+				}
+			}
+			if ar, err := e.createApproval(req, decision, govReq); err == nil {
+				respErr.Details = map[string]string{"approval_id": ar.DecisionID}
+			}
 		}
 		respErr.Timestamp = e.now()
 	} else if execOutcome != nil {
@@ -443,12 +468,16 @@ func (e *Engine) chainValidate(_ context.Context, req *Request) error {
 
 // chainGovernance checks governance policies.
 func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
-	decision := e.govEngine.Evaluate(governance.Request{
+	govReq := governance.Request{
 		Actor:      req.Context.ActorID,
 		Action:     "execute_request",
 		Resource:   "core",
 		BusinessID: req.Context.BusinessID,
-	})
+		// Approval resume: an approved record for this request satisfies
+		// a REQUIRE_APPROVAL policy (nil otherwise — no behavior change).
+		ApprovalState: e.approvalStateFor(req.ID),
+	}
+	decision := e.govEngine.Evaluate(govReq)
 	if decision.IsAllowing() {
 		return nil
 	}
@@ -461,14 +490,21 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 	// cannot succeed before approval for REQUIRE_APPROVAL.
 	code, category := "POLICY_DENIED", "POLICY_DENIED"
 	message := fmt.Sprintf("governance denied (outcome=%s): %s", decision.Outcome, decision.Reason)
+	var details map[string]string
 	if decision.Outcome == governance.REQUIRE_APPROVAL {
 		code, category = "APPROVAL_REQUIRED", "APPROVAL_REQUIRED"
 		message = fmt.Sprintf("governance requires approval (outcome=%s): %s", decision.Outcome, decision.Reason)
+		// P1 wiring: open the approval loop — record + approval.requested
+		// event; the client learns approval_id via error.details.
+		if ar, err := e.createApproval(req, decision, govReq); err == nil {
+			details = map[string]string{"approval_id": ar.DecisionID}
+		}
 	}
 	return &ChainError{
 		Code:      code,
 		Category:  category,
 		Message:   message,
+		Details:   details,
 		ChainStep: string(StepGovernance),
 		Retryable: false,
 	}
@@ -563,6 +599,9 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 		Intent:        req.Intent,
 		Priority:      req.Priority,
 		Constraints:   req.Constraints,
+		// Approval resume: carries an approved approval into the executor
+		// gate so its REQUIRE_APPROVAL policy is satisfied on the re-run.
+		ApprovalState: e.approvalStateFor(req.ID),
 	}
 
 	// C-026 fix: honor caller-owned Deadline when set, else default 60s.

@@ -51,6 +51,15 @@ type Engine struct {
 	// Governance
 	govEngine *governance.Engine
 
+	// Approval wiring (P1): validator + core-side resume index.
+	// approvalMu is a leaf lock — it may call into approvalEngine (which
+	// has its own lock) but is never held while acquiring e.mu/resultsMu/
+	// inflightMu.
+	approvalEngine *governance.ApprovalEngine
+	approvalMu     sync.Mutex
+	approvals      map[string]*approvalEntry // approvalID → entry
+	approvalByReq  map[string]string         // requestID → approvalID
+
 	// Cognition
 	objectiveEng *cognition.ObjectiveEngine
 	decisionEng  *cognition.DecisionEngine
@@ -124,15 +133,17 @@ func WithPersistence(dir string) EngineOption {
 // NewEngine creates a new Core Runtime engine with all foundation components wired.
 func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e := &Engine{
-		config:      cfg,
-		status:      lifecycle.StateCreated,
-		now:         time.Now,
-		requests:    make(chan *Request, 100),
-		results:     make(map[string]*Response),
-		resultOrder: make([]string, 0, maxResults),
-		inflight:    make(map[string]*inflightRequest),
-		shutdownCh:  make(chan struct{}),
-		loopDone:    make(chan struct{}),
+		config:        cfg,
+		status:        lifecycle.StateCreated,
+		now:           time.Now,
+		requests:      make(chan *Request, 100),
+		results:       make(map[string]*Response),
+		resultOrder:   make([]string, 0, maxResults),
+		inflight:      make(map[string]*inflightRequest),
+		approvals:     make(map[string]*approvalEntry),
+		approvalByReq: make(map[string]string),
+		shutdownCh:    make(chan struct{}),
+		loopDone:      make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -164,6 +175,9 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 			Precedence: 0,
 		},
 	})
+	// Approval validator for REQUIRE_APPROVAL outcomes — shares the engine
+	// clock so timeout sweeps are deterministic under WithClock tests.
+	e.approvalEngine = governance.NewApprovalEngineWithClock(e.now)
 
 	// Cognition
 	e.objectiveEng = cognition.NewObjectiveEngine()
@@ -392,6 +406,10 @@ func (e *Engine) processRequests(ctx context.Context) {
 			// (no window where neither exists).
 			e.deregisterInflight(req.ID)
 
+			// Approval resume: once an approved approval's re-run stored its
+			// terminal result, the index entry has served its purpose.
+			e.cleanupResumeApproval(req.ID)
+
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{
 				ID:         req.ID,
@@ -450,6 +468,13 @@ func (e *Engine) AgentRuntime() *agent.AgentRuntime {
 // TaskExecutor returns the engine's task executor.
 func (e *Engine) TaskExecutor() *executor.Executor {
 	return e.taskExec
+}
+
+// Governance returns the governance engine for external policy management
+// (loading/refreshing policies at runtime — same export rationale as C-020's
+// ModelRegistry/ModelRouter accessors).
+func (e *Engine) Governance() *governance.Engine {
+	return e.govEngine
 }
 
 // CircuitBreaker returns the engine's circuit breaker for external inspection.
