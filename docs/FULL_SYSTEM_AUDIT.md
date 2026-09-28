@@ -130,39 +130,39 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 
 | ID | File:Line | Finding |
 |----|-----------|---------|
-| C-002 | chain.go:322-324 | M2 fix: distinct strings but semantically identical rephrasings |
-| C-011 | chain.go:491-504 | Attention error silently absorbed, no audit trail note |
-| C-012 | chain.go:450-458 | Memory read does not filter by ObjectiveID |
-| C-020 | engine.go:56-62 | modelRegistry/modelRouter created but no public accessor |
-| C-022 | engine.go:89 | `startCtx` field set but never read |
-| C-024 | context.go:171 | `Retryable` field never set to true |
-| C-025 | context.go:153-156 | Outcome.Artifacts and Metrics never populated |
-| C-026 | context.go:123 | `Request.Deadline` never used; hardcoded 60s timeout |
+| C-002 | chain.go:322-324 | M2 fix: distinct strings but semantically identical rephrasings — **FIXED** (`06c8122`): description now states the requesting actor, success criteria states the verifiable completion condition, explicitly distinct |
+| C-011 | chain.go:491-504 | Attention error silently absorbed, no audit trail note — **FIXED** (`daec954`): attention failures recorded in the Step-attention audit outcome (`attention_error=...`), chain continues (attention is advisory) |
+| C-012 | chain.go:450-458 | Memory read does not filter by ObjectiveID — **FIXED** (`b6de1b6`): `chainMemoryRead` forwards `req.Context.ObjectiveID` into `MemoryQuery` (memory-level filter + TEST-M8-021 predated; chain call site was the gap); TEST-CORE-066 |
+| C-020 | engine.go:56-62 | modelRegistry/modelRouter created but no public accessor — **FIXED** (`0496e00`): `Engine.ModelRegistry()` / `Engine.ModelRouter()` |
+| C-022 | engine.go:89 | `startCtx` field set but never read — **FIXED** (`59ed624`): dead field removed; lifecycle start contexts are function-local |
+| C-024 | context.go:171 | `Retryable` field never set to true — **FIXED** (`b6de1b6`, building on A's stage-7 pre-check): executor `ErrAtCapacity` sentinel + `chainExecute` mapping gives the RUNTIME §3.2 submit-time capacity race the RESOURCE_UNAVAILABLE/Retryable=true envelope (was generic EXECUTION_FAILED/INTERNAL_FAILURE); TEST-CORE-067, TEST-CORE-060 (pre-check path) |
+| C-025 | context.go:153-156 | Outcome.Artifacts and Metrics never populated — **PARTIAL / DISPOSITIONED**: Metrics populated on every outcome branch (`0496e00`); Artifacts awaits the artifact-entity pipeline (SCHEMA_EXECUTION §2.4, deferred with the identity/entity milestone §7 item 5) — no chain stage persists artifact records today, populating would fabricate data; field doc updated (`b6de1b6`) |
+| C-026 | context.go:123 | `Request.Deadline` never used; hardcoded 60s timeout — **FIXED** (`daec954`): `chainExecute` honors `req.Deadline` (remaining time), fails fast when already passed, defaults 60s otherwise |
 | C-032 | core_test.go | Tests use time.Sleep for synchronization (flaky) — **FIXED** (`9b0dc4e`): deterministic `waitForResult`/state-wait helpers, zero `time.Sleep` remains |
 | C-034 | core_test.go:556-559 | Event test uses arbitrary Dispatch() count — **FIXED** (`9b0dc4e`): one `Dispatch()` after `waitForResult` with deterministic ordering (events published synchronously before the result is stored) |
 | C-035 | core_test.go:667-696 | RecoveryManager test does not test chain integration — **FIXED** (`9b0dc4e`): `TestRecoveryRecordsFailureThroughChain` drives failure through SubmitRequest → executeChain → chainExecute (the production call site) |
-| E-003 | executor.go:177 | Startup event lacks BusinessID |
-| E-005 | executor.go:358 | No external cancellation mechanism for in-flight tasks — **FIXED** (`e976562`, `d4f6821`, `04f213e`): cooperative executor cancellation, `CancelRequest` authority, POST `/api/v1/requests/{id}/cancel`; covered by TEST-E005-*
-| E-020 | approval.go:33-36 | ApprovalEngine has no mutex |
-| E-027 | authenticate.go:99-105 | LocalAuthenticator has no mutex |
-| E-041 | memory.go:127 | Admit generates time-based IDs (collision possible) |
-| E-046 | membus.go:132-165 | Minor race on concurrent Dispatch + QueueSize |
-| L-007 | launcher.go:91 | Wrong address logged (health host vs gateway addr) |
+| E-003 | executor.go:177 | Startup event lacks BusinessID — **DISPOSITIONED (intentional)**: `executor.started` is emitted before any request or business context exists; the call site documents it as a system-level event, intentionally unscoped (`executor.go:263`). No contract requires business scope on process-startup events (SCHEMA_EVENTS_TRIGGERS startup §) |
+| E-005 | executor.go:358 | No external cancellation mechanism for in-flight tasks — **FIXED** (`e976562`, `d4f6821`, `04f213e`): cooperative executor cancellation, `CancelRequest` authority, POST `/api/v1/requests/{id}/cancel`; covered by TEST-E005-* |
+| E-020 | approval.go:33-36 | ApprovalEngine has no mutex — **FIXED** (`59ed624`): `sync.RWMutex` guards `pending` map and clock reads |
+| E-027 | authenticate.go:99-105 | LocalAuthenticator has no mutex — **FIXED** (`59ed624`): `sync.RWMutex` guards `verifiers`, `now`, `ttl` |
+| E-041 | memory.go:127 | Admit generates time-based IDs (collision possible) — **FIXED** (`daec954`): monotonic `seq.Add(1)` combined with `UnixNano` (`mem-%d-%d`), injectable clock cannot collide |
+| E-046 | membus.go:132-165 | Minor race on concurrent Dispatch + QueueSize — **DISPOSITIONED (not a data race)**: all queue state (`queue`, `dedup`, `consumers`, `attempts`) is read and written under `b.mu` at the audit baseline and now; `go test -race` clean. The observed effect is a transient count window: events Dispatch popped for delivery are excluded from `QueueSize` until a handler failure re-queues them (at-least-once semantics) — documented on the method (`b6de1b6`) |
+| L-007 | launcher.go:91 | Wrong address logged (health host vs gateway addr) — **FIXED** (`98752fa`): `gateway started` logs `l.addr` (gateway listen address), not `cfg.Health.Host` |
 
 ### P4 — Cosmetic (11 findings)
 
 | ID | File:Line | Finding |
 |----|-----------|---------|
-| C-007 | chain.go | Circuit breaker reuses StepValidate name |
-| C-038 | core_test.go:518 | Test uses string literal matching step constant |
-| E-002 | executor.go:529 | Event ID could collide within same nanosecond |
-| E-009 | executor.go:424 | Model ID hardcoded as "default" |
+| C-007 | chain.go | Circuit breaker reuses StepValidate name — **FIXED** (Phase D D18, verified): circuit-breaker gate returns `StepHardening` (`chain.go:114`) |
+| C-038 | core_test.go:518 | Test uses string literal matching step constant — **FIXED** (Phase D D26, verified): core tests reference `ChainStep` constants throughout |
+| E-002 | executor.go:529 | Event ID could collide within same nanosecond — **FIXED** (Phase D D7 note, verified): `exec-%d-%d` = UnixNano + monotonic `evtSeq` (`executor.go:815`) |
+| E-009 | executor.go:424 | Model ID hardcoded as "default" — **FIXED** (`3a15a2e`, D2): `DefaultConfig().DefaultModelID` is `""` (routing decision selects the model); the executor passes the configured ID through to `modelrouter.Invoke` instead of a literal |
 | E-015 | executor_test.go | All tests use time.Sleep for synchronization — **FIXED** (`7fcea80`): timing-based synchronization removed |
-| G-014 | server.go:231 | Correlation ID collision risk (UnixNano) |
-| G-016 | server.go:84-90 | No MaxHeaderBytes configured |
+| G-014 | server.go:231 | Correlation ID collision risk (UnixNano) — **FIXED** (Phase D D7, verified): gateway correlation IDs are `api-%d-%d` — UnixNano + monotonic `corrSeq` |
+| G-016 | server.go:84-90 | No MaxHeaderBytes configured — **FIXED** (Phase D D9, verified): `MaxHeaderBytes: 1 << 20` (1 MB header DoS limit, `server.go:177`) |
 | G-017 | server.go:470-477 | Error code is string not int — **REJECTED (contract)**: the common error envelope defines `code: string` ("Machine-readable code", CORE_INTERFACE_CONTRACTS.md §3) — string is the contract; `writeError` renders the HTTP status as that machine-readable string. The integer field in contracts is `status_code` (INTEGRATION_EXTERNAL_CONTRACTS.md), a different field |
-| L-006 | launcher.go:167-173 | Dead code (`defaultAddr`) |
-| L-010 | launcher.go:83 | Gateway goroutine may race with test cleanup |
+| L-006 | launcher.go:167-173 | Dead code (`defaultAddr`) — **FIXED** (Phase D D2, verified): no `defaultAddr` reference remains in the launcher |
+| L-010 | launcher.go:83 | Gateway goroutine may race with test cleanup — **FIXED** (Phase D D5): `TestStopWaitsForTasks` submits a task and waits on proper signaling |
 | E-036 | security.go:300-305 | DevResolver has no TTL or rotation — **REJECTED (scope)**: `DevResolver` is a documented dev/test-only in-memory double ("intentionally NOT a production secret store"); `Secret` carries no expiry field and no contract mandates resolver TTL/rotation — adding them would invent requirements for a test affordance |
 
 ---
@@ -362,11 +362,13 @@ go.mod unchanged (zero deps confirmed)
 | D28 | C-025 | `Outcome.Metrics` populated (duration, executor status, agent) | ✅ FIXED + TESTED |
 | D29 | C-018 | Backpressure Accept/Release semantics documented (no leak, errs safe) | ✅ DOCUMENTED |
 
+**Post-M13 reconciliation batch (`b6de1b6` + audit commit):** §4 is now fully statused — every P0–P4 row carries a status or disposition annotation. Beyond annotating rows the Phase D table already covered, the batch verified three claims that were stale or superseded at the M13 baseline: C-012's Phase D row covered only the memory-layer filter (the chain call site still did not forward `ObjectiveID` — completed in `b6de1b6`); C-024's Phase D "Retryable set for REQUIRE_APPROVAL" claim was correctly superseded by the contract-correct Retryable=false-for-approval decision, leaving the true-path gap closed only by the A-phase stage-7 pre-check (submit-time capacity now also carries RESOURCE_UNAVAILABLE/Retryable=true, `b6de1b6`); E-009's D19 configurability row predates a baseline that still held the `ModelID: "default"` literal (closed by `3a15a2e`). E-046 dispositioned as not-a-data-race (backlog count window documented on `QueueSize`), E-003 dispositioned as intentionally unscoped (both documented in code). Residual open scope is unchanged and listed in §7 (identity entity schema) plus the §6 accepted risks.
+
 ---
 
 ## 10. Conclusion
 
-**All 4 phases of remediation COMPLETE as scoped** (Phases A–D covered their assigned P0/P1/P2 scope in full and the P3/P4 subset they addressed; the 7 residual P3/P4 findings were later dispositioned — 5 FIXED, 2 REJECTED — see Phase D note below).
+**All 4 phases of remediation COMPLETE as scoped** (Phases A–D covered their assigned P0/P1/P2 scope in full and the P3/P4 subset they addressed; the 7 residual P3/P4 findings were later dispositioned — 5 FIXED, 2 REJECTED — and the post-M13 reconciliation batch (`b6de1b6`) statused every remaining §4 row, closing C-012/C-024 code gaps along the way — see Phase D note below).
 
 ### Phase A — Security (P0): ALL 4 FIXED (identity-bound)
 1. ✅ **G-001 FIXED** — Auth middleware `strings.HasPrefix` (was broken `[:18]`)
