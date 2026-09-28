@@ -759,6 +759,16 @@ func (e *Executor) ActiveCount() int {
 	return len(e.active)
 }
 
+// Capacity reports the current active task count and the configured
+// MaxConcurrent limit. It backs the chain's RESOURCE CHECK admission stage
+// (RUNTIME §3.1 stage 7): admission may pre-check capacity, but admission
+// never guarantees capacity at execution time (RUNTIME §3.2).
+func (e *Executor) Capacity() (active, max int) {
+	e.activeMu.RLock()
+	defer e.activeMu.RUnlock()
+	return len(e.active), e.config.MaxConcurrent
+}
+
 // IsRunning reports whether the executor is accepting work (Start has been
 // called and Stop has not completed). This is the authoritative runtime state
 // used by the control-components endpoint (G-012) — never infer "active" from
