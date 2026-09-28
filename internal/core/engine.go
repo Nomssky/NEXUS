@@ -96,6 +96,8 @@ type Engine struct {
 
 	// Attention
 	attentionEng *attention.FullAttentionEngine
+	// escalations is the CTR-GOV-002 escalation queue (governance → attention).
+	escalations *escalationQueue
 
 	// Hardening
 	circuitBreaker *hardening.CircuitBreaker
@@ -246,11 +248,24 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e.memoryStore = memory.NewMemoryStore()
 
 	// Attention
-	e.attentionEng = attention.NewFullAttentionEngine(
+	e.attentionEng = attention.NewFullAttentionEngineWithClock(
 		attention.AttentionBudget{},
 		attention.QuietHours{},
 		attention.SuppressionGuard{},
+		e.now,
 	)
+
+	// Escalation queue + CTR-GOV-002 intake: the bus consumer acks
+	// governance.escalated by queueing (D3 handoff, contract output
+	// { escalation_id }). The consumer lives as long as the bus, which the
+	// engine owns — both are released together.
+	e.escalations = newEscalationQueue(e.now)
+	if _, err := e.eventBus.Subscribe(
+		event.ConsumerFunc(e.handleGovernanceEscalated),
+		event.EventTypeGovernanceEscalated,
+	); err != nil {
+		return nil, fmt.Errorf("core: subscribe escalation intake: %w", err)
+	}
 
 	// Hardening
 	e.circuitBreaker = hardening.NewCircuitBreakerWithClock(5, 30*time.Second, e.now)

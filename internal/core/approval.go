@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -457,17 +458,31 @@ func mapApprovalErr(err error) error {
 }
 
 // emitEscalation publishes governance.escalated — the D3 async handoff of an
-// ESCALATE outcome to a higher authority (CTR-GOV-002 input shape:
-// escalation_id, reason, context; ack is the event bus accept itself).
+// ESCALATE outcome to a higher authority. Full CTR-GOV-002 input shape:
+// escalation_id, reason, context, urgency, deadline; ack is the event bus
+// accept (the escalation intake consumer then queues the escalation_id —
+// see escalation.go).
 func (e *Engine) emitEscalation(req *Request, escalationRef, reason, gate string) {
 	if req == nil || req.Context == nil {
 		return
 	}
+	urgency := req.Priority
+	if urgency <= 0 {
+		// Schema §4.4: governance escalations are "high"; 0 = unset.
+		urgency = defaultEscalationUrgency
+	}
+	deadline := e.now().Add(defaultEscalationTTL)
+	if req.Deadline != nil {
+		deadline = *req.Deadline
+	}
 	payload := map[string]string{
 		"escalation_ref": escalationRef,
+		"request_id":     req.ID,
 		"requester_id":   req.Context.ActorID,
 		"reason":         reason,
 		"gate":           gate,
+		"urgency":        strconv.Itoa(urgency),
+		"deadline":       deadline.UTC().Format(time.RFC3339Nano),
 	}
 	data, _ := json.Marshal(payload)
 	_ = e.eventBus.Publish(&event.Event{
