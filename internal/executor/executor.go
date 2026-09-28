@@ -619,9 +619,12 @@ func (e *Executor) executeWork(req *WorkRequest) {
 // Returns the governance decision for the caller to handle.
 func (e *Executor) checkGovernance(req *WorkRequest) governance.Decision {
 	return e.governance.Evaluate(governance.Request{
-		Actor:      req.ActorID,
-		Action:     ActionExecuteTask,
-		Resource:   ResourceWorkflow,
+		Actor:    req.ActorID,
+		Action:   ActionExecuteTask,
+		Resource: ResourceWorkflow,
+		// D1: the task id is known at this gate (the agent is provisioned
+		// only after governance passes), so task-scoped policies apply.
+		TaskID:     req.TaskID,
 		BusinessID: req.BusinessID,
 		// Approval resume: carries an approved approval record so an
 		// existing REQUIRE_APPROVAL policy can be satisfied (nil otherwise).

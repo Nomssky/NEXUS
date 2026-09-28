@@ -128,13 +128,18 @@ type ApprovalConfig struct {
 
 // Policy is a complete governance policy record.
 type Policy struct {
-	SchemaVersion  string          `json:"schema_version"`
-	EntityType     string          `json:"entity_type"` // always "policy"
-	PolicyID       string          `json:"policy_id"`
-	PolicyVersion  string          `json:"policy_version"`
-	NexusID        string          `json:"nexus_id"`
-	BusinessID     string          `json:"business_id,omitempty"`
-	DivisionID     string          `json:"division_id,omitempty"`
+	SchemaVersion string `json:"schema_version"`
+	EntityType    string `json:"entity_type"` // always "policy"
+	PolicyID      string `json:"policy_id"`
+	PolicyVersion string `json:"policy_version"`
+	NexusID       string `json:"nexus_id"`
+	BusinessID    string `json:"business_id,omitempty"`
+	DivisionID    string `json:"division_id,omitempty"`
+	// D1: narrower scope levels (additive, optional). A policy pinned to an
+	// agent/workflow/task applies only when the request carries that id.
+	AgentID        string          `json:"agent_id,omitempty"`
+	WorkflowID     string          `json:"workflow_id,omitempty"`
+	TaskID         string          `json:"task_id,omitempty"`
 	PolicyType     PolicyType      `json:"policy_type"`
 	Name           string          `json:"name"`
 	Description    string          `json:"description"`
@@ -172,8 +177,19 @@ func (p *Policy) IsActive(now time.Time) bool {
 		now.After(p.EffectiveFrom)
 }
 
-// ScopeLevel returns the scope level of this policy based on which IDs are set.
+// ScopeLevelFor returns the scope level of this policy: the most specific
+// identifier set wins (TASK > WORKFLOW > AGENT > DIVISION > BUSINESS >
+// GLOBAL, per the ScopeLevel precedence documented above).
 func (p *Policy) ScopeLevelFor() ScopeLevel {
+	if p.TaskID != "" {
+		return ScopeLevelTask
+	}
+	if p.WorkflowID != "" {
+		return ScopeLevelWorkflow
+	}
+	if p.AgentID != "" {
+		return ScopeLevelAgent
+	}
 	if p.BusinessID == "" {
 		return ScopeLevelGlobal
 	}

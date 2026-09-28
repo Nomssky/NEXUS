@@ -875,6 +875,71 @@ func TestGovernanceEscalate(t *testing.T) {
 	}
 }
 
+// TEST-EXEC-021 (D1): task-scoped governance policies apply at the executor
+// gate — the executor populates Request.TaskID (the agent is provisioned
+// only after governance passes), so a policy pinned to this task denies it
+// while other tasks fall through to the default-allow.
+func TestGovernanceTaskScopedPolicy(t *testing.T) {
+	now := time.Now()
+	govEngine := governance.NewEngine([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+		{
+			PolicyID:   "deny-this-task",
+			Name:       "Deny This Task",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.DENY,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			TaskID:     "exec-task-deny",
+			Precedence: 0,
+		},
+	})
+
+	e := New(
+		agent.NewAgentRuntime(),
+		tool.NewToolRegistry(),
+		govEngine,
+		event.NewMemBus(),
+		nil,
+		DefaultConfig(),
+		WithClock(func() time.Time { return now }),
+	)
+	ctx := context.Background()
+	e.Start(ctx)
+	defer e.Stop(ctx)
+
+	// Task pinned by the scoped policy → denied at the gate; the handler
+	// must never run.
+	denied := testRequest("exec-task-deny")
+	denied.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		return &Outcome{Status: "completed", Output: "should not reach"}, nil
+	}
+	e.Submit(denied)
+	if result := waitForOutcome(t, e, "exec-task-deny"); result.Status != "denied" {
+		t.Errorf("task-scoped deny: want denied, got %s", result.Status)
+	}
+
+	// Any other task id is outside the policy's scope → allowed.
+	allowed := testRequest("exec-task-other")
+	allowed.Handler = func(ctx context.Context, wr *WorkRequest, ag *agent.Agent) (*Outcome, error) {
+		return &Outcome{Status: "completed", Output: "ok"}, nil
+	}
+	e.Submit(allowed)
+	if result := waitForOutcome(t, e, "exec-task-other"); result.Status != "completed" {
+		t.Errorf("task outside scope: want completed, got %s", result.Status)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // E-005: external cancellation of in-flight tasks (executor scope).
 // ---------------------------------------------------------------------------

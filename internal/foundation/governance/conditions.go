@@ -12,13 +12,14 @@
 //	           past midnight; start==end covers the full day. days is
 //	           optional (absent = every day), otherwise an unordered list
 //	           of 3-letter English day names.
-//	scope      business=<id> and/or division=<id> (at least one required).
-//	           Each set key must equal the request's field exactly; an
-//	           unset request field never matches a set condition key.
+//	scope      business=<id> and/or division=<id> and/or agent=<id> and/or
+//	           workflow=<id> and/or task=<id> (at least one required). Each
+//	           set key must equal the request's field exactly; an unset
+//	           request field never matches a set condition key.
 //	attribute  key=value pairs over the fixed request attributes: actor,
-//	           action, resource, resource_type, business, division,
-//	           objective, risk (risk is case-insensitive). Unknown keys are
-//	           an evaluation error.
+//	           action, resource, resource_type, business, division, agent,
+//	           workflow, task, objective, risk (risk is case-insensitive).
+//	           Unknown keys are an evaluation error.
 //	count      action=<action>[,actor=<actor>],max=<n>[,window_seconds=<n>]
 //	           Records one evaluation per Evaluate() call for this condition
 //	           (the current evaluation included) and is true once the number
@@ -252,7 +253,7 @@ func isKnownDay(d string) bool {
 	return false
 }
 
-// evalScope implements the business/division scope condition.
+// evalScope implements the business/division/agent/workflow/task condition.
 func evalScope(c Condition, req Request) (conditionOutcome, error) {
 	kv, err := parseCondExpr(c.Expression)
 	if err != nil {
@@ -260,13 +261,28 @@ func evalScope(c Condition, req Request) (conditionOutcome, error) {
 	}
 	if _, ok := kv["business"]; !ok {
 		if _, ok := kv["division"]; !ok {
-			return false, fmt.Errorf("condition %s: scope requires business= and/or division=", c.ConditionID)
+			if _, ok := kv["agent"]; !ok {
+				if _, ok := kv["workflow"]; !ok {
+					if _, ok := kv["task"]; !ok {
+						return false, fmt.Errorf("condition %s: scope requires at least one of business=/division=/agent=/workflow=/task=", c.ConditionID)
+					}
+				}
+			}
 		}
 	}
 	if b, ok := kv["business"]; ok && b != req.BusinessID {
 		return false, nil
 	}
 	if d, ok := kv["division"]; ok && d != req.DivisionID {
+		return false, nil
+	}
+	if a, ok := kv["agent"]; ok && a != req.AgentID {
+		return false, nil
+	}
+	if w, ok := kv["workflow"]; ok && w != req.WorkflowID {
+		return false, nil
+	}
+	if tk, ok := kv["task"]; ok && tk != req.TaskID {
 		return false, nil
 	}
 	return true, nil
@@ -302,6 +318,18 @@ func evalAttribute(c Condition, req Request) (conditionOutcome, error) {
 			}
 		case "division":
 			if v != req.DivisionID {
+				return false, nil
+			}
+		case "agent":
+			if v != req.AgentID {
+				return false, nil
+			}
+		case "workflow":
+			if v != req.WorkflowID {
+				return false, nil
+			}
+		case "task":
+			if v != req.TaskID {
 				return false, nil
 			}
 		case "objective":

@@ -111,9 +111,13 @@ func (e *Engine) Evaluate(req Request) Decision {
 		}
 	}
 	if len(evaluated) == 0 {
+		reason := "no active policies (default deny)"
+		if len(matching) > 0 {
+			reason = "no matching policies with conditions holding (default deny)"
+		}
 		return Decision{
 			Outcome:    DENY,
-			Reason:     "no matching policies with conditions holding (default deny)",
+			Reason:     reason,
 			ScopeLevel: ScopeLevelGlobal,
 			Timestamp:  now,
 		}
@@ -176,18 +180,28 @@ func (e *Engine) findMatchingPolicies(req Request, now time.Time) []*Policy {
 
 // matchesScope checks if a policy's scope matches the request.
 func (e *Engine) matchesScope(p *Policy, req Request) bool {
-	// Global policy matches everything
-	if p.BusinessID == "" {
-		return true
+	// Global policy matches everything on the business/division axis.
+	if p.BusinessID != "" {
+		// Business policy must match business
+		if p.BusinessID != req.BusinessID {
+			return false
+		}
+		// Division policy must match division
+		if p.DivisionID != "" && p.DivisionID != req.DivisionID {
+			return false
+		}
 	}
 
-	// Business policy must match business
-	if p.BusinessID != req.BusinessID {
+	// D1: narrower scope levels. A policy pinned to an agent/workflow/task
+	// applies only when the request carries that id — an unset request id
+	// never matches a set policy id (same rule as business/division).
+	if p.AgentID != "" && p.AgentID != req.AgentID {
 		return false
 	}
-
-	// Division policy must match division
-	if p.DivisionID != "" && p.DivisionID != req.DivisionID {
+	if p.WorkflowID != "" && p.WorkflowID != req.WorkflowID {
+		return false
+	}
+	if p.TaskID != "" && p.TaskID != req.TaskID {
 		return false
 	}
 
@@ -266,13 +280,20 @@ func (e *Engine) applyPrecedence(policies []*Policy, req Request, now time.Time)
 	}
 
 	// Sort by restrictiveness (most restrictive first), then by precedence
-	sort.Slice(policies, func(i, j int) bool {
+	// (higher first), then by scope narrowness — when outcome and precedence
+	// tie, the narrower scope wins (SCHEMA_COMMON: when scope is ambiguous,
+	// default to the narrowest possible scope). SliceStable keeps input
+	// order for full ties.
+	sort.SliceStable(policies, func(i, j int) bool {
 		ri := restrictiveness(policies[i].Effect)
 		rj := restrictiveness(policies[j].Effect)
 		if ri != rj {
 			return ri > rj // more restrictive first
 		}
-		return policies[i].Precedence > policies[j].Precedence // higher precedence first
+		if policies[i].Precedence != policies[j].Precedence {
+			return policies[i].Precedence > policies[j].Precedence // higher precedence first
+		}
+		return policies[i].ScopeLevelFor() > policies[j].ScopeLevelFor() // narrower first
 	})
 
 	// The most restrictive policy wins

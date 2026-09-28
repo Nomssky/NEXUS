@@ -19,6 +19,12 @@ type Request struct {
 	BusinessID string `json:"business_id,omitempty"`
 	// DivisionID scopes the request to a division (empty = business-level).
 	DivisionID string `json:"division_id,omitempty"`
+	// AgentID narrows the request to a specific agent (D1, optional).
+	AgentID string `json:"agent_id,omitempty"`
+	// WorkflowID narrows the request to a specific workflow (D1, optional).
+	WorkflowID string `json:"workflow_id,omitempty"`
+	// TaskID narrows the request to a specific task (D1, optional).
+	TaskID string `json:"task_id,omitempty"`
 	// ObjectiveID links the request to an objective (optional).
 	ObjectiveID string `json:"objective_id,omitempty"`
 	// RiskLevel indicates the assessed risk of the action.
