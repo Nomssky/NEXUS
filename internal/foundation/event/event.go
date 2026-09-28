@@ -87,6 +87,9 @@ type Event struct {
 	BusinessID string `json:"business_id,omitempty"`
 	// DivisionID scopes the event to a division.
 	DivisionID string `json:"division_id,omitempty"`
+	// TaskID links the event to the related task when one exists
+	// (SCHEMA_EVENTS_TRIGGERS §2.2: task_id, conditional).
+	TaskID string `json:"task_id,omitempty"`
 	// CorrelationID links events across a correlation chain.
 	CorrelationID string `json:"correlation_id,omitempty"`
 	// CausationID links to the event/action that caused this event.

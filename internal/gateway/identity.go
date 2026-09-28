@@ -86,7 +86,11 @@ func isScopedAPIPath(path string) bool {
 		return true
 	}
 	// Approval records and decisions are business-scoped governance data.
-	return path == "/api/v1/approvals" || strings.HasPrefix(path, "/api/v1/approvals/")
+	if path == "/api/v1/approvals" || strings.HasPrefix(path, "/api/v1/approvals/") {
+		return true
+	}
+	// Escalation alerts and human responses (CTR-ATT) are likewise scoped.
+	return path == "/api/v1/escalations" || strings.HasPrefix(path, "/api/v1/escalations/")
 }
 
 // identityMiddleware authenticates scoped requests when enforcement is on and

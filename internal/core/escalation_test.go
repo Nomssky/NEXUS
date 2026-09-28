@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -181,27 +182,33 @@ func TestEscalationAcknowledgeResolve(t *testing.T) {
 		"gate":           "executor",
 	}))
 
-	if err := e.AcknowledgeEscalation("esc-ack-1"); err != nil {
+	if err := e.AcknowledgeEscalation("esc-ack-1", "biz-1", "nx:human:alice", "seen the alert"); err != nil {
 		t.Fatalf("acknowledge: %v", err)
 	}
 	esc, _ := e.GetEscalation("esc-ack-1")
 	if esc.Status != EscalationAcknowledged || esc.AcknowledgedAt == nil {
 		t.Errorf("want acknowledged with timestamp, got %s %v", esc.Status, esc.AcknowledgedAt)
 	}
-	if err := e.AcknowledgeEscalation("esc-ack-1"); err == nil {
+	if esc.AcknowledgedBy != "nx:human:alice" {
+		t.Errorf("acknowledged_by: want nx:human:alice, got %q", esc.AcknowledgedBy)
+	}
+	if err := e.AcknowledgeEscalation("esc-ack-1", "biz-1", "nx:human:alice", "seen the alert"); err == nil {
 		t.Error("second acknowledge must fail (not pending)")
 	}
-	if err := e.ResolveEscalation("esc-ack-1"); err != nil {
+	if err := e.ResolveEscalation("esc-ack-1", "biz-1", "nx:human:alice", "alert handled"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	esc, _ = e.GetEscalation("esc-ack-1")
 	if esc.Status != EscalationResolved || esc.ResolvedAt == nil {
 		t.Errorf("want resolved with timestamp, got %s %v", esc.Status, esc.ResolvedAt)
 	}
-	if err := e.ResolveEscalation("esc-ack-1"); err == nil {
+	if esc.ResolvedBy != "nx:human:alice" || esc.Resolution != "alert handled" {
+		t.Errorf("human response attribution: got by=%q resolution=%q", esc.ResolvedBy, esc.Resolution)
+	}
+	if err := e.ResolveEscalation("esc-ack-1", "biz-1", "nx:human:alice", "again"); err == nil {
 		t.Error("resolve on resolved must fail")
 	}
-	if err := e.AcknowledgeEscalation("esc-nope"); err == nil {
+	if err := e.AcknowledgeEscalation("esc-nope", "biz-1", "nx:human:alice", "n/a"); err == nil {
 		t.Error("unknown id must fail")
 	}
 }
@@ -233,10 +240,10 @@ func TestEscalationExpiresAfterDeadline(t *testing.T) {
 	if !ok || esc.Status != EscalationExpired {
 		t.Fatalf("after deadline: want expired, got %v (ok=%v)", esc, ok)
 	}
-	if err := e.AcknowledgeEscalation("esc-exp-1"); err == nil {
+	if err := e.AcknowledgeEscalation("esc-exp-1", "biz-1", "nx:human:alice", "too late"); err == nil {
 		t.Error("acknowledge after expiry must fail")
 	}
-	if err := e.ResolveEscalation("esc-exp-1"); err == nil {
+	if err := e.ResolveEscalation("esc-exp-1", "biz-1", "nx:human:alice", "late"); err == nil {
 		t.Error("resolve after expiry must fail")
 	}
 }
@@ -280,5 +287,104 @@ func TestEscalationIntakeFailureLoggedRetryOnce(t *testing.T) {
 	}
 	if len(e.Escalations()) != 1 {
 		t.Errorf("want only the bad-title escalation queued, got %d", len(e.Escalations()))
+	}
+}
+
+// TEST-CORE-068 (CTR-ATT): business scoping on the human surface —
+// cross-tenant ack/resolve fail with ErrEscalationScope, unknown ids with
+// ErrEscalationNotFound, invalid transitions with ErrEscalationNotDecidable,
+// and the business list serves only its own scope (G-002 posture).
+func TestEscalationScopedHumanSurface(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishEscalated(t, e, "ev-esc-scope-1", "biz-1", escalationJSON(t, map[string]string{
+		"escalation_ref": "esc-scope-1",
+		"reason":         "needs a human",
+	}))
+	publishEscalated(t, e, "ev-esc-scope-2", "biz-2", escalationJSON(t, map[string]string{
+		"escalation_ref": "esc-scope-2",
+		"reason":         "other tenant",
+	}))
+
+	if got := len(e.ListEscalations("biz-1")); got != 1 {
+		t.Fatalf("biz-1 list: want 1, got %d", got)
+	}
+	if got := len(e.ListEscalations("biz-9")); got != 0 {
+		t.Errorf("biz-9 list: want 0, got %d", got)
+	}
+	if esc, _ := e.GetEscalation("esc-scope-1"); esc.BusinessID != "biz-1" {
+		t.Errorf("record business_id: want biz-1, got %q", esc.BusinessID)
+	}
+
+	err = e.AcknowledgeEscalation("esc-scope-1", "biz-2", "nx:human:mallory", "cross tenant")
+	if !errors.Is(err, ErrEscalationScope) {
+		t.Errorf("cross-tenant ack: want ErrEscalationScope, got %v", err)
+	}
+	err = e.ResolveEscalation("esc-scope-2", "biz-1", "nx:human:alice", "nope")
+	if !errors.Is(err, ErrEscalationScope) {
+		t.Errorf("cross-tenant resolve: want ErrEscalationScope, got %v", err)
+	}
+	err = e.AcknowledgeEscalation("esc-missing", "biz-1", "nx:human:alice", "n/a")
+	if !errors.Is(err, ErrEscalationNotFound) {
+		t.Errorf("unknown id: want ErrEscalationNotFound, got %v", err)
+	}
+
+	if err := e.AcknowledgeEscalation("esc-scope-1", "biz-1", "nx:human:alice", "acknowledged"); err != nil {
+		t.Fatalf("same-tenant ack: %v", err)
+	}
+	err = e.AcknowledgeEscalation("esc-scope-1", "biz-1", "nx:human:alice", "acknowledged")
+	if !errors.Is(err, ErrEscalationNotDecidable) {
+		t.Errorf("double ack: want ErrEscalationNotDecidable, got %v", err)
+	}
+}
+
+// TEST-CORE-069 (CTR-ATT-001): the governance.escalated notification carries
+// the contract input — alert_id, summary (reason), context fields, options,
+// deadline — so a human consumer can both see the alert and answer it.
+func TestEscalationNotificationCarriesOptions(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured []byte
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		if ev.Type == event.EventTypeGovernanceEscalated {
+			captured = append([]byte(nil), ev.Data...)
+		}
+		return nil
+	}))
+
+	req := &Request{
+		ID:      "req-esc-opts",
+		Context: NewRequestContext("corr-esc-opts", "biz-1", "user-1"),
+		Intent:  "work that escalates",
+	}
+	e.emitEscalation(req, "esc-opts-1", "needs a human", "chain")
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("expected governance.escalated to be captured")
+	}
+
+	var p struct {
+		EscalationRef string   `json:"escalation_ref"`
+		Reason        string   `json:"reason"`
+		Deadline      string   `json:"deadline"`
+		Options       []string `json:"options"`
+	}
+	if err := json.Unmarshal(captured, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.EscalationRef != "esc-opts-1" || p.Reason != "needs a human" {
+		t.Errorf("alert fields: got ref=%q reason=%q", p.EscalationRef, p.Reason)
+	}
+	if p.Deadline == "" {
+		t.Error("expected deadline in the notification")
+	}
+	if len(p.Options) != 2 || p.Options[0] != "acknowledge" || p.Options[1] != "resolve" {
+		t.Errorf("CTR-ATT-001 options: want [acknowledge resolve], got %v", p.Options)
 	}
 }

@@ -1352,6 +1352,11 @@ func TestCancelEmitsTaskCancelledPayload(t *testing.T) {
 	if ev.CorrelationID != "corr-task-cancel-payload" {
 		t.Errorf("expected correlation id, got %q", ev.CorrelationID)
 	}
+	// H1: the envelope itself carries task_id (SCHEMA_EVENTS_TRIGGERS §2.2),
+	// not only the payload body.
+	if ev.TaskID != req.TaskID {
+		t.Errorf("expected envelope task_id %s, got %q", req.TaskID, ev.TaskID)
+	}
 }
 
 // TEST-E005-EXEC-10: cancelling a running task releases its capacity slot.

@@ -458,7 +458,9 @@ func mapApprovalErr(err error) error {
 }
 
 // emitEscalation publishes governance.escalated — the D3 async handoff of an
-// ESCALATE outcome to a higher authority. Full CTR-GOV-002 input shape:
+// ESCALATE outcome to a higher authority, which doubles as the CTR-ATT-001
+// human notification (alert_id=escalation_ref, summary=reason, context via
+// requester/gate/request ids, options, deadline). CTR-GOV-002 input shape:
 // escalation_id, reason, context, urgency, deadline; ack is the event bus
 // accept (the escalation intake consumer then queues the escalation_id —
 // see escalation.go).
@@ -475,16 +477,16 @@ func (e *Engine) emitEscalation(req *Request, escalationRef, reason, gate string
 	if req.Deadline != nil {
 		deadline = *req.Deadline
 	}
-	payload := map[string]string{
-		"escalation_ref": escalationRef,
-		"request_id":     req.ID,
-		"requester_id":   req.Context.ActorID,
-		"reason":         reason,
-		"gate":           gate,
-		"urgency":        strconv.Itoa(urgency),
-		"deadline":       deadline.UTC().Format(time.RFC3339Nano),
-	}
-	data, _ := json.Marshal(payload)
+	data, _ := json.Marshal(escalationPayload{
+		EscalationRef: escalationRef,
+		RequestID:     req.ID,
+		RequesterID:   req.Context.ActorID,
+		Reason:        reason,
+		Gate:          gate,
+		Urgency:       strconv.Itoa(urgency),
+		Deadline:      deadline.UTC().Format(time.RFC3339Nano),
+		Options:       escalationAlertOptions,
+	})
 	_ = e.eventBus.Publish(&event.Event{
 		ID:            fmt.Sprintf("%s-%s", escalationRef, event.EventTypeGovernanceEscalated),
 		Type:          event.EventTypeGovernanceEscalated,

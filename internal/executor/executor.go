@@ -816,6 +816,7 @@ func (e *Executor) emitEvent(eventType string, taskID, corrID string, data inter
 		Source:        "executor",
 		Timestamp:     e.now(),
 		CorrelationID: corrID,
+		TaskID:        taskID, // H1: the task scope the parameter always carried
 	}
 
 	// Serialize data payload

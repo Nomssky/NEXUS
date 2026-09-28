@@ -159,6 +159,12 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/approve", s.handleApproveApproval)
 	s.mux.HandleFunc("POST /api/v1/approvals/{id}/deny", s.handleDenyApproval)
 
+	// Escalation endpoints (CTR-ATT human surface): list the scope's alerts
+	// (CTR-ATT-001 pull) and answer one (CTR-ATT-002 decision + reasoning).
+	s.mux.HandleFunc("GET /api/v1/escalations", s.handleListEscalations)
+	s.mux.HandleFunc("POST /api/v1/escalations/{id}/ack", s.handleAckEscalation)
+	s.mux.HandleFunc("POST /api/v1/escalations/{id}/resolve", s.handleResolveEscalation)
+
 	s.mux.HandleFunc("GET /events", s.handleSSE)
 
 	// Control surface endpoints
@@ -643,6 +649,106 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 	default:
 		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
 			fmt.Sprintf("approval decision failed: %v", err))
+	}
+}
+
+// escalationResponseBody is the CTR-ATT-002 input body: alert_id and decision
+// travel in the path, reasoning is the human's rationale.
+type escalationResponseBody struct {
+	Reasoning string `json:"reasoning"`
+}
+
+// handleListEscalations serves the scope's queued alerts (CTR-ATT-001 pull
+// surface: alert_id/summary/context/options/deadline via the record and the
+// governance.escalated notification).
+func (s *Server) handleListEscalations(w http.ResponseWriter, r *http.Request) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"escalations": s.engine.ListEscalations(businessID),
+	})
+}
+
+func (s *Server) handleAckEscalation(w http.ResponseWriter, r *http.Request) {
+	s.decideEscalation(w, r, false)
+}
+
+func (s *Server) handleResolveEscalation(w http.ResponseWriter, r *http.Request) {
+	s.decideEscalation(w, r, true)
+}
+
+// decideEscalation answers one alert per CTR-ATT-002. Success is the
+// contract Output {accepted}; failures use the standard error envelope
+// (404 unknown, 403 foreign scope, 409 non-decidable state).
+func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolve bool) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+
+	id := r.PathValue("id")
+	if id == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "escalation ID required")
+		return
+	}
+	var body escalationResponseBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(body.Reasoning) == "" {
+		s.writeError(w, http.StatusBadRequest, "VALIDATION", "reasoning required")
+		return
+	}
+
+	// G-009 posture: only a verified identity is attributed (same rule as
+	// the approval decisions); without enforcement the fixed marker is bound.
+	actorID := unauthenticatedActorID
+	if res.IdentityID != "" {
+		actorID = res.IdentityID
+	}
+
+	var err error
+	status := "acknowledged"
+	if resolve {
+		status = "resolved"
+		err = s.engine.ResolveEscalation(id, businessID, actorID, body.Reasoning)
+	} else {
+		err = s.engine.AcknowledgeEscalation(id, businessID, actorID, body.Reasoning)
+	}
+
+	switch {
+	case err == nil:
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", id)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"escalation_id": id,
+			"status":        status,
+			"accepted":      true,
+		})
+	case errors.Is(err, core.ErrEscalationNotFound):
+		s.writeError(w, http.StatusNotFound, "VALIDATION", "escalation not found")
+	case errors.Is(err, core.ErrEscalationScope):
+		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: business scope mismatch")
+	case errors.Is(err, core.ErrEscalationNotDecidable):
+		s.writeError(w, http.StatusConflict, "CONFLICT", err.Error())
+	default:
+		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			fmt.Sprintf("escalation decision failed: %v", err))
 	}
 }
 

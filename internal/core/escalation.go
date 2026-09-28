@@ -25,6 +25,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -34,6 +35,18 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 )
+
+// Escalation decision errors (CTR-ATT-002 human response surface). The
+// gateway maps them to 404/403/409 and answers contract-shaped {accepted}.
+var (
+	ErrEscalationNotFound     = errors.New("escalation not found")
+	ErrEscalationNotDecidable = errors.New("escalation not in a decidable state")
+	ErrEscalationScope        = errors.New("escalation business scope mismatch")
+)
+
+// escalationAlertOptions is the CTR-ATT-001 options list presented with the
+// human notification — the decisions a human may return via CTR-ATT-002.
+var escalationAlertOptions = []string{"acknowledge", "resolve"}
 
 // defaultEscalationTTL bounds how long an escalation waits for an answer
 // when the originating request carries no deadline. The contract requires a
@@ -57,10 +70,12 @@ const (
 	EscalationExpired      EscalationStatus = "expired"
 )
 
-// Escalation is one queued Governance → Attention handoff (CTR-GOV-002).
+// Escalation is one queued Governance → Attention handoff (CTR-GOV-002),
+// presented to humans through the CTR-ATT-001/002 surface.
 type Escalation struct {
 	EscalationID   string            `json:"escalation_id"`
 	RequestID      string            `json:"request_id,omitempty"`
+	BusinessID     string            `json:"business_id,omitempty"`
 	Reason         string            `json:"reason"`
 	Context        map[string]string `json:"context,omitempty"`
 	Urgency        int               `json:"urgency"`
@@ -70,7 +85,13 @@ type Escalation struct {
 	Gate           string            `json:"gate,omitempty"`
 	CreatedAt      time.Time         `json:"created_at"`
 	AcknowledgedAt *time.Time        `json:"acknowledged_at,omitempty"`
-	ResolvedAt     *time.Time        `json:"resolved_at,omitempty"`
+	AcknowledgedBy string            `json:"acknowledged_by,omitempty"`
+	// AckReason is the CTR-ATT-002 reasoning recorded with an acknowledge.
+	AckReason  string     `json:"ack_reason,omitempty"`
+	ResolvedAt *time.Time `json:"resolved_at,omitempty"`
+	ResolvedBy string     `json:"resolved_by,omitempty"`
+	// Resolution carries the CTR-ATT-002 reasoning for the human response.
+	Resolution string `json:"resolution,omitempty"`
 }
 
 // escalationQueue is the in-memory queue keyed by escalation_id.
@@ -139,47 +160,53 @@ func (q *escalationQueue) list() []*Escalation {
 	return out
 }
 
-// acknowledge moves pending → acknowledged.
-func (q *escalationQueue) acknowledge(id string) error {
+// acknowledge moves pending → acknowledged, attributing the responding
+// authority and reasoning (CTR-ATT-002 decision + reasoning).
+func (q *escalationQueue) acknowledge(id, actorID, reasoning string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.sweepLocked()
 	esc, ok := q.items[id]
 	if !ok {
-		return fmt.Errorf("core: escalation %q not found", id)
+		return fmt.Errorf("%w: %q", ErrEscalationNotFound, id)
 	}
 	switch esc.Status {
 	case EscalationPending:
 		now := q.now()
 		esc.Status = EscalationAcknowledged
 		esc.AcknowledgedAt = &now
+		esc.AcknowledgedBy = actorID
+		esc.AckReason = reasoning
 		return nil
 	case EscalationExpired:
-		return fmt.Errorf("core: escalation %q already expired", id)
+		return fmt.Errorf("%w: escalation %q already expired", ErrEscalationNotDecidable, id)
 	default:
-		return fmt.Errorf("core: escalation %q is %s, not pending", id, esc.Status)
+		return fmt.Errorf("%w: escalation %q is %s, not pending", ErrEscalationNotDecidable, id, esc.Status)
 	}
 }
 
-// resolve moves pending or acknowledged → resolved.
-func (q *escalationQueue) resolve(id string) error {
+// resolve moves pending or acknowledged → resolved, recording the human
+// response (CTR-ATT-002 decision=resolve with reasoning).
+func (q *escalationQueue) resolve(id, actorID, reasoning string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.sweepLocked()
 	esc, ok := q.items[id]
 	if !ok {
-		return fmt.Errorf("core: escalation %q not found", id)
+		return fmt.Errorf("%w: %q", ErrEscalationNotFound, id)
 	}
 	switch esc.Status {
 	case EscalationPending, EscalationAcknowledged:
 		now := q.now()
 		esc.Status = EscalationResolved
 		esc.ResolvedAt = &now
+		esc.ResolvedBy = actorID
+		esc.Resolution = reasoning
 		return nil
 	case EscalationExpired:
-		return fmt.Errorf("core: escalation %q already expired", id)
+		return fmt.Errorf("%w: escalation %q already expired", ErrEscalationNotDecidable, id)
 	default:
-		return fmt.Errorf("core: escalation %q is %s, not resolvable", id, esc.Status)
+		return fmt.Errorf("%w: escalation %q is %s, not resolvable", ErrEscalationNotDecidable, id, esc.Status)
 	}
 }
 
@@ -207,31 +234,68 @@ func (e *Engine) Escalations() []*Escalation {
 	return e.escalations.list()
 }
 
+// ListEscalations returns the escalations of one business scope (CTR-ATT-001
+// pull surface — the list endpoint serves alert_id/summary/context/deadline).
+func (e *Engine) ListEscalations(businessID string) []*Escalation {
+	all := e.escalations.list()
+	out := make([]*Escalation, 0, len(all))
+	for _, esc := range all {
+		if esc.BusinessID == businessID {
+			out = append(out, esc)
+		}
+	}
+	return out
+}
+
 // GetEscalation returns one escalation by id (deadline-swept).
 func (e *Engine) GetEscalation(id string) (*Escalation, bool) {
 	return e.escalations.get(id)
 }
 
-// AcknowledgeEscalation marks a pending escalation as seen by an authority.
-func (e *Engine) AcknowledgeEscalation(id string) error {
-	return e.escalations.acknowledge(id)
+// AcknowledgeEscalation is the CTR-ATT-002 human response (decision =
+// acknowledge) scoped to the caller's business; reasoning is recorded with
+// the acknowledgement.
+func (e *Engine) AcknowledgeEscalation(id, businessID, actorID, reasoning string) error {
+	if err := e.escalationScope(id, businessID); err != nil {
+		return err
+	}
+	return e.escalations.acknowledge(id, actorID, reasoning)
 }
 
-// ResolveEscalation closes an escalation.
-func (e *Engine) ResolveEscalation(id string) error {
-	return e.escalations.resolve(id)
+// ResolveEscalation is the CTR-ATT-002 human response (decision = resolve);
+// reasoning is stored as the resolution.
+func (e *Engine) ResolveEscalation(id, businessID, actorID, reasoning string) error {
+	if err := e.escalationScope(id, businessID); err != nil {
+		return err
+	}
+	return e.escalations.resolve(id, actorID, reasoning)
 }
 
-// escalationPayload is the governance.escalated Data shape (extended by D3
-// with the urgency/deadline the CTR-GOV-002 input requires).
+// escalationScope fails closed unless the escalation exists inside the
+// caller's business scope (G-002 posture: no cross-tenant decisions).
+func (e *Engine) escalationScope(id, businessID string) error {
+	esc, ok := e.escalations.get(id)
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrEscalationNotFound, id)
+	}
+	if esc.BusinessID != businessID {
+		return fmt.Errorf("%w: escalation %q", ErrEscalationScope, id)
+	}
+	return nil
+}
+
+// escalationPayload is the governance.escalated Data shape: the CTR-GOV-002
+// input (extended by D3 with urgency/deadline) plus the CTR-ATT-001
+// notification fields (summary=reason, context, options, deadline).
 type escalationPayload struct {
-	EscalationRef string `json:"escalation_ref"`
-	RequestID     string `json:"request_id"`
-	RequesterID   string `json:"requester_id"`
-	Reason        string `json:"reason"`
-	Gate          string `json:"gate"`
-	Urgency       string `json:"urgency"`
-	Deadline      string `json:"deadline"`
+	EscalationRef string   `json:"escalation_ref"`
+	RequestID     string   `json:"request_id"`
+	RequesterID   string   `json:"requester_id"`
+	Reason        string   `json:"reason"`
+	Gate          string   `json:"gate"`
+	Urgency       string   `json:"urgency"`
+	Deadline      string   `json:"deadline"`
+	Options       []string `json:"options,omitempty"`
 }
 
 // handleGovernanceEscalated is the CTR-GOV-002 attention-side intake. The
@@ -252,6 +316,7 @@ func (e *Engine) handleGovernanceEscalated(ev *event.Event) error {
 	esc := &Escalation{
 		EscalationID: p.EscalationRef,
 		RequestID:    p.RequestID,
+		BusinessID:   ev.BusinessID,
 		Reason:       p.Reason,
 		Gate:         p.Gate,
 		Status:       EscalationPending,
