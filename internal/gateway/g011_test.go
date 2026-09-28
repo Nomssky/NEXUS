@@ -205,7 +205,7 @@ func TestG011SuccessfulWriteStillStreams(t *testing.T) {
 	if !sse.stillOpen() {
 		t.Fatal("healthy stream must stay open until client disconnect")
 	}
-	if !strings.Contains(w.body(), `"id":"g011-ok"`) {
+	if !strings.Contains(w.body(), `"event_id":"g011-ok"`) {
 		t.Errorf("event not written; body=%q", w.body())
 	}
 	if w.flushes == 0 {
@@ -280,7 +280,8 @@ func TestG011PreservesG010OversizedDrop(t *testing.T) {
 	w := newSSEFailWriter()
 	sse := startSSEWithWriter(t, srv, w)
 
-	big := make([]byte, 4096)
+	// Large but valid-JSON payload: projectable, so the drop is the size cap.
+	big := []byte(`{"blob":"` + strings.Repeat("A", 4096) + `"}`)
 	if err := engine.EventBus().Publish(&event.Event{
 		ID:         "g011-big",
 		Type:       event.EventType("custom"),
@@ -299,7 +300,7 @@ func TestG011PreservesG010OversizedDrop(t *testing.T) {
 	if !sse.stillOpen() {
 		t.Fatal("oversized drop must not terminate the stream (G-010)")
 	}
-	if strings.Contains(w.body(), `"id":"g011-big"`) {
+	if strings.Contains(w.body(), `"event_id":"g011-big"`) {
 		t.Error("oversized frame should be dropped, not written")
 	}
 	sse.finishCancel(t)

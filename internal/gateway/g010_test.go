@@ -3,7 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -203,21 +202,18 @@ func TestG010NormalResultUnchanged(t *testing.T) {
 // B. Oversized SSE event is not written; stream stays open (not torn down).
 func TestG010OversizedSSEEventDropped(t *testing.T) {
 	engine := g010Engine(t)
-	// Per-event cap far below a large Data payload.
-	srv := NewServer(engine, ":0", WithMaxSSEEventBytes(256))
+	// Per-event cap far below the frame of a large payload (the projected
+	// wire envelope plus payload must exceed 1024; a small event must not).
+	srv := NewServer(engine, ":0", WithMaxSSEEventBytes(1024))
 	sse := startSSE(t, srv)
 
-	// Large payload: Event.Data is JSON-marshaled as base64 (~4/3 expansion),
-	// so the frame far exceeds the 256-byte cap. Use a distinctive pattern.
-	big := make([]byte, 4096)
-	for i := range big {
-		big[i] = 'A'
-	}
-	bigB64 := base64.StdEncoding.EncodeToString(big)
+	// Large but valid-JSON payload: the event is projectable, so the drop is
+	// attributable to the size bound (G-010), not to a marshal failure.
+	blob := `{"blob":"` + strings.Repeat("A", 4096) + `"}`
 	publishDispatch(t, engine, &event.Event{
 		ID:   "g010-big",
 		Type: event.EventType("custom"),
-		Data: big,
+		Data: []byte(blob),
 	})
 
 	// Give the consumer a moment to run; stream must remain open.
@@ -238,14 +234,10 @@ func TestG010OversizedSSEEventDropped(t *testing.T) {
 	}
 
 	body := sse.finish(t)
-	// []byte payloads serialize as base64 — match the encoded form, not raw bytes.
-	if strings.Contains(body, bigB64[:64]) {
-		t.Error("oversized SSE event payload was written to the stream")
-	}
-	if strings.Contains(body, `"id":"g010-big"`) {
+	if strings.Contains(body, `"event_id":"g010-big"`) {
 		t.Error("oversized SSE event frame was written to the stream")
 	}
-	if !strings.Contains(body, `"id":"g010-after"`) {
+	if !strings.Contains(body, `"event_id":"g010-after"`) {
 		t.Errorf("follow-up normal event not delivered; body_len=%d", len(body))
 	}
 }
@@ -273,7 +265,7 @@ func TestG010NormalSSEEventDelivered(t *testing.T) {
 	if ct := sse.w.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("expected text/event-stream, got %q", ct)
 	}
-	if !strings.Contains(body, `"id":"g010-normal"`) {
+	if !strings.Contains(body, `"event_id":"g010-normal"`) {
 		t.Errorf("normal SSE event not delivered; body=%q", body)
 	}
 	if !strings.Contains(body, "event: custom") {
@@ -285,8 +277,9 @@ func TestG010NormalSSEEventDelivered(t *testing.T) {
 // (sum > cap) are all delivered; the stream is not torn down.
 func TestG010SSEPerEventNotCumulative(t *testing.T) {
 	engine := g010Engine(t)
-	// Cap sized so each small event fits but their sum exceeds the cap.
-	srv := NewServer(engine, ":0", WithMaxSSEEventBytes(400))
+	// Cap sized so each projected wire frame (~430 bytes with envelope and
+	// payload) fits but their sum exceeds the cap.
+	srv := NewServer(engine, ":0", WithMaxSSEEventBytes(700))
 	sse := startSSE(t, srv)
 
 	// Measure a typical frame: if a single normal event exceeds 400 the test
@@ -310,8 +303,8 @@ func TestG010SSEPerEventNotCumulative(t *testing.T) {
 		t.Errorf("expected %d per-event deliveries (sum may exceed cap), got %d; body_len=%d",
 			n, delivered, len(body))
 	}
-	if len(body) <= 400 {
-		t.Errorf("cumulative body %d should exceed per-event cap 400 to prove non-cumulative bound", len(body))
+	if len(body) <= 700 {
+		t.Errorf("cumulative body %d should exceed per-event cap 700 to prove non-cumulative bound", len(body))
 	}
 }
 

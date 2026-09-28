@@ -82,6 +82,10 @@ type Server struct {
 	// the org endpoints fail closed (503).
 	registry *identity.Registry
 
+	// nexusID stamps the installation identity onto external event
+	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
+	nexusID string
+
 	// G-010: maxResponseBytes caps one-shot JSON response bodies (GET result).
 	// maxSSEEventBytes caps each individual SSE event frame; it does not bound
 	// stream duration or cumulative stream size.
@@ -132,6 +136,12 @@ func WithMaxSSEEventBytes(n int) ServerOption {
 // Production code leaves this nil and uses net.Listen.
 func WithListenFunc(fn func(network, addr string) (net.Listener, error)) ServerOption {
 	return func(s *Server) { s.listenFunc = fn }
+}
+
+// WithNexusID sets the installation identity stamped onto external event
+// projections (SSE frames). Empty leaves nexus_id empty on the wire.
+func WithNexusID(id string) ServerOption {
+	return func(s *Server) { s.nexusID = id }
 }
 
 // NewServer creates a new HTTP Gateway server.
@@ -867,7 +877,15 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		if e.BusinessID != businessFilter {
 			return nil // skip events from other businesses and unscoped events
 		}
-		data, _ := json.Marshal(e)
+		// Project onto the contract Event Record (SCHEMA_EVENTS_TRIGGERS §2.2,
+		// honest projection: nexus_id stamped from the installation identity;
+		// unsourced §2.2 fields omitted — see event.WireRecord).
+		data, err := json.Marshal(e.Wire(s.nexusID))
+		if err != nil {
+			// Payload not JSON-serializable (violates §2.5) cannot become a
+			// contract record — drop the frame, keep the stream.
+			return nil
+		}
 		// G-010: bound each SSE event frame before writing. Oversized events
 		// are dropped without tearing down the stream — connection lifetime
 		// and cumulative stream bytes remain unbounded (long-lived by design).

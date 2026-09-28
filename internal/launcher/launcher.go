@@ -84,6 +84,7 @@ func New(opts Options) *Launcher {
 		gateway.WithControlAPIKey(opts.ControlAPIKey),
 		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
 		gateway.WithRegistry(opts.Registry),
+		gateway.WithNexusID(opts.Config.Nexus.ID),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
 	}
