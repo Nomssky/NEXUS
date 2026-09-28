@@ -309,8 +309,8 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		// chain-level gate — failed with POLICY_DENIED (CORE_INTERFACE_CONTRACTS
 		// §3). The executor records DENY as an outcome with execErr == nil,
 		// which would otherwise fall through to the default "completed" status.
-		// REQUIRE_APPROVAL (pending_approval) and ESCALATE (escalated) keep
-		// their current behavior until their own contract decision.
+		// REQUIRE_APPROVAL (pending_approval → D2) and ESCALATE (escalated
+		// → D3) have their own Step-12 branches below.
 		status = "failed"
 		outcomeResult = &Outcome{
 			Metrics: map[string]interface{}{
@@ -397,6 +397,40 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			}
 		}
 		respErr.Timestamp = e.now()
+	} else if execOutcome != nil && execOutcome.Status == "escalated" {
+		// D3: executor-level governance ESCALATE must not fall through to
+		// "completed" — the handler never ran (pre-dispatch block). Same
+		// envelope as the chain gate: failed / ESALATION_REQUIRED /
+		// POLICY_DENIED (CORE §3 has no escalation category), Retryable
+		// false, error.details.escalation_ref, governance.escalated event.
+		status = "failed"
+		outcomeResult = &Outcome{
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
+		}
+		message := execOutcome.Error
+		if message == "" {
+			message = "governance escalation required"
+		}
+		escRef := fmt.Sprintf("esc-%s-%d", req.Context.ActorID, e.now().UnixNano())
+		respErr = &ChainError{
+			Code:      "ESCALATION_REQUIRED",
+			Category:  "POLICY_DENIED",
+			Message:   message,
+			Details:   map[string]string{"escalation_ref": escRef},
+			ChainStep: string(StepAgent),
+			Retryable: false,
+		}
+		if req.Context != nil {
+			respErr.CorrelationID = req.Context.CorrelationID
+		}
+		respErr.Timestamp = e.now()
+		e.emitEscalation(req, escRef, execOutcome.Error, "executor")
 	} else if execOutcome != nil {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
@@ -499,6 +533,19 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		if ar, err := e.createApproval(req, decision, govReq); err == nil {
 			details = map[string]string{"approval_id": ar.DecisionID}
 		}
+	} else if decision.Outcome == governance.ESCALATE {
+		// D3: code ESALATION_REQUIRED distinguishes an escalation from a
+		// pure DENY (D1 uses code POLICY_DENIED); category stays
+		// POLICY_DENIED because CORE §3 has no escalation category and
+		// the action was blocked by governance (documented stretch of the
+		// §3 "(outcome DENY)" parenthetical — the free-form code is the
+		// machine-readable distinction). Retryable=false: an escalation
+		// needs a higher authority, not a retry.
+		code, category = "ESCALATION_REQUIRED", "POLICY_DENIED"
+		message = fmt.Sprintf("governance escalation required (outcome=%s): %s", decision.Outcome, decision.Reason)
+		escRef := fmt.Sprintf("esc-%s-%d", req.Context.ActorID, e.now().UnixNano())
+		details = map[string]string{"escalation_ref": escRef}
+		e.emitEscalation(req, escRef, decision.Reason, "chain")
 	}
 	return &ChainError{
 		Code:      code,

@@ -2649,3 +2649,179 @@ func TestApprovalApproveRequiresRunningEngine(t *testing.T) {
 		t.Error("refused approve must not touch the stored result")
 	}
 }
+
+// TEST-CORE-054 (D3): chain-gate ESCALATE → failed / ESALATION_REQUIRED /
+// POLICY_DENIED with error.details.escalation_ref and the
+// governance.escalated handoff event (CTR-GOV-002 minimal artifact).
+func TestEscalationChainGateEnvelope(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "escalate-all",
+			Name:       "Escalate All",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ESCALATE,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-esc-chain",
+		Context: NewRequestContext("corr-esc-chain", "biz-1", "user-1"),
+		Intent:  "work that must escalate",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Errorf("expected failed, got %s", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error envelope")
+	}
+	if result.Error.Code != "ESCALATION_REQUIRED" {
+		t.Errorf("expected code ESALATION_REQUIRED, got %s", result.Error.Code)
+	}
+	if result.Error.Category != "POLICY_DENIED" {
+		t.Errorf("expected category POLICY_DENIED (CORE §3), got %s", result.Error.Category)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false — escalation needs authority, not retry")
+	}
+	if ref := result.Error.Details["escalation_ref"]; ref == "" {
+		t.Errorf("expected error.details.escalation_ref, got %v", result.Error.Details)
+	}
+	if !strings.Contains(result.Error.Message, "outcome=ESCALATE") {
+		t.Errorf("message should carry the outcome, got %q", result.Error.Message)
+	}
+	// D1 distinction: a pure DENY uses code POLICY_DENIED — the code must
+	// never be POLICY_DENIED on this escalation path.
+	if result.Error.Code == "POLICY_DENIED" {
+		t.Error("ESCALATE must not share D1's code")
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	var sawEscalated bool
+	for _, typ := range received {
+		if typ == "governance.escalated" {
+			sawEscalated = true
+		}
+		if typ == "approval.requested" {
+			t.Error("escalation must not open the approval loop")
+		}
+	}
+	if !sawEscalated {
+		t.Errorf("expected governance.escalated event, got %v", received)
+	}
+}
+
+// TEST-CORE-055 (D3): executor-gate ESCALATE surfaced as failed /
+// ESCALATION_REQUIRED — pins the fix of the pre-D3 fallthrough where the
+// pre-dispatch block was reported as status "completed".
+func TestEscalationExecutorGateEnvelope(t *testing.T) {
+	now := time.Now()
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Default-allow keeps the chain gate passing; ESCALATE is scoped to the
+	// executor's action (TEST-CORE-051 pattern).
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID:   "default-allow",
+			Name:       "Default Allow",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ALLOW,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "custom"},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+		{
+			PolicyID:   "escalate-exec",
+			Name:       "Escalate On Execute Task",
+			Status:     governance.PolicyStatusActive,
+			Effect:     governance.ESCALATE,
+			Subject:    governance.Subject{SubjectType: "all"},
+			Action:     governance.Action{ActionType: "execute_task", ActionIDs: []string{"execute_task"}},
+			Resource:   governance.Resource{ResourceType: "all"},
+			Precedence: 0,
+		},
+	})
+
+	ctx := context.Background()
+	var received []string
+	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {
+		received = append(received, string(ev.Type))
+		return nil
+	}))
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-esc-exec",
+		Context: NewRequestContext("corr-esc-exec", "biz-1", "user-1"),
+		Intent:  "executor-gated escalation",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" {
+		t.Errorf("expected failed (pre-dispatch block must not report completed), got %s", result.Status)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error envelope")
+	}
+	if result.Error.Code != "ESCALATION_REQUIRED" || result.Error.Category != "POLICY_DENIED" {
+		t.Errorf("expected ESALATION_REQUIRED/POLICY_DENIED, got %s/%s",
+			result.Error.Code, result.Error.Category)
+	}
+	if result.Error.Retryable {
+		t.Error("expected Retryable=false")
+	}
+	if result.Error.Details["escalation_ref"] == "" {
+		t.Errorf("expected error.details.escalation_ref, got %v", result.Error.Details)
+	}
+	if result.Outcome == nil || result.Outcome.Metrics["executor_status"] != "escalated" {
+		t.Errorf("expected executor_status escalated, got %+v", result.Outcome)
+	}
+
+	if _, err := e.EventBus().Dispatch(); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	var sawEscalated bool
+	for _, typ := range received {
+		if typ == "governance.escalated" {
+			sawEscalated = true
+		}
+	}
+	if !sawEscalated {
+		t.Errorf("expected governance.escalated event, got %v", received)
+	}
+}

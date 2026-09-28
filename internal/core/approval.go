@@ -455,3 +455,29 @@ func mapApprovalErr(err error) error {
 		return err
 	}
 }
+
+// emitEscalation publishes governance.escalated — the D3 async handoff of an
+// ESCALATE outcome to a higher authority (CTR-GOV-002 input shape:
+// escalation_id, reason, context; ack is the event bus accept itself).
+func (e *Engine) emitEscalation(req *Request, escalationRef, reason, gate string) {
+	if req == nil || req.Context == nil {
+		return
+	}
+	payload := map[string]string{
+		"escalation_ref": escalationRef,
+		"requester_id":   req.Context.ActorID,
+		"reason":         reason,
+		"gate":           gate,
+	}
+	data, _ := json.Marshal(payload)
+	_ = e.eventBus.Publish(&event.Event{
+		ID:            fmt.Sprintf("%s-%s", escalationRef, event.EventTypeGovernanceEscalated),
+		Type:          event.EventTypeGovernanceEscalated,
+		Source:        "core",
+		Timestamp:     e.now(),
+		BusinessID:    req.Context.BusinessID,
+		CorrelationID: req.Context.CorrelationID,
+		Priority:      event.PriorityNormal,
+		Data:          data,
+	})
+}

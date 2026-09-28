@@ -42,11 +42,15 @@ const (
 	// Contract-canonical decision events (SCHEMA_EVENTS_TRIGGERS approval
 	// domain; RUNTIME §16.2). approval.resolved predates them and is kept
 	// for compatibility, but new emissions use approved/denied/expired.
-	EventTypeApprovalApproved  EventType = "approval.approved"
-	EventTypeApprovalDenied    EventType = "approval.denied"
-	EventTypeApprovalExpired   EventType = "approval.expired"
-	EventTypeSecurityViolation EventType = "security.violation"
-	EventTypeCustom            EventType = "custom"
+	EventTypeApprovalApproved EventType = "approval.approved"
+	EventTypeApprovalDenied   EventType = "approval.denied"
+	EventTypeApprovalExpired  EventType = "approval.expired"
+	// D3: governance outcome ESCALATE surfaces to callers with an
+	// escalation_ref; this event is the async handoff to a higher
+	// authority (CORE CTR-GOV-002 shape: escalation_id + reason + context).
+	EventTypeGovernanceEscalated EventType = "governance.escalated"
+	EventTypeSecurityViolation   EventType = "security.violation"
+	EventTypeCustom              EventType = "custom"
 )
 
 // Priority represents the priority of an event in the queue.
