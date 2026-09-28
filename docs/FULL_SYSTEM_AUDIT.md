@@ -90,7 +90,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | **G-006** | FIXED | `gateway/server.go:367-378` | Resume does not pre-check engine state. Inconsistent with pause handler. | Resume now pre-checks state: 409 `ALREADY_RUNNING` if running, 400 `INVALID_STATE` if not stopped (Phase B7) |
 | **G-007** | FIXED | `gateway/server.go:157-159` | `Mux()` returns raw mux without auth middleware. Exported function can bypass auth if misused. Production path safe: Start() installs Handler() (identity+auth); no production Mux() callers; Mux() formally deprecated (`// Deprecated:`). Covered by TestG007HandlerEnforcesControlAuth/TestG007MuxIsRawTestOnlyBypass/TestG007HandlerDiffersFromMuxForControl. | Auth bypass vector closed (test-only residual API, formally deprecated) |
 | **G-008** | FIXED | `gateway/server.go:108-111` | `Shutdown(context.Background())` has no timeout. SSE handlers can hang indefinitely. | Shutdown goroutine uses `context.WithTimeout(…, 5*time.Second)` (Phase B1); hang on shutdown closed |
-| **E-004** | FIXED | `executor/executor.go:318-341` | `REQUIRE_APPROVAL` returns `pending_approval` and `ESCALATE` returns `escalated` before handler dispatch — no silent allow. Covered by TEST-EXEC-011/012. Residual: ApprovalEngine not wired (no approval-request creation / re-execution path) — deferred with full admission pipeline. | Governance bypass closed; approval workflow integration residual |
+| **E-004** | FIXED | `executor/executor.go:318-341` | `REQUIRE_APPROVAL` returns `pending_approval` and `ESCALATE` returns `escalated` before handler dispatch — no silent allow. Covered by TEST-EXEC-011/012. Residual: ApprovalEngine not wired — **CLOSED by P1**: approval records created at both gates, `approval.*` events, gateway list/approve/deny, approve → resume re-execution (`7b4f809`, `48d0df6`, `4c8bfc1`, `b193bf8`); ESCALATE surfaces as failed/`ESCALATION_REQUIRED` with `escalation_ref` + `governance.escalated` (D3, `4266ba3`) | Governance bypass closed; approval loop fully wired (P1) and escalation surfaced (D3) |
 | **M-042** | FIXED | `event/membus.go:177-191` | Wildcard + type-specific subscriber receives duplicate deliveries. | `getMatchingConsumers` deduplicates by subscriber ID `seen` map (Phase B3); duplicate delivery closed |
 | **M-044** | FIXED | `event/membus.go:53-58` | Dedup map grows indefinitely — never cleaned. Unbounded memory leak in long-running processes. | FIFO eviction at `maxDedupSize = 10000` (Phase B4); unbounded growth closed |
 | **L-002** | FIXED | `launcher/launcher.go:86-106` | Gateway start error only detected within 100 ms window — not deterministic full startup barrier. | Deterministic `Ready()` barrier after `net.Listen` (no timing window); `WithListenFunc` test seam; covered by `l002_test.go` (commit 94dd2f0) |
@@ -138,11 +138,11 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | C-024 | context.go:171 | `Retryable` field never set to true |
 | C-025 | context.go:153-156 | Outcome.Artifacts and Metrics never populated |
 | C-026 | context.go:123 | `Request.Deadline` never used; hardcoded 60s timeout |
-| C-032 | core_test.go | Tests use time.Sleep for synchronization (flaky) |
-| C-034 | core_test.go:556-559 | Event test uses arbitrary Dispatch() count |
-| C-035 | core_test.go:667-696 | RecoveryManager test does not test chain integration |
+| C-032 | core_test.go | Tests use time.Sleep for synchronization (flaky) — **FIXED** (`9b0dc4e`): deterministic `waitForResult`/state-wait helpers, zero `time.Sleep` remains |
+| C-034 | core_test.go:556-559 | Event test uses arbitrary Dispatch() count — **FIXED** (`9b0dc4e`): one `Dispatch()` after `waitForResult` with deterministic ordering (events published synchronously before the result is stored) |
+| C-035 | core_test.go:667-696 | RecoveryManager test does not test chain integration — **FIXED** (`9b0dc4e`): `TestRecoveryRecordsFailureThroughChain` drives failure through SubmitRequest → executeChain → chainExecute (the production call site) |
 | E-003 | executor.go:177 | Startup event lacks BusinessID |
-| E-005 | executor.go:358 | No external cancellation mechanism for in-flight tasks |
+| E-005 | executor.go:358 | No external cancellation mechanism for in-flight tasks — **FIXED** (`e976562`, `d4f6821`, `04f213e`): cooperative executor cancellation, `CancelRequest` authority, POST `/api/v1/requests/{id}/cancel`; covered by TEST-E005-*
 | E-020 | approval.go:33-36 | ApprovalEngine has no mutex |
 | E-027 | authenticate.go:99-105 | LocalAuthenticator has no mutex |
 | E-041 | memory.go:127 | Admit generates time-based IDs (collision possible) |
@@ -157,13 +157,13 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | C-038 | core_test.go:518 | Test uses string literal matching step constant |
 | E-002 | executor.go:529 | Event ID could collide within same nanosecond |
 | E-009 | executor.go:424 | Model ID hardcoded as "default" |
-| E-015 | executor_test.go | All tests use time.Sleep for synchronization |
+| E-015 | executor_test.go | All tests use time.Sleep for synchronization — **FIXED** (`7fcea80`): timing-based synchronization removed |
 | G-014 | server.go:231 | Correlation ID collision risk (UnixNano) |
 | G-016 | server.go:84-90 | No MaxHeaderBytes configured |
-| G-017 | server.go:470-477 | Error code is string not int |
+| G-017 | server.go:470-477 | Error code is string not int — **REJECTED (contract)**: the common error envelope defines `code: string` ("Machine-readable code", CORE_INTERFACE_CONTRACTS.md §3) — string is the contract; `writeError` renders the HTTP status as that machine-readable string. The integer field in contracts is `status_code` (INTEGRATION_EXTERNAL_CONTRACTS.md), a different field |
 | L-006 | launcher.go:167-173 | Dead code (`defaultAddr`) |
 | L-010 | launcher.go:83 | Gateway goroutine may race with test cleanup |
-| E-036 | security.go:300-305 | DevResolver has no TTL or rotation |
+| E-036 | security.go:300-305 | DevResolver has no TTL or rotation — **REJECTED (scope)**: `DevResolver` is a documented dev/test-only in-memory double ("intentionally NOT a production secret store"); `Secret` carries no expiry field and no contract mandates resolver TTL/rotation — adding them would invent requirements for a test affordance |
 
 ---
 
@@ -198,11 +198,11 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 ### Cannot Prove Safe
 - ~~**G-002/G-003**: Cross-tenant data leakage via results and SSE.~~ **CLOSED by A6** — identity-bound membership at gateway when enforcement is on.
 - ~~**I-032**: Identity/authentication/authorization packages are fully implemented but **zero enforcement** at any runtime entry point.~~ **CLOSED by A6** — enforced on scoped gateway paths via `Handler()`.
-- ~~**E-004**: REQUIRE_APPROVAL and ESCALATE governance outcomes silently allow execution.~~ **CLOSED** — executor blocks both outcomes pre-dispatch (TEST-EXEC-011/012); ApprovalEngine wiring remains a deferred admission-pipeline item.
+- ~~**E-004**: REQUIRE_APPROVAL and ESCALATE governance outcomes silently allow execution.~~ **CLOSED** — executor blocks both outcomes pre-dispatch (TEST-EXEC-011/012); ApprovalEngine wiring closed by P1 (`7b4f809`…`b193bf8`: records at both gates, gateway decisions, approve → resume) and ESCALATE surfaced by D3 (`4266ba3`).
 
 ### Deferred (Requires Architecture Decision)
 - Identity entity schema (contract defines, code doesn't materialize) — needs milestone planning
-- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — current chain only has validation + governance
+- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — chain now covers POLICY (governance) + APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution); identity resolution and resource check stages remain unwired
 - Condition evaluation in governance (currently a no-op) — documented deferral
 
 ### Accepted Risks
@@ -219,11 +219,11 @@ These are features from later milestones that are not yet implemented, correctly
 1. **Full admission pipeline** — identity resolution step in chain (planned, not yet milestone-gated)
 2. **Condition evaluation** in governance policies (documented deferral in governance/engine.go:212-216)
 3. **AGENT/WORKFLOW/TASK scope levels** in governance (policy.go:176-183)
-4. **External task cancellation** mechanism
+4. ~~**External task cancellation** mechanism~~ — **DONE** (E-005: cooperative executor cancellation `e976562`, core `CancelRequest` `d4f6821`, gateway POST `/requests/{id}/cancel` `04f213e`; TEST-E005-*)
 5. **Full identity entity** with provenance, metadata, status tracking
 6. **Model selection intelligence** (currently hardcoded "default")
 7. ~~**Response body size limits**~~ — **DONE** (G-010: `maxResponseBytes` on GET, `maxSSEEventBytes` per SSE frame)
-8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); residual: ApprovalEngine request-creation/re-execution path still deferred with full admission pipeline
+8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); ~~ApprovalEngine request-creation/re-execution path~~ **DONE (P1)**: approval records created at both gates with `approval.requested`/`approved`/`denied`/`expired` events, `GET /api/v1/approvals` + approve/deny endpoints, approve → auto resume re-execution; ESCALATE surfaced as `ESCALATION_REQUIRED` + `escalation_ref` (D3)
 
 ---
 
@@ -328,7 +328,7 @@ go.mod unchanged (zero deps confirmed)
 | C7 | — | Test BusinessID in response | ✅ 1 NEW TEST |
 | C8 | — | Test REQUIRE_APPROVAL + ESCALATE outcomes | ✅ 2 NEW TESTS |
 
-### Phase D: Cleanup — P3/P4: 22 of 29 findings handled ✅ (scoped COMPLETE — 7 residual P3/P4 findings remain OPEN)
+### Phase D: Cleanup — P3/P4: 22 of 29 findings handled ✅ (scoped COMPLETE — 7 residual findings since dispositioned: 5 FIXED post-Phase-D, 2 REJECTED with contract/scope justification)
 
 | Order | Finding | Fix | Status |
 |-------|---------|-----|--------|
@@ -366,7 +366,7 @@ go.mod unchanged (zero deps confirmed)
 
 ## 10. Conclusion
 
-**All 4 phases of remediation COMPLETE as scoped** (Phases A–D covered their assigned P0/P1/P2 scope in full and the P3/P4 subset they addressed; residual P3/P4 findings remain OPEN — see Phase D note below).
+**All 4 phases of remediation COMPLETE as scoped** (Phases A–D covered their assigned P0/P1/P2 scope in full and the P3/P4 subset they addressed; the 7 residual P3/P4 findings were later dispositioned — 5 FIXED, 2 REJECTED — see Phase D note below).
 
 ### Phase A — Security (P0): ALL 4 FIXED (identity-bound)
 1. ✅ **G-001 FIXED** — Auth middleware `strings.HasPrefix` (was broken `[:18]`)
@@ -394,7 +394,7 @@ Persistence error/success, Resume lifecycle, concurrent submissions, ChainError 
 ### Phase D — Cleanup (P3/P4): 30 FIXES (scoped)
 Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test fixed, constant-time API key comparison, collision-safe IDs, correct address logging, `MaxHeaderBytes`, `Retryable`, memory `ObjectiveID` filtering, phantom audit entries removed, attention errors audited, `Request.Deadline` enforced, `Response.Error` on failure, circuit breaker step naming, configurable model ID, MemBus bounded retry, distinct objective criteria, `chain.failed` events, `Stop()` loop sync, `shutdownOnce` reset, ChainStep constants, model accessors, `Outcome.Metrics`, backpressure semantics documented.
 
-**Phase D scope note:** the Phase D table records remediation for the P3/P4 findings it covered — 22 of the 29 total P3/P4 findings (E-002 was addressed by the same D7 collision-safe ID change, commit `98752fa`, though the D7 row cites G-014) — it is *not* a claim that all P3/P4 findings are resolved. Residual P3/P4 findings remain **OPEN**: **C-032, C-034, C-035, E-005** (P3) and **E-015, G-017, E-036** (P4). All seven are still listed in §4 (the P3/P4 tables carry no status column) and none is marked FIXED anywhere in this document.
+**Phase D scope note:** the Phase D table records remediation for the P3/P4 findings it covered — 22 of the 29 total P3/P4 findings (E-002 was addressed by the same D7 collision-safe ID change, commit `98752fa`, though the D7 row cites G-014) — it is *not* a claim that all P3/P4 findings are resolved. The 7 residual P3/P4 findings are now dispositioned in §4 (the P3/P4 tables carry no status column; status is annotated in the Finding cell): **C-032, C-034, C-035, E-005** (P3) and **E-015** (P4) **FIXED** post-Phase-D (`9b0dc4e`, `e976562`/`d4f6821`/`04f213e`, `7fcea80`); **G-017**, **E-036** (P4) **REJECTED** with contract/scope justification in §4.
 
 ### Final Metrics
 
