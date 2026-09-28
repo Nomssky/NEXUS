@@ -29,6 +29,17 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
+// Governance evaluation parameters for the executor gate. Exported so the
+// core approval wiring can re-evaluate governance with exactly the same
+// inputs when it needs the REQUIRE_APPROVAL decision payload (single source
+// of truth — no duplicated literals).
+const (
+	// ActionExecuteTask is the governance action evaluated before dispatch.
+	ActionExecuteTask = "execute_task"
+	// ResourceWorkflow is the governance resource evaluated before dispatch.
+	ResourceWorkflow = "workflow"
+)
+
 // Cancellation errors returned by CancelTask (E-005). Callers map them to
 // HTTP semantics: ErrTaskNotFound → 404, a terminal task → 409.
 var (
@@ -129,6 +140,12 @@ type WorkRequest struct {
 	Constraints []string `json:"constraints,omitempty"`
 	// Priority (0-10, 10 highest).
 	Priority int `json:"priority"`
+	// ApprovalState carries an existing approval for this work into the
+	// governance gate. The core chain sets it only after the ApprovalEngine
+	// confirmed an approved record for the parent request; governance
+	// Evaluate then satisfies a REQUIRE_APPROVAL policy with it (approval
+	// resume path). nil = no approval on file (normal execution).
+	ApprovalState *governance.ApprovalState `json:"-"`
 	// Handler performs the actual work. If nil, a default handler is used.
 	Handler TaskHandler
 }
@@ -603,9 +620,12 @@ func (e *Executor) executeWork(req *WorkRequest) {
 func (e *Executor) checkGovernance(req *WorkRequest) governance.Decision {
 	return e.governance.Evaluate(governance.Request{
 		Actor:      req.ActorID,
-		Action:     "execute_task",
-		Resource:   "workflow",
+		Action:     ActionExecuteTask,
+		Resource:   ResourceWorkflow,
 		BusinessID: req.BusinessID,
+		// Approval resume: carries an approved approval record so an
+		// existing REQUIRE_APPROVAL policy can be satisfied (nil otherwise).
+		ApprovalState: req.ApprovalState,
 	})
 }
 
