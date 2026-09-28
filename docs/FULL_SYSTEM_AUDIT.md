@@ -223,7 +223,7 @@ These are features from later milestones that are not yet implemented, correctly
 5. **Full identity entity** with provenance, metadata, status tracking
 6. **Model selection intelligence** (currently hardcoded "default")
 7. ~~**Response body size limits**~~ — **DONE** (G-010: `maxResponseBytes` on GET, `maxSSEEventBytes` per SSE frame)
-8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); ~~ApprovalEngine request-creation/re-execution path~~ **DONE (P1)**: approval records created at both gates with `approval.requested`/`approved`/`denied`/`expired` events, `GET /api/v1/approvals` + approve/deny endpoints, approve → auto resume re-execution; ESCALATE surfaced as `ESCALATION_REQUIRED` + `escalation_ref` (D3)
+8. **Approval workflow wiring** into executor — ~~REQUIRE_APPROVAL outcome handling~~ **DONE** (E-004: executor returns `pending_approval`/`escalated` pre-dispatch); ~~ApprovalEngine request-creation/re-execution path~~ **DONE (P1)**: approval records created at both gates with `approval.requested`/`approved`/`denied`/`expired` events, `GET /api/v1/approvals` + approve/deny endpoints, approve → auto resume re-execution; ESCALATE surfaced as `ESCALATION_REQUIRED` + `escalation_ref` (D3), and the handoff now completes: escalation queue + attention intake consumer on `governance.escalated` implementing CTR-GOV-002 full input `{escalation_id, reason, context, urgency, deadline}` with ack, idempotent redelivery, pending → acknowledged → resolved → expired lifecycle, and the contract's logged/retry-once failure rule (C, TEST-CORE-061..065)
 
 ---
 
