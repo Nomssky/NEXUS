@@ -90,7 +90,17 @@ func isScopedAPIPath(path string) bool {
 		return true
 	}
 	// Escalation alerts and human responses (CTR-ATT) are likewise scoped.
-	return path == "/api/v1/escalations" || strings.HasPrefix(path, "/api/v1/escalations/")
+	if path == "/api/v1/escalations" || strings.HasPrefix(path, "/api/v1/escalations/") {
+		return true
+	}
+	// Organization entity records (identity/business/division, §2–§4).
+	if path == "/api/v1/identities" || strings.HasPrefix(path, "/api/v1/identities/") {
+		return true
+	}
+	if path == "/api/v1/businesses" || strings.HasPrefix(path, "/api/v1/businesses/") {
+		return true
+	}
+	return path == "/api/v1/divisions" || strings.HasPrefix(path, "/api/v1/divisions/")
 }
 
 // identityMiddleware authenticates scoped requests when enforcement is on and

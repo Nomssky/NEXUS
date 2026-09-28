@@ -53,6 +53,10 @@ type Options struct {
 	RequireAuthentication bool
 	EnforceBusinessScope  bool
 
+	// Registry is the organization entity registry (Identity/Business/
+	// Division). Optional: nil leaves the org endpoints fail-closed (503).
+	Registry *identity.Registry
+
 	// GatewayOptions are passed through to the gateway server (L-002 test
 	// seam for deterministic listen behavior). Nil/empty in production.
 	GatewayOptions []gateway.ServerOption
@@ -79,6 +83,7 @@ func New(opts Options) *Launcher {
 	gwOpts := []gateway.ServerOption{
 		gateway.WithControlAPIKey(opts.ControlAPIKey),
 		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
+		gateway.WithRegistry(opts.Registry),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
 	}

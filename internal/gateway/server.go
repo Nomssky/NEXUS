@@ -78,6 +78,10 @@ type Server struct {
 	requireAuth          bool
 	enforceBusinessScope bool
 
+	// Organization entity registry (SCHEMA_IDENTITIES_ORG §2–§4). Nil makes
+	// the org endpoints fail closed (503).
+	registry *identity.Registry
+
 	// G-010: maxResponseBytes caps one-shot JSON response bodies (GET result).
 	// maxSSEEventBytes caps each individual SSE event frame; it does not bound
 	// stream duration or cumulative stream size.
@@ -146,6 +150,13 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		opt(s)
 	}
 
+	// Registry audit trail (SCHEMA_IDENTITIES_ORG §9): bind the registry's
+	// event publisher to the engine bus so creates/transitions are observed
+	// on the SSE stream like every other lifecycle event.
+	if s.registry != nil {
+		s.registry.SetPublisher(s.engine.EventBus())
+	}
+
 	// Register routes
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /ready", s.handleReady)
@@ -164,6 +175,52 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /api/v1/escalations", s.handleListEscalations)
 	s.mux.HandleFunc("POST /api/v1/escalations/{id}/ack", s.handleAckEscalation)
 	s.mux.HandleFunc("POST /api/v1/escalations/{id}/resolve", s.handleResolveEscalation)
+
+	// Organization entity endpoints (SCHEMA_IDENTITIES_ORG §2–§4): identity,
+	// business and division records with lifecycle transitions (§9 audit).
+	s.mux.HandleFunc("GET /api/v1/identities", s.handleListIdentities)
+	s.mux.HandleFunc("POST /api/v1/identities", s.handleCreateIdentity)
+	s.mux.HandleFunc("GET /api/v1/identities/{id}", s.handleGetIdentity)
+	s.mux.HandleFunc("POST /api/v1/identities/{id}/suspend",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleIdentityTransition(w, r, identity.StatusSuspended)
+		})
+	s.mux.HandleFunc("POST /api/v1/identities/{id}/revoke",
+		func(w http.ResponseWriter, r *http.Request) { s.handleIdentityTransition(w, r, identity.StatusRevoked) })
+	s.mux.HandleFunc("POST /api/v1/identities/{id}/activate",
+		func(w http.ResponseWriter, r *http.Request) { s.handleIdentityTransition(w, r, identity.StatusActive) })
+
+	s.mux.HandleFunc("GET /api/v1/businesses", s.handleListBusinesses)
+	s.mux.HandleFunc("POST /api/v1/businesses", s.handleCreateBusiness)
+	s.mux.HandleFunc("GET /api/v1/businesses/{id}", s.handleGetBusiness)
+	s.mux.HandleFunc("POST /api/v1/businesses/{id}/suspend",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleBusinessTransition(w, r, identity.BusinessSuspended)
+		})
+	s.mux.HandleFunc("POST /api/v1/businesses/{id}/archive",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleBusinessTransition(w, r, identity.BusinessArchived)
+		})
+	s.mux.HandleFunc("POST /api/v1/businesses/{id}/activate",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleBusinessTransition(w, r, identity.BusinessActive)
+		})
+
+	s.mux.HandleFunc("GET /api/v1/divisions", s.handleListDivisions)
+	s.mux.HandleFunc("POST /api/v1/divisions", s.handleCreateDivision)
+	s.mux.HandleFunc("GET /api/v1/divisions/{id}", s.handleGetDivision)
+	s.mux.HandleFunc("POST /api/v1/divisions/{id}/suspend",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleDivisionTransition(w, r, identity.DivisionSuspended)
+		})
+	s.mux.HandleFunc("POST /api/v1/divisions/{id}/archive",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleDivisionTransition(w, r, identity.DivisionArchived)
+		})
+	s.mux.HandleFunc("POST /api/v1/divisions/{id}/activate",
+		func(w http.ResponseWriter, r *http.Request) {
+			s.handleDivisionTransition(w, r, identity.DivisionActive)
+		})
 
 	s.mux.HandleFunc("GET /events", s.handleSSE)
 

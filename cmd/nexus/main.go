@@ -64,7 +64,12 @@ func run() int {
 	// components so the gateway enforces authenticated actor + membership on
 	// scoped paths when require_authentication / enforce_business_scope are on.
 	// The authenticator starts empty (fail-closed until credentials are
-	// registered); memberships are the process membership set from app.
+	// registered) and is bound to the organization registry, so a credential
+	// only authenticates when the identity record exists and is usable
+	// (active, unexpired). Memberships are the process membership set from app.
+	auth := identity.NewLocalAuthenticator()
+	auth.SetRegistry(a.Registry())
+
 	launch := launcher.New(launcher.Options{
 		Config:        cfg,
 		Logger:        log,
@@ -73,8 +78,9 @@ func run() int {
 		Addr:          addr,
 		ControlAPIKey: os.Getenv(config.EnvControlAPIKey),
 
-		Authenticator:         identity.NewLocalAuthenticator(),
+		Authenticator:         auth,
 		Memberships:           a.Memberships(),
+		Registry:              a.Registry(),
 		RequireAuthentication: cfg.Security.RequireAuthentication,
 		EnforceBusinessScope:  cfg.Security.EnforceBusinessScope,
 	})

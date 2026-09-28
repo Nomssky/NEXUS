@@ -23,10 +23,16 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
+	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 )
+
+// entityTypeIdentity is the canonical entity_type for an Identity record
+// (SCHEMA_IDENTITIES_ORG §2.2: always "identity").
+const entityTypeIdentity = "identity"
 
 // Type is the canonical identity type. It mirrors the minimal identity types in
 // Core/NEXUS-IDENTITY-ACCESS-TRUST-SYSTEM.md §4 and the contract enum in
@@ -237,6 +243,10 @@ func (s Scope) String() string {
 // (INV-04/05/06/07). Trust, authority, capabilities, and permissions are
 // resolved elsewhere and are referenced, not embedded.
 type Identity struct {
+	// SchemaVersion is the common envelope schema version (SCHEMA_COMMON §3.1).
+	SchemaVersion string `json:"schema_version"`
+	// EntityType is always "identity" (contract §2.2).
+	EntityType string `json:"entity_type"`
 	// ID is the unique identifier, e.g. "nx:agent:<hex>".
 	ID string `json:"entity_id"`
 	// NexusID is the NEXUS installation identifier.
@@ -248,6 +258,24 @@ type Identity struct {
 	// Status is the lifecycle status.
 	Status Status `json:"status"`
 
+	// CreatedAt is when the identity was created (contract §2.2, required).
+	CreatedAt time.Time `json:"created_at"`
+	// UpdatedAt is when the identity was last modified (contract §2.2).
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+	// ExpiresAt bounds the identity's validity (contract §2.2: e.g. temporary
+	// agents). Authentication is refused once this passes (enforced by
+	// LocalAuthenticator when a registry is wired).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
+	// BusinessID is the flat contract scope field (§2.2: conditionally
+	// required — present for business-scoped identities, absent for
+	// global/system identities). It mirrors Scope.BusinessID; Validate keeps
+	// the two representations consistent.
+	BusinessID string `json:"business_id,omitempty"`
+	// DivisionID is the flat contract division scope field (§2.2), mirroring
+	// Scope.DivisionID.
+	DivisionID string `json:"division_id,omitempty"`
+
 	// Scope is the primary scoping of this identity (business/division/...).
 	Scope Scope `json:"scope"`
 
@@ -258,13 +286,20 @@ type Identity struct {
 	// identities (e.g. an agent's stable identity, per SCHEMA_IDENTITIES_ORG §5).
 	IdentityRef string `json:"identity_ref,omitempty"`
 
+	// Provenance is the required origin record (contract §2.2, SCHEMA_COMMON §4).
+	Provenance schema.ProvenanceRef `json:"provenance"`
+
 	// Metadata carries namespaced extension data. It must never hold secrets.
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // Validate checks structural correctness. It returns a canonical VALIDATION
 // error on the first problem (deterministic). A malformed identity is rejected.
-func (i Identity) Validate() error {
+//
+// Validate has a pointer receiver because it first reconciles the flat
+// contract scope fields (business_id/division_id) with the nested Scope
+// representation — exactly one of the two may drive, never a contradiction.
+func (i *Identity) Validate() error {
 	if strings.TrimSpace(i.ID) == "" {
 		return nerrors.Validation("identity.id_required", "identity id is required")
 	}
@@ -282,6 +317,27 @@ func (i Identity) Validate() error {
 	if strings.TrimSpace(i.DisplayName) == "" {
 		return nerrors.Validation("identity.display_name_required", "identity display_name is required")
 	}
+	if err := i.reconcileScope(); err != nil {
+		return err
+	}
+	if i.SchemaVersion == "" {
+		return nerrors.Validation("identity.schema_version_required", "identity schema_version is required")
+	}
+	if i.EntityType != entityTypeIdentity {
+		return nerrors.Validation("identity.entity_type_invalid",
+			fmt.Sprintf("entity_type must be %q, got %q", entityTypeIdentity, i.EntityType))
+	}
+	if i.CreatedAt.IsZero() {
+		return nerrors.Validation("identity.created_at_required", "identity created_at is required")
+	}
+	if !i.Provenance.Valid() {
+		return nerrors.Validation("identity.provenance_required",
+			"identity provenance must carry origin, producer and produced_at")
+	}
+	if i.ExpiresAt != nil && !i.ExpiresAt.After(i.CreatedAt) {
+		return nerrors.Validation("identity.expires_at_invalid",
+			"identity expires_at must be after created_at")
+	}
 	if err := i.Scope.Validate(); err != nil {
 		return err
 	}
@@ -297,6 +353,45 @@ func (i Identity) Validate() error {
 	}
 	if err := i.validateMetadata(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// reconcileScope keeps the flat contract fields (business_id/division_id) and
+// the nested Scope in lockstep: whichever side is populated fills the other;
+// a contradiction between the two fails closed.
+func (i *Identity) reconcileScope() error {
+	flatBusiness, flatDivision := i.BusinessID, i.DivisionID
+	scopeBusiness, scopeDivision := i.Scope.BusinessID, i.Scope.DivisionID
+
+	switch {
+	case flatBusiness == "" && flatDivision == "":
+		// Scope drives: hydrate the flat contract fields from it. A record with
+		// no scope information at all is global (§2.2: business_id absent for
+		// global identities).
+		i.BusinessID = scopeBusiness
+		i.DivisionID = scopeDivision
+		if i.Scope.Kind == "" {
+			i.Scope.Kind = ScopeGlobal
+		}
+		return nil
+	case scopeBusiness == "" && scopeDivision == "":
+		// Flat fields drive: hydrate the scope from them.
+		i.Scope.BusinessID = flatBusiness
+		i.Scope.DivisionID = flatDivision
+		if i.Scope.Kind == "" {
+			if flatDivision != "" {
+				i.Scope.Kind = ScopeDivision
+			} else if flatBusiness != "" {
+				i.Scope.Kind = ScopeBusiness
+			}
+		}
+		return nil
+	}
+	// Both sides populated: they must agree exactly.
+	if flatBusiness != scopeBusiness || flatDivision != scopeDivision {
+		return nerrors.Validation("identity.scope_conflict",
+			"business_id/division_id contradict the scope object")
 	}
 	return nil
 }
@@ -321,14 +416,21 @@ func (i Identity) isBusinessScopedType() bool {
 	}
 }
 
-// validateMetadata enforces the metadata extension rules (SCHEMA_COMMON §11) and
-// rejects secret-looking keys, so identity metadata can never smuggle a secret.
+// validateMetadata enforces the metadata extension rules (SCHEMA_COMMON §11)
+// via the shared map validator.
 func (i Identity) validateMetadata() error {
-	if len(i.Metadata) > 50 {
-		return nerrors.Validation("identity.metadata_too_many", "identity metadata exceeds 50 entries")
+	return validateMetadataMap(i.Metadata)
+}
+
+// validateMetadataMap enforces the metadata extension rules (SCHEMA_COMMON
+// §11) on any entity record: bounded entries, bounded key/value sizes, and
+// rejection of secret-bearing keys so metadata can never smuggle a secret.
+func validateMetadataMap(m map[string]string) error {
+	if len(m) > 50 {
+		return nerrors.Validation("identity.metadata_too_many", "metadata exceeds 50 entries")
 	}
-	keys := make([]string, 0, len(i.Metadata))
-	for k := range i.Metadata {
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -338,9 +440,9 @@ func (i Identity) validateMetadata() error {
 		}
 		if security.IsSecretKey(k) {
 			return nerrors.Validation("identity.metadata_secret_key",
-				"identity metadata must not carry secret-bearing keys")
+				"metadata must not carry secret-bearing keys")
 		}
-		if len(i.Metadata[k]) > 1024 {
+		if len(m[k]) > 1024 {
 			return nerrors.Validation("identity.metadata_value_too_long", "metadata value exceeds 1024 characters")
 		}
 	}
@@ -360,19 +462,30 @@ func (i Identity) String() string {
 }
 
 // New creates a validated identity with a generated ID. It is the safe default
-// constructor: it never accepts authority fields because none exist.
+// constructor: it never accepts authority fields because none exist. It stamps
+// the common envelope (schema_version, entity_type, created_at, provenance)
+// required by SCHEMA_IDENTITIES_ORG §2.2.
 func New(nexusID string, t Type, displayName string, scope Scope) (Identity, error) {
 	id, err := security.NewID(string(t))
 	if err != nil {
 		return Identity{}, err
 	}
+	now := time.Now().UTC()
 	ident := Identity{
-		ID:          id,
-		NexusID:     nexusID,
-		Type:        t,
-		DisplayName: displayName,
-		Status:      StatusActive,
-		Scope:       scope,
+		SchemaVersion: schema.Version,
+		EntityType:    entityTypeIdentity,
+		ID:            id,
+		NexusID:       nexusID,
+		Type:          t,
+		DisplayName:   displayName,
+		Status:        StatusActive,
+		CreatedAt:     now,
+		Scope:         scope,
+		Provenance: schema.ProvenanceRef{
+			Origin:     "system",
+			Producer:   "identity.New",
+			ProducedAt: now,
+		},
 	}
 	if err := ident.Validate(); err != nil {
 		return Identity{}, err

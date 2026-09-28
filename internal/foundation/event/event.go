@@ -50,7 +50,16 @@ const (
 	// authority (CORE CTR-GOV-002 shape: escalation_id + reason + context).
 	EventTypeGovernanceEscalated EventType = "governance.escalated"
 	EventTypeSecurityViolation   EventType = "security.violation"
-	EventTypeCustom              EventType = "custom"
+	// Organization lifecycle events (ad-hoc vocabulary, precedent approval.*;
+	// required as audit trail by SCHEMA_IDENTITIES_ORG §9 — no contract event
+	// enum binds these names).
+	EventTypeIdentityCreated       EventType = "identity.created"
+	EventTypeIdentityStatusChanged EventType = "identity.status_changed"
+	EventTypeBusinessOnboarded     EventType = "business.onboarded"
+	EventTypeBusinessStatusChanged EventType = "business.status_changed"
+	EventTypeDivisionCreated       EventType = "division.created"
+	EventTypeDivisionStatusChanged EventType = "division.status_changed"
+	EventTypeCustom                EventType = "custom"
 )
 
 // Priority represents the priority of an event in the queue.

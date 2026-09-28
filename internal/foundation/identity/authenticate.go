@@ -100,6 +100,11 @@ type credentialVerifier struct {
 type LocalAuthenticator struct {
 	mu        sync.RWMutex
 	verifiers map[string]credentialVerifier
+	// registry, when wired, makes authentication consult the identity record:
+	// a credential alone is not enough — the record must exist and be usable
+	// (status active, not expired). Nil keeps the M1 credential-only posture
+	// for embedders that do not run a registry.
+	registry *Registry
 	// now is injectable for deterministic tests.
 	now func() time.Time
 	// ttl bounds the validity of a successful authentication (0 = no expiry).
@@ -128,6 +133,17 @@ func (a *LocalAuthenticator) SetTTL(d time.Duration) {
 	a.ttl = d
 }
 
+// SetRegistry wires the identity-record registry for status/expiry enforcement
+// (contract §2.4: an identity "ceases to be valid" at expires_at; §2.2 status
+// active is the only usable state). With a registry wired, authentication
+// fails closed when the identity record is missing, not active, or expired —
+// the credential alone no longer suffices.
+func (a *LocalAuthenticator) SetRegistry(r *Registry) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.registry = r
+}
+
 // Register records a verification hash for an identity. The raw credential is
 // hashed by the caller via security.HashCredential and is never stored here.
 func (a *LocalAuthenticator) Register(identityID string, credentialHash string, method AuthMethod) error {
@@ -145,11 +161,14 @@ func (a *LocalAuthenticator) Register(identityID string, credentialHash string, 
 
 // Authenticate implements Authenticator. It fails closed: unknown identities,
 // empty credentials, and mismatches all return a non-authenticated result with a
-// canonical AUTH error.
+// canonical AUTH error. When a registry is wired, the identity record must also
+// exist and be usable (active, unexpired) — same uniform failure, so the reason
+// never leaks which check failed.
 func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) (AuthResult, error) {
 	a.mu.RLock()
 	v, ok := a.verifiers[identityID]
 	nowFn := a.now
+	reg := a.registry
 	a.mu.RUnlock()
 	if !ok || len(credential) == 0 {
 		// Uniform failure reason avoids leaking which identities exist.
@@ -170,6 +189,20 @@ func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) 
 		}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
 	}
 	now := nowFn()
+	if reg != nil {
+		// Fail closed: no record, non-active status, or past expires_at all
+		// deny with the same uniform error (never reveal which).
+		ident, found := reg.GetIdentity(identityID)
+		if !found || ident.Status != StatusActive ||
+			(ident.ExpiresAt != nil && !now.Before(*ident.ExpiresAt)) {
+			return AuthResult{
+				Authenticated: false,
+				IdentityID:    identityID,
+				Method:        v.method,
+				Reason:        "authentication failed",
+			}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
+		}
+	}
 	res := AuthResult{
 		Authenticated:   true,
 		IdentityID:      identityID,

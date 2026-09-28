@@ -52,6 +52,7 @@ type App struct {
 	opts    Options
 	egress  *security.EgressPolicy
 	members *identity.MembershipSet
+	reg     *identity.Registry
 }
 
 // New loads configuration and constructs an App. It performs startup validation;
@@ -86,6 +87,7 @@ func New(opts Options) (*App, error) {
 		health:  health.NewServer(),
 		egress:  security.NewEgressPolicy(cfg.Security.EgressAllowList),
 		members: identity.NewMembershipSet(),
+		reg:     identity.NewRegistry(cfg.Nexus.ID),
 		life: lifecycle.New(lifecycle.Options{
 			ShutdownTimeout: time.Duration(cfg.Lifecycle.ShutdownTimeoutSeconds) * time.Second,
 		}),
@@ -107,6 +109,11 @@ func (a *App) Egress() *security.EgressPolicy { return a.egress }
 // Memberships returns the (empty at M1) membership set. It is exposed so later
 // milestones can populate it; M1 does not persist memberships.
 func (a *App) Memberships() *identity.MembershipSet { return a.members }
+
+// Registry returns the in-memory organization entity registry
+// (Identity/Business/Division, SCHEMA_IDENTITIES_ORG §2–§4), stamped with the
+// installation's nexus_id. Durability is a later milestone.
+func (a *App) Registry() *identity.Registry { return a.reg }
 
 // Logger returns the structured logger.
 func (a *App) Logger() *logging.Logger { return a.log }
