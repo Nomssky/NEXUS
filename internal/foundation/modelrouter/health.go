@@ -54,6 +54,9 @@ func (hr *HealthRegistry) RecordSuccess(providerID string, latencyMs int64) {
 	status.LastCheck = now
 	status.LatencyMs = latencyMs
 	status.Status = ProviderStatusHealthy
+	// Failures are consecutive (documented threshold intent): a success
+	// clears the strike count so the next failure starts a new streak.
+	status.ErrorCount = 0
 }
 
 // RecordFailure records a failed invocation.

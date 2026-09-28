@@ -1,6 +1,10 @@
 package modelrouter
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -392,5 +396,285 @@ func TestProviderStatuses(t *testing.T) {
 	}
 	if len(statuses) != 4 {
 		t.Errorf("expected 4 provider statuses, got %d", len(statuses))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// D2: model selection intelligence (SCHEMA_EXECUTION §3.3 + m6).
+// ---------------------------------------------------------------------------
+
+// spyProvider is a Provider test double that records the ModelID it was
+// invoked with and can be told to fail.
+type spyProvider struct {
+	id        string
+	lastModel string
+	err       error
+}
+
+func (s *spyProvider) Identify() string { return s.id }
+
+func (s *spyProvider) HealthCheck() error { return nil }
+
+func (s *spyProvider) ListModels() ([]string, error) { return []string{s.id + "-model"}, nil }
+
+func (s *spyProvider) Invoke(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error) {
+	s.lastModel = req.ModelID
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &GenerateResponse{ModelID: req.ModelID, Content: "ok", LatencyMs: 5}, nil
+}
+
+// d2Registry builds a registry with one local and two remote reasoning
+// models at known prices/privacy postures.
+func d2Registry(t *testing.T) *ModelRegistry {
+	t.Helper()
+	reg := NewModelRegistry()
+	defs := []*ModelDefinition{
+		{ID: "local-cheap", ProviderID: "ollama", Capabilities: []ModelCapability{CapabilityReasoning},
+			Runtime: RuntimeLocal, Status: ModelStatusActive, PricingInput: 0.0},
+		{ID: "remote-cheap", ProviderID: "spy-a", Capabilities: []ModelCapability{CapabilityReasoning},
+			Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.001},
+		{ID: "remote-pricey", ProviderID: "spy-b", Capabilities: []ModelCapability{CapabilityReasoning},
+			Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.01, ExternalTransfer: true},
+	}
+	for _, d := range defs {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register %s: %v", d.ID, err)
+		}
+	}
+	return reg
+}
+
+// TEST-M6-023 (D2): the strategy enum follows the most specific request
+// signal (SCHEMA §3.3).
+func TestRouteStrategyDerivation(t *testing.T) {
+	base := func() *RoutingRequest {
+		return &RoutingRequest{RequestID: "req-strat", RequiredCaps: []ModelCapability{CapabilityReasoning}}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*RoutingRequest)
+		want   RoutingStrategy
+	}{
+		{"capability_match", func(r *RoutingRequest) {}, StrategyCapabilityMatch},
+		{"manual_override", func(r *RoutingRequest) { r.AllowedModels = []string{"remote-cheap"} }, StrategyManualOverride},
+		{"cost_optimize", func(r *RoutingRequest) { r.MaxCostPerToken = 0.005 }, StrategyCostOptimize},
+		{"latency_optimize", func(r *RoutingRequest) { r.MaxLatencyMs = 100 }, StrategyLatencyOptimize},
+		{"privacy_first", func(r *RoutingRequest) { r.PrivacyFirst = true }, StrategyPrivacyFirst},
+		{"local_first", func(r *RoutingRequest) { r.PreferLocal = true }, StrategyLocalFirst},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewModelRouter(d2Registry(t), RoutingPolicyNearest)
+			req := base()
+			tc.mutate(req)
+			d, err := router.Route(req)
+			if err != nil {
+				t.Fatalf("route: %v", err)
+			}
+			if d.Strategy != tc.want {
+				t.Errorf("strategy: want %s, got %s", tc.want, d.Strategy)
+			}
+		})
+	}
+}
+
+// TEST-M6-024 (D2): dead constraint fields are live — cost and privacy
+// bound the whole fallback chain, candidates still show every model
+// considered, and constraints_applied records what filtered.
+func TestRouteConstraintFiltering(t *testing.T) {
+	router := NewModelRouter(d2Registry(t), RoutingPolicyNearest)
+
+	d, err := router.Route(&RoutingRequest{
+		RequestID:       "req-cost",
+		RequiredCaps:    []ModelCapability{CapabilityReasoning},
+		MaxCostPerToken: 0.005,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	for _, id := range d.FallbackChain {
+		if id == "remote-pricey" {
+			t.Errorf("pricey model must not survive the cost bound, chain=%v", d.FallbackChain)
+		}
+	}
+	found := false
+	for _, c := range d.ConstraintsApplied {
+		if c == "max_cost_per_token=0.005" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("constraints_applied: want max_cost_per_token entry, got %v", d.ConstraintsApplied)
+	}
+	if len(d.Candidates) != 3 {
+		t.Errorf("candidates: want all 3 capability-matched models, got %v", d.Candidates)
+	}
+
+	d, err = router.Route(&RoutingRequest{
+		RequestID:    "req-privacy",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+		PrivacyFirst: true,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	for _, id := range d.FallbackChain {
+		if id == "remote-pricey" {
+			t.Errorf("external-transfer model must not survive privacy_first, chain=%v", d.FallbackChain)
+		}
+	}
+}
+
+// TEST-M6-025 (D2): the cheapest router policy orders by input price and
+// reports cost_optimize.
+func TestRouteCheapestPolicy(t *testing.T) {
+	router := NewModelRouter(d2Registry(t), RoutingPolicyCheapest)
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-cheap",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	// local-cheap (0.0) < remote-cheap (0.001) < remote-pricey (0.01)
+	want := []string{"local-cheap", "remote-cheap", "remote-pricey"}
+	if len(d.FallbackChain) != len(want) {
+		t.Fatalf("chain: want %v, got %v", want, d.FallbackChain)
+	}
+	for i, id := range want {
+		if d.FallbackChain[i] != id {
+			t.Errorf("chain[%d]: want %s, got %s (chain=%v)", i, id, d.FallbackChain[i], d.FallbackChain)
+		}
+	}
+	if d.Strategy != StrategyCostOptimize {
+		t.Errorf("strategy: want cost_optimize from cheapest policy, got %s", d.Strategy)
+	}
+}
+
+// TEST-M6-026 (D2): the decision marshals with the §3.3 contract field
+// names (strategy, candidates, selected_reason, constraints_applied).
+func TestRoutingDecisionContractJSON(t *testing.T) {
+	router := NewModelRouter(d2Registry(t), RoutingPolicyNearest)
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-json",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	raw, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(raw)
+	for _, want := range []string{`"strategy":`, `"candidates":`, `"selected_reason":`, `"constraints_applied":`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("decision JSON missing %s: %s", want, s)
+		}
+	}
+	if strings.Contains(s, `"reason"`) {
+		t.Errorf("legacy reason field must not appear (contract name is selected_reason): %s", s)
+	}
+}
+
+// TEST-M6-027 (D2): Invoke stamps the selected model onto the provider
+// request (the old path sent the caller's placeholder) and feeds the
+// health registry on success and failure.
+func TestInvokeUsesSelectedModelAndRecordsHealth(t *testing.T) {
+	reg := NewModelRegistry()
+	if err := reg.RegisterModel(&ModelDefinition{
+		ID: "m-sel", ProviderID: "spy", Capabilities: []ModelCapability{CapabilityReasoning},
+		Runtime: RuntimeRemote, Status: ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	spy := &spyProvider{id: "spy"}
+	router := NewModelRouter(reg, RoutingPolicyNearest)
+	router.RegisterProvider(spy)
+
+	// Caller placeholder like the pre-D2 executor ("default").
+	genReq := &GenerateRequest{RequestID: "req-inv", ModelID: "default",
+		Messages: []Message{{Role: "user", Content: "hi"}}}
+	resp, d, err := router.Invoke(context.Background(), &RoutingRequest{
+		RequestID:    "req-inv",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	}, genReq)
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if spy.lastModel != "m-sel" {
+		t.Errorf("provider saw model %q, want the routed model m-sel", spy.lastModel)
+	}
+	if d.ModelID != "m-sel" {
+		t.Errorf("decision model: want m-sel, got %s", d.ModelID)
+	}
+	if resp.Content != "ok" {
+		t.Errorf("response: got %q", resp.Content)
+	}
+	if hs, ok := router.GetHealth().GetStatus("spy"); !ok || hs.SuccessCount != 1 {
+		t.Errorf("health: want 1 recorded success, got %+v", hs)
+	}
+
+	// Failure records into health (degraded, not yet unhealthy).
+	spy.err = errors.New("boom")
+	_, _, err = router.Invoke(context.Background(), &RoutingRequest{
+		RequestID:       "req-inv-fail",
+		RequiredCaps:    []ModelCapability{CapabilityReasoning},
+		FallbackEnabled: false,
+	}, &GenerateRequest{RequestID: "req-inv-fail", Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err == nil {
+		t.Fatal("want invoke error when the provider fails")
+	}
+	if hs, _ := router.GetHealth().GetStatus("spy"); hs == nil || hs.ErrorCount != 1 {
+		t.Errorf("health: want 1 recorded failure, got %+v", hs)
+	}
+}
+
+// TEST-M6-028 (D2): unhealthy providers demote to the back of the
+// fallback chain (kept for failover), and health strikes are consecutive —
+// a success resets the count.
+func TestRouteHealthDemotionAndConsecutiveStrikes(t *testing.T) {
+	reg := NewModelRegistry()
+	for _, d := range []*ModelDefinition{
+		{ID: "m-bad", ProviderID: "bad", Capabilities: []ModelCapability{CapabilityReasoning},
+			Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "m-good", ProviderID: "good", Capabilities: []ModelCapability{CapabilityReasoning},
+			Runtime: RuntimeRemote, Status: ModelStatusActive},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyNearest)
+	for i := 0; i < 3; i++ {
+		router.GetHealth().RecordFailure("bad")
+	}
+
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-health",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if len(d.FallbackChain) != 2 || d.FallbackChain[0] != "m-good" {
+		t.Errorf("chain: healthy model must lead, got %v", d.FallbackChain)
+	}
+	if d.FallbackChain[1] != "m-bad" {
+		t.Errorf("chain: unhealthy model must remain as last resort, got %v", d.FallbackChain)
+	}
+
+	// A success resets the consecutive strike count.
+	router.GetHealth().RecordSuccess("bad", 10)
+	hs, _ := router.GetHealth().GetStatus("bad")
+	if hs.ErrorCount != 0 || hs.Status != ProviderStatusHealthy {
+		t.Errorf("after success: want ErrorCount 0/healthy, got %d/%s", hs.ErrorCount, hs.Status)
+	}
+	router.GetHealth().RecordFailure("bad")
+	hs, _ = router.GetHealth().GetStatus("bad")
+	if hs.Status != ProviderStatusDegraded {
+		t.Errorf("first strike after reset: want degraded, got %s", hs.Status)
 	}
 }

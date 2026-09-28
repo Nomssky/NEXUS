@@ -162,7 +162,8 @@ type Config struct {
 	// MaxRetries is the maximum number of retries for failed tasks.
 	MaxRetries int
 	// DefaultModelID is the model requested when no specific model is set.
-	// Empty falls back to the router's default routing behavior.
+	// Empty — selection is the router's job: Route picks by capability and
+	// strategy (D2) and Invoke stamps the chosen model onto the request.
 	DefaultModelID string
 }
 
@@ -172,7 +173,7 @@ func DefaultConfig() Config {
 		MaxConcurrent:  10,
 		TaskTimeout:    5 * time.Minute,
 		MaxRetries:     3,
-		DefaultModelID: "default",
+		DefaultModelID: "",
 	}
 }
 
