@@ -153,7 +153,10 @@ type Outcome struct {
 	// Summary is a human-readable summary of what was accomplished.
 	Summary string `json:"summary"`
 
-	// Artifacts are any artifacts produced (files, data, etc).
+	// Artifacts are any artifacts produced (files, data, etc). Populated once
+	// the artifact-entity pipeline reports persisted outputs (SCHEMA_EXECUTION
+	// §2.4 — deferred with the identity/entity milestone); no chain stage
+	// produces one today (C-025 disposition).
 	Artifacts []string `json:"artifacts,omitempty"`
 
 	// Metrics captures performance metrics.

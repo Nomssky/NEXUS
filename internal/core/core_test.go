@@ -3112,3 +3112,93 @@ func TestAdmissionResourceCheckCapacity(t *testing.T) {
 		t.Errorf("expected chain_step resource_check, got %q", result.Error.ChainStep)
 	}
 }
+
+// TEST-CORE-066 (P3 C-012): chainMemoryRead forwards the caller's objective
+// scope into the memory query — retrieval excludes entries tagged with a
+// different objective while untagged entries (no objective relation) still
+// match (SCHEMA_MEMORY §1: retrieval is computed according to scope,
+// relevance, objective, time, confidence, privacy, and policy).
+func TestChainMemoryReadForwardsObjectiveScope(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []*memory.MemoryEntry{
+		{Type: memory.MemoryTypeEpisodic, BusinessID: "biz-1", ObjectiveID: "obj-keep", Content: "keep me", Provenance: memory.Provenance{Confidence: 1.0}},
+		{Type: memory.MemoryTypeEpisodic, BusinessID: "biz-1", ObjectiveID: "obj-other", Content: "other objective memory", Provenance: memory.Provenance{Confidence: 1.0}},
+		{Type: memory.MemoryTypeEpisodic, BusinessID: "biz-1", Content: "untagged memory", Provenance: memory.Provenance{Confidence: 1.0}},
+	}
+	for _, entry := range entries {
+		if err := e.memoryStore.Admit(entry); err != nil {
+			t.Fatalf("admit: %v", err)
+		}
+	}
+
+	// Empty intent disables the keyword filter so the objective scope is the
+	// only discriminating dimension under test.
+	ctx := NewRequestContext("corr-066", "biz-1", "user-1").WithObjective("obj-keep", "test objective scope")
+	req := &Request{ID: "req-066", Context: ctx, Intent: ""}
+	got := e.chainMemoryRead(context.Background(), req)
+
+	contents := make(map[string]bool, len(got))
+	for _, entry := range got {
+		contents[entry.Content] = true
+	}
+	if !contents["keep me"] || !contents["untagged memory"] {
+		t.Errorf("expected untagged + obj-keep entries, got %v", contents)
+	}
+	if contents["other objective memory"] {
+		t.Errorf("objective-scoped read must exclude the other-objective entry, got %v", contents)
+	}
+}
+
+// TEST-CORE-067 (P3 C-024): a capacity rejection that surfaces at executor
+// Submit — the race shape RUNTIME §3.2 says admission cannot rule out —
+// records ChainError.Retryable=true with category RESOURCE_UNAVAILABLE,
+// matching the stage-7 pre-check envelope (CORE §3 table: Yes).
+// MaxConcurrent=0 makes the admission→submit divergence deterministic: the
+// pre-check's `max > 0` guard passes while Submit's `0 >= 0` rejects, a
+// controlled version of capacity filling between check and submit.
+func TestSubmitCapacityFailureIsRetryable(t *testing.T) {
+	now := time.Now()
+	cfg := executor.DefaultConfig()
+	cfg.MaxConcurrent = 0
+	e, err := NewEngine(nil,
+		WithClock(func() time.Time { return now }),
+		WithExecutorConfig(cfg),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-cap-submit",
+		Context: NewRequestContext("corr-cap-submit", "biz-1", "user-1"),
+		Intent:  "work submitted into full capacity",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+
+	if result.Status != "failed" || result.Error == nil {
+		t.Fatalf("expected failed with error, got %+v", result)
+	}
+	if result.Error.Code != "RESOURCE_UNAVAILABLE" || result.Error.Category != "RESOURCE_UNAVAILABLE" {
+		t.Errorf("expected RESOURCE_UNAVAILABLE, got %s/%s", result.Error.Code, result.Error.Category)
+	}
+	if !result.Error.Retryable {
+		t.Error("expected Retryable=true (§3 RESOURCE_UNAVAILABLE = Yes) — C-024")
+	}
+	if result.Error.ChainStep != string(StepAgent) {
+		t.Errorf("expected chain_step %s, got %q", StepAgent, result.Error.ChainStep)
+	}
+	if result.Error.Message != "executor at capacity (0/0)" {
+		t.Errorf("expected wrapped capacity message, got %q", result.Error.Message)
+	}
+}

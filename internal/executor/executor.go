@@ -48,6 +48,9 @@ var (
 	// ErrTaskCompleted reports that the task already reached a terminal state.
 	// Use errors.Is to match; *TaskTerminalError carries the terminal status.
 	ErrTaskCompleted = errors.New("executor: task already terminal")
+	// ErrAtCapacity reports that Submit found no free execution slot.
+	// Use errors.Is to match; the wrapped message carries active/max counts.
+	ErrAtCapacity = errors.New("executor at capacity")
 )
 
 // TaskTerminalError reports a terminal task status alongside ErrTaskCompleted.
@@ -322,7 +325,9 @@ func (e *Executor) Submit(req *WorkRequest) error {
 		count := len(e.active)
 		e.activeMu.Unlock()
 		baseCancel()
-		return fmt.Errorf("executor at capacity (%d/%d)", count, e.config.MaxConcurrent)
+		// %w keeps the historical message format while letting callers
+		// classify capacity rejections via errors.Is(err, ErrAtCapacity).
+		return fmt.Errorf("%w (%d/%d)", ErrAtCapacity, count, e.config.MaxConcurrent)
 	}
 	// Reserve a slot atomically
 	e.active[req.TaskID] = &Outcome{TaskID: req.TaskID}

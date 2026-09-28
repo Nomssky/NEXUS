@@ -236,7 +236,12 @@ func (b *MemBus) Dispatch() (int, error) {
 	return dispatched, nil
 }
 
-// QueueSize returns the number of events in the queue.
+// QueueSize returns the number of events in the queue. It counts undelivered
+// backlog only: events Dispatch already popped for delivery are excluded until
+// a handler failure re-queues them (at-least-once). All queue state is read
+// and written under b.mu — concurrent Dispatch + QueueSize is data-race-free
+// (E-046 disposition: the finding describes this transient count window, not
+// a memory race).
 func (b *MemBus) QueueSize() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

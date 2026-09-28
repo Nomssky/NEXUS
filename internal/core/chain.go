@@ -834,6 +834,19 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 
 	// Submit outside inflightMu (leaf lock — no nesting in either direction).
 	if err := e.taskExec.Submit(workReq); err != nil {
+		// RUNTIME §3.2: admission never guarantees capacity at execution
+		// time — a capacity race that surfaces at Submit is the same
+		// RESOURCE_UNAVAILABLE/retryable envelope as the stage-7 pre-check
+		// (CORE §3 table), not a generic internal failure (C-024).
+		if errors.Is(err, executor.ErrAtCapacity) {
+			return nil, &ChainError{
+				Code:      "RESOURCE_UNAVAILABLE",
+				Category:  "RESOURCE_UNAVAILABLE",
+				Message:   err.Error(),
+				ChainStep: string(StepAgent),
+				Retryable: true,
+			}
+		}
 		return nil, err
 	}
 
@@ -954,6 +967,7 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 func (e *Engine) chainMemoryRead(_ context.Context, req *Request) []*memory.MemoryEntry {
 	query := &memory.MemoryQuery{
 		BusinessID:    req.Context.BusinessID,
+		ObjectiveID:   req.Context.ObjectiveID, // C-012: forward the caller's objective scope; empty = cross-objective retrieval (SCHEMA_MEMORY §1: retrieval considers objective)
 		Keywords:      req.Intent,
 		MaxResults:    5,
 		MinConfidence: 0.3,
