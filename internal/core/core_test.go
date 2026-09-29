@@ -1951,6 +1951,108 @@ func TestCancelExecutingRequestCancelsTask(t *testing.T) {
 	}
 }
 
+// uncooperativeProvider blocks until the test releases it and IGNORES context
+// cancellation — the shape of a provider/tool that does not honour ctx promptly.
+// It gives cancellation tests a deterministic window where the chain's wait
+// context expires while an explicit user cancellation is already on record.
+type uncooperativeProvider struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func registerUncooperativeProvider(t *testing.T, e *Engine) *uncooperativeProvider {
+	t.Helper()
+	p := &uncooperativeProvider{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	if err := e.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+		ID:         "uncoop-model",
+		ProviderID: "uncooperative-provider",
+		Capabilities: []modelrouter.ModelCapability{
+			modelrouter.CapabilityReasoning,
+			modelrouter.CapabilityToolCalling,
+		},
+		Runtime: modelrouter.RuntimeLocal,
+		Status:  modelrouter.ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	e.ModelRouter().RegisterProvider(uncooperativeRouterShim{p})
+	return p
+}
+
+// uncooperativeRouterShim adapts the blocking test double to the provider
+// interface without pulling the modelrouter provider types into the test.
+type uncooperativeRouterShim struct{ p *uncooperativeProvider }
+
+func (s uncooperativeRouterShim) Identify() string              { return "uncooperative-provider" }
+func (s uncooperativeRouterShim) HealthCheck() error            { return nil }
+func (s uncooperativeRouterShim) ListModels() ([]string, error) { return nil, nil }
+func (s uncooperativeRouterShim) Invoke(ctx context.Context, req *modelrouter.GenerateRequest) (*modelrouter.GenerateResponse, error) {
+	select {
+	case s.p.started <- struct{}{}:
+	default:
+	}
+	<-s.p.release // deliberately ignores ctx — see uncooperativeProvider docs
+	return &modelrouter.GenerateResponse{
+		RequestID:    req.RequestID,
+		ModelID:      req.ModelID,
+		Content:      "released",
+		FinishReason: "stop",
+	}, nil
+}
+
+// TEST-C5-01 (C-5): a user cancellation that races an executor error must
+// still be reported as cancelled, never as a failure. The executor's own
+// wait-expiry path already applies "first cause wins" (an explicit user
+// cancellation is never downgraded); the chain must do the same before it
+// records a circuit-breaker failure and a recovery record for the request.
+//
+// Deterministic repro: the provider ignores ctx, so cancelling cannot end the
+// handler; the request's Deadline expires the chain's wait context and
+// WaitOutcome returns an error while cancelRequested is already true.
+func TestCancelRacingExecutorFailureReportsCancelled(t *testing.T) {
+	now := time.Now()
+	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	ctx := context.Background()
+	e.Start(ctx)
+	p := registerUncooperativeProvider(t, e)
+	defer e.Stop(ctx)
+	defer close(p.release)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	req := &Request{
+		ID:       "req-cancel-race",
+		Context:  NewRequestContext("corr-c5", "biz-1", "user-1"),
+		Intent:   "work that outlives its deadline",
+		Deadline: &deadline,
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitSignal(t, p.started, "uncooperative provider invocation")
+
+	if err := e.CancelRequest(req.ID, "biz-1", "user-1"); err != nil {
+		t.Fatalf("cancel executing: %v", err)
+	}
+
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "cancelled" {
+		t.Fatalf("expected cancelled (user cancel wins), got %s (err=%v)", result.Status, result.Error)
+	}
+	if result.Error == nil || result.Error.Code != "CANCELLED" ||
+		result.Error.Category != "CANCELLATION" || result.Error.Retryable {
+		t.Fatalf("expected CANCELLED/CANCELLATION non-retryable, got %+v", result.Error)
+	}
+	if state := e.CircuitBreaker().State(); state != "closed" {
+		t.Errorf("cancellation must not record a circuit-breaker failure, state=%s", state)
+	}
+	if got := e.RecoveryManager().RecordCount(); got != 0 {
+		t.Errorf("cancellation must not record a recovery failure, got %d", got)
+	}
+}
+
 // TEST-E005-CORE-06: completed request → ErrAlreadyCompleted with the terminal
 // status (gateway 409 CONFLICT).
 func TestCancelRequestCompletedConflict(t *testing.T) {

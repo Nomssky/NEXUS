@@ -265,6 +265,16 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		_ = e.workflowEng.Cancel(wf.ID)
 		return e.chainCancelled(ctx, req, audit, start, "request cancelled before execution")
 	}
+	// C-5: a cancellation that raced an executor error must be reported as
+	// cancelled, never as a failure (E-005: cancellation is not a failure).
+	// The executor's wait-expiry path already applies "first cause wins" —
+	// an explicit user cancellation is never downgraded — so the chain
+	// re-checks the cancel flag BEFORE recording a circuit-breaker failure
+	// and a recovery record, which user cancellations must never cause.
+	if execErr != nil && e.isCancelRequested(req.ID) {
+		_ = e.workflowEng.Cancel(wf.ID)
+		return e.chainCancelled(ctx, req, audit, start, "request cancelled before completion")
+	}
 	if execErr != nil {
 		audit = append(audit, AuditEntry{
 			Step:      string(StepAgent),
