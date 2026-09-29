@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
 // orgGateway builds a started engine plus registry/authenticator/memberships
@@ -567,5 +570,58 @@ func TestGatewayRejectsUnsafeEntityID(t *testing.T) {
 				t.Errorf("category: want VALIDATION, got %s", payload.Error.Category)
 			}
 		})
+	}
+}
+
+// leakStore is a store whose every write fails with an error carrying an
+// internal path. The client must never see it.
+type leakStore struct{ store.Store }
+
+func (l *leakStore) Put(*store.Record) error {
+	return fmt.Errorf("registry: persist %q: %w", "nx:human:x", &store.StoreError{
+		Code:    "IO_ERROR",
+		Message: "/var/lib/nexus/secret-path: device is full",
+	})
+}
+
+// TEST-F7 (F7): a 500 must not echo the underlying error. The package
+// invariant is "No internal details leaked in error responses"
+// (gateway/server.go doc), but the INTERNAL_FAILURE branches interpolated
+// err into the body — an IO_ERROR carried the on-disk path straight back to
+// the caller.
+func TestGatewayInternalFailureDoesNotLeakDetail(t *testing.T) {
+	reg, err := identity.OpenRegistry("nx:nexus:test",
+		&leakStore{Store: store.NewMemStore()})
+	if err != nil {
+		t.Fatalf("open registry: %v", err)
+	}
+	_, _, _, srv := orgGateway(t, WithRegistry(reg))
+
+	w := postJSON(srv, "/api/v1/identities", map[string]any{
+		"identity_type": "human", "display_name": "X",
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status: want 500, got %d body=%s", w.Code, w.Body.String())
+	}
+	for _, secret := range []string{"/var/lib/nexus", "device is full", "IO_ERROR"} {
+		if strings.Contains(w.Body.String(), secret) {
+			t.Errorf("response leaks internal detail %q: %s", secret, w.Body.String())
+		}
+	}
+	var payload struct {
+		Error struct {
+			Code     string `json:"code"`
+			Category string `json:"category"`
+			Message  string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("body is not an error envelope: %v: %s", err, w.Body.String())
+	}
+	if payload.Error.Category != "INTERNAL_FAILURE" {
+		t.Errorf("category: want INTERNAL_FAILURE, got %s", payload.Error.Category)
+	}
+	if payload.Error.Message == "" {
+		t.Errorf("message must still be present for the contract envelope: %s", w.Body.String())
 	}
 }

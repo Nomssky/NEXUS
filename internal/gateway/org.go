@@ -70,7 +70,8 @@ func (s *Server) writeRegistryError(w http.ResponseWriter, r *http.Request, err 
 			s.writeError(w, r, http.StatusBadRequest, "VALIDATION", err.Error())
 			return
 		}
-		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
+		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			"registry write failed", err)
 	}
 }
 
@@ -278,7 +279,8 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	// descriptive role (MEMBERSHIP != AUTHORITY — no permission is granted).
 	if body.BusinessID != "" && s.memberships != nil {
 		if err := s.memberships.Add(member); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
+			s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+				"membership add failed", err)
 			return
 		}
 	}

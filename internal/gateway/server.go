@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -668,8 +669,8 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		s.writeError(w, r, http.StatusConflict, "CONFLICT", msg)
 	default:
-		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
-			fmt.Sprintf("cancellation failed: %v", err))
+		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			"cancellation failed", err)
 	}
 }
 
@@ -780,8 +781,8 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 	case errors.Is(err, core.ErrApprovalNotResumable):
 		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
-		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
-			fmt.Sprintf("approval decision failed: %v", err))
+		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			"approval decision failed", err)
 	}
 }
 
@@ -880,8 +881,8 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 	case errors.Is(err, core.ErrEscalationNotDecidable):
 		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
-		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
-			fmt.Sprintf("escalation decision failed: %v", err))
+		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			"escalation decision failed", err)
 	}
 }
 
@@ -1082,7 +1083,7 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.engine.Stop(r.Context()); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("pause failed: %v", err))
+		s.writeInternal(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", "pause failed", err)
 		return
 	}
 
@@ -1112,7 +1113,7 @@ func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
 	// loop's lifetime is the fresh shutdown channel created by Resume; it
 	// closes on the next Engine.Stop.
 	if err := s.engine.Resume(context.Background()); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
+		s.writeInternal(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", "resume failed", err)
 		return
 	}
 
@@ -1250,6 +1251,18 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 	w.Header().Set("X-Correlation-ID", corrID)
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{"error": nerr})
+}
+
+// writeInternal answers an unexpected failure without echoing err into the
+// response body. The package invariant is "No internal details leaked in
+// error responses" (this file's doc); the INTERNAL_FAILURE and
+// CONTROL_FAILURE branches used to interpolate err, returning store paths,
+// wrapped internals and raw Go error text to the caller (F7). The detail is
+// logged server-side where an operator can act on it; the client keeps the
+// canonical code/category plus a stable operation-naming message.
+func (s *Server) writeInternal(w http.ResponseWriter, r *http.Request, status int, code, message string, err error) {
+	log.Printf("gateway: %s: %v", message, err)
+	s.writeError(w, r, status, code, message)
 }
 
 // canonicalErrorCategory maps a machine-readable gateway code onto the closed
