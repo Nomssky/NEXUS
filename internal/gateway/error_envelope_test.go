@@ -138,3 +138,69 @@ func TestErrorEnvelopeRetryableFollowsCategory(t *testing.T) {
 		t.Errorf("VALIDATION must be non-retryable, got true")
 	}
 }
+
+// TEST-GW-ENVELOPE-05 (F10): unknown routes must answer in the §3 envelope,
+// not the ServeMux default text/plain "404 page not found" body.
+func TestUnknownRouteErrorEnvelope(t *testing.T) {
+	srv := envelopeServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/definitely-not-a-route", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status: want 404, got %d body=%s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type: want application/json, got %q body=%s", ct, w.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code          string `json:"code"`
+			Category      string `json:"category"`
+			Message       string `json:"message"`
+			CorrelationID string `json:"correlation_id"`
+			Timestamp     string `json:"timestamp"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("body is not an error envelope: %v: %s", err, w.Body.String())
+	}
+	if payload.Error.Code == "" || payload.Error.Category == "" || payload.Error.Message == "" {
+		t.Errorf("envelope incomplete: %+v", payload.Error)
+	}
+	if w.Header().Get("X-Correlation-ID") == "" {
+		t.Error("missing X-Correlation-ID header")
+	}
+}
+
+// TEST-GW-ENVELOPE-06 (F10): a method mismatch on a known route must also
+// answer in the envelope (was the mux's plain-text "Method Not Allowed").
+func TestMethodNotAllowedErrorEnvelope(t *testing.T) {
+	srv := envelopeServer(t)
+	req := httptest.NewRequest(http.MethodDelete, "/health", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status: want 405, got %d body=%s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type: want application/json, got %q body=%s", ct, w.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code     string `json:"code"`
+			Category string `json:"category"`
+			Message  string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("body is not an error envelope: %v: %s", err, w.Body.String())
+	}
+	if payload.Error.Code == "" {
+		t.Errorf("missing code: %s", w.Body.String())
+	}
+	if allow := w.Header().Get("Allow"); allow == "" {
+		t.Error("405 must keep the Allow header from the mux")
+	}
+}

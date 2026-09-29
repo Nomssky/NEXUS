@@ -336,7 +336,59 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 // on the server; security regression tests must exercise this (not raw Mux())
 // so the real request path is covered.
 func (s *Server) Handler() http.Handler {
-	return s.identityMiddleware(s.authMiddleware(s.mux))
+	return s.identityMiddleware(s.authMiddleware(s.envelopeRoutes()))
+}
+
+// envelopeRoutes wraps the route mux so unrouted paths (404) and method
+// mismatches (405) answer in the CORE §3 error envelope instead of the
+// ServeMux default plain-text bodies (F10) — text/plain is not
+// machine-readable and breaks the gateway's error contract.
+func (s *Server) envelopeRoutes() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, pattern := s.mux.Handler(r)
+		if pattern != "" {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+		// No matching pattern: unknown path (404) or method mismatch on a
+		// known path (405). The mux hides the distinction behind its
+		// default handlers — probe one with a detached writer to tell them
+		// apart and to recover the Allow header for the 405.
+		probe := &muxProbe{header: http.Header{}}
+		h.ServeHTTP(probe, r)
+		if probe.status == http.StatusMethodNotAllowed {
+			if allow := probe.header.Get("Allow"); allow != "" {
+				w.Header().Set("Allow", allow)
+			}
+			s.writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED",
+				fmt.Sprintf("method %s not allowed for %s", r.Method, r.URL.Path))
+			return
+		}
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION",
+			fmt.Sprintf("no such endpoint: %s %s", r.Method, r.URL.Path))
+	})
+}
+
+// muxProbe is a detached ResponseWriter used to classify the mux's default
+// 404/405 handling without writing anything to the client.
+type muxProbe struct {
+	header http.Header
+	status int
+}
+
+func (p *muxProbe) Header() http.Header { return p.header }
+
+func (p *muxProbe) Write(b []byte) (int, error) {
+	if p.status == 0 {
+		p.status = http.StatusOK
+	}
+	return len(b), nil
+}
+
+func (p *muxProbe) WriteHeader(code int) {
+	if p.status == 0 {
+		p.status = code
+	}
 }
 
 // authMiddleware checks X-API-Key on control endpoints.
@@ -1205,7 +1257,7 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, 
 // (the code itself stays on the envelope for callers).
 func canonicalErrorCategory(code string) nerrors.Category {
 	switch code {
-	case "VALIDATION":
+	case "VALIDATION", "METHOD_NOT_ALLOWED":
 		return nerrors.CategoryValidation
 	case "AUTH", "UNAUTHORIZED":
 		return nerrors.CategoryAuth
