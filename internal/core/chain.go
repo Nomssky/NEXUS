@@ -438,6 +438,15 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 				Action:     executor.ActionExecuteTask,
 				Resource:   executor.ResourceWorkflow,
 				BusinessID: req.Context.BusinessID,
+				// N1: mirror the executor gate's scope ids so this re-eval
+				// reproduces the same decision (incl. ApprovalConfig) the
+				// gate made — TaskID from the outcome, division from the
+				// request context.
+				TaskID:     execOutcome.TaskID,
+				DivisionID: req.Context.DivisionID,
+				// chainExecute sets WorkflowID = TaskID (the workflow record
+				// id), so mirror it for an exact gate decision.
+				WorkflowID: execOutcome.TaskID,
 			}
 			decision := e.govEngine.Evaluate(govReq)
 			if decision.Outcome != governance.REQUIRE_APPROVAL {
@@ -697,6 +706,12 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		Action:     "execute_request",
 		Resource:   "core",
 		BusinessID: req.Context.BusinessID,
+		// N1: scope ids known at this gate — division and objective live on
+		// the request context. Narrower ids (agent/workflow/task) do not
+		// exist yet (this step runs before objective/workflow creation);
+		// they are wired at the executor gate instead.
+		DivisionID:  req.Context.DivisionID,
+		ObjectiveID: req.Context.ObjectiveID,
 		// Approval resume: an approved record for this request satisfies
 		// a REQUIRE_APPROVAL policy (nil otherwise — no behavior change).
 		ApprovalState: e.approvalStateFor(req.ID),
@@ -832,10 +847,15 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 		TaskID:        wf.ID,
 		CorrelationID: req.Context.CorrelationID,
 		BusinessID:    req.Context.BusinessID,
-		ActorID:       req.Context.ActorID,
-		Intent:        req.Intent,
-		Priority:      req.Priority,
-		Constraints:   req.Constraints,
+		// N1: wire the division sub-scope and the workflow id so
+		// division/workflow-pinned governance policies match at the
+		// executor gate (an unset id never matches a pinned policy id).
+		DivisionID:  req.Context.DivisionID,
+		WorkflowID:  wf.ID,
+		ActorID:     req.Context.ActorID,
+		Intent:      req.Intent,
+		Priority:    req.Priority,
+		Constraints: req.Constraints,
 		// Approval resume: carries an approved approval into the executor
 		// gate so its REQUIRE_APPROVAL policy is satisfied on the re-run.
 		ApprovalState: e.approvalStateFor(req.ID),

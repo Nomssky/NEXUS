@@ -133,6 +133,14 @@ type WorkRequest struct {
 	CorrelationID string `json:"correlation_id"`
 	// BusinessID for scope isolation.
 	BusinessID string `json:"business_id"`
+	// DivisionID is the optional division sub-scope of the business, carried
+	// from the request context so division-scoped governance policies match
+	// at this gate (N1 — an unset field can never match a pinned policy id).
+	DivisionID string `json:"division_id,omitempty"`
+	// WorkflowID is the workflow this work belongs to when the caller
+	// executes one (chainExecute), so workflow-scoped governance policies
+	// match at this gate (N1).
+	WorkflowID string `json:"workflow_id,omitempty"`
 	// ActorID who initiated the work.
 	ActorID string `json:"actor_id"`
 	// Intent describes what to do.
@@ -632,6 +640,11 @@ func (e *Executor) checkGovernance(req *WorkRequest) governance.Decision {
 		// only after governance passes), so task-scoped policies apply.
 		TaskID:     req.TaskID,
 		BusinessID: req.BusinessID,
+		// N1: division and workflow scope ids are known at this gate and
+		// must be wired — matchesScope treats an unset request id as a
+		// non-match against a pinned policy id (silent DENY bypass).
+		DivisionID: req.DivisionID,
+		WorkflowID: req.WorkflowID,
 		// Approval resume: carries an approved approval record so an
 		// existing REQUIRE_APPROVAL policy can be satisfied (nil otherwise).
 		ApprovalState: req.ApprovalState,
