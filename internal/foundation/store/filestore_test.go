@@ -261,25 +261,47 @@ func TestFileStoreEmptyDir(t *testing.T) {
 	}
 }
 
-func TestFileStoreCorruptFileSkipped(t *testing.T) {
+// TEST-F4-01: a corrupt record file must fail the open (fail-closed boot),
+// not be silently dropped from the index. Skipping it meant the documented
+// fail-closed hydration (OpenRegistry "failing closed on corrupt records")
+// never saw the corruption and booted with silently missing data.
+func TestFileStoreCorruptFileFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write a corrupt file
 	typeDir := filepath.Join(dir, "test")
-	os.MkdirAll(typeDir, 0o755)
-	os.WriteFile(filepath.Join(typeDir, "bad.json"), []byte("not json"), 0o644)
-
-	// Write a valid file
-	os.WriteFile(filepath.Join(typeDir, "good.json"), []byte(`{"id":"good","type":"test","status":"active","version":1}`), 0o644)
-
-	fs, err := NewFileStore(dir)
-	if err != nil {
+	if err := os.MkdirAll(typeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(typeDir, "bad.json"), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A valid file next to it must not mask the corruption.
+	if err := os.WriteFile(filepath.Join(typeDir, "good.json"), []byte(`{"id":"good","type":"test","status":"active","version":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	count, _ := fs.Count(Filter{})
-	if count != 1 {
-		t.Errorf("expected 1 valid record, got %d", count)
+	if _, err := NewFileStore(dir); err == nil {
+		t.Fatal("expected corrupt record file to fail the open (fail-closed)")
+	} else if !strings.Contains(err.Error(), "bad.json") {
+		t.Errorf("error must name the corrupt file, got: %v", err)
+	}
+}
+
+// TEST-F4-02: a file that parses but carries no record id is equally
+// unusable data — it must fail the open rather than index under "".
+func TestFileStoreRecordWithoutIDFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+
+	typeDir := filepath.Join(dir, "test")
+	if err := os.MkdirAll(typeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(typeDir, "noid.json"), []byte(`{"type":"test","status":"active"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewFileStore(dir); err == nil {
+		t.Fatal("expected id-less record file to fail the open (fail-closed)")
 	}
 }
 

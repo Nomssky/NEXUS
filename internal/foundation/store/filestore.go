@@ -248,13 +248,19 @@ func (fs *FileStore) writeRecord(record *Record) error {
 }
 
 // loadAll loads all records from disk into the index.
+//
+// Fail closed (F4): an unreadable directory, an unreadable file, an
+// unparseable file, or a file that carries no record id aborts the open.
+// Silently skipping such a file dropped it from the index, so the caller's
+// documented fail-closed hydration (OpenRegistry on corrupt records) never
+// saw the corruption and booted with silently missing data.
 func (fs *FileStore) loadAll() error {
 	entries, err := os.ReadDir(fs.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // empty store
 		}
-		return err
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("read dir: %v", err)}
 	}
 
 	for _, entry := range entries {
@@ -264,7 +270,7 @@ func (fs *FileStore) loadAll() error {
 		typeDir := filepath.Join(fs.dir, entry.Name())
 		files, err := os.ReadDir(typeDir)
 		if err != nil {
-			continue // skip unreadable dirs
+			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("read dir %s: %v", typeDir, err)}
 		}
 
 		for _, f := range files {
@@ -274,12 +280,15 @@ func (fs *FileStore) loadAll() error {
 			path := filepath.Join(typeDir, f.Name())
 			data, err := os.ReadFile(path)
 			if err != nil {
-				continue // skip unreadable files
+				return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("read %s: %v", path, err)}
 			}
 
 			var record Record
 			if err := json.Unmarshal(data, &record); err != nil {
-				continue // skip corrupt files
+				return &StoreError{Code: "CORRUPT_RECORD", Message: fmt.Sprintf("parse %s: %v", path, err)}
+			}
+			if record.ID == "" {
+				return &StoreError{Code: "CORRUPT_RECORD", Message: fmt.Sprintf("parse %s: record id is empty", path)}
 			}
 
 			fs.index[record.ID] = &record
