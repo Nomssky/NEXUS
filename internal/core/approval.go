@@ -257,21 +257,65 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 	// original request. On the re-run approvalStateFor(req.ID) returns
 	// approved, so both governance gates pass and the handler executes.
 	old, hadResult := e.dropResult(entry.requestID)
+
+	// C-018: the dequeue path Releases a slot for every item it pops
+	// (engine.go:453) and SubmitRequest pairs that with an Accept. Resume
+	// re-admits through that same queue, so it must take an Accept slot
+	// too — skipping it left a Release with no matching Accept, permanently
+	// under-counting QueueSize() until the counter was pinned at 0 and the
+	// gate stopped rejecting.
+	//
+	// The approval is already APPROVED here (one decision per record), so a
+	// saturated queue waits for a slot rather than failing: returning an
+	// error would strand an approved record with no run and no way to
+	// re-decide it. The send below already blocks on the buffered channel,
+	// so this adds no new blocking behaviour — only an honest count.
+	if !e.acceptResumeSlot(shutdownCh) {
+		if hadResult {
+			e.restoreResult(entry.requestID, old)
+		}
+		return fmt.Errorf("%w: engine shutting down during resume", ErrApprovalNotResumable)
+	}
 	e.registerInflight(entry.req)
 
 	select {
 	case e.requests <- entry.req:
 		return nil
 	case <-shutdownCh:
-		// Engine went down between the running check and the send: keep
-		// the previously stored result, release the registration. The
-		// approval stays APPROVED (in-memory state dies with the process
-		// anyway) — surfaced so the client can resubmit.
+		// Engine went down between the running check and the send: give the
+		// slot back (exactly one Release per Accept), release the
+		// registration, keep the previously stored result. The approval
+		// stays APPROVED (in-memory state dies with the process anyway) —
+		// surfaced so the client can resubmit.
+		e.backpressure.Release()
 		e.deregisterInflight(entry.requestID)
 		if hadResult {
 			e.restoreResult(entry.requestID, old)
 		}
 		return fmt.Errorf("%w: engine shutting down during resume", ErrApprovalNotResumable)
+	}
+}
+
+// resumeAcceptRetryInterval is how long acceptResumeSlot waits before
+// re-trying a saturated queue. It only applies when the engine is already at
+// its queue limit; the normal path takes a slot on the first attempt.
+const resumeAcceptRetryInterval = 5 * time.Millisecond
+
+// acceptResumeSlot takes a backpressure slot for an approval resume,
+// blocking until one frees up or the engine shuts down. Reports false only
+// on shutdown (the caller then unwinds the resume).
+func (e *Engine) acceptResumeSlot(shutdownCh <-chan struct{}) bool {
+	for {
+		if e.backpressure.Accept() {
+			return true
+		}
+		timer := time.NewTimer(resumeAcceptRetryInterval)
+		select {
+		case <-shutdownCh:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
 	}
 }
 
