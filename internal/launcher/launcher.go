@@ -19,6 +19,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/gateway"
 )
 
@@ -78,6 +79,44 @@ func New(opts Options) *Launcher {
 			health:  opts.Health,
 			life:    opts.Lifecycle,
 			initErr: err,
+		}
+	}
+	// Seed the model layer when nothing is registered (docs/m6-model-router.md:
+	// callers register models and providers). The shipped binary has no other
+	// registration path — no config surface, no API endpoint — so without a
+	// seed every request fails honestly at model invocation (E-008, no model)
+	// and the documented submit → GET result lifecycle can never reach a
+	// completed terminal state. The seed uses modelrouter's simulated
+	// LocalProvider stub; real inference requires registering real models and
+	// providers per m6 (the warning below keeps the simulation explicit).
+	if engine.ModelRegistry().ModelCount() == 0 {
+		simProvider := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: "simulated"})
+		if regErr := engine.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+			ID:         "simulated:default",
+			ProviderID: simProvider.Identify(),
+			Capabilities: []modelrouter.ModelCapability{
+				modelrouter.CapabilityReasoning,
+				modelrouter.CapabilityToolCalling,
+			},
+			Runtime: modelrouter.RuntimeLocal,
+			Status:  modelrouter.ModelStatusActive,
+		}); regErr != nil {
+			if opts.Logger != nil {
+				opts.Logger.Error("failed to seed simulated default model", logging.Fields{
+					Context: map[string]any{"err": regErr.Error()},
+				})
+			}
+		} else {
+			engine.ModelRouter().RegisterProvider(simProvider)
+			if opts.Logger != nil {
+				opts.Logger.Warn("no model registered: seeded simulated default model", logging.Fields{
+					Context: map[string]any{
+						"model_id": "simulated:default",
+						"provider": "simulated",
+						"note":     "simulated execution via LocalProvider stub; register real models per docs/m6-model-router.md for real inference",
+					},
+				})
+			}
 		}
 	}
 	gwOpts := []gateway.ServerOption{
