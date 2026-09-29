@@ -343,6 +343,16 @@ const (
 	// config file (config holds SecretRef references, not raw secret values).
 	// Empty disables control endpoints (403 fail-closed).
 	EnvControlAPIKey = "NEXUS_CONTROL_API_KEY"
+
+	// EnvBootstrapCredential provisions the FIRST identity + credential +
+	// membership on a fresh install (F3). Secret: environment only, same
+	// posture as EnvControlAPIKey. Only consulted while identity enforcement
+	// (require_authentication / enforce_business_scope) is active; empty
+	// leaves the system fail-closed (401) and logged.
+	EnvBootstrapCredential = "NEXUS_BOOTSTRAP_CREDENTIAL"
+	// EnvBootstrapBusiness selects the business the bootstrap identity
+	// belongs to (created if missing). Empty defaults to "default".
+	EnvBootstrapBusiness = "NEXUS_BOOTSTRAP_BUSINESS"
 )
 
 func applyEnv(cfg *Config, environ []string) error {
