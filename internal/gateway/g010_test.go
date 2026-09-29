@@ -26,6 +26,7 @@ func g010Engine(t *testing.T) *core.Engine {
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
+	registerSimulatedProvider(t, engine)
 	ctx := context.Background()
 	if err := engine.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)

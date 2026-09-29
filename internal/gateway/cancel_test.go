@@ -136,6 +136,31 @@ func cancelEngine(t *testing.T) (*core.Engine, *blockingProvider) {
 
 // fastEngine builds a started engine without a blocking provider: submitted
 // requests complete quickly (used for terminal-state tests).
+
+// registerSimulatedProvider wires the repository's simulated LocalProvider and
+// one model into the engine so the executor's default handler can route and
+// complete a request. The default engine ships an empty model registry — with
+// no model the provider invocation fails (E-008) and honest chain semantics
+// report "failed"; tests that assert a genuinely completed lifecycle must
+// register a model first (mirrors the production wiring in launcher.New).
+func registerSimulatedProvider(t *testing.T, engine *core.Engine) {
+	t.Helper()
+	p := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: "simulated"})
+	if err := engine.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+		ID:         "simulated:default",
+		ProviderID: p.Identify(),
+		Capabilities: []modelrouter.ModelCapability{
+			modelrouter.CapabilityReasoning,
+			modelrouter.CapabilityToolCalling,
+		},
+		Runtime: modelrouter.RuntimeLocal,
+		Status:  modelrouter.ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	engine.ModelRouter().RegisterProvider(p)
+}
+
 func fastEngine(t *testing.T) *core.Engine {
 	t.Helper()
 	now := time.Now()
@@ -143,6 +168,7 @@ func fastEngine(t *testing.T) *core.Engine {
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
+	registerSimulatedProvider(t, engine)
 	if err := engine.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}

@@ -25,6 +25,7 @@ func approvalGateway(t *testing.T, opts ...ServerOption) (*core.Engine, *Server)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
+	registerSimulatedProvider(t, engine)
 	engine.Governance().SetPolicies([]*governance.Policy{
 		{
 			PolicyID:   "require-approval",

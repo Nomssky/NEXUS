@@ -213,6 +213,7 @@ func TestGetResultNotFound(t *testing.T) {
 func TestGetResultFound(t *testing.T) {
 	now := time.Now()
 	engine, _ := core.NewEngine(nil, core.WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, engine)
 	ctx := context.Background()
 	engine.Start(ctx)
 	defer engine.Stop(ctx)

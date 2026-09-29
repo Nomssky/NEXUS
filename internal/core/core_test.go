@@ -143,6 +143,7 @@ func TestEngineDoubleStart(t *testing.T) {
 func TestSubmitRequest(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -209,6 +210,7 @@ func TestChainValidationMissingIntent(t *testing.T) {
 func TestFullChainExecution(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -527,6 +529,7 @@ func TestFullChainHasMemoryAndAttentionSteps(t *testing.T) {
 func TestChainEmitsEvents(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -1506,6 +1509,7 @@ func TestModelAccessors(t *testing.T) {
 func TestOutcomeMetricsPopulated(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -1685,6 +1689,31 @@ func registerBlockingProvider(t *testing.T, e *Engine) *blockingProvider {
 	}
 	e.ModelRouter().RegisterProvider(p)
 	return p
+}
+
+// registerSimulatedProvider wires the repository's simulated LocalProvider and
+// one model into the engine so the executor's default handler can route and
+// complete a request. The default engine ships an empty model registry — with
+// no model the provider invocation fails (E-008) and honest chain semantics
+// report "failed", not "completed" — tests that assert a genuinely completed
+// lifecycle must register a model first (mirrors the production wiring in
+// launcher.New).
+func registerSimulatedProvider(t *testing.T, e *Engine) {
+	t.Helper()
+	p := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: "simulated"})
+	if err := e.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+		ID:         "simulated:default",
+		ProviderID: p.Identify(),
+		Capabilities: []modelrouter.ModelCapability{
+			modelrouter.CapabilityReasoning,
+			modelrouter.CapabilityToolCalling,
+		},
+		Runtime: modelrouter.RuntimeLocal,
+		Status:  modelrouter.ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	e.ModelRouter().RegisterProvider(p)
 }
 
 // TEST-E005-CORE-01: unknown request → ErrRequestNotFound (gateway 404).
@@ -1919,6 +1948,7 @@ func TestCancelExecutingRequestCancelsTask(t *testing.T) {
 func TestCancelRequestCompletedConflict(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	e.Start(ctx)
 	defer e.Stop(ctx)
@@ -2182,6 +2212,7 @@ func TestApprovalWiringChainGateResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	registerSimulatedProvider(t, e)
 	// All-action REQUIRE_APPROVAL: the chain gate gates the first run; on
 	// the resume run BOTH the chain gate and the executor gate must be
 	// satisfied by the approved record (ApprovalState pass-through).
@@ -2995,6 +3026,7 @@ func TestAdmissionPipelinePassThrough(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 	var received []string
 	_, _ = e.EventBus().Subscribe(event.ConsumerFunc(func(ev *event.Event) error {

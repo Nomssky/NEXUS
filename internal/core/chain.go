@@ -486,7 +486,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		}
 		respErr.Timestamp = e.now()
 		e.emitEscalation(req, escRef, execOutcome.Error, "executor")
-	} else if execOutcome != nil {
+	} else if execOutcome != nil && execOutcome.Status == "completed" {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,
 			// C-025: populate execution metrics (was always nil).
@@ -498,6 +498,39 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		if execOutcome.AgentID != "" {
 			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
 		}
+	} else if execOutcome != nil {
+		// Fail closed: any other executor outcome (failed, unknown — e.g. an
+		// E-008 provider failure or "no agent available" — or a handler-
+		// passthrough status) is NOT a success. WaitOutcome returns terminal
+		// outcomes with a nil error, so without this branch those outcomes
+		// fell through to "completed" with a nil error (D1's no-false-success
+		// rule applied to every status, not just the governance ones).
+		// Envelope mirrors the generic execution-failure wrap above.
+		status = "failed"
+		outcomeResult = &Outcome{
+			Metrics: map[string]interface{}{
+				"duration_ms":     e.now().Sub(start).Milliseconds(),
+				"executor_status": execOutcome.Status,
+			},
+		}
+		if execOutcome.AgentID != "" {
+			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
+		}
+		message := execOutcome.Error
+		if message == "" {
+			message = fmt.Sprintf("executor did not complete the task (status=%s)", execOutcome.Status)
+		}
+		respErr = &ChainError{
+			Code:      "EXECUTION_FAILED",
+			Category:  "INTERNAL_FAILURE",
+			Message:   message,
+			ChainStep: string(StepAgent),
+			Retryable: false,
+		}
+		if req.Context != nil {
+			respErr.CorrelationID = req.Context.CorrelationID
+		}
+		respErr.Timestamp = e.now()
 	}
 
 	// Step 13: Store outcome in memory
