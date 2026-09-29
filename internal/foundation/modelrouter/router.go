@@ -300,7 +300,12 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 }
 
 func (mr *ModelRouter) invokeProvider(ctx context.Context, providerID string, req *GenerateRequest) (*GenerateResponse, error) {
+	// R-3: the providers map is written by RegisterProvider under the
+	// router lock; read it under RLock too. Only the lookup is guarded —
+	// provider.Invoke does I/O and must not hold the lock.
+	mr.mu.RLock()
 	provider, ok := mr.providers[providerID]
+	mr.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("provider %s not found", providerID)
 	}

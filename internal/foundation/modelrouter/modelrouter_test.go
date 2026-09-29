@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -676,5 +677,52 @@ func TestRouteHealthDemotionAndConsecutiveStrikes(t *testing.T) {
 	hs, _ = router.GetHealth().GetStatus("bad")
 	if hs.Status != ProviderStatusDegraded {
 		t.Errorf("first strike after reset: want degraded, got %s", hs.Status)
+	}
+}
+
+// TEST-R3-01 (R-3): invokeProvider reads the providers map without holding
+// the router lock while RegisterProvider writes it under the lock — a data
+// race under concurrent Invoke + RegisterProvider (-race).
+func TestRouterConcurrentInvokeAndRegisterProvider(t *testing.T) {
+	mr := NewModelRegistry()
+	mr.RegisterModel(&ModelDefinition{
+		ID:           "local-model",
+		ProviderID:   "ollama",
+		Capabilities: []ModelCapability{CapabilityReasoning},
+		Runtime:      RuntimeLocal,
+		Status:       ModelStatusActive,
+	})
+	router := NewModelRouter(mr, RoutingPolicyLocalFirst)
+	router.RegisterProvider(NewLocalProvider(ProviderConfig{ID: "ollama"}))
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		for i := 0; i < 200; i++ {
+			select {
+			case <-stop:
+				errCh <- nil
+				return
+			default:
+			}
+			_, _, err := router.Invoke(context.Background(), &RoutingRequest{
+				RequestID:    fmt.Sprintf("req-r3-%d", i),
+				RequiredCaps: []ModelCapability{CapabilityReasoning},
+			}, &GenerateRequest{RequestID: fmt.Sprintf("req-r3-%d", i)})
+			if err != nil {
+				// Registration churn may briefly report a missing provider;
+				// the test is about the data race, not error values.
+				continue
+			}
+		}
+		errCh <- nil
+	}()
+
+	for i := 0; i < 50; i++ {
+		router.RegisterProvider(NewLocalProvider(ProviderConfig{ID: fmt.Sprintf("p-%d", i)}))
+	}
+	close(stop)
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
 	}
 }
