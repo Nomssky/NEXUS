@@ -50,6 +50,19 @@ import (
 const (
 	defaultMaxResponseBytes = 1 << 20
 	defaultMaxSSEEventBytes = 1 << 20
+
+	// sseFrameQueueDepth bounds the per-stream frame queue between the shared
+	// dispatch goroutine and the stream's writer goroutine. When full, the
+	// frame is dropped (that subscriber falls behind) instead of stalling the
+	// whole event pipeline.
+	sseFrameQueueDepth = 64
+	// sseWriteTimeout bounds ONE frame write to a stalled client; it does not
+	// bound idle time between events — SSE streams are long-lived by design
+	// (the server-level WriteTimeout is cleared per stream in handleSSE).
+	sseWriteTimeout = 30 * time.Second
+	// sseFrameOverhead is the fixed frame layout cost: "event: " + type +
+	// "\ndata: " + data + "\n\n".
+	sseFrameOverhead = len("event: \ndata: \n\n")
 )
 
 // Server is the HTTP Gateway server.
@@ -867,10 +880,30 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer cancelStream()
 	rc := http.NewResponseController(w)
 
+	// C-4: http.Server.WriteTimeout is applied once, when the request headers
+	// are read — without clearing it here every SSE stream is killed 30s
+	// after connect regardless of activity (long-lived by design, see the
+	// package doc). The deadline is instead set per frame write below, which
+	// bounds a stalled client without limiting stream lifetime. Best-effort:
+	// test ResponseWriters do not support deadlines.
+	_ = rc.SetWriteDeadline(time.Time{})
+	// Flush headers immediately so the client sees the stream open before
+	// the first event arrives.
+	_ = rc.Flush()
+
+	// R-2/R-5: frames are queued and written ONLY by the handler goroutine.
+	// The event-bus consumer (which runs on the shared dispatch goroutine)
+	// must never touch the ResponseWriter — writing from two goroutines
+	// raced net/http's finishRequest on client disconnect, and a slow client
+	// would have stalled the entire event pipeline (including escalation
+	// intake) because bus handlers run synchronously. The bounded queue
+	// drops frames for a consumer that cannot keep up instead of blocking.
+	frames := make(chan []byte, sseFrameQueueDepth)
+
 	// Subscribe to events
 	bus := s.engine.EventBus()
 	consumer := event.ConsumerFunc(func(e *event.Event) error {
-		// Stream already unwritable or cancelled: do not write further frames.
+		// Stream already unwritable or cancelled: do not queue further frames.
 		if streamCtx.Err() != nil {
 			return nil
 		}
@@ -887,24 +920,24 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			// contract record — drop the frame, keep the stream.
 			return nil
 		}
-		// G-010: bound each SSE event frame before writing. Oversized events
+		// G-010: bound each SSE event frame before queueing. Oversized events
 		// are dropped without tearing down the stream — connection lifetime
 		// and cumulative stream bytes remain unbounded (long-lived by design).
 		// Frame layout: "event: " + type + "\ndata: " + json + "\n\n".
-		const frameOverhead = len("event: \ndata: \n\n")
-		if frameOverhead+len(e.Type)+len(data) > s.maxSSEEventBytes {
+		frame := make([]byte, 0, len(e.Type)+len(data)+sseFrameOverhead)
+		frame = append(frame, "event: "...)
+		frame = append(frame, e.Type...)
+		frame = append(frame, "\ndata: "...)
+		frame = append(frame, data...)
+		frame = append(frame, "\n\n"...)
+		if len(frame) > s.maxSSEEventBytes {
 			return nil
 		}
-		// G-011: surface write/flush failures. Return nil (not error) so the
-		// event bus does not re-queue a doomed write or abort the dispatch
-		// batch; cancelStream wakes the handler to unsubscribe and exit.
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data); err != nil {
-			cancelStream()
-			return nil
-		}
-		if err := rc.Flush(); err != nil {
-			cancelStream()
-			return nil
+		// Non-blocking enqueue: never stall the shared dispatch loop.
+		select {
+		case frames <- frame:
+		default:
+			// Queue full — this subscriber is too slow; drop the frame.
 		}
 		return nil
 	})
@@ -914,10 +947,47 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", "subscribe failed")
 		return
 	}
+	// Unsubscribe before cancelStream (LIFO) so no consumer runs after the
+	// handler stops caring about the queue.
 	defer bus.Unsubscribe(subID)
 
+	// writeFrame owns every byte written to this connection (single-writer,
+	// R-2). The per-write deadline bounds a stalled client to 30s — nothing
+	// bounds the idle time between events (long-lived streams are intended).
+	writeFrame := func(frame []byte) error {
+		_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+		if _, err := w.Write(frame); err != nil {
+			return err
+		}
+		// G-011: surface write/flush failures; the caller cancels the stream
+		// (no error to the bus — it must not re-queue a doomed write).
+		return rc.Flush()
+	}
+
 	// Keep connection open until client disconnect or stream write failure.
-	<-streamCtx.Done()
+	for {
+		select {
+		case <-streamCtx.Done():
+			// Best-effort drain: frames already queued before the client
+			// disconnected are delivered if the connection still accepts
+			// writes (test recorders do; real dead sockets fail fast).
+			for {
+				select {
+				case frame := <-frames:
+					if writeFrame(frame) != nil {
+						return
+					}
+				default:
+					return
+				}
+			}
+		case frame := <-frames:
+			if writeFrame(frame) != nil {
+				cancelStream()
+				return
+			}
+		}
+	}
 }
 
 // ControlStatusResponse is the detailed engine status.
@@ -983,7 +1053,13 @@ func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.engine.Resume(r.Context()); err != nil {
+	// C-2: never hand the HTTP request's own context to Resume — net/http
+	// cancels it the moment this handler returns, which killed the freshly
+	// started processing loop (subsequent requests were admitted with 202
+	// and never processed, cancel answered 202 forever with GET 404). The
+	// loop's lifetime is the fresh shutdown channel created by Resume; it
+	// closes on the next Engine.Stop.
+	if err := s.engine.Resume(context.Background()); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
 		return
 	}

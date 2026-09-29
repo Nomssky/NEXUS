@@ -827,10 +827,15 @@ func TestPersistenceSuccessPath(t *testing.T) {
 	}
 }
 
-// TEST-CORE-032: Resume lifecycle — start, stop, resume, submit
+// TEST-CORE-032: Resume lifecycle — start, stop, resume, submit. C-3
+// regression: the resumed request must genuinely COMPLETE — Resume restarts
+// the task executor, so before the fix every post-resume request died with
+// "executor not running" (this test then passed on a failed result because
+// it only asserted BusinessID).
 func TestResumeLifecycle(t *testing.T) {
 	now := time.Now()
 	e, _ := NewEngine(nil, WithClock(func() time.Time { return now }))
+	registerSimulatedProvider(t, e)
 	ctx := context.Background()
 
 	// Start
@@ -871,6 +876,9 @@ func TestResumeLifecycle(t *testing.T) {
 	result := waitForResult(t, e, "req-resume-1")
 	if result.BusinessID != "biz-1" {
 		t.Errorf("expected business_id biz-1, got %s", result.BusinessID)
+	}
+	if result.Status != "completed" {
+		t.Errorf("C-3: post-resume request must complete, got %q (err=%+v)", result.Status, result.Error)
 	}
 }
 

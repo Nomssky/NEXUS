@@ -345,7 +345,9 @@ func (e *Engine) Stop(_ context.Context) error {
 }
 
 // Resume resumes the engine from STOPPED state back to RUNNING.
-// It creates a fresh shutdown channel and restarts the request processing loop.
+// It creates a fresh shutdown channel, restarts the task executor (Stop
+// stopped it — without this every post-resume request died with
+// "executor not running") and restarts the request processing loop.
 func (e *Engine) Resume(ctx context.Context) error {
 	e.mu.Lock()
 	if e.status != lifecycle.StateStopped {
@@ -358,6 +360,16 @@ func (e *Engine) Resume(ctx context.Context) error {
 	// Reset Once so the next Stop() closes the fresh shutdownCh —
 	// previously the fired Once made Stop after Resume a no-op (latent bug).
 	e.shutdownOnce = sync.Once{}
+	e.mu.Unlock()
+
+	// C-3: restart the task executor BEFORE flipping to RUNNING, so a failed
+	// restart leaves the engine cleanly STOPPED instead of accepting work it
+	// cannot execute.
+	if err := e.taskExec.Start(ctx); err != nil {
+		return fmt.Errorf("executor restart: %w", err)
+	}
+
+	e.mu.Lock()
 	e.status = lifecycle.StateRunning
 	e.mu.Unlock()
 
