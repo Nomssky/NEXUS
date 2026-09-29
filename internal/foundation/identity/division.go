@@ -87,6 +87,9 @@ func (d *Division) Validate() error {
 	if strings.TrimSpace(d.EntityID) == "" {
 		return nerrors.Validation("identity.division_id_required", "division entity_id is required")
 	}
+	if err := ValidateEntityID(d.EntityID); err != nil {
+		return err
+	}
 	if strings.TrimSpace(d.NexusID) == "" {
 		return nerrors.Validation("identity.division_nexus_required", "division nexus_id is required")
 	}

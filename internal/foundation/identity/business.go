@@ -85,6 +85,9 @@ func (b *Business) Validate() error {
 	if strings.TrimSpace(b.EntityID) == "" {
 		return nerrors.Validation("identity.business_id_required", "business entity_id is required")
 	}
+	if err := ValidateEntityID(b.EntityID); err != nil {
+		return err
+	}
 	if strings.TrimSpace(b.NexusID) == "" {
 		return nerrors.Validation("identity.business_nexus_required", "business nexus_id is required")
 	}

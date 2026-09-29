@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
+	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 )
 
 const testNexus = "nx:nexus:test"
@@ -228,5 +229,82 @@ func TestSecurityContextBusinessSwitch(t *testing.T) {
 	}
 	if _, err := sc.TrySwitchBusiness(ms, "biz-b", ""); err == nil {
 		t.Fatal("switch to non-member business must fail closed")
+	}
+}
+
+// TEST-F8-01: caller-supplied entity ids become file names (FileStore) and
+// log/event fields — a charset must be enforced so path separators, spaces,
+// control characters and "." / ".." are rejected with a VALIDATION error
+// instead of surfacing later as an opaque store IO_ERROR (HTTP 500).
+func TestEntityIDCharsetRejected(t *testing.T) {
+	bad := []string{
+		"../../etc/passwd",
+		"a/b",
+		"a b",
+		"..",
+		".",
+		"tab\there",
+		"null\x00byte",
+		"",
+	}
+	for _, id := range bad {
+		ident := Identity{
+			ID: id, NexusID: testNexus, Type: TypeHuman, DisplayName: "x",
+			Status: StatusActive, Scope: GlobalScope(),
+			CreatedAt: time.Now().UTC(), SchemaVersion: "1.0.0",
+			EntityType: "identity",
+			Provenance: schema.ProvenanceRef{Origin: "test", Producer: "t", ProducedAt: time.Now().UTC()},
+		}
+		if err := ident.Validate(); err == nil {
+			t.Errorf("identity id %q must be rejected", id)
+		}
+
+		b := Business{
+			EntityID: id, BusinessID: id, Name: "n", Status: BusinessActive,
+			OwnerIdentityID: "nx:human:owner", CreatedAt: time.Now().UTC(),
+			SchemaVersion: "1.0.0", EntityType: "business",
+			Provenance: schema.ProvenanceRef{Origin: "test", Producer: "t", ProducedAt: time.Now().UTC()},
+		}
+		if err := b.Validate(); err == nil {
+			t.Errorf("business entity_id %q must be rejected", id)
+		}
+
+		d := Division{
+			EntityID: id, BusinessID: "biz-a", ParentBusinessID: "biz-a",
+			Name: "n", Status: DivisionActive, CreatedAt: time.Now().UTC(),
+			SchemaVersion: "1.0.0", EntityType: "division",
+			Provenance: schema.ProvenanceRef{Origin: "test", Producer: "t", ProducedAt: time.Now().UTC()},
+		}
+		if err := d.Validate(); err == nil {
+			t.Errorf("division entity_id %q must be rejected", id)
+		}
+	}
+}
+
+// TEST-F8-02: the allowed charset must keep every id the codebase and the
+// contract actually use working — generated `nx:{type}:{hex}` ids, the
+// contract §7 examples, and the hyphenated ids tests seed.
+func TestEntityIDCharsetAcceptsValidIDs(t *testing.T) {
+	good := []string{
+		"nx:identity:abc123",
+		"nx:business:def456",
+		"nx:objective:abc123",
+		"nx:human:bootstrap",
+		"biz-1",
+		"user-1",
+		"default",
+		"acme_corp",
+	}
+	for _, id := range good {
+		ident := Identity{
+			ID: id, NexusID: testNexus, Type: TypeHuman, DisplayName: "x",
+			Status: StatusActive, Scope: GlobalScope(),
+			CreatedAt: time.Now().UTC(), SchemaVersion: "1.0.0",
+			EntityType: "identity",
+			Provenance: schema.ProvenanceRef{Origin: "test", Producer: "t", ProducedAt: time.Now().UTC()},
+		}
+		if err := ident.Validate(); err != nil {
+			t.Errorf("identity id %q must be accepted, got %v", id, err)
+		}
 	}
 }

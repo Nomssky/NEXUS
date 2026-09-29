@@ -303,6 +303,9 @@ func (i *Identity) Validate() error {
 	if strings.TrimSpace(i.ID) == "" {
 		return nerrors.Validation("identity.id_required", "identity id is required")
 	}
+	if err := ValidateEntityID(i.ID); err != nil {
+		return err
+	}
 	if strings.TrimSpace(i.NexusID) == "" {
 		return nerrors.Validation("identity.nexus_id_required", "identity nexus_id is required")
 	}
@@ -444,6 +447,45 @@ func validateMetadataMap(m map[string]string) error {
 		}
 		if len(m[k]) > 1024 {
 			return nerrors.Validation("identity.metadata_value_too_long", "metadata value exceeds 1024 characters")
+		}
+	}
+	return nil
+}
+
+// maxEntityIDLen bounds a caller-supplied entity id. It matches the metadata
+// key bound (§11) so no id can outgrow the fields it is stored beside.
+const maxEntityIDLen = 128
+
+// ValidateEntityID enforces the entity-id charset (F8).
+//
+// Entity ids become file names (FileStore writes <type>/<id>.json) and are
+// echoed into logs, events and error messages. Without a charset, a
+// caller-supplied id such as "../../etc/passwd" reached the store and only
+// failed there as an opaque IO_ERROR (HTTP 500) instead of a VALIDATION
+// rejection at the boundary.
+//
+// The allowed set — letters, digits, "-", "_", ":" and "." — is a superset of
+// the contract §7 shape `{nx}:{entity_type}:{unique_part}`
+// (SCHEMA_COMMON §7) and of the ids the codebase seeds. The "." and ".."
+// names are rejected outright because they are directory entries, not names.
+// An empty id is reported by each record's own id_required rule, so this is
+// only reached for present ids.
+func ValidateEntityID(id string) error {
+	if id == "." || id == ".." {
+		return nerrors.Validation("identity.entity_id_invalid",
+			"entity_id must not be a directory entry name")
+	}
+	if len(id) > maxEntityIDLen {
+		return nerrors.Validation("identity.entity_id_invalid",
+			fmt.Sprintf("entity_id exceeds %d characters", maxEntityIDLen))
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '_', r == ':', r == '.':
+		default:
+			return nerrors.Validation("identity.entity_id_invalid",
+				"entity_id may only contain letters, digits, '-', '_', ':' and '.'")
 		}
 	}
 	return nil

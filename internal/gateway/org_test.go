@@ -522,3 +522,50 @@ func TestGatewayOrgIdentityEnforcement(t *testing.T) {
 		t.Errorf("mallory business dir must be empty, got %d", len(bizList.Businesses))
 	}
 }
+
+// TEST-F8-03 (F8): a caller-supplied entity_id with an unsafe charset must be
+// a 400 VALIDATION at the API boundary. Before the charset check the id
+// reached FileStore.writeRecord and surfaced as an opaque store IO_ERROR
+// (HTTP 500 INTERNAL_FAILURE) — a validation problem reported as an internal
+// failure, with the raw path echoed back in the message.
+func TestGatewayRejectsUnsafeEntityID(t *testing.T) {
+	_, _, _, srv := orgGateway(t)
+	ownerID, b := bootstrapOrg(t, srv)
+
+	cases := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{"identity", "/api/v1/identities", map[string]any{
+			"entity_id": "../../escape", "identity_type": "human", "display_name": "Bad",
+		}},
+		{"business", "/api/v1/businesses", map[string]any{
+			"entity_id": "a/b", "name": "Bad", "owner_identity_id": ownerID,
+		}},
+		{"division", "/api/v1/divisions", map[string]any{
+			"entity_id": "has space", "business_id": b.BusinessID, "name": "Bad",
+			"owner_identity_id": ownerID,
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postJSON(srv, tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status: want 400, got %d body=%s", w.Code, w.Body.String())
+			}
+			var payload struct {
+				Error struct {
+					Code     string `json:"code"`
+					Category string `json:"category"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("body is not an error envelope: %v: %s", err, w.Body.String())
+			}
+			if payload.Error.Category != "VALIDATION" {
+				t.Errorf("category: want VALIDATION, got %s", payload.Error.Category)
+			}
+		})
+	}
+}
