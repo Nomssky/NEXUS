@@ -33,6 +33,9 @@ type Launcher struct {
 	life    *lifecycle.Manager
 	addr    string // actual gateway listen address
 	initErr error
+	// startupTimeout bounds the startup barrier only (L-002). It must never
+	// be inherited by components as a lifetime context — see Run.
+	startupTimeout time.Duration
 }
 
 // Options configures the launcher.
@@ -74,11 +77,12 @@ func New(opts Options) *Launcher {
 	if err != nil {
 		// Store error; will be returned by Start
 		return &Launcher{
-			cfg:     opts.Config,
-			log:     opts.Logger,
-			health:  opts.Health,
-			life:    opts.Lifecycle,
-			initErr: err,
+			cfg:            opts.Config,
+			log:            opts.Logger,
+			health:         opts.Health,
+			life:           opts.Lifecycle,
+			initErr:        err,
+			startupTimeout: 30 * time.Second,
 		}
 	}
 	// Seed the model layer when nothing is registered (docs/m6-model-router.md:
@@ -138,6 +142,8 @@ func New(opts Options) *Launcher {
 		gateway: gw,
 		life:    opts.Lifecycle,
 		addr:    opts.Addr,
+		// C-1: default 30s, bounds the startup barrier only.
+		startupTimeout: 30 * time.Second,
 	}
 }
 
@@ -176,7 +182,12 @@ func (l *Launcher) Start(ctx context.Context) error {
 	}()
 
 	// Deterministic barrier: wait for listener established (Ready) or a
-	// definitive startup failure — never an arbitrary timer.
+	// definitive startup failure — never an arbitrary timer. The startup
+	// deadline lives here (a local timer), NOT in the context handed to
+	// components: engine/gateway receive the run-lifetime context from
+	// Run (C-1 fix) and must keep serving after startup completes.
+	startupTimer := time.NewTimer(l.startupTimeout)
+	defer startupTimer.Stop()
 	select {
 	case err := <-gwErr:
 		if err != nil {
@@ -194,6 +205,16 @@ func (l *Launcher) Start(ctx context.Context) error {
 		}
 	case <-l.gateway.Ready():
 		// Listener bound — startup barrier satisfied.
+	case <-startupTimer.C:
+		// Startup deadline exceeded: abort owned components (Stop shuts the
+		// gateway down, which releases the gateway goroutine), then report
+		// the timeout. abortStart FIRST — nothing else will cancel the
+		// gateway's lifetime context here.
+		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		l.abortStart(abortCtx)
+		<-gwErr
+		return fmt.Errorf("gateway start: startup timeout after %s", l.startupTimeout)
 	case <-ctx.Done():
 		// Cancellation during startup: wait for gateway goroutine cleanup,
 		// then abort owned components and report cancellation.
@@ -294,11 +315,18 @@ func (l *Launcher) Run(ctx context.Context) lifecycle.ExitCode {
 		},
 	})
 
-	// Start lifecycle
-	startCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
+	// Start lifecycle. C-1 fix: components receive a RUN-LIFETIME context
+	// (cancelled only when Run's parent context is cancelled), never a
+	// deadline-bearing startup context — the previous
+	// WithTimeout(ctx, 30s) was inherited by engine.Start and gateway.Start
+	// as their lifetime context, so the whole system silently stopped
+	// serving 30 seconds after boot while the app-owned health server kept
+	// answering 200. The startup deadline now lives in Start's barrier
+	// (startupTimeout) where it belongs.
+	lifetimeCtx, cancelLifetime := context.WithCancel(ctx)
+	defer cancelLifetime()
 
-	if err := l.life.Start(startCtx); err != nil {
+	if err := l.life.Start(lifetimeCtx); err != nil {
 		l.log.Error("startup failed", logging.Fields{
 			Context: map[string]any{"err": err.Error()},
 		})
