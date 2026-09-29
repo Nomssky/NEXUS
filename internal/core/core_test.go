@@ -2588,8 +2588,9 @@ func TestApprovalWiringExecutorGateResume(t *testing.T) {
 			Resource:   governance.Resource{ResourceType: "all"},
 			Precedence: 0,
 			ApprovalConfig: &governance.ApprovalConfig{
-				TimeoutSeconds:    3600,
-				AutoDenyOnTimeout: true,
+				TimeoutSeconds:         3600,
+				AutoDenyOnTimeout:      true,
+				SelfApprovalProhibited: true,
 			},
 		},
 	})
@@ -2635,9 +2636,26 @@ func TestApprovalWiringExecutorGateResume(t *testing.T) {
 	if rec.PolicyRef != "require-approval-exec" {
 		t.Errorf("expected policy_ref from the executor-gate decision, got %q", rec.PolicyRef)
 	}
+	// N3: the executor discards its Decision, so core re-evaluates to build
+	// the record. The re-eval must reproduce the matched policy's
+	// ApprovalConfig — losing it would silently create a zero-config
+	// approval (no timeout, no self-approval prohibition) and weaken the
+	// policy that produced REQUIRE_APPROVAL.
+	if rec.ExpiresAt == nil {
+		t.Error("expected expires_at from the policy approval timeout (INV-16)")
+	}
+	if !rec.SelfApprovalProhibited {
+		t.Error("expected self_approval_prohibited from the policy approval config")
+	}
+
+	// The reproduced config is enforced, not merely present: the requester
+	// cannot approve their own action.
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-1", "self"); !errors.Is(err, ErrSelfApprovalProhibited) {
+		t.Fatalf("self-approval must be refused by the reproduced config, got %v", err)
+	}
 
 	// Approve → resume must pass the executor gate and actually execute.
-	if err := e.ApproveRequest(approvalID, "biz-1", "user-1", "approved"); err != nil {
+	if err := e.ApproveRequest(approvalID, "biz-1", "user-2", "approved"); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	resumed := waitForResult(t, e, req.ID)
