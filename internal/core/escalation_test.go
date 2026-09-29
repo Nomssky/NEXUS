@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -386,5 +387,60 @@ func TestEscalationNotificationCarriesOptions(t *testing.T) {
 	}
 	if len(p.Options) != 2 || p.Options[0] != "acknowledge" || p.Options[1] != "resolve" {
 		t.Errorf("CTR-ATT-001 options: want [acknowledge resolve], got %v", p.Options)
+	}
+}
+
+// TEST-R1-01 (R-1): the escalation record is published by put() before the
+// attention submit returns, and the attention item is live in the engine as
+// soon as SubmitItem returns — so both AttentionID and item.ExpiresAt were
+// written with no synchronization against concurrent readers
+// (Escalations list / PendingItems). Data race under -race.
+func TestEscalationAttentionLinkConcurrentReaders(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	e, err := NewEngine(nil, WithClock(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for _, esc := range e.Escalations() {
+				_ = esc.AttentionID
+			}
+			for _, item := range e.attentionEng.PendingItems() {
+				_ = item.ExpiresAt
+			}
+		}
+	}()
+
+	for i := 0; i < 30; i++ {
+		data := escalationJSON(t, map[string]string{
+			"escalation_ref": fmt.Sprintf("esc-r1-%d", i),
+			"request_id":     fmt.Sprintf("req-r1-%d", i),
+			"requester_id":   "user-1",
+			"reason":         "r1 concurrent link",
+			"gate":           "chain",
+		})
+		publishEscalated(t, e, fmt.Sprintf("ev-r1-%d", i), "biz-1", data)
+	}
+	close(stop)
+	<-done
+
+	list := e.Escalations()
+	if len(list) != 30 {
+		t.Fatalf("want 30 escalations, got %d", len(list))
+	}
+	for _, esc := range list {
+		if esc.AttentionID == "" {
+			t.Fatalf("escalation %s missing attention link", esc.EscalationID)
+		}
 	}
 }

@@ -122,6 +122,22 @@ func (q *escalationQueue) put(esc *Escalation) bool {
 	return true
 }
 
+// linkAttention records the attention item id on a queued escalation under
+// the queue lock. The record is already published by put() when the attention
+// submit returns, so the write must serialize with list/get readers (R-1).
+// False means the record disappeared (never happens today: entries are never
+// removed) — callers then leave the link empty rather than race.
+func (q *escalationQueue) linkAttention(id, attentionID string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	esc, ok := q.items[id]
+	if !ok {
+		return false
+	}
+	esc.AttentionID = attentionID
+	return true
+}
+
 // sweepLocked expires escalations past their deadline. Callers hold q.mu.
 func (q *escalationQueue) sweepLocked() {
 	now := q.now()
@@ -341,6 +357,10 @@ func (e *Engine) handleGovernanceEscalated(ev *event.Event) error {
 		}
 	}
 
+	// Capture locally: the record is published below, and readers may hold
+	// clones of it while this handler finishes.
+	deadline := esc.Deadline
+
 	// Idempotent queue: a redelivered event neither duplicates the record
 	// nor the attention item below.
 	if !e.escalations.put(esc) {
@@ -370,9 +390,14 @@ func (e *Engine) handleGovernanceEscalated(ev *event.Event) error {
 			return nil
 		}
 	}
-	esc.AttentionID = item.ID
-	if esc.Deadline.After(e.now()) {
-		item.ExpiresAt = &esc.Deadline
+	// R-1: the record is already visible (put above) and the item is live
+	// in the attention engine (SubmitItem stores the returned pointer), so
+	// both links go through lock-holding setters instead of direct writes.
+	e.escalations.linkAttention(esc.EscalationID, item.ID)
+	if deadline.After(e.now()) {
+		if err := e.attentionEng.SetExpiresAt(item.ID, deadline); err != nil {
+			log.Printf("core: escalation %s attention expiry stamp failed: %v", esc.EscalationID, err)
+		}
 	}
 	return nil
 }

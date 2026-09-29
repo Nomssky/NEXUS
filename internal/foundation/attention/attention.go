@@ -346,15 +346,22 @@ func (fae *FullAttentionEngine) RecordInterruption() {
 	fae.urgentToday++
 }
 
-// GetItem returns an attention item by ID.
+// GetItem returns a copy of an attention item by ID. Cloning under the engine
+// lock keeps readers from dereferencing live stored pointers while the engine
+// mutates them (R-1).
 func (fae *FullAttentionEngine) GetItem(itemID string) (*AttentionItem, bool) {
 	fae.mu.RLock()
 	defer fae.mu.RUnlock()
 	item, ok := fae.items[itemID]
-	return item, ok
+	if !ok {
+		return nil, false
+	}
+	cp := *item
+	return &cp, true
 }
 
-// PendingItems returns all unresolved items.
+// PendingItems returns copies of all unresolved items (see GetItem on why
+// the entries are cloned rather than shared).
 func (fae *FullAttentionEngine) PendingItems() []*AttentionItem {
 	fae.mu.RLock()
 	defer fae.mu.RUnlock()
@@ -362,10 +369,26 @@ func (fae *FullAttentionEngine) PendingItems() []*AttentionItem {
 	var pending []*AttentionItem
 	for _, item := range fae.items {
 		if item.Status != StatusResolved && item.Status != StatusExpired {
-			pending = append(pending, item)
+			cp := *item
+			pending = append(pending, &cp)
 		}
 	}
 	return pending
+}
+
+// SetExpiresAt stamps the expiration deadline on a submitted item under the
+// engine lock. SubmitItem returns the live stored pointer, so writing it
+// outside the lock races with PendingItems/GetItem readers (R-1).
+func (fae *FullAttentionEngine) SetExpiresAt(itemID string, expiresAt time.Time) error {
+	fae.mu.Lock()
+	defer fae.mu.Unlock()
+	item, ok := fae.items[itemID]
+	if !ok {
+		return fmt.Errorf("attention item %s not found", itemID)
+	}
+	t := expiresAt
+	item.ExpiresAt = &t
+	return nil
 }
 
 // ItemCount returns the total number of attention items.
