@@ -44,9 +44,9 @@ func WithRegistry(r *identity.Registry) ServerOption {
 }
 
 // requireRegistry fails closed when the registry is not wired.
-func (s *Server) requireRegistry(w http.ResponseWriter) bool {
+func (s *Server) requireRegistry(w http.ResponseWriter, r *http.Request) bool {
 	if s.registry == nil {
-		s.writeError(w, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
+		s.writeError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
 			"organization registry not configured")
 		return false
 	}
@@ -56,21 +56,21 @@ func (s *Server) requireRegistry(w http.ResponseWriter) bool {
 // writeRegistryError maps registry results to the HTTP error contract:
 // 404 unknown record, 409 duplicate/invalid transition, 400 validation,
 // 500 everything else.
-func (s *Server) writeRegistryError(w http.ResponseWriter, err error) {
+func (s *Server) writeRegistryError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, identity.ErrIdentityNotFound),
 		errors.Is(err, identity.ErrBusinessNotFound),
 		errors.Is(err, identity.ErrDivisionNotFound):
-		s.writeError(w, http.StatusNotFound, "VALIDATION", err.Error())
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", err.Error())
 	case errors.Is(err, identity.ErrDuplicateEntity),
 		errors.Is(err, identity.ErrInvalidTransition):
-		s.writeError(w, http.StatusConflict, "CONFLICT", err.Error())
+		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
 		if nerrors.CategoryOf(err) == nerrors.CategoryValidation {
-			s.writeError(w, http.StatusBadRequest, "VALIDATION", err.Error())
+			s.writeError(w, r, http.StatusBadRequest, "VALIDATION", err.Error())
 			return
 		}
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
 	}
 }
 
@@ -140,19 +140,19 @@ type createIdentityBody struct {
 // handleCreateIdentity creates an identity record (§2.2), optionally
 // registering a credential and an active membership for its business.
 func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	var body createIdentityBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
 		return
 	}
 
 	// Bootstrap restriction: system identities are created by the runtime,
 	// not through the public surface.
 	if body.IdentityType == string(identity.TypeSystem) {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION",
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 			"system identities are created by the runtime, not via the API")
 		return
 	}
@@ -162,7 +162,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	case string(identity.StatusActive), string(identity.StatusPending):
 		status = identity.Status(body.Status)
 	default:
-		s.writeError(w, http.StatusBadRequest, "VALIDATION",
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 			"status must be active or pending at creation")
 		return
 	}
@@ -182,7 +182,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		generated, err := security.NewID(body.IdentityType)
 		if err != nil {
-			s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid identity_type")
+			s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid identity_type")
 			return
 		}
 		id = generated
@@ -212,7 +212,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 		Provenance:  gatewayProvenanceRef(now),
 	}
 	if ident.Type == "" || !ident.Type.IsValid() {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION",
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 			"identity_type is required and must be a canonical type")
 		return
 	}
@@ -231,14 +231,14 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.BusinessID != "" {
 		if err := member.Validate(); err != nil {
-			s.writeError(w, http.StatusBadRequest, "VALIDATION", err.Error())
+			s.writeError(w, r, http.StatusBadRequest, "VALIDATION", err.Error())
 			return
 		}
 	}
 
 	created, err := s.registry.CreateIdentity(ident, actor)
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 
@@ -248,7 +248,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 		reg, ok := s.authenticator.(credentialRegistrar)
 		if !ok || s.authenticator == nil {
 			s.registry.RemoveIdentity(created.ID)
-			s.writeError(w, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
+			s.writeError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
 				"authenticator does not support credential registration")
 			return
 		}
@@ -262,14 +262,14 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 				method = identity.AuthMethod(body.CredentialMethod)
 			default:
 				s.registry.RemoveIdentity(created.ID)
-				s.writeError(w, http.StatusBadRequest, "VALIDATION",
+				s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 					"credential_method must be token, password, service or device")
 				return
 			}
 		}
 		if err := reg.Register(created.ID, security.HashCredential([]byte(body.Credential)), method); err != nil {
 			s.registry.RemoveIdentity(created.ID)
-			s.writeRegistryError(w, err)
+			s.writeRegistryError(w, r, err)
 			return
 		}
 	}
@@ -278,7 +278,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	// descriptive role (MEMBERSHIP != AUTHORITY — no permission is granted).
 	if body.BusinessID != "" && s.memberships != nil {
 		if err := s.memberships.Add(member); err != nil {
-			s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
+			s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", err.Error())
 			return
 		}
 	}
@@ -290,12 +290,12 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 // handleListIdentities lists a business's identities. business_id is
 // mandatory (fail closed — no unscoped listing).
 func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
@@ -311,13 +311,13 @@ func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
 // handleGetIdentity returns one identity. A foreign business scope answers
 // the same 404 as an unknown id (no cross-tenant existence leak).
 func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	ident, ok := s.registry.GetIdentity(id)
 	if !ok || !s.orgScopeVisible(r, ident.BusinessID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "identity not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "identity not found")
 		return
 	}
 
@@ -328,18 +328,18 @@ func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
 // handleIdentityTransition applies suspend/revoke/activate (audit §9:
 // identity suspended/revoked).
 func (s *Server) handleIdentityTransition(w http.ResponseWriter, r *http.Request, to identity.Status) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	ident, ok := s.registry.GetIdentity(id)
 	if !ok || !s.orgScopeVisible(r, ident.BusinessID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "identity not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "identity not found")
 		return
 	}
 	updated, err := s.registry.SetIdentityStatus(id, to, currentActor(r))
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 
@@ -365,12 +365,12 @@ type createBusinessBody struct {
 // Bootstrap: authenticated when enforcement is on, membership-free (the
 // business does not exist yet).
 func (s *Server) handleCreateBusiness(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	var body createBusinessBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
 		return
 	}
 
@@ -384,7 +384,7 @@ func (s *Server) handleCreateBusiness(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.registry.CreateBusiness(b, currentActor(r))
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 
@@ -396,7 +396,7 @@ func (s *Server) handleCreateBusiness(w http.ResponseWriter, r *http.Request) {
 // filtered to the actor's memberships — a non-member sees no businesses
 // (G-002: no cross-tenant business directory).
 func (s *Server) handleListBusinesses(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	all := s.registry.ListBusinesses()
@@ -407,7 +407,7 @@ func (s *Server) handleListBusinesses(w http.ResponseWriter, r *http.Request) {
 	}
 	res, ok := actorFromContext(r.Context())
 	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return
 	}
 	visible := make([]identity.Business, 0, len(all))
@@ -423,13 +423,13 @@ func (s *Server) handleListBusinesses(w http.ResponseWriter, r *http.Request) {
 // handleGetBusiness returns one business to a member of it (or anyone when
 // enforcement is off). Foreign scope answers 404 (hidden).
 func (s *Server) handleGetBusiness(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	b, ok := s.registry.GetBusiness(id)
 	if !ok || !s.orgScopeVisible(r, b.EntityID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "business not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "business not found")
 		return
 	}
 
@@ -439,18 +439,18 @@ func (s *Server) handleGetBusiness(w http.ResponseWriter, r *http.Request) {
 
 // handleBusinessTransition applies suspend/archive/activate to a business.
 func (s *Server) handleBusinessTransition(w http.ResponseWriter, r *http.Request, to identity.BusinessStatus) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	b, ok := s.registry.GetBusiness(id)
 	if !ok || !s.orgScopeVisible(r, b.EntityID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "business not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "business not found")
 		return
 	}
 	updated, err := s.registry.SetBusinessStatus(id, to, currentActor(r))
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 
@@ -476,16 +476,16 @@ type createDivisionBody struct {
 
 // handleCreateDivision creates a division of the caller's business (§4).
 func (s *Server) handleCreateDivision(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	var body createDivisionBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
 		return
 	}
 	if body.BusinessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if _, stopped := s.requireActorMembership(w, r, body.BusinessID); stopped {
@@ -504,7 +504,7 @@ func (s *Server) handleCreateDivision(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := s.registry.CreateDivision(d, currentActor(r))
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 
@@ -514,12 +514,12 @@ func (s *Server) handleCreateDivision(w http.ResponseWriter, r *http.Request) {
 
 // handleListDivisions lists a business's divisions (fail-closed business_id).
 func (s *Server) handleListDivisions(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
@@ -535,13 +535,13 @@ func (s *Server) handleListDivisions(w http.ResponseWriter, r *http.Request) {
 // handleGetDivision returns one division to a member of its business.
 // Foreign scope answers 404 (hidden).
 func (s *Server) handleGetDivision(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	d, ok := s.registry.GetDivision(id)
 	if !ok || !s.orgScopeVisible(r, d.BusinessID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "division not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "division not found")
 		return
 	}
 
@@ -551,18 +551,18 @@ func (s *Server) handleGetDivision(w http.ResponseWriter, r *http.Request) {
 
 // handleDivisionTransition applies suspend/archive/activate to a division.
 func (s *Server) handleDivisionTransition(w http.ResponseWriter, r *http.Request, to identity.DivisionStatus) {
-	if !s.requireRegistry(w) {
+	if !s.requireRegistry(w, r) {
 		return
 	}
 	id := r.PathValue("id")
 	d, ok := s.registry.GetDivision(id)
 	if !ok || !s.orgScopeVisible(r, d.BusinessID) {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "division not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "division not found")
 		return
 	}
 	updated, err := s.registry.SetDivisionStatus(id, to, currentActor(r))
 	if err != nil {
-		s.writeRegistryError(w, err)
+		s.writeRegistryError(w, r, err)
 		return
 	}
 

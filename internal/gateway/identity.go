@@ -114,21 +114,21 @@ func (s *Server) identityMiddleware(next http.Handler) http.Handler {
 
 		if s.authenticator == nil {
 			// Fail-closed: enforcement requested but no way to verify identity.
-			s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED",
+			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
 				"authentication not configured")
 			return
 		}
 
 		actorID, credential, ok := extractActorCredentials(r)
 		if !ok {
-			s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED",
+			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
 				"authentication required")
 			return
 		}
 
 		res, err := s.authenticator.Authenticate(actorID, credential)
 		if err != nil || !res.Authenticated {
-			s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED",
+			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
 				"invalid credentials")
 			return
 		}
@@ -193,12 +193,12 @@ func (s *Server) requireActorMembership(w http.ResponseWriter, r *http.Request, 
 
 	res, ok := actorFromContext(r.Context())
 	if !ok {
-		s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 		return identity.AuthResult{}, true
 	}
 
 	if err := s.authorizeMembership(res.IdentityID, businessID); err != nil {
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 			"access denied: actor is not a member of the requested business")
 		return res, true
 	}

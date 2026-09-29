@@ -163,8 +163,8 @@ func TestG010OversizedResultRejected(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&errResp); err != nil {
 		t.Fatalf("expected JSON error body, got %q", w.Body.String())
 	}
-	if errResp["error"]["category"] != "RESOURCE_LIMIT" {
-		t.Errorf("expected RESOURCE_LIMIT, got %v", errResp["error"]["category"])
+	if errResp["error"]["category"] != "RESOURCE_UNAVAILABLE" {
+		t.Errorf("expected RESOURCE_UNAVAILABLE, got %v", errResp["error"]["category"])
 	}
 	// Must not leak the full result payload.
 	if strings.Contains(w.Body.String(), `"audit_trace"`) {

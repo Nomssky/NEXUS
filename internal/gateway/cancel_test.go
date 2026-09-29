@@ -386,8 +386,8 @@ func TestCancelMissingCredential401(t *testing.T) {
 		t.Fatalf("expected 401, got %d body=%s", w.Code, w.Body.String())
 	}
 	errBody := decodeErrorBody(t, w)
-	if errBody["category"] != "UNAUTHORIZED" {
-		t.Errorf("expected UNAUTHORIZED, got %v", errBody["category"])
+	if errBody["category"] != "AUTH" {
+		t.Errorf("expected AUTH, got %v", errBody["category"])
 	}
 }
 

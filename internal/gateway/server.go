@@ -39,6 +39,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
+	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 )
 
 // G-010 response bounds. Defaults match the gateway's existing 1 MB
@@ -332,13 +333,13 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
 			if s.controlAPIKey == "" {
-				s.writeError(w, http.StatusForbidden, "CONTROL_DISABLED",
+				s.writeError(w, r, http.StatusForbidden, "CONTROL_DISABLED",
 					"control API key not configured — control endpoints disabled")
 				return
 			}
 			got := r.Header.Get("X-API-Key")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.controlAPIKey)) != 1 {
-				s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
+				s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "invalid or missing API key")
 				return
 			}
 		}
@@ -411,20 +412,20 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 
 	var req submitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid request body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid request body")
 		return
 	}
 
 	if req.Intent == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "intent required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "intent required")
 		return
 	}
 	if req.BusinessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if req.ActorID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "actor_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "actor_id required")
 		return
 	}
 
@@ -433,16 +434,16 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	if s.identityEnforced() {
 		res, ok := actorFromContext(r.Context())
 		if !ok {
-			s.writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
 			return
 		}
 		if req.ActorID != res.IdentityID {
-			s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+			s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 				"access denied: actor_id does not match authenticated identity")
 			return
 		}
 		if err := s.authorizeMembership(res.IdentityID, req.BusinessID); err != nil {
-			s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+			s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 				"access denied: actor is not a member of the requested business")
 			return
 		}
@@ -468,7 +469,7 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.engine.SubmitRequest(coreReq); err != nil {
-		s.writeError(w, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE", err.Error())
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE", err.Error())
 		return
 	}
 
@@ -494,7 +495,7 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	// Authorization scope is mandatory — no unscoped result access.
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 
@@ -506,19 +507,19 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	// Extract request ID from URL path: /api/v1/requests/{id}
 	id := r.PathValue("id")
 	if id == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "request ID required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "request ID required")
 		return
 	}
 
 	result, ok := s.engine.GetResult(id)
 	if !ok {
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "request not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 		return
 	}
 
 	// Enforce scope match
 	if result.BusinessID != businessID {
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
 		return
 	}
 
@@ -527,11 +528,11 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	// truncated JSON). Default cap matches the 1 MB request-body limit.
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(result); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "failed to encode result")
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", "failed to encode result")
 		return
 	}
 	if buf.Len() > s.maxResponseBytes {
-		s.writeError(w, http.StatusRequestEntityTooLarge, "RESOURCE_LIMIT",
+		s.writeError(w, r, http.StatusRequestEntityTooLarge, "RESOURCE_LIMIT",
 			fmt.Sprintf("response exceeds size limit of %d bytes", s.maxResponseBytes))
 		return
 	}
@@ -555,7 +556,7 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 	// Authorization scope is mandatory — no unscoped cancellation.
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 
@@ -567,7 +568,7 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 
 	id := r.PathValue("id")
 	if id == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "request ID required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "request ID required")
 		return
 	}
 
@@ -590,9 +591,9 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 			"status":         "cancelling",
 		})
 	case errors.Is(err, core.ErrRequestNotFound):
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "request not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 	case errors.Is(err, core.ErrScopeMismatch):
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 			"access denied: business scope mismatch")
 	case errors.Is(err, core.ErrAlreadyCompleted):
 		msg := "request already in a non-cancellable terminal state"
@@ -600,9 +601,9 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &terminal) {
 			msg = fmt.Sprintf("request already in terminal state: %s", terminal.Status)
 		}
-		s.writeError(w, http.StatusConflict, "CONFLICT", msg)
+		s.writeError(w, r, http.StatusConflict, "CONFLICT", msg)
 	default:
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
 			fmt.Sprintf("cancellation failed: %v", err))
 	}
 }
@@ -612,7 +613,7 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
@@ -648,7 +649,7 @@ func (s *Server) handleDenyApproval(w http.ResponseWriter, r *http.Request) {
 func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve bool) {
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	res, stopped := s.requireActorMembership(w, r, businessID)
@@ -657,17 +658,17 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 	}
 	id := r.PathValue("id")
 	if id == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "approval ID required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "approval ID required")
 		return
 	}
 
 	var body approvalDecisionBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
 		return
 	}
 	if strings.TrimSpace(body.Reason) == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION",
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 			"reason required (decision_rationale)")
 		return
 	}
@@ -702,19 +703,19 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 			"status":      status,
 		})
 	case errors.Is(err, core.ErrApprovalNotFound):
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "approval not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "approval not found")
 	case errors.Is(err, core.ErrScopeMismatch):
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 			"access denied: business scope mismatch")
 	case errors.Is(err, core.ErrApprovalNotPending):
-		s.writeError(w, http.StatusConflict, "CONFLICT", "approval not pending")
+		s.writeError(w, r, http.StatusConflict, "CONFLICT", "approval not pending")
 	case errors.Is(err, core.ErrSelfApprovalProhibited),
 		errors.Is(err, core.ErrApproverUnauthorized):
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION", err.Error())
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", err.Error())
 	case errors.Is(err, core.ErrApprovalNotResumable):
-		s.writeError(w, http.StatusConflict, "CONFLICT", err.Error())
+		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
 			fmt.Sprintf("approval decision failed: %v", err))
 	}
 }
@@ -731,7 +732,7 @@ type escalationResponseBody struct {
 func (s *Server) handleListEscalations(w http.ResponseWriter, r *http.Request) {
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
@@ -758,7 +759,7 @@ func (s *Server) handleResolveEscalation(w http.ResponseWriter, r *http.Request)
 func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolve bool) {
 	businessID := r.URL.Query().Get("business_id")
 	if businessID == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 	res, stopped := s.requireActorMembership(w, r, businessID)
@@ -768,16 +769,16 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 
 	id := r.PathValue("id")
 	if id == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "escalation ID required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "escalation ID required")
 		return
 	}
 	var body escalationResponseBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
 		return
 	}
 	if strings.TrimSpace(body.Reasoning) == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "reasoning required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "reasoning required")
 		return
 	}
 
@@ -807,14 +808,14 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 			"accepted":      true,
 		})
 	case errors.Is(err, core.ErrEscalationNotFound):
-		s.writeError(w, http.StatusNotFound, "VALIDATION", "escalation not found")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "escalation not found")
 	case errors.Is(err, core.ErrEscalationScope):
-		s.writeError(w, http.StatusForbidden, "AUTHORIZATION",
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 			"access denied: business scope mismatch")
 	case errors.Is(err, core.ErrEscalationNotDecidable):
-		s.writeError(w, http.StatusConflict, "CONFLICT", err.Error())
+		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE",
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
 			fmt.Sprintf("escalation decision failed: %v", err))
 	}
 }
@@ -830,7 +831,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Authorization scope is mandatory — no unscoped event stream.
 	businessFilter := r.URL.Query().Get("business_id")
 	if businessFilter == "" {
-		s.writeError(w, http.StatusBadRequest, "VALIDATION", "business_id required")
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
 
@@ -844,12 +845,12 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	case s.sseClients <- struct{}{}:
 		defer func() { <-s.sseClients }()
 	default:
-		s.writeError(w, http.StatusServiceUnavailable, "RESOURCE_LIMIT", "maximum SSE clients reached")
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_LIMIT", "maximum SSE clients reached")
 		return
 	}
 
 	if _, ok := w.(http.Flusher); !ok {
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "streaming not supported")
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", "streaming not supported")
 		return
 	}
 
@@ -910,7 +911,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	subID, err := bus.Subscribe(consumer)
 	if err != nil {
-		s.writeError(w, http.StatusInternalServerError, "INTERNAL_FAILURE", "subscribe failed")
+		s.writeError(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", "subscribe failed")
 		return
 	}
 	defer bus.Unsubscribe(subID)
@@ -950,16 +951,16 @@ func (s *Server) handleControlStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 	status := s.engine.Status()
 	if status == lifecycle.StateStopped {
-		s.writeError(w, http.StatusConflict, "ALREADY_PAUSED", "engine is already stopped")
+		s.writeError(w, r, http.StatusConflict, "ALREADY_PAUSED", "engine is already stopped")
 		return
 	}
 	if status != lifecycle.StateRunning {
-		s.writeError(w, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot pause", status))
+		s.writeError(w, r, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot pause", status))
 		return
 	}
 
 	if err := s.engine.Stop(r.Context()); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("pause failed: %v", err))
+		s.writeError(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("pause failed: %v", err))
 		return
 	}
 
@@ -974,16 +975,16 @@ func (s *Server) handleControlPause(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleControlResume(w http.ResponseWriter, r *http.Request) {
 	status := s.engine.Status()
 	if status == lifecycle.StateRunning {
-		s.writeError(w, http.StatusConflict, "ALREADY_RUNNING", "engine is already running")
+		s.writeError(w, r, http.StatusConflict, "ALREADY_RUNNING", "engine is already running")
 		return
 	}
 	if status != lifecycle.StateStopped {
-		s.writeError(w, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot resume", status))
+		s.writeError(w, r, http.StatusBadRequest, "INVALID_STATE", fmt.Sprintf("engine in %s state, cannot resume", status))
 		return
 	}
 
 	if err := s.engine.Resume(r.Context()); err != nil {
-		s.writeError(w, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
+		s.writeError(w, r, http.StatusInternalServerError, "CONTROL_FAILURE", fmt.Sprintf("resume failed: %v", err))
 		return
 	}
 
@@ -1100,16 +1101,63 @@ func (s *Server) handleControlComponents(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-// writeError writes a JSON error response.
-func (s *Server) writeError(w http.ResponseWriter, code int, category, message string) {
+// writeError writes a contract §3 error envelope (CORE_INTERFACE_CONTRACTS):
+// {code, category, message, retryable, correlation_id, timestamp} under the
+// top-level "error" key. The third argument is the machine-readable code
+// (legacy call sites pass tokens like "UNAUTHORIZED"/"ALREADY_PAUSED"); its
+// canonical contract category is derived by canonicalErrorCategory so the
+// wire enum can never drift outside the closed set. retryable follows the
+// contract's per-category default (nerrors.New), not the HTTP status.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	nerr := nerrors.New(code, canonicalErrorCategory(code), message)
+	corrID := ""
+	if r != nil {
+		corrID = r.Header.Get("X-Correlation-ID")
+	}
+	if corrID == "" {
+		corrID = fmt.Sprintf("api-%d-%d", s.now().UnixNano(), s.corrSeq.Add(1))
+	}
+	nerr.CorrelationID = corrID
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"error": map[string]interface{}{
-			"code":      fmt.Sprintf("%d", code),
-			"category":  category,
-			"message":   message,
-			"retryable": code >= 500,
-		},
-	})
+	w.Header().Set("X-Correlation-ID", corrID)
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{"error": nerr})
+}
+
+// canonicalErrorCategory maps a machine-readable gateway code onto the closed
+// contract §3 category enum. Unknown codes fail closed to INTERNAL_FAILURE
+// (the code itself stays on the envelope for callers).
+func canonicalErrorCategory(code string) nerrors.Category {
+	switch code {
+	case "VALIDATION":
+		return nerrors.CategoryValidation
+	case "AUTH", "UNAUTHORIZED":
+		return nerrors.CategoryAuth
+	case "AUTHORIZATION":
+		return nerrors.CategoryAuthorization
+	case "POLICY_DENIED":
+		return nerrors.CategoryPolicyDenied
+	case "APPROVAL_REQUIRED":
+		return nerrors.CategoryApprovalRequired
+	case "RESOURCE_UNAVAILABLE", "RESOURCE_LIMIT":
+		return nerrors.CategoryResourceUnavailable
+	case "TIMEOUT":
+		return nerrors.CategoryTimeout
+	case "DEPENDENCY_FAILURE":
+		return nerrors.CategoryDependencyFailure
+	case "RATE_LIMIT":
+		return nerrors.CategoryRateLimit
+	case "CONFLICT", "INVALID_STATE", "ALREADY_PAUSED", "ALREADY_RUNNING":
+		return nerrors.CategoryConflict
+	case "UNKNOWN_OUTCOME":
+		return nerrors.CategoryUnknownOutcome
+	case "CANCELLATION":
+		return nerrors.CategoryCancellation
+	case "SECURITY_REJECTION", "CONTROL_DISABLED":
+		return nerrors.CategorySecurityRejection
+	case "INTERNAL_FAILURE", "CONTROL_FAILURE":
+		return nerrors.CategoryInternalFailure
+	default:
+		return nerrors.CategoryInternalFailure
+	}
 }

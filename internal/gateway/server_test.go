@@ -530,8 +530,8 @@ func TestAuthMiddlewareBlocksNoKey(t *testing.T) {
 	var resp map[string]map[string]interface{}
 	json.NewDecoder(w.Body).Decode(&resp)
 	if errResp, ok := resp["error"]; ok {
-		if errResp["category"] != "UNAUTHORIZED" {
-			t.Errorf("expected UNAUTHORIZED category, got %v", errResp["category"])
+		if errResp["category"] != "AUTH" {
+			t.Errorf("expected AUTH category, got %v", errResp["category"])
 		}
 	}
 }
