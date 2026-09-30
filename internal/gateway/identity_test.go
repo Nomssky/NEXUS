@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -419,5 +420,82 @@ func TestA6EnforceBizOnlyWithoutAuthenticatorDenied(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 when enforce_biz only without authenticator, got %d", w.Code)
+	}
+}
+
+// TestBasicAuthColonDelimitedIdentity pins the documented Basic form
+// Authorization: Basic base64(actor_id:credential) (docs/http-gateway.md) for
+// identities whose id carries a colon. SCHEMA_COMMON §7 ids are
+// {nx}:{entity_type}:{unique_part}, so splitting the decoded value on the
+// FIRST colon yields "nx" as the identity and the rest as the credential — the
+// default bootstrap identity nx:human:bootstrap could never authenticate.
+// Credentials are opaque and may contain colons too, so every split point is a
+// candidate and the caller takes the first one that verifies.
+//
+// The probe is GET /api/v1/requests/{id}: it is identity-authenticated and
+// business-scoped, needs no registry, and answers 404 for a member asking
+// about an unknown id — so 404 proves both authentication and membership
+// succeeded, while 401 proves authentication failed.
+func TestBasicAuthColonDelimitedIdentity(t *testing.T) {
+	tests := []struct {
+		name       string
+		actorID    string
+		credential string
+	}{
+		{name: "id with two colons", actorID: "nx:human:bootstrap", credential: "secret123"},
+		{name: "credential containing colons", actorID: "nx:human:bootstrap", credential: "pa:ss:word"},
+		{name: "id with one colon", actorID: "nx:human:grace", credential: "grace-secret"},
+		{name: "no colon in either side", actorID: "grace", credential: "grace-secret"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := a6Fixture(t, tc.actorID, tc.credential, "biz-A")
+
+			req := httptest.NewRequest("GET", "/api/v1/requests/basic-auth-probe?business_id=biz-A", nil)
+			req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString(
+				[]byte(tc.actorID+":"+tc.credential)))
+			w := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(w, req)
+
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("basic auth as %q: expected 404 (authenticated member, unknown id), got %d body=%s",
+					tc.actorID, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestBasicAuthWrongCredentialStill401 keeps the failure side of Basic auth on
+// the same envelope as the header form: making the split robust must not open
+// a path that accepts a wrong credential.
+func TestBasicAuthWrongCredentialStill401(t *testing.T) {
+	srv := a6Fixture(t, "nx:human:bootstrap", "secret123", "biz-A")
+
+	req := httptest.NewRequest("GET", "/api/v1/requests/basic-auth-probe?business_id=biz-A", nil)
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString(
+		[]byte("nx:human:bootstrap:wrong")))
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("basic auth with wrong credential: expected 401, got %d body=%s",
+			w.Code, w.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code     string `json:"code"`
+			Category string `json:"category"`
+			Message  string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if payload.Error.Code != "UNAUTHORIZED" || payload.Error.Category != "AUTH" {
+		t.Fatalf("expected UNAUTHORIZED/AUTH envelope, got %+v", payload.Error)
+	}
+	if payload.Error.Message != "invalid credentials" {
+		t.Fatalf("expected invalid credentials, got %q", payload.Error.Message)
 	}
 }

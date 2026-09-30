@@ -119,15 +119,25 @@ func (s *Server) identityMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		actorID, credential, ok := extractActorCredentials(r)
+		candidates, ok := extractActorCredentials(r)
 		if !ok {
 			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
 				"authentication required")
 			return
 		}
 
-		res, err := s.authenticator.Authenticate(actorID, credential)
-		if err != nil || !res.Authenticated {
+		var res identity.AuthResult
+		authenticated := false
+		for _, cand := range candidates {
+			out, err := s.authenticator.Authenticate(cand.identityID, []byte(cand.credential))
+			if err == nil && out.Authenticated {
+				res, authenticated = out, true
+				break
+			}
+		}
+		if !authenticated {
+			// Uniform for every candidate: an unknown id, a wrong credential
+			// and a missplit all answer the same way (F11).
 			s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED",
 				"invalid credentials")
 			return
@@ -144,29 +154,59 @@ func actorFromContext(ctx context.Context) (identity.AuthResult, bool) {
 	return res, ok
 }
 
-// extractActorCredentials pulls actor identity and credential from the request.
-// Supported forms:
+// actorCredential is one candidate (identity, credential) pair decoded from a
+// single credential presentation.
+type actorCredential struct {
+	identityID string
+	credential string
+}
+
+// maxBasicAuthSplits bounds how many colon positions of an Authorization:
+// Basic payload are turned into candidates. The correct split is always the
+// last colon of the identity id, and ids are short ({nx}:{entity_type}:{unique},
+// SCHEMA_COMMON §7), so 16 candidates covers every real id while keeping a
+// header full of colons from turning into an authentication loop.
+const maxBasicAuthSplits = 16
+
+// extractActorCredentials pulls the actor identity and credential from the
+// request. Supported forms:
 //   - X-Actor-ID + X-Actor-Credential headers
 //   - Authorization: Basic base64(actorID:credential)
-func extractActorCredentials(r *http.Request) (string, []byte, bool) {
+//
+// The Basic form is deliberately ambiguous: SCHEMA_COMMON §7 ids contain
+// colons themselves, while credentials are opaque and may contain them too, so
+// no single colon position is a safe separator. Every colon is therefore
+// returned as a candidate and the caller authenticates each until one
+// verifies. The candidate count is a property of the client's own payload, so
+// it discloses nothing about the secret (F11), and a missplit simply fails to
+// verify instead of rejecting a legitimate credential.
+func extractActorCredentials(r *http.Request) ([]actorCredential, bool) {
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Basic ") {
 		raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
 		if err != nil {
-			return "", nil, false
+			return nil, false
 		}
-		parts := strings.SplitN(string(raw), ":", 2)
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return "", nil, false
+		decoded := string(raw)
+		candidates := make([]actorCredential, 0, 4)
+		for i := 0; i < len(decoded) && len(candidates) < maxBasicAuthSplits; i++ {
+			if decoded[i] != ':' {
+				continue
+			}
+			id, credential := decoded[:i], decoded[i+1:]
+			if id == "" || credential == "" {
+				continue
+			}
+			candidates = append(candidates, actorCredential{identityID: id, credential: credential})
 		}
-		return parts[0], []byte(parts[1]), true
+		return candidates, len(candidates) > 0
 	}
 
 	actorID := r.Header.Get("X-Actor-ID")
 	cred := r.Header.Get("X-Actor-Credential")
 	if actorID == "" || cred == "" {
-		return "", nil, false
+		return nil, false
 	}
-	return actorID, []byte(cred), true
+	return []actorCredential{{identityID: actorID, credential: cred}}, true
 }
 
 // authorizeMembership fails closed unless actorID is an active member of
