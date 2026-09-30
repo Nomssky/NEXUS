@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -306,5 +307,32 @@ func TestEntityIDCharsetAcceptsValidIDs(t *testing.T) {
 		if err := ident.Validate(); err != nil {
 			t.Errorf("identity id %q must be accepted, got %v", id, err)
 		}
+	}
+}
+
+// F8: the length bound is a separate failure from the charset rule. Limits are
+// written as literals rather than against maxEntityIDLen so that silently
+// narrowing the constant fails this test.
+func TestEntityIDLengthBound(t *testing.T) {
+	ident := func(id string) Identity {
+		return Identity{
+			ID: id, NexusID: testNexus, Type: TypeHuman, DisplayName: "x",
+			Status: StatusActive, Scope: GlobalScope(),
+			CreatedAt: time.Now().UTC(), SchemaVersion: "1.0.0",
+			EntityType: "identity",
+			Provenance: schema.ProvenanceRef{Origin: "test", Producer: "t", ProducedAt: time.Now().UTC()},
+		}
+	}
+	atLimit := ident(strings.Repeat("a", 128))
+	if err := atLimit.Validate(); err != nil {
+		t.Errorf("128-character id must be accepted, got %v", err)
+	}
+	overLimit := ident(strings.Repeat("a", 129))
+	err := overLimit.Validate()
+	if err == nil {
+		t.Fatal("129-character id must be rejected")
+	}
+	if nerrors.CategoryOf(err) != nerrors.CategoryValidation {
+		t.Errorf("category: want VALIDATION, got %s", nerrors.CategoryOf(err))
 	}
 }

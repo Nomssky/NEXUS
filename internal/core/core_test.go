@@ -3413,3 +3413,40 @@ func TestGovernanceConstraintsSurfacedOnResponse(t *testing.T) {
 		t.Errorf("constraints: want [budget:1000], got %v — the ALLOW_WITH_CONSTRAINTS decision was dropped", result.Constraints)
 	}
 }
+
+// N2 rendering branches: each constraint becomes "type:expression", falling
+// back to whichever half exists, and no outcome other than
+// ALLOW_WITH_CONSTRAINTS may put anything on the Response.
+func TestGovernanceConstraintsRendering(t *testing.T) {
+	full := governance.Decision{
+		Outcome: governance.ALLOW_WITH_CONSTRAINTS,
+		Constraints: []governance.Constraint{
+			{ConstraintID: "c1", ConstraintType: "budget", Expression: "1000"},
+			{ConstraintID: "c2", Expression: "expression-only"},
+			{ConstraintID: "c3", ConstraintType: "type-only"},
+			{ConstraintID: "c4"},
+		},
+	}
+	want := []string{"budget:1000", "expression-only", "type-only", "c4"}
+	got := governanceConstraints(full)
+	if len(got) != len(want) {
+		t.Fatalf("rendered: want %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rendered[%d]: want %q, got %q (full list %v)", i, want[i], got[i], got)
+		}
+	}
+
+	if out := governanceConstraints(governance.Decision{Outcome: governance.ALLOW}); out != nil {
+		t.Errorf("ALLOW must not carry constraints, got %v", out)
+	}
+	if out := governanceConstraints(governance.Decision{
+		Outcome: governance.DENY, Constraints: full.Constraints,
+	}); out != nil {
+		t.Errorf("DENY must not carry constraints, got %v", out)
+	}
+	if out := governanceConstraints(governance.Decision{Outcome: governance.ALLOW_WITH_CONSTRAINTS}); out != nil {
+		t.Errorf("constraint-less ALLOW_WITH_CONSTRAINTS must render empty, got %v", out)
+	}
+}
