@@ -1020,7 +1020,7 @@ func TestChainGovernanceRetryable(t *testing.T) {
 			Precedence: 0,
 		},
 	})
-	err = e.chainGovernance(context.Background(), req)
+	_, err = e.chainGovernance(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected governance error")
 	}
@@ -1045,7 +1045,7 @@ func TestChainGovernanceRetryable(t *testing.T) {
 			Precedence: 0,
 		},
 	})
-	err = e.chainGovernance(context.Background(), req)
+	_, err = e.chainGovernance(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected governance error")
 	}
@@ -1104,7 +1104,7 @@ func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 
 	// Unit: REQUIRE_APPROVAL → APPROVAL_REQUIRED category/code.
 	e.govEngine = governance.NewEngine(requireApproval)
-	err = e.chainGovernance(context.Background(), req)
+	_, err = e.chainGovernance(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected governance error")
 	}
@@ -1124,7 +1124,7 @@ func TestChainGovernanceApprovalRequiredCategory(t *testing.T) {
 
 	// Unit: DENY keeps POLICY_DENIED category (contract: DENY outcome only).
 	e.govEngine = governance.NewEngine(denyAll)
-	err = e.chainGovernance(context.Background(), req)
+	_, err = e.chainGovernance(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected governance error")
 	}
@@ -3360,5 +3360,56 @@ func TestSubmitCapacityFailureIsRetryable(t *testing.T) {
 	}
 	if result.Error.Message != "executor at capacity (0/0)" {
 		t.Errorf("expected wrapped capacity message, got %q", result.Error.Message)
+	}
+}
+
+// TEST-N2: an ALLOW_WITH_CONSTRAINTS decision used to be indistinguishable
+// from a plain ALLOW — the chain gate treated both as "proceed" and
+// decision.Constraints was never read again, so neither the caller nor the
+// policy author could tell that constraints applied. CORE_INTERFACE_CONTRACTS
+// §4.2 defines the governance decision output as `constraints: list[string]`
+// when the outcome is ALLOW_WITH_CONSTRAINTS, and SCHEMA_GOVERNANCE records
+// the same; the Response is where an HTTP caller reads it back.
+func TestGovernanceConstraintsSurfacedOnResponse(t *testing.T) {
+	e, err := NewEngine(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerSimulatedProvider(t, e)
+	e.govEngine.SetPolicies([]*governance.Policy{
+		{
+			PolicyID: "constrained-allow",
+			Name:     "Allow With Budget",
+			Status:   governance.PolicyStatusActive,
+			Effect:   governance.ALLOW_WITH_CONSTRAINTS,
+			Subject:  governance.Subject{SubjectType: "all"},
+			Action:   governance.Action{ActionType: "custom"},
+			Resource: governance.Resource{ResourceType: "all"},
+			Constraints: []governance.Constraint{
+				{ConstraintID: "c-budget", ConstraintType: "budget", Expression: "1000", Severity: "mandatory"},
+			},
+		},
+	})
+
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer e.Stop(ctx)
+
+	req := &Request{
+		ID:      "req-n2-constraints",
+		Context: NewRequestContext("corr-n2", "biz-1", "user-1"),
+		Intent:  "constrained work",
+	}
+	if err := e.SubmitRequest(req); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	result := waitForResult(t, e, req.ID)
+	if result.Status != "completed" {
+		t.Fatalf("ALLOW_WITH_CONSTRAINTS must still complete, got %q (err=%v)", result.Status, result.Error)
+	}
+	if len(result.Constraints) != 1 || result.Constraints[0] != "budget:1000" {
+		t.Errorf("constraints: want [budget:1000], got %v — the ALLOW_WITH_CONSTRAINTS decision was dropped", result.Constraints)
 	}
 }

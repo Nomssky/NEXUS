@@ -135,6 +135,16 @@ type Response struct {
 	// Status is the final status: completed, failed, cancelled, escalated.
 	Status string `json:"status"`
 
+	// Constraints carries the governance constraints when the effective
+	// chain-gate decision was ALLOW_WITH_CONSTRAINTS — CORE_INTERFACE_CONTRACTS
+	// §4.2 defines them as `constraints: list[string]` on the decision output
+	// and SCHEMA_GOVERNANCE records the same. Without them the outcome was
+	// indistinguishable from a plain ALLOW and the policy's intent was
+	// silently dropped (N2). Rendered as `type:expression`. Empty for every
+	// other outcome; enforcement of the values is a governance-execution
+	// milestone — this makes the decision observable, not applied.
+	Constraints []string `json:"constraints,omitempty"`
+
 	// Outcome is the structured outcome of the request.
 	Outcome *Outcome `json:"outcome,omitempty"`
 

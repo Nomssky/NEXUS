@@ -65,6 +65,13 @@ this the whole run window answered `404` — indistinguishable from a typo'd id
 on the endpoint clients are told to poll. `404` therefore means the id was
 never admitted (or its admission was rejected). Poll until `200`.
 
+When the chain-gate governance decision was `ALLOW_WITH_CONSTRAINTS`, the
+terminal result carries `constraints` — `["type:expression", ...]`, e.g.
+`["budget:1000"]` — matching CORE_INTERFACE_CONTRACTS §4.2's decision output
+and the SCHEMA_GOVERNANCE decision record. The values are **reported, not
+enforced**: constraint enforcement is a governance-execution milestone. Every
+other outcome omits the field.
+
 ### POST /api/v1/requests/{id}/cancel
 
 External cancellation of an in-flight request. No body.

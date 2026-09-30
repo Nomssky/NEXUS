@@ -115,9 +115,12 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	}
 	e.chainEmit(req, "chain.hardening.circuit_breaker.ok", "hardening", e.circuitBreaker.State())
 
-	// Step 2: Governance check
-	if err := e.chainGovernance(ctx, req); err != nil {
-		return e.chainError(req, err, StepGovernance, audit, start)
+	// Step 2: Governance check. The decision is kept so an
+	// ALLOW_WITH_CONSTRAINTS outcome can surface its constraints on the
+	// Response (N2) — proceeding on IsAllowing alone discarded them.
+	govDecision, govErr := e.chainGovernance(ctx, req)
+	if govErr != nil {
+		return e.chainError(req, govErr, StepGovernance, audit, start)
 	}
 	audit = append(audit, AuditEntry{
 		Step:      string(StepGovernance),
@@ -577,13 +580,14 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	}
 
 	return &Response{
-		RequestID:  req.ID,
-		BusinessID: req.Context.BusinessID,
-		Status:     status,
-		Outcome:    outcomeResult,
-		Error:      respErr,
-		AuditTrail: audit,
-		Duration:   e.now().Sub(start),
+		RequestID:   req.ID,
+		BusinessID:  req.Context.BusinessID,
+		Status:      status,
+		Constraints: governanceConstraints(govDecision),
+		Outcome:     outcomeResult,
+		Error:       respErr,
+		AuditTrail:  audit,
+		Duration:    e.now().Sub(start),
 	}
 }
 
@@ -709,8 +713,10 @@ func (e *Engine) chainResourceCheck(_ context.Context, _ *Request) (string, erro
 	return fmt.Sprintf("available active=%d/%d", active, max), nil
 }
 
-// chainGovernance checks governance policies.
-func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
+// chainGovernance checks governance policies. It returns the evaluated
+// decision alongside the error so the caller can surface an
+// ALLOW_WITH_CONSTRAINTS decision's constraints (N2).
+func (e *Engine) chainGovernance(_ context.Context, req *Request) (governance.Decision, error) {
 	govReq := governance.Request{
 		Actor:      req.Context.ActorID,
 		Action:     "execute_request",
@@ -728,7 +734,7 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 	}
 	decision := e.govEngine.Evaluate(govReq)
 	if decision.IsAllowing() {
-		return nil
+		return decision, nil
 	}
 	// CORE_INTERFACE_CONTRACTS §3: POLICY_DENIED covers governance outcome
 	// DENY only; a governance REQUIRE_APPROVAL surfaces as category
@@ -762,7 +768,7 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		details = map[string]string{"escalation_ref": escRef}
 		e.emitEscalation(req, escRef, decision.Reason, "chain")
 	}
-	return &ChainError{
+	return decision, &ChainError{
 		Code:      code,
 		Category:  category,
 		Message:   message,
@@ -770,6 +776,31 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) error {
 		ChainStep: string(StepGovernance),
 		Retryable: false,
 	}
+}
+
+// governanceConstraints renders an ALLOW_WITH_CONSTRAINTS decision's
+// constraints as the contract's list[string] (CORE_INTERFACE_CONTRACTS §4.2,
+// SCHEMA_GOVERNANCE decision record). Rendered `type:expression` — the shape
+// request constraints already use ("budget:1000", docs/http-gateway.md).
+// Every other outcome contributes nothing.
+func governanceConstraints(decision governance.Decision) []string {
+	if decision.Outcome != governance.ALLOW_WITH_CONSTRAINTS || len(decision.Constraints) == 0 {
+		return nil
+	}
+	rendered := make([]string, 0, len(decision.Constraints))
+	for _, c := range decision.Constraints {
+		switch {
+		case c.ConstraintType != "" && c.Expression != "":
+			rendered = append(rendered, c.ConstraintType+":"+c.Expression)
+		case c.Expression != "":
+			rendered = append(rendered, c.Expression)
+		case c.ConstraintType != "":
+			rendered = append(rendered, c.ConstraintType)
+		default:
+			rendered = append(rendered, c.ConstraintID)
+		}
+	}
+	return rendered
 }
 
 // chainObjective creates an objective from the request intent.
