@@ -1,0 +1,13 @@
+{
+  "name": "nexus-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Black-box HTTP E2E suite for the NEXUS gateway. Runs the real compiled binary as a child process and talks to it only over HTTP.",
+  "scripts": {
+    "test": "playwright test",
+    "test:report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
