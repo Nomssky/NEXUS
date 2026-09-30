@@ -101,6 +101,38 @@ func (e *Engine) deregisterInflight(requestID string) {
 	delete(e.inflight, requestID)
 }
 
+// PendingInfo describes an admitted request that has not reached a terminal
+// state yet.
+type PendingInfo struct {
+	// BusinessID is the scope the request was submitted under, so a reader
+	// can authorize the same way it does for a stored result.
+	BusinessID string
+	// CorrelationID is the request's correlation chain id, echoed back to a
+	// polling client.
+	CorrelationID string
+}
+
+// Pending reports an admitted, not-yet-terminal request: the window between
+// SubmitRequest admitting the request and the terminal result being stored.
+// ok is false when the id is unknown — never admitted, already finished, or
+// rejected at admission.
+//
+// Results are only written once the chain reaches a terminal state, so
+// without this a running request was indistinguishable from a typo'd id on
+// every read path: GET /api/v1/requests/{id} answered 404 for the entire run
+// (F6). GetResult answers once the result is stored, and the registry entry
+// is removed only after that store — so a read never falls through to
+// not-found for an id that was admitted.
+func (e *Engine) Pending(requestID string) (PendingInfo, bool) {
+	e.inflightMu.RLock()
+	defer e.inflightMu.RUnlock()
+	inf := e.inflight[requestID]
+	if inf == nil {
+		return PendingInfo{}, false
+	}
+	return PendingInfo{BusinessID: inf.businessID, CorrelationID: inf.correlationID}, true
+}
+
 // isCancelRequested reports whether cancellation was requested for requestID.
 func (e *Engine) isCancelRequested(requestID string) bool {
 	e.inflightMu.RLock()

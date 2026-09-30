@@ -579,8 +579,31 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 
 	result, ok := s.engine.GetResult(id)
 	if !ok {
-		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
-		return
+		// F6: results are only stored when the chain reaches a terminal
+		// state, so an admitted request had no result to return and this
+		// endpoint answered 404 for the whole run — indistinguishable from
+		// a typo'd id, over the very path docs/http-gateway.md tells a
+		// client to observe. Known but running → 202 pending.
+		if pending, inFlight := s.engine.Pending(id); inFlight {
+			if pending.BusinessID != businessID {
+				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Correlation-ID", pending.CorrelationID)
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]string{
+				"request_id":     id,
+				"correlation_id": pending.CorrelationID,
+				"status":         "pending",
+			})
+			return
+		}
+		// The result may have landed between the two lookups.
+		if result, ok = s.engine.GetResult(id); !ok {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
+			return
+		}
 	}
 
 	// Enforce scope match

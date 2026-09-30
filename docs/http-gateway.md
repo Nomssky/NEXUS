@@ -18,7 +18,7 @@ The HTTP Gateway (`internal/gateway/`) is the external-facing API layer that mak
 | `GET` | `/ready` | Readiness check — 200 if engine running, 503 otherwise |
 | `GET` | `/status` | Engine status (CREATED, RUNNING, DRAINING, STOPPED) |
 | `POST` | `/api/v1/requests` | Submit a new request |
-| `GET` | `/api/v1/requests/{id}` | Get request result |
+| `GET` | `/api/v1/requests/{id}` | Get request result (`202 pending` while running) |
 | `POST` | `/api/v1/requests/{id}/cancel` | Cancel an in-flight request (E-005) |
 | `GET` | `/events` | SSE stream of events |
 
@@ -42,6 +42,28 @@ Response: `202 Accepted`
   "status": "accepted"
 }
 ```
+
+### GET /api/v1/requests/{id}
+
+Query parameters:
+
+- `business_id` (required) — authorization scope. Missing → `400 VALIDATION` (fail closed).
+
+Authorization mirrors the cancel path: identity middleware, then identity-bound
+membership in `business_id`, then a scope match against the request's recorded
+business (`403 AUTHORIZATION`).
+
+| Status | Category | Body |
+|---|---|---|
+| `200` | — | the terminal result (`completed` / `failed` / `cancelled`) |
+| `202` | — | `{"request_id","correlation_id","status":"pending"}` |
+| `404` | `VALIDATION` | unknown request id |
+
+`202 pending` is returned while the request is admitted but has not reached a
+terminal state. A result is only stored when the chain finishes, so without
+this the whole run window answered `404` — indistinguishable from a typo'd id
+on the endpoint clients are told to poll. `404` therefore means the id was
+never admitted (or its admission was rejected). Poll until `200`.
 
 ### POST /api/v1/requests/{id}/cancel
 

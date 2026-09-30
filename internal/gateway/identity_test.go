@@ -265,8 +265,8 @@ func TestA6MemberAllowedViaHandler(t *testing.T) {
 		if w.Code == http.StatusOK {
 			break
 		}
-		if w.Code != http.StatusNotFound {
-			t.Fatalf("member result: expected 200 or transient 404, got %d body=%s", w.Code, w.Body.String())
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("member result: expected 200 or transient 202 pending, got %d body=%s", w.Code, w.Body.String())
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("member result: timed out waiting for result, last=%d body=%s", w.Code, w.Body.String())
