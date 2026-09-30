@@ -132,7 +132,12 @@ type Response struct {
 	// Used for authorization checks on result retrieval.
 	BusinessID string `json:"business_id"`
 
-	// Status is the final status: completed, failed, cancelled, escalated.
+	// Status is the final status of a stored result: completed, failed or
+	// cancelled — those are the only values executeChain writes (ESCALATE
+	// and REQUIRE_APPROVAL both land on failed with their own error code;
+	// there is no "escalated" terminal status). A Response exists only once
+	// the request is terminal; while it runs the request is registered but
+	// result-less and Engine.Pending reports it (F6: GET answers 202).
 	Status string `json:"status"`
 
 	// Constraints carries the governance constraints when the effective

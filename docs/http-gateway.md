@@ -8,6 +8,41 @@ This document covers the HTTP Gateway implementation.
 
 The HTTP Gateway (`internal/gateway/`) is the external-facing API layer that makes the Core Runtime reachable via HTTP. It provides REST endpoints for submitting requests, querying results, health checks, and Server-Sent Events for real-time streaming.
 
+### Where it listens
+
+The gateway binds `<health-host>:<health-port+1>` by default — with the stock config that is `127.0.0.1:8081`, because the health server owns `8080` first (`cmd/nexus/main.go` `defaultAddr`). Override it with `-http-addr`. The health endpoints (`/health`, `/readiness`) are served by the health server on the health port, not by the gateway; the gateway serves its own `/health` and `/ready`.
+
+```bash
+BASE=http://127.0.0.1:8081
+curl -fsS "$BASE/ready"
+```
+
+### Authentication and business scope
+
+Identity enforcement is **on by default** (`security.require_authentication`,
+`security.enforce_business_scope`) — an unauthenticated call to any scoped
+endpoint gets `401`, and a caller outside the requested `business_id` gets
+`403`. Identify yourself on every call with either:
+
+```http
+X-Actor-ID: nx:human:bootstrap
+X-Actor-Credential: <secret>
+```
+
+or `Authorization: Basic base64(actor_id:credential)`.
+
+On a fresh install the only credential that exists is the one you supply at
+boot (nothing in the API can create the *first* membership):
+
+```bash
+export NEXUS_BOOTSTRAP_CREDENTIAL=$(openssl rand -hex 32)
+go run ./cmd/nexus          # provisions nx:human:bootstrap in business "default"
+```
+
+`business_id` is a **required** query/body parameter on every scoped endpoint:
+missing → `400 VALIDATION`, not a member → `403 AUTHORIZATION`.
+
+
 ---
 
 ## Endpoints

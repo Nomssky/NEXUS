@@ -79,7 +79,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | **G-003** | **FIXED** (identity-bound) | `gateway/server.go` `handleSSE` + `identity.go` | SSE no business-scope filtering — all events leaked | `business_id` **required** (400 if omitted); consumer drops non-matching/unscoped events; when enforcement on, subscriber must be member before stream opens (A6) |
 | **L-001** | **FIXED** | `cmd/nexus/main.go:59-67`, `launcher/launcher.go:45,61` | `controlAPIKey` never wired to gateway | Env `NEXUS_CONTROL_API_KEY` → `launcher.Options.ControlAPIKey` → `gateway.WithControlAPIKey()`; integration tests `TEST-LAUNCH-007/008` |
 
-**Residual R-001 — CLOSED by A6:** `business_id` / `actor_id` are no longer trusted solely as client claims when identity enforcement is on (`security.require_authentication` or `security.enforce_business_scope`). The gateway authenticates the actor (`X-Actor-ID` + `X-Actor-Credential` or Basic auth), validates membership via `foundation/identity.MembershipSet.IsMember`, requires submit `actor_id` to match the authenticated identity, and fails closed on empty/missing membership stores. Multi-business production may open only after credentials and memberships are provisioned (empty authenticator/membership → deny).
+**Residual R-001 — CLOSED by A6:** `business_id` / `actor_id` are no longer trusted solely as client claims when identity enforcement is on (`security.require_authentication` or `security.enforce_business_scope`). The gateway authenticates the actor (`X-Actor-ID` + `X-Actor-Credential` or Basic auth), validates membership via `foundation/identity.MembershipSet.IsMember`, requires submit `actor_id` to match the authenticated identity, and fails closed on empty/missing membership stores. F3 (`93ec4eb`) closed the first-install deadlock: with enforcement on, no API path can create the *first* membership (identity-in-business creation needs an existing member), so `NEXUS_BOOTSTRAP_CREDENTIAL` (env-only, never config) now provisions one bootstrap human identity + business + membership at boot; anything beyond that still requires explicit provisioning (empty authenticator/membership → deny).
 
 ### P1 — High (13 findings)
 
@@ -119,7 +119,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | **G-011** | FIXED | `gateway/server.go:302-306` | SSE write errors silently ignored; consumer always returns nil | Write/flush failures cancel stream cleanly (return nil intentionally so event bus does not re-queue); commit 069049d; covered by `g011_test.go` |
 | **G-012** | FIXED | `gateway/server.go:445-464` | Component statuses hardcoded "active" | Statuses derived from authoritative runtime state (`Status()`/`State()`/`IsRunning()`); no-lifecycle components report `"configured"` (commit 44e73a4); covered by `g012_test.go` |
 | **G-013** | FIXED | `gateway/server.go:141-142` | Non-constant-time API key comparison | `crypto/subtle.ConstantTimeCompare` (Phase D6) |
-| **E-008** | FIXED | `executor/executor.go:443-456` | Provider failure silently masked as "completed" outcome | Provider failure propagates as handler error → status `failed`, `executor.failed` emitted (commit 0c2a94b); covered by `TestProviderFailurePath` |
+| **E-008** | FIXED | `executor/executor.go:720-726` (propagation) + `core/chain.go:527-540` (Step-12 fail-closed) | Provider failure silently masked as "completed" outcome | Provider failure propagates as handler error → status `failed`, `executor.failed` emitted (commit 0c2a94b); the Step-12 fall-through that let *any* non-`completed` executor outcome through as `completed, nil` was closed separately by the no-false-success fix (`d1da765`); covered by `TestProviderFailurePath` |
 | **E-011** | FIXED | `executor/executor_test.go` | No test for provider failure path | `TestProviderFailurePath` + `TestProviderSuccessPath` (Phase C5) |
 | **A-019** | FIXED | `governance/approval.go:60-61` | Self-approval check is weak at RequestApproval stage | Invariant lives in `Approve()` (`SelfApprovalProhibited && approver == requester`); `RequestApproval` is identity prerequisite only; docs clarified + `a019_test.go` (commit 8a5c1d1) |
 | **I-032** | FIXED | `identity/` + `gateway/` | Identity primitives not wired into any runtime gate | CLOSED by A6: `identityMiddleware` in production `Handler()`, membership checks on scoped paths when enforcement on (matches Section 6) |
@@ -162,7 +162,7 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 | G-016 | server.go:84-90 | No MaxHeaderBytes configured — **FIXED** (Phase D D9, verified): `MaxHeaderBytes: 1 << 20` (1 MB header DoS limit, `server.go:177`) |
 | G-017 | server.go:470-477 | Error code is string not int — **REJECTED (contract)**: the common error envelope defines `code: string` ("Machine-readable code", CORE_INTERFACE_CONTRACTS.md §3) — string is the contract; `writeError` renders the HTTP status as that machine-readable string. The integer field in contracts is `status_code` (INTEGRATION_EXTERNAL_CONTRACTS.md), a different field |
 | L-006 | launcher.go:167-173 | Dead code (`defaultAddr`) — **FIXED** (Phase D D2, verified): no `defaultAddr` reference remains in the launcher |
-| L-010 | launcher.go:83 | Gateway goroutine may race with test cleanup — **FIXED** (Phase D D5): `TestStopWaitsForTasks` submits a task and waits on proper signaling |
+| L-010 | `internal/launcher/launcher.go:174` (gateway goroutine; was `launcher.go:83` at audit time — line drifted) | Gateway goroutine may race with test cleanup — **FIXED** (Phase D D5): the regression test is `TestStopWaitsForTasks` in `internal/executor/executor_test.go:629` (a different package from the file above), which submits a task and waits on proper signaling |
 | E-036 | security.go:300-305 | DevResolver has no TTL or rotation — **REJECTED (scope)**: `DevResolver` is a documented dev/test-only in-memory double ("intentionally NOT a production secret store"); `Secret` carries no expiry field and no contract mandates resolver TTL/rotation — adding them would invent requirements for a test affordance |
 
 ---
@@ -203,13 +203,31 @@ The most critical issues found were in the **gateway layer**: broken auth middle
 ### Deferred (Requires Architecture Decision)
 - ~~Identity entity schema (contract defines, code doesn't materialize)~~ **CLOSED (`b6e49b3`)** — Identity/Business/Division records materialized per SCHEMA_IDENTITIES_ORG §2–§4: envelope fields (`schema_version`/`entity_type`/`created_at`/`expires_at`), flat `business_id`/`division_id` reconciled with `scope`, required `provenance` (SCHEMA_COMMON §4), in-memory Registry with lifecycle matrices (revoked/archived terminal), §8 reference rules fail-closed, §9 audit events, gateway CRUD + transitions, and authentication now fails closed without a usable identity record (status/expiry enforced). ~~Durability deferred~~ **Durability DONE (`45391a6`, user decision: registry-only scope + fail-closed boot)** — `storage.data_dir` config (default empty = in-memory, `NEXUS_DATA_DIR` override, blank rejected), atomic FileStore writes (temp + fsync + rename), `OpenRegistry` hydrating Identity/Business/Division and failing closed on corrupt/invalid/mismatched records, write-through ordering persist → memory → publish (store failure leaves registry untouched, no event; CreateDivision rolls the division back if the business write fails); TEST-IDR-08..11, TEST-CONF-STOR-01..05, TEST-APP-PERSIST-01/02, TEST-FS-01. Approvals/escalations/policies remain in-memory (unchanged, separate disposition).
 - Event envelope alignment with an external wire format — **DONE (`ee9c626`, user decision: honest §2.2 projection + `nexus_id`)** — `event.Event` stays the in-process transport; the external boundary (`/events` SSE) now marshals `event.WireRecord` = sourced §2.2 fields only: `nexus_id` stamped from the installation identity (`WithNexusID`, wired from `cfg.Nexus.ID`), `schema_version`/`entity_type`, `event_id`/`event_type`, business/division scope, `occurred_at`+`emitted_at` from the single transport instant, §2.3 producer (`module` = Source), `task_id`, `correlation_id` present even when empty (required — presence honest, value never invented), payload as raw JSON (never base64), priority → contract enum (normal→medium, unknown omitted). **Known gaps recorded (no source on the transport, omitted not fabricated):** `event_version`, `payload_schema`, `provenance`, `actor`, `workflow_id`, `objective_id`, `parent_event_id`, `classification`, `deduplication_key`, `ordering`, `ttl_seconds`, `expires_at`; `occurred_at == emitted_at` (one transport instant, no separate fact-time); contracts stay silent on HTTP response envelopes (no API surface contract exists) and on the webhook payload shape (INTEGRATION §10 outbound record's `payload_schema` fills in when that pipeline is built); TEST-EVT-WIRE-01..03 + TEST-GW-SSE-WIRE-01
-- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — **all five chain stages now wired**: identity/authorization (A, opt-in via `--require-authentication`/`--enforce-business-scope`, default unenforced), POLICY (governance), APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution), resource check (A: executor `Capacity()` gate pre-schedule)
+- Full admission pipeline (IDENTITY → AUTHORIZATION → POLICY → APPROVAL → RESOURCE CHECK) — **all five chain stages now wired**: identity/authorization (A: `security.require_authentication` / `security.enforce_business_scope`, wired to `identityMiddleware` on scoped gateway paths), POLICY (governance), APPROVAL (P1: records at both gates, gateway approve/deny, resume re-execution), resource check (A: executor `Capacity()` gate pre-schedule). **Enforcement is ON by default** — there are no `--require-authentication` / `--enforce-business-scope` CLI flags (an earlier version of this note implied both); `config.Defaults()` sets both flags `true`, production config refuses to turn them off (`config.go:524-528`, rejected with `config.security_unsafe`), the `NEXUS_SECURITY_*` env vars can clear them only outside production, and an empty authenticator or membership store fails closed either way.
 - ~~Condition evaluation in governance (currently a no-op)~~ **CLOSED (B)** — all five contract types (`time`/`scope`/`attribute`/`count`/`composite`, SCHEMA_GOVERNANCE_ATTENTION §2.6) evaluated in `governance/conditions.go` with documented key=value expression grammar; unevaluable conditions fail safe to DENY (never silent pass); TEST-GOV-COND-01..07
 
 ### Accepted Risks
 - Memory write lock for reads (performance concern, correctness is fine) — verified accepted risk: exclusive lock retained to protect Retrieve()'s AccessCount/LastAccessed mutations (counterfactual RLock() raced and lost updates, reverted); remaining concern is serialized read-path performance; covered by `m038_test.go`
 - SHA-256 for credential hashing (documented limitation, not for human passwords)
 - Deterministic model routing (intentional failover, not load balancing)
+
+### Dispositions from the contract-consistency hardening round (`d1da765` … `6aaabab`)
+
+No normative contract was changed by this round. Where a contract was silent or the code and contract disagreed, the choice is recorded here instead of being baked silently into behavior; class codes are the audit's A (implementation bug) / B (stale doc) / D (deferred by design) / E (contract ambiguity) / F (no issue).
+
+| # | Item | Disposition | Class |
+|---|------|-------------|-------|
+| 1 | 404/405 envelope category (F1 `e6a1900`, F10 `4ff1da2`) | CORE §3 has no `NOT_FOUND` category, so a 404 carries code `VALIDATION` with HTTP status 404; `METHOD_NOT_ALLOWED` also maps to `CategoryValidation`. Contract text wins over the intuitive label | E → contract |
+| 2 | `GET /api/v1/requests/{id}` while a request is running (F6 `30bbad2`) | `202` + `{request_id, correlation_id, status:"pending"}` (admitted, not yet stored); `404` unknown id; `403` foreign scope. User decision: surface pending rather than 404 | E → decision |
+| 3 | `ALLOW_WITH_CONSTRAINTS` values reaching the caller (N2 `346f8a2`) | `Response.constraints` carries the contract's `constraints: list[string]` (rendered `type:expression`) — **reported, not enforced**. Enforcement is a governance-execution milestone, deliberately not started here | D |
+| 4 | Event delivery in a core-only embedding (N4, test `8a53dd9`) | Nothing dispatches the membus unless a gateway runs its `dispatchLoop` — documented by design at `gateway/server.go:316-318`; `MemBus.queue` is unbounded so nothing is lost while paused | F (documented) |
+| 5 | Approval config surviving the executor-gate re-evaluation (N3, test `8c5ecf9`) | Verified fixed by the N1 scope-id wiring (`7103371`): `SelfApprovalProhibited` and `ExpiresAt` survive into the core re-eval; the synthetic zero-config fallback remains only as a documented last resort | F |
+| 6 | Caller-supplied entity ids vs SCHEMA_COMMON §7 (F8 `98a9898`) | §7 specifies `{prefix}:{entity_type}:{unique_part}`; enforcement added is **charset + 128-char length + `.`/`..` rejection**, not the full §7 grammar — existing records and tests use ids such as `biz-1`, so strict format enforcement would be a breaking change and stays deferred | E |
+| 7 | `Response.Status` vocabulary (comment fix in `context.go`) | Only `completed` / `failed` / `cancelled` are ever stored. `escalated` was listed as a terminal status in a comment but is mapped to `failed` + `ESALATION_REQUIRED` (decision D3); `REQUIRE_APPROVAL` likewise stores `failed` + `APPROVAL_REQUIRED` | B |
+| 8 | Authentication failure uniformity (F11 `6aaabab`) | Unknown identity and wrong credential now share error text, reason, method and cost (dummy-hash compare), removing the timing oracle over `X-Actor-ID` | A |
+| 9 | Everything else in this round — internal error details (F7), approval-resume backpressure (R-4), model-router read lock (R-3), attention id race (R-1), store corruption fail-closed (F4), cancel re-check (C-5), governance scope ids (N1), default gateway port (F2), env bootstrap (F3), P0 no-false-success (`d1da765`) | Fixed with a regression test each (class A) | A |
+
+**End-to-end evidence (§19, shipped binary `/tmp/opencode/nexus`):** boot with `NEXUS_BOOTSTRAP_CREDENTIAL` → `401` unauthenticated and `401` wrong credential → `202` submit → `202 pending` then `200 completed` on `GET /requests/{id}` → `404` unknown id → `403` foreign `business_id` → control `pause`/`resume` (`401` with a bad key) → still serving 40s later (past the old 30s startup-ctx window, C-1) → clean `SIGTERM` exit 0. Restart on the same `NEXUS_DATA_DIR` re-authenticates from the persisted registry (`identity/nx:human:bootstrap.json` + `business/default.json`).
 
 ---
 
@@ -331,10 +349,12 @@ go.mod unchanged (zero deps confirmed)
 
 ### Phase D: Cleanup — P3/P4: 22 of 29 findings handled ✅ (scoped COMPLETE — 7 residual findings since dispositioned: 5 FIXED post-Phase-D, 2 REJECTED with contract/scope justification)
 
+> **Label warning.** The ids in the table below (`D1`–`D29`) are **Phase-D work orders**. Bare decision labels used elsewhere in this document and in code comments are a *different* series — `(D1, f8a209e)` = additive agent/workflow/task scope-level schema, `(D2, 3a15a2e)` = model-selection intelligence, `(D3, 4266ba3)` = ESCALATE surfacing — and a third set appears in older comments (`dabc4e9` calls ApprovalEngine/ESCALATE "their own contract decisions (D2/D3)"). `D3` is the only label with one consistent meaning (ESCALATE). This collision is a documentation-hygiene defect (class B), not a behavioral one: no code reads these labels.
+
 | Order | Finding | Fix | Status |
 |-------|---------|-----|--------|
 | D1 | C-022 | Remove unused `startCtx` field from Engine | ✅ FIXED |
-| D2 | L-006 | Remove dead `defaultAddr` function + unused `net` import | ✅ FIXED |
+| D2 | L-006 | Remove dead `defaultAddr` function + unused `net` import | ✅ FIXED — the removed function was the unused copy in `launcher.go:167-173`. F2 (`a20a15d`) later **added** a different `defaultAddr` to `cmd/nexus/main.go`, deriving `health.port+1` so the gateway can never collide with the health server (it previously inlined a hard-coded `8080`). Live code, unrelated to L-006's copy. |
 | D3 | E-020 | Add mutex to `ApprovalEngine` | ✅ FIXED |
 | D4 | E-027 | Add mutex to `LocalAuthenticator` | ✅ FIXED |
 | D5 | L-010 | Fix flaky `TestStopWaitsForTasks` (submit task + proper signaling) | ✅ FIXED |
@@ -377,7 +397,7 @@ go.mod unchanged (zero deps confirmed)
 3. ✅ **G-003 FIXED** — SSE business-scope filtering: `business_id` required + A6 membership check at subscribe
 4. ✅ **L-001 FIXED** — API key wired from launcher Options (`NEXUS_CONTROL_API_KEY`) to gateway
 
-**A6 (issue #43):** Identity binding implemented on scoped gateway paths (`submit`, `result`, `SSE`). Multi-business production still requires provisioning credentials + memberships — empty authenticator/membership fails closed.
+**A6 (issue #43):** Identity binding implemented on scoped gateway paths (`submit`, `result`, `SSE`). A fresh install is usable: F3 (`93ec4eb`) provisions the bootstrap identity/business/membership from `NEXUS_BOOTSTRAP_CREDENTIAL` at boot. Any *additional* business still needs provisioning through the org APIs by an existing member — empty authenticator/membership fails closed.
 
 ### Phase B — Correctness (P1): ALL 10 FIXED
 1. ✅ Shutdown timeout (`context.WithTimeout`)
@@ -403,12 +423,12 @@ Dead code removal, mutexes on `ApprovalEngine`/`LocalAuthenticator`, flaky test 
 
 | Metric | Before Audit | After All Phases |
 |--------|-------------|-----------------|
-| **Tests** | 391 | **498** (+107, current incl. post-phase remediation tests) |
+| **Test functions** | 391 | **656** (top-level `func Test*` across the repo; `go test ./... -count=1` green, race/vet/fmt clean, incl. this round's regression tests) |
 | **Race clean** | ✅ | ✅ |
 | **Vet clean** | ✅ | ✅ |
 | **Fmt clean** | ✅ | ✅ |
 | **Zero deps** | ✅ | ✅ |
 | **P0 findings** | 4 open | **0** |
 | **P1 findings** | 13 open | **0** |
-| **Fixes total** | — | **47** (Phases A–D) + subsequent remediation commits (E-008, G-009/010/011/012, M-043, L-002, L-004, C-019, A-019, G-007, C-018 lifecycle race fix — `71ea4145c2850cebb60521309d9eddf691c3c6da` `fix(core): synchronize request admission lifecycle reads`) |
+| **Fixes total** | — | **47** (Phases A–D) + subsequent remediation commits (E-008, G-009/010/011/012, M-043, L-002, L-004, C-019, A-019, G-007, C-018 lifecycle race fix — `71ea4145c2850cebb60521309d9eddf691c3c6da` `fix(core): synchronize request admission lifecycle reads`) + the contract-consistency round `d1da765`…`6aaabab` (P0 no-false-success, F1–F11, C-1–C-5, N1–N4, R-1–R-4 — dispositions in §6) |
 | **Files changed** | — | **19** (+1,850 lines) for Phases A–D; subsequent commits tracked in git |

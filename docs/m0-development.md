@@ -107,13 +107,39 @@ defaults  <  file (JSON)  <  environment
 | `NEXUS_HEALTH_HOST` | bind host (safe default: loopback) | `127.0.0.1` |
 | `NEXUS_HEALTH_PORT` | bind port | `8080` |
 | `NEXUS_SHUTDOWN_TIMEOUT_SECONDS` | graceful drain budget | `30` |
+| `NEXUS_DATA_DIR` | durable-record root (`storage.data_dir`); empty = in-memory | `` |
+| `NEXUS_SECURITY_AUDIT_ENABLED` | security audit trail | `true` |
+| `NEXUS_SECURITY_REQUIRE_AUTHENTICATION` | require an authenticated actor on scoped paths | `true` |
+| `NEXUS_SECURITY_ENFORCE_BUSINESS_SCOPE` | require membership of the requested `business_id` | `true` |
+| `NEXUS_SECURITY_SANDBOX_ENABLED` | isolation sandbox | `true` |
+| `NEXUS_SECURITY_EGRESS_ALLOW_LIST` | outbound egress allow-list (empty = deny-by-default) | `` |
+| `NEXUS_SECURITY_DEV_ALLOW_UNSAFE_OVERRIDES` | dev-only escape hatch (reported in the config snapshot) | `false` |
+| `NEXUS_BOOTSTRAP_BUSINESS` | business the bootstrap identity joins (created if missing) | `default` |
+
+Security enforcement is **on by default**; production configuration refuses to
+start with `require_authentication`, `enforce_business_scope`, `audit_enabled` or
+`sandbox_enabled` turned off (`config.security_unsafe`). Only outside production
+can the `NEXUS_SECURITY_*` variables relax them.
 
 ### Public vs secret configuration
 
 - **Public configuration** (the table above) may be set in files or environment.
 - **Secret configuration** (API keys, passwords, tokens) is **never** stored as a
-  plain configuration value. The foundation defines a `SecretRef` (a pointer such
-  as `vault:nexus/provider/openrouter`) whose resolution is deferred to M1.
+  plain configuration value in a config file — config holds a `SecretRef` (a
+  pointer such as `vault:nexus/provider/openrouter`) instead. Two secrets are
+  read from the environment only, because there is no other way to hand a fresh
+  install its first credential:
+
+  | Variable | Meaning | Empty |
+  |---|---|---|
+  | `NEXUS_CONTROL_API_KEY` | API key for `/api/v1/control/*` | control endpoints answer `403` (fail closed) |
+  | `NEXUS_BOOTSTRAP_CREDENTIAL` | provisions the **first** identity + credential + membership (F3 `93ec4eb`) | with enforcement on, every scoped endpoint stays `401` — logged at startup |
+
+  `NEXUS_BOOTSTRAP_CREDENTIAL` is the only way in on a fresh install: identity
+  creation itself requires an existing member, so without it the org APIs are
+  unreachable. Give it a long random value, e.g.
+  `NEXUS_BOOTSTRAP_CREDENTIAL=$(openssl rand -hex 32)`.
+
   Secrets are never logged; secret-looking log fields are redacted.
 
 ### Startup validation

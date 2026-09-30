@@ -330,7 +330,10 @@ const (
 	// the root directory for durable records (empty = in-memory).
 	EnvDataDir = "NEXUS_DATA_DIR"
 
-	// M1 security keys. These can only tighten or enable defensive behavior.
+	// M1 security keys. Enforcement defaults on (Defaults() sets both true);
+	// outside production they may be relaxed through these variables, while
+	// Validate() forces require_authentication / enforce_business_scope /
+	// audit_enabled / sandbox_enabled back on for production (§18 fail-closed).
 	EnvSecurityAuditEnabled            = "NEXUS_SECURITY_AUDIT_ENABLED"
 	EnvSecurityRequireAuthentication   = "NEXUS_SECURITY_REQUIRE_AUTHENTICATION"
 	EnvSecurityEnforceBusinessScope    = "NEXUS_SECURITY_ENFORCE_BUSINESS_SCOPE"
