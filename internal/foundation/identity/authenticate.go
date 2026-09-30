@@ -159,32 +159,42 @@ func (a *LocalAuthenticator) Register(identityID string, credentialHash string, 
 	return nil
 }
 
+// unknownIdentityHash is what an identity with no verifier is compared
+// against. The unknown-id path therefore performs the same SHA-256 and the
+// same constant-time compare as a known id with a wrong credential — without
+// it the skipped work is a timing oracle for which identity ids exist (F11).
+// It can never authenticate anyone: the !ok branch fails regardless of the
+// comparison result.
+var unknownIdentityHash = security.HashCredential([]byte("nexus:unknown-identity"))
+
 // Authenticate implements Authenticator. It fails closed: unknown identities,
-// empty credentials, and mismatches all return a non-authenticated result with a
-// canonical AUTH error. When a registry is wired, the identity record must also
-// exist and be usable (active, unexpired) — same uniform failure, so the reason
-// never leaks which check failed.
+// empty credentials, mismatches, and unusable records all return a
+// non-authenticated result with the same canonical AUTH error, the same
+// reason and the same method — nothing in the result distinguishes which
+// check failed — and all of them cost the same amount of work.
 func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) (AuthResult, error) {
 	a.mu.RLock()
 	v, ok := a.verifiers[identityID]
 	nowFn := a.now
 	reg := a.registry
 	a.mu.RUnlock()
-	if !ok || len(credential) == 0 {
-		// Uniform failure reason avoids leaking which identities exist.
+
+	// Hash and compare unconditionally: the branch below must not change how
+	// much work an unknown identity costs (F11).
+	expected := unknownIdentityHash
+	if ok {
+		expected = v.hash
+	}
+	matched := security.ConstantTimeEqual(security.HashCredential(credential), expected)
+
+	if !ok || len(credential) == 0 || !matched {
+		// Uniform failure: reason, method and error are identical whatever
+		// the cause, so neither the response nor its cost leaks which
+		// identities exist or which check failed.
 		return AuthResult{
 			Authenticated: false,
 			IdentityID:    identityID,
 			Method:        AuthMethodNone,
-			Reason:        "authentication failed",
-		}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
-	}
-	got := security.HashCredential(credential)
-	if !security.ConstantTimeEqual(got, v.hash) {
-		return AuthResult{
-			Authenticated: false,
-			IdentityID:    identityID,
-			Method:        v.method,
 			Reason:        "authentication failed",
 		}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
 	}
@@ -198,7 +208,7 @@ func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) 
 			return AuthResult{
 				Authenticated: false,
 				IdentityID:    identityID,
-				Method:        v.method,
+				Method:        AuthMethodNone,
 				Reason:        "authentication failed",
 			}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
 		}

@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"sort"
 	"testing"
 	"time"
 
@@ -221,4 +222,82 @@ func TestGovernanceOutcomesDistinct(t *testing.T) {
 	if IsGovernanceOutcome(string(Authorized)) || IsGovernanceOutcome(string(NotAuthorized)) {
 		t.Fatal("authorization results must not collide with governance outcomes")
 	}
+}
+
+// TEST-F11: authentication must not tell an attacker which identity ids
+// exist. Two sub-properties:
+//
+//	uniform failure — an unknown id and a known id with a wrong credential
+//	must produce the same AuthResult (modulo the echoed id) and the same
+//	error, so no field distinguishes "no such identity" from "wrong secret";
+//
+//	uniform cost — the unknown-id path used to return before hashing, so it
+//	skipped a SHA-256 and a constant-time compare. That difference is a
+//	timing oracle for identity existence, probed by replaying guesses.
+func TestAuthenticateLeaksNoIdentityExistence(t *testing.T) {
+	a := NewLocalAuthenticator()
+	const known = "nx:human:known"
+	if err := a.Register(known, security.HashCredential([]byte("right")), AuthMethodPassword); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	guess := []byte("wrong-guess")
+
+	t.Run("uniform failure", func(t *testing.T) {
+		absent, errAbsent := a.Authenticate("nx:human:absent", guess)
+		wrong, errWrong := a.Authenticate(known, guess)
+		if errAbsent == nil || errWrong == nil {
+			t.Fatal("both must fail")
+		}
+		if errAbsent.Error() != errWrong.Error() {
+			t.Errorf("error text differs: %q vs %q", errAbsent, errWrong)
+		}
+		if absent.Authenticated || wrong.Authenticated {
+			t.Fatal("neither may authenticate")
+		}
+		if absent.Reason != wrong.Reason {
+			t.Errorf("reason differs: %q vs %q", absent.Reason, wrong.Reason)
+		}
+		if absent.Method != wrong.Method {
+			t.Errorf("method differs: unknown id gives %q, wrong credential gives %q",
+				absent.Method, wrong.Method)
+		}
+	})
+
+	t.Run("no timing oracle", func(t *testing.T) {
+		const samples = 4000
+		for i := 0; i < 2000; i++ { // warm caches and the allocator
+			_, _ = a.Authenticate("nx:human:absent", guess)
+			_, _ = a.Authenticate(known, guess)
+		}
+		absentD := make([]time.Duration, samples)
+		knownD := make([]time.Duration, samples)
+		for i := 0; i < samples; i++ {
+			// Interleave so scheduler drift affects both series alike.
+			start := time.Now()
+			_, _ = a.Authenticate("nx:human:absent", guess)
+			absentD[i] = time.Since(start)
+			start = time.Now()
+			_, _ = a.Authenticate(known, guess)
+			knownD[i] = time.Since(start)
+		}
+		absentMed, knownMed := medianDuration(absentD), medianDuration(knownD)
+		t.Logf("median unknown=%v known-wrong=%v", absentMed, knownMed)
+		// Both conditions must hold before the test fails, so ordinary
+		// scheduler noise on a sub-microsecond signal cannot flake it: the
+		// gap has to be both proportionally large and absolute. When the
+		// two paths do the same work the gap is ~0 and neither holds.
+		if knownMed > 2*absentMed && knownMed-absentMed > 50*time.Nanosecond {
+			t.Errorf("unknown id is cheaper than a wrong credential: median %v vs %v — one path skips work (timing oracle for identity existence)",
+				absentMed, knownMed)
+		}
+	})
+}
+
+func medianDuration(d []time.Duration) time.Duration {
+	if len(d) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), d...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	return sorted[len(sorted)/2]
 }
