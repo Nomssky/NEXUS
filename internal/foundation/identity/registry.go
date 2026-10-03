@@ -215,15 +215,8 @@ func (r *Registry) persistLocked(record *store.Record) error {
 	if r.st == nil {
 		return nil
 	}
-	prev, err := r.st.Get(record.ID)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("registry: read before persist %q: %w", record.ID, err)
-	}
-	if prev != nil {
-		record.Version = prev.Version
-	}
-	if err := r.st.Put(record); err != nil {
-		return fmt.Errorf("registry: persist %q: %w", record.ID, err)
+	if err := persistRecord(r.st, record); err != nil {
+		return fmt.Errorf("registry: %w", err)
 	}
 	return nil
 }

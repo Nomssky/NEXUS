@@ -67,11 +67,17 @@ func run() int {
 	// Identity binding (A6): pass security flags and foundation identity
 	// components so the gateway enforces authenticated actor + membership on
 	// scoped paths when require_authentication / enforce_business_scope are on.
-	// The authenticator starts empty (fail-closed until credentials are
-	// registered) and is bound to the organization registry, so a credential
-	// only authenticates when the identity record exists and is usable
-	// (active, unexpired). Memberships are the process membership set from app.
-	auth := identity.NewLocalAuthenticator()
+	// The authenticator hydrates the stored verification hashes (never raw
+	// credentials) from the same record store as the registry, so credentials
+	// registered through the API survive a restart, and is bound to the
+	// organization registry, so a credential only authenticates when the
+	// identity record exists and is usable (active, unexpired). Memberships
+	// hydrate from that store inside app.New.
+	auth, err := identity.OpenLocalAuthenticator(a.Store())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "nexus: startup aborted: %s\n", safeMessage(err))
+		return int(lifecycle.ExitFailure)
+	}
 	auth.SetRegistry(a.Registry())
 
 	// F3: with enforcement active a fresh install has no credential and no
@@ -143,10 +149,16 @@ const (
 // requires an existing member), so every scoped endpoint would answer 401
 // forever. When NEXUS_BOOTSTRAP_CREDENTIAL is set it ensures the bootstrap
 // identity, its business and its membership exist, and registers the
-// credential — re-registering on every boot also repairs the in-memory
-// authenticator's credential wipe across restarts (credentials are never
-// persisted; memberships are not persisted either, so the membership is
-// re-added idempotently).
+// credential — re-registering on every boot overwrites the stored hash with
+// the current env value, so rotating NEXUS_BOOTSTRAP_CREDENTIAL takes effect
+// immediately. The membership is re-added idempotently (it is persisted too;
+// the duplicate check makes the second boot a no-op).
+//
+// Note (SCHEMA_IDENTITIES_ORG §10): the env variable is this identity's only
+// *source*, but it is no longer its only *state*. Once a hash has been stored,
+// unsetting NEXUS_BOOTSTRAP_CREDENTIAL on a later boot stops refreshing it —
+// it does not remove it. Revoking or suspending the identity record remains
+// the revocation path, and that record is enforced on every authentication.
 //
 // Posture mirrors NEXUS_CONTROL_API_KEY: the secret is environment-only,
 // never config. With enforcement off, bootstrap is skipped entirely. With
@@ -195,7 +207,8 @@ func bootstrapIdentity(cfg config.Config, log *logging.Logger, reg *identity.Reg
 				"bootstrap business provisioning failed")
 		}
 	}
-	// Idempotent: also repairs the unpersisted membership set after a restart.
+	// Idempotent: after a restart the membership is already hydrated, so this
+	// is a no-op; on a first run it is the write that persists it.
 	if err := members.Add(identity.Membership{
 		IdentityID: bootstrapIdentityID,
 		BusinessID: businessID,
@@ -205,8 +218,9 @@ func bootstrapIdentity(cfg config.Config, log *logging.Logger, reg *identity.Reg
 		return nerrors.Wrap(err, "bootstrap.membership_failed", nerrors.CategoryInternalFailure,
 			"bootstrap membership provisioning failed")
 	}
-	// Idempotent overwrite: re-arm the credential every boot (in-memory
-	// authenticator starts empty after each restart).
+	// Idempotent overwrite: re-arm the credential every boot from the
+	// env-only secret (see the function comment for why this is authoritative
+	// over whatever hash is already stored).
 	if err := auth.Register(bootstrapIdentityID, security.HashCredential([]byte(credential)), identity.AuthMethodPassword); err != nil {
 		return nerrors.Wrap(err, "bootstrap.credential_failed", nerrors.CategoryInternalFailure,
 			"bootstrap credential registration failed")

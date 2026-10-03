@@ -311,4 +311,41 @@ NEXUS Installation (nexus_id)
 
 ---
 
+## 10. Persistence of Credentials and Memberships (ADDENDUM)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–9 are
+unchanged. This section records what `storage.data_dir` makes durable beyond
+the Identity/Business/Division records the sections above define, together with
+the fail-closed hydration rule that durability adds. It creates no new entity,
+no new status and no new event, and neither record type is exposed over HTTP.
+
+### 10.1 Record types
+
+| Store record type | Payload | Record id |
+|---|---|---|
+| `identity` / `business` / `division` | the §2 / §3 / §4 record | entity id |
+| `credential` | `{schema_version, entity_type, identity_id, hash, method}` | `credential:<identity id>` |
+| `membership` | `{schema_version, entity_type, identity_id, memberships: [...]}` | `membership:<identity id>` |
+
+A `memberships` element is the membership object the code already carries:
+`identity_id`, `business_id`, `division_id?`, `role`, `status`. One record per
+identity keeps the payload to a single owner, and the two record ids are
+namespaced by their type because `Store.Get`/`Delete` are keyed by id alone
+across every type — reusing the identity id would shadow the identity record
+in the store's index. The shape mirrors the SCHEMA_COMMON §7
+`{prefix}:{type}:{unique}` convention.
+
+### 10.2 Rules
+
+| Rule | Detail |
+|---|---|
+| No raw secrets | The `credential` record stores a verification hash and the `method` that presents it. The raw credential never reaches the store, a log or a response. |
+| Canonical values only | A `method` outside `{none, password, token, service, device}` is rejected at the write, not deferred to the next boot. |
+| Write-through order | persist → memory. A store failure leaves the in-memory authenticator or membership set untouched; a successful mutation is never memory-only. |
+| Fail-closed hydration | A record that cannot be decoded, that disagrees with its record id, that fails validation, or that carries a non-canonical `method` aborts boot (F4) — boot never continues on a partially restored set. |
+| Bootstrap source | `NEXUS_BOOTSTRAP_CREDENTIAL` remains the only *source* for `nx:human:bootstrap`'s credential, and every boot with the variable set overwrites the stored hash. Unsetting it later stops refreshing that hash rather than removing it: revocation is the identity record's status transition, which the registry-bound authentication check enforces on every call. |
+| Deny by default | `storage.data_dir` unset → all three record types stay in-memory and a restart starts empty, exactly as before. |
+
+---
+
 *This document defines the structural foundation for who exists in NEXUS. Identity is the root; authority is resolved separately.*

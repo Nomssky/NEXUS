@@ -83,7 +83,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | Governance decisions | A `DENY` reaches the client as a terminal `failed` whose `error` carries code/category `POLICY_DENIED`, `chain_step: "governance"`, `retryable: false` and a message naming the matched policy (`matched policy <id> (v<version>, precedence <n>)` — that is how the winning rule is observed). `ALLOW_WITH_CONSTRAINTS` is the only allowing outcome that leaves a mark: the terminal result carries `constraints: ["type:expression"]`, reported and not enforced. A policy pinned to another `business_id` never matches, and `status: "disabled"` is never active. |
 | Approvals | A `REQUIRE_APPROVAL` policy holds the request: terminal `failed` with code/category `APPROVAL_REQUIRED`, `retryable: false` and `error.details.approval_id`. `GET /api/v1/approvals?business_id=` lists only the **pending** records as `{approvals:[{entity_id, requester_id, policy_ref, status:"PENDING", …}]}` (missing `business_id` → `400`, non-member → `403`). `POST /api/v1/approvals/{id}/{approve,deny}?business_id=` requires a non-empty `reason` (`400 VALIDATION`, the §6.2 `decision_rationale`); `approve` → `202 {approval_id, status:"approved"}` and the original request resumes to `completed`, `deny` → `200 {approval_id, status:"denied"}` with **no** resume (the stored result stays `failed`/`APPROVAL_REQUIRED`). The approver must be a member of `business_id`; with `self_approval_prohibited` the requester is refused `403 AUTHORIZATION` (`core: self-approval prohibited`). Unknown id → `404 VALIDATION`. |
 | Escalations | An `ESCALATE` policy fails the request with code `ESCALATION_REQUIRED`, category `POLICY_DENIED` (CORE §3 has no escalation category), `retryable: false` and `error.details.escalation_ref`; the alert is queued asynchronously from the `governance.escalated` event, so `GET /api/v1/escalations?business_id=` must be polled. The record answers `pending → acknowledged → resolved` (`expired` past `deadline`). `POST /api/v1/escalations/{id}/{ack,resolve}?business_id=` requires non-empty `reasoning` (`400 VALIDATION`) and returns `{escalation_id, status, accepted: true}`; an `ack` that is not `pending` or a `resolve` that is not `pending`/`acknowledged` → `409 CONFLICT`. Unknown id → `404`, foreign scope → `403`. |
-| Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json` and `<NEXUS_DATA_DIR>/business/<id>.json`; the bootstrap identity, credential and membership are re-armed on every boot from the environment. |
+| Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json`, `<NEXUS_DATA_DIR>/business/<id>.json`, `<NEXUS_DATA_DIR>/credential/credential:<identity id>.json` and `<NEXUS_DATA_DIR>/membership/membership:<identity id>.json`. The registry, the credential verifiers and the memberships all hydrate on boot and all fail closed on a corrupt record. Record ids are unique store-wide, hence the `<type>:` namespace on the last two. The bootstrap identity's credential is re-armed (overwritten) from `NEXUS_BOOTSTRAP_CREDENTIAL` on every boot; rotating the variable takes effect immediately, unsetting it stops refreshing rather than removing the stored hash. |
 
 ## Coverage
 
@@ -98,7 +98,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | PAUSE/RESUME | `tests/05-control.spec.ts` |
 | SSE | `tests/06-sse.spec.ts` |
 | CANCEL | `tests/07-cancel.spec.ts` |
-| RESTART/PERSISTENCE | `tests/08-restart.spec.ts` |
+| RESTART/PERSISTENCE | `tests/08-restart.spec.ts` (records, credential **and** membership across a restart) |
 | GOVERNANCE | `tests/09-governance.spec.ts` |
 | APPROVAL/ESCALATION | `tests/10-approval.spec.ts` |
 
@@ -141,11 +141,13 @@ timing luck.
   (`503` while paused, `409` on a terminal request). The no-false-success
   invariant for a *provider* failure is still covered by Go tests only; there
   is no configuration surface that makes a provider fail deterministically.
-* **Credentials registered through the API do not survive a restart.** The
-  local authenticator is in-memory only; only the bootstrap identity is
-  re-armed at boot. Their *records* do persist (asserted), their credentials
-  do not.
-* **Memberships are also re-armed only for bootstrap**, for the same reason.
+* **Unsetting `NEXUS_BOOTSTRAP_CREDENTIAL` no longer removes an already-armed
+  bootstrap credential.** The variable is still the only *source* for it, and
+  every boot with it set overwrites the stored hash; but once a hash is on
+  disk a later boot without the variable simply stops refreshing it.
+  Revocation is the identity record's status transition, which authentication
+  enforces on every call (SCHEMA_IDENTITIES_ORG §10.2). Recorded rather than
+  "fixed": it is the direct consequence of making credentials durable.
 * **Approval/escalation state is in-memory only.** `10-approval.spec.ts` drives
   both lifecycles over HTTP, but neither the pending approval index nor the
   escalation queue is written to the file store, so a restart loses them (the

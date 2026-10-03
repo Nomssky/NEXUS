@@ -54,6 +54,9 @@ type App struct {
 	egress  *security.EgressPolicy
 	members *identity.MembershipSet
 	reg     *identity.Registry
+	// st backs registry, credential and membership durability. Nil when
+	// storage.data_dir is empty (in-memory installation).
+	st store.Store
 }
 
 // New loads configuration and constructs an App. It performs startup validation;
@@ -81,9 +84,19 @@ func New(opts Options) (*App, error) {
 		NexusID:  cfg.Nexus.ID,
 	})
 
-	reg, err := openRegistry(cfg)
+	st, reg, err := openStore(cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	// Memberships hydrate from the same store as the registry so a restart
+	// restores "who belongs where" together with "who exists" (fail closed:
+	// a corrupt membership record aborts boot exactly like a corrupt identity).
+	members, err := identity.OpenMembershipSet(st)
+	if err != nil {
+		return nil, nerrors.Internal("app.memberships_hydration_failed",
+			fmt.Sprintf("cannot hydrate memberships from %s: %v", cfg.Storage.DataDir, err)).
+			WithDetail("data_dir", cfg.Storage.DataDir)
 	}
 
 	a := &App{
@@ -92,8 +105,9 @@ func New(opts Options) (*App, error) {
 		log:     log,
 		health:  health.NewServer(),
 		egress:  security.NewEgressPolicy(cfg.Security.EgressAllowList),
-		members: identity.NewMembershipSet(),
+		members: members,
 		reg:     reg,
+		st:      st,
 		life: lifecycle.New(lifecycle.Options{
 			ShutdownTimeout: time.Duration(cfg.Lifecycle.ShutdownTimeoutSeconds) * time.Second,
 		}),
@@ -103,28 +117,32 @@ func New(opts Options) (*App, error) {
 	return a, nil
 }
 
-// openRegistry builds the organization entity registry. Without
-// storage.data_dir it is in-memory only (the historical default). With a
-// data_dir, records persist to a file store and hydrate on boot; any store or
-// hydration failure aborts startup (fail closed — never serve an App whose
-// registry is only partially restored).
-func openRegistry(cfg config.Config) (*identity.Registry, error) {
+// openStore builds the process-wide record store and the organization entity
+// registry on top of it. Without storage.data_dir both are in-memory only (the
+// historical default) and a nil store is returned. With a data_dir, records
+// persist to a file store and hydrate on boot; any store or hydration failure
+// aborts startup (fail closed — never serve an App whose registry is only
+// partially restored).
+//
+// The store is opened exactly once and shared by the registry, the
+// authenticator and the membership set (SCHEMA_IDENTITIES_ORG §10).
+func openStore(cfg config.Config) (store.Store, *identity.Registry, error) {
 	if cfg.Storage.DataDir == "" {
-		return identity.NewRegistry(cfg.Nexus.ID), nil
+		return nil, identity.NewRegistry(cfg.Nexus.ID), nil
 	}
 	st, err := store.NewFileStore(cfg.Storage.DataDir)
 	if err != nil {
-		return nil, nerrors.Internal("app.store_open_failed",
+		return nil, nil, nerrors.Internal("app.store_open_failed",
 			fmt.Sprintf("cannot open record store in %s: %v", cfg.Storage.DataDir, err)).
 			WithDetail("data_dir", cfg.Storage.DataDir)
 	}
 	reg, err := identity.OpenRegistry(cfg.Nexus.ID, st)
 	if err != nil {
-		return nil, nerrors.Internal("app.registry_hydration_failed",
+		return nil, nil, nerrors.Internal("app.registry_hydration_failed",
 			fmt.Sprintf("cannot hydrate registry from %s: %v", cfg.Storage.DataDir, err)).
 			WithDetail("data_dir", cfg.Storage.DataDir)
 	}
-	return reg, nil
+	return st, reg, nil
 }
 
 // Config returns the effective configuration.
@@ -136,9 +154,14 @@ func (a *App) ConfigSnapshot() config.Snapshot { return a.snap }
 // Egress returns the deny-by-default egress policy from configuration.
 func (a *App) Egress() *security.EgressPolicy { return a.egress }
 
-// Memberships returns the (empty at M1) membership set. It is exposed so later
-// milestones can populate it; M1 does not persist memberships.
+// Memberships returns the process membership set, hydrated from the record
+// store when storage.data_dir is configured.
 func (a *App) Memberships() *identity.MembershipSet { return a.members }
+
+// Store returns the record store backing the registry, the authenticator and
+// the membership set. It is nil for an in-memory installation
+// (storage.data_dir unset).
+func (a *App) Store() store.Store { return a.st }
 
 // Registry returns the organization entity registry (Identity/Business/
 // Division, SCHEMA_IDENTITIES_ORG §2–§4), stamped with the installation's

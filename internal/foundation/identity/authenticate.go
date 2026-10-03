@@ -16,12 +16,15 @@
 package identity
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
 // AuthMethod names how an identity was authenticated.
@@ -34,6 +37,22 @@ const (
 	AuthMethodService  AuthMethod = "service"
 	AuthMethodDevice   AuthMethod = "device"
 )
+
+// authMethods is the closed set of AuthMethod values (SCHEMA_IDENTITIES_ORG
+// §10: only these can be stored or hydrated).
+var authMethods = map[AuthMethod]struct{}{
+	AuthMethodNone:     {},
+	AuthMethodPassword: {},
+	AuthMethodToken:    {},
+	AuthMethodService:  {},
+	AuthMethodDevice:   {},
+}
+
+// IsValid reports whether m is one of the canonical methods.
+func (m AuthMethod) IsValid() bool {
+	_, ok := authMethods[m]
+	return ok
+}
 
 // AuthResult is the outcome of an authentication attempt.
 //
@@ -100,6 +119,8 @@ type credentialVerifier struct {
 type LocalAuthenticator struct {
 	mu        sync.RWMutex
 	verifiers map[string]credentialVerifier
+	// st is the optional write-through store (nil = in-memory only).
+	st store.Store
 	// registry, when wired, makes authentication consult the identity record:
 	// a credential alone is not enough — the record must exist and be usable
 	// (status active, not expired). Nil keeps the M1 credential-only posture
@@ -111,12 +132,98 @@ type LocalAuthenticator struct {
 	ttl time.Duration
 }
 
-// NewLocalAuthenticator constructs an empty local authenticator.
+// NewLocalAuthenticator constructs an empty, in-memory-only local
+// authenticator: registered credentials do not survive the process.
 func NewLocalAuthenticator() *LocalAuthenticator {
 	return &LocalAuthenticator{
 		verifiers: map[string]credentialVerifier{},
 		now:       func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// credentialRecord is the stored form of a verifier (SCHEMA_IDENTITIES_ORG
+// §10). It carries the verification hash and how the credential is presented —
+// never the raw credential, which never leaves the caller's hands.
+type credentialRecord struct {
+	SchemaVersion string     `json:"schema_version"`
+	EntityType    string     `json:"entity_type"`
+	IdentityID    string     `json:"identity_id"`
+	Hash          string     `json:"hash"`
+	Method        AuthMethod `json:"method"`
+}
+
+// Stored-envelope stamps for the two record types this package owns beyond
+// the registry's entities (SCHEMA_COMMON §3.1).
+const (
+	credentialSchemaVersion = "1.0.0"
+	entityTypeCredential    = "credential"
+	membershipSchemaVersion = "1.0.0"
+	entityTypeMembership    = "membership"
+)
+
+// Store record ids are unique across the whole store (Store.Get/Delete are
+// keyed by id alone, and FileStore keeps one index for every type), so a
+// credential or membership record cannot reuse its identity's id. Both are
+// therefore namespaced by their type, mirroring the SCHEMA_COMMON §7
+// {prefix}:{type}:{unique} shape with the identity id as the unique part.
+func credentialRecordID(identityID string) string {
+	return entityTypeCredential + ":" + identityID
+}
+
+func membershipRecordID(identityID string) string {
+	return entityTypeMembership + ":" + identityID
+}
+
+// OpenLocalAuthenticator constructs a write-through local authenticator: every
+// Register persists the verification hash, and the stored verifiers are
+// hydrated before OpenLocalAuthenticator returns. Hydration fails closed — a
+// record that cannot be decoded or validated aborts the call so boot never
+// continues on a partially restored authenticator. A nil st degrades to
+// NewLocalAuthenticator.
+//
+// The registry binding is separate (SetRegistry): durability answers "does
+// this hash survive?", the registry answers "is this identity usable?".
+func OpenLocalAuthenticator(st store.Store) (*LocalAuthenticator, error) {
+	a := NewLocalAuthenticator()
+	if st == nil {
+		return a, nil
+	}
+	a.st = st
+	if err := a.hydrate(); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// hydrate loads every stored verification hash into memory. Soft-deleted
+// records are already excluded by the store's List. Call with a fresh
+// authenticator (nothing else holds a reference yet).
+func (a *LocalAuthenticator) hydrate() error {
+	records, err := a.st.List(store.Filter{Type: store.RecordTypeCredential})
+	if err != nil {
+		return fmt.Errorf("auth: hydrate credentials: %w", err)
+	}
+	for _, rec := range records {
+		var c credentialRecord
+		if err := json.Unmarshal(rec.Data, &c); err != nil {
+			return fmt.Errorf("auth: corrupt credential record %q: %w", rec.ID, err)
+		}
+		if credentialRecordID(c.IdentityID) != rec.ID {
+			return fmt.Errorf("auth: credential record %q carries identity_id %q", rec.ID, c.IdentityID)
+		}
+		if strings.TrimSpace(c.IdentityID) == "" || strings.TrimSpace(c.Hash) == "" {
+			return fmt.Errorf("auth: invalid credential record %q", rec.ID)
+		}
+		if !c.Method.IsValid() {
+			return fmt.Errorf("auth: credential record %q carries unknown method %q", rec.ID, c.Method)
+		}
+		a.verifiers[c.IdentityID] = credentialVerifier{
+			identityID: c.IdentityID,
+			hash:       c.Hash,
+			method:     c.Method,
+		}
+	}
+	return nil
 }
 
 // SetClock injects a clock for deterministic tests.
@@ -146,6 +253,10 @@ func (a *LocalAuthenticator) SetRegistry(r *Registry) {
 
 // Register records a verification hash for an identity. The raw credential is
 // hashed by the caller via security.HashCredential and is never stored here.
+//
+// Write-through order matches the registry: persist → memory, so a store
+// failure leaves the authenticator untouched (no credential that exists only
+// in memory). A nil store keeps the historical in-memory-only posture.
 func (a *LocalAuthenticator) Register(identityID string, credentialHash string, method AuthMethod) error {
 	if strings.TrimSpace(identityID) == "" {
 		return nerrors.Validation("auth.identity_required", "identity id is required for authentication registration")
@@ -153,8 +264,29 @@ func (a *LocalAuthenticator) Register(identityID string, credentialHash string, 
 	if strings.TrimSpace(credentialHash) == "" {
 		return nerrors.Validation("auth.credential_hash_required", "credential hash is required")
 	}
+	// Reject at the write rather than at the next boot: an unknown method
+	// would otherwise be persisted happily and then fail hydration closed.
+	if !method.IsValid() {
+		return nerrors.Validation("auth.method_invalid",
+			fmt.Sprintf("auth method %q is not a canonical method", method))
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.st != nil {
+		rec, err := marshalRecord(store.RecordTypeCredential, credentialRecordID(identityID), "", "", credentialRecord{
+			SchemaVersion: credentialSchemaVersion,
+			EntityType:    entityTypeCredential,
+			IdentityID:    identityID,
+			Hash:          credentialHash,
+			Method:        method,
+		})
+		if err != nil {
+			return err
+		}
+		if err := persistRecord(a.st, rec); err != nil {
+			return err
+		}
+	}
 	a.verifiers[identityID] = credentialVerifier{identityID: identityID, hash: credentialHash, method: method}
 	return nil
 }

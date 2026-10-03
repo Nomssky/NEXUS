@@ -37,6 +37,10 @@ const (
 	// Organization records (SCHEMA_IDENTITIES_ORG §3/§4).
 	RecordTypeBusiness RecordType = "business"
 	RecordTypeDivision RecordType = "division"
+	// Authentication and membership records (SCHEMA_IDENTITIES_ORG §10).
+	// The credential record carries a verification hash, never a raw secret.
+	RecordTypeCredential RecordType = "credential"
+	RecordTypeMembership RecordType = "membership"
 )
 
 // RecordStatus tracks the lifecycle state of a stored record.

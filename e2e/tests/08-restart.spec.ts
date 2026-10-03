@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { test, expect } from '../fixtures/test';
 import {
+  actorHeaders,
   bootstrapHeaders,
   expectEnvelope,
   pollResult,
@@ -12,18 +13,21 @@ import {
 /**
  * §14 — restart against the same NEXUS_DATA_DIR.
  *
- * Discovered contract:
+ * Discovered contract (SCHEMA_IDENTITIES_ORG §10 addendum):
  *   - records are persisted by the file store at
- *       <NEXUS_DATA_DIR>/identity/<id>.json and <NEXUS_DATA_DIR>/business/<id>.json
- *   - the bootstrap identity and its membership are re-armed on every boot
- *     from NEXUS_BOOTSTRAP_CREDENTIAL / NEXUS_BOOTSTRAP_BUSINESS, so the same
- *     credential keeps working across a restart;
+ *       <NEXUS_DATA_DIR>/identity/<id>.json and <NEXUS_DATA_DIR>/business/<id>.json,
+ *       plus the namespaced credential/membership records
+ *       <NEXUS_DATA_DIR>/credential/credential:<identity id>.json and
+ *       <NEXUS_DATA_DIR>/membership/membership:<identity id>.json;
+ *   - the bootstrap identity, its credential and its membership are re-armed
+ *     on every boot from NEXUS_BOOTSTRAP_CREDENTIAL / NEXUS_BOOTSTRAP_BUSINESS,
+ *     so the same credential keeps working across a restart;
+ *   - a credential registered through POST /api/v1/identities and the
+ *     membership that call creates are hydrated on the next boot too, so a
+ *     non-bootstrap identity authenticates and reaches scoped endpoints after
+ *     a restart without being re-created;
+ *   - the credential record carries a verification hash, never the raw value;
  *   - the gateway keeps serving authenticated requests afterwards.
- *
- * Known, documented limitation (not asserted here): credentials registered
- * through POST /api/v1/identities live only in the in-process authenticator
- * and are not re-armed at boot, so those identities cannot authenticate after
- * a restart even though their records persist. See e2e/README.md.
  */
 test.describe('RESTART/PERSISTENCE', () => {
   test('data, bootstrap credential and real traffic survive a restart', async ({
@@ -66,6 +70,36 @@ test.describe('RESTART/PERSISTENCE', () => {
     expect(fs.existsSync(secondRecord), `${secondRecord} exists`).toBe(true);
     const parsed = JSON.parse(fs.readFileSync(identityRecord, 'utf8'));
     expect(JSON.stringify(parsed)).toContain(nexus.actorID);
+
+    // The credential and membership written by that same call are on disk,
+    // and the credential file holds the hash rather than the secret.
+    // Record ids are unique store-wide, so both records are namespaced by
+    // their type: <type>:<identity id>.
+    const credentialRecord = path.join(nexus.dataDir, 'credential', `credential:${secondActor}.json`);
+    const membershipRecord = path.join(nexus.dataDir, 'membership', `membership:${secondActor}.json`);
+    expect(fs.existsSync(credentialRecord), `${credentialRecord} exists`).toBe(true);
+    expect(fs.existsSync(membershipRecord), `${membershipRecord} exists`).toBe(true);
+    const credentialRaw = fs.readFileSync(credentialRecord, 'utf8');
+    expect(credentialRaw, 'no raw credential on disk').not.toContain(secondCredential);
+    const credentialOnDisk = JSON.parse(credentialRaw);
+    expect(credentialOnDisk.type).toBe('credential');
+    const credentialPayload = JSON.parse(Buffer.from(credentialOnDisk.data, 'base64').toString('utf8'));
+    expect(credentialPayload.entity_type).toBe('credential');
+    expect(credentialPayload.identity_id).toBe(secondActor);
+    expect(credentialPayload.method).toBe('password');
+    expect(typeof credentialPayload.hash).toBe('string');
+
+    const membershipOnDisk = JSON.parse(fs.readFileSync(membershipRecord, 'utf8'));
+    expect(membershipOnDisk.type).toBe('membership');
+    // One record per identity, so the envelope carries no single business id.
+    expect(membershipOnDisk.business_id ?? '').toBe('');
+    const membershipPayload = JSON.parse(Buffer.from(membershipOnDisk.data, 'base64').toString('utf8'));
+    expect(membershipPayload.entity_type).toBe('membership');
+    expect(membershipPayload.identity_id).toBe(secondActor);
+    expect(
+      membershipPayload.memberships.some((m: any) => m.business_id === nexus.businessID),
+      'the membership this identity was created with is stored',
+    ).toBe(true);
 
     // 3. Restart the real binary on the same data dir and ports.
     await nexus.restart();
@@ -124,10 +158,30 @@ test.describe('RESTART/PERSISTENCE', () => {
     const unauth = await request.get(`${nexus.baseURL}/api/v1/identities/${nexus.actorID}`);
     await expectEnvelope(unauth, 401, 'UNAUTHORIZED', 'AUTH', 'unauth after restart');
 
-    // 9. The second identity's record was hydrated (asserted in step 5), but
-    //    its credential is only ever registered in the in-process
-    //    authenticator, which starts empty on every boot. That is a known,
-    //    documented limitation (e2e/README.md, "Deferred"), so it is
-    //    deliberately not asserted here as either passing or failing.
+    // 9. The identity created before the restart authenticates with its own
+    //    credential — the hash was hydrated, not re-armed from anywhere —
+    //    and reaches a scoped endpoint, which also proves its membership
+    //    hydrated (a credential alone is not enough to pass the scope check).
+    const secondHeaders = actorHeaders(secondActor, secondCredential);
+    const selfRead = await request.get(
+      `${nexus.baseURL}/api/v1/identities/${secondActor}`,
+      { headers: secondHeaders },
+    );
+    expect(selfRead.status(), 'API-registered credential survives a restart').toBe(200);
+    expect((await selfRead.json()).entity_id).toBe(secondActor);
+
+    const scoped = await request.get(
+      `${nexus.baseURL}/api/v1/identities?business_id=${nexus.businessID}`,
+      { headers: secondHeaders },
+    );
+    expect(scoped.status(), 'membership survives a restart').toBe(200);
+
+    // A wrong credential is still rejected after hydration (the stored hash
+    // does not widen what authenticates).
+    const wrong = await request.get(
+      `${nexus.baseURL}/api/v1/identities/${secondActor}`,
+      { headers: actorHeaders(secondActor, `${secondCredential}-wrong`) },
+    );
+    await expectEnvelope(wrong, 401, 'UNAUTHORIZED', 'AUTH', 'wrong credential after restart');
   });
 });
