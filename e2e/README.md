@@ -31,6 +31,7 @@ Useful variables:
 | --- | --- |
 | `E2E_KEEP=1` | keep the per-run `NEXUS_DATA_DIR` under `e2e/.tmp/` for inspection |
 | `DEBUG=1` | Playwright's own debug output for the harness |
+| `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` | skip the browser download: the suite is API-only and never opens a page |
 
 ## How the harness works (`fixtures/nexus.ts`)
 
@@ -55,7 +56,10 @@ Useful variables:
 
    The bootstrap identity (`nx:human:bootstrap`), its credential and its
    membership of `default` are therefore provisioned by the process itself at
-   boot — no test pre-seeds data behind its back.
+   boot — no test pre-seeds data behind its back. `startNexus({extraEnv})`
+   merges additional variables over this table for configuration that only
+   exists at boot (`11-provider-failure.spec.ts`); the harness still owns the
+   credentials.
 4. **Wait for real readiness.** `GET /ready` is polled until it returns
    `200 {"status":"ready"}`, which the gateway only serves while the engine is
    `RUNNING`. Startup failures dump the captured stdout/stderr.
@@ -83,6 +87,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | Governance decisions | A `DENY` reaches the client as a terminal `failed` whose `error` carries code/category `POLICY_DENIED`, `chain_step: "governance"`, `retryable: false` and a message naming the matched policy (`matched policy <id> (v<version>, precedence <n>)` — that is how the winning rule is observed). `ALLOW_WITH_CONSTRAINTS` is the only allowing outcome that leaves a mark: the terminal result carries `constraints: ["type:expression"]`, reported and not enforced. A policy pinned to another `business_id` never matches, and `status: "disabled"` is never active. |
 | Approvals | A `REQUIRE_APPROVAL` policy holds the request: terminal `failed` with code/category `APPROVAL_REQUIRED`, `retryable: false` and `error.details.approval_id`. `GET /api/v1/approvals?business_id=` lists only the **pending** records as `{approvals:[{entity_id, requester_id, policy_ref, status:"PENDING", …}]}` (missing `business_id` → `400`, non-member → `403`). `POST /api/v1/approvals/{id}/{approve,deny}?business_id=` requires a non-empty `reason` (`400 VALIDATION`, the §6.2 `decision_rationale`); `approve` → `202 {approval_id, status:"approved"}` and the original request resumes to `completed`, `deny` → `200 {approval_id, status:"denied"}` with **no** resume (the stored result stays `failed`/`APPROVAL_REQUIRED`). The approver must be a member of `business_id`; with `self_approval_prohibited` the requester is refused `403 AUTHORIZATION` (`core: self-approval prohibited`). Unknown id → `404 VALIDATION`. |
 | Escalations | An `ESCALATE` policy fails the request with code `ESCALATION_REQUIRED`, category `POLICY_DENIED` (CORE §3 has no escalation category), `retryable: false` and `error.details.escalation_ref`; the alert is queued asynchronously from the `governance.escalated` event, so `GET /api/v1/escalations?business_id=` must be polled. The record answers `pending → acknowledged → resolved` (`expired` past `deadline`). `POST /api/v1/escalations/{id}/{ack,resolve}?business_id=` requires non-empty `reasoning` (`400 VALIDATION`) and returns `{escalation_id, status, accepted: true}`; an `ack` that is not `pending` or a `resolve` that is not `pending`/`acknowledged` → `409 CONFLICT`. Unknown id → `404`, foreign scope → `403`. |
+| Provider failure | The launcher seeds `simulated:default` + a `simulated` provider when no model is registered. `NEXUS_SEEDED_PROVIDER_STATUS=offline` starts that provider offline (PROVIDER_CONTRACTS §12); admission is unaffected (`202`) but the request ends `200` with `status:"failed"`, `error.code:"EXECUTION_FAILED"`, `error.category:"INTERNAL_FAILURE"`, `error.chain_step:"agent"`, `error.retryable:false`, a message containing `provider invocation failed` … `provider simulated is offline`, `outcome.metrics.executor_status:"failed"` and an audit trace whose `agent` step reads `status=failed`. It is never `completed` and never carries a summary (no false success). `/ready` and the control plane stay up — the gateway did not fail. Any other value for the variable is a `VALIDATION` boot error. |
 | Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json`, `<NEXUS_DATA_DIR>/business/<id>.json`, `<NEXUS_DATA_DIR>/credential/credential:<identity id>.json` and `<NEXUS_DATA_DIR>/membership/membership:<identity id>.json`. The registry, the credential verifiers and the memberships all hydrate on boot and all fail closed on a corrupt record. Record ids are unique store-wide, hence the `<type>:` namespace on the last two. The bootstrap identity's credential is re-armed (overwritten) from `NEXUS_BOOTSTRAP_CREDENTIAL` on every boot; rotating the variable takes effect immediately, unsetting it stops refreshing rather than removing the stored hash. |
 
 ## Coverage
@@ -101,6 +106,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | RESTART/PERSISTENCE | `tests/08-restart.spec.ts` (records, credential **and** membership across a restart) |
 | GOVERNANCE | `tests/09-governance.spec.ts` |
 | APPROVAL/ESCALATION | `tests/10-approval.spec.ts` |
+| PROVIDER FAILURE | `tests/11-provider-failure.spec.ts` (its own offline gateway; the shared one stays healthy) |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than
@@ -132,15 +138,16 @@ timing luck.
   but the *client-supplied* list has no corresponding decision output, and
   constraint *enforcement* remains out of scope — the decision's values are
   reported, never applied.
-* **No `failed` terminal status is reachable through execution with the default
-  configuration.** Every field `chainValidate` checks is validated by the
-  gateway before admission, `findAgent` provisions an agent on demand, and the
-  launcher seeds `simulated:default` when the model list is empty, so a
-  well-formed request always completes — unless governance denies it, which
-  `09-governance.spec.ts` covers. Admission-level rejection is covered instead
-  (`503` while paused, `409` on a terminal request). The no-false-success
-  invariant for a *provider* failure is still covered by Go tests only; there
-  is no configuration surface that makes a provider fail deterministically.
+* **With the default configuration a well-formed request still always
+  completes.** Every field `chainValidate` checks is validated by the gateway
+  before admission, `findAgent` provisions an agent on demand, and the launcher
+  seeds `simulated:default` when the model list is empty — so `failed` is
+  reachable only by *asking* for it: a governance decision
+  (`09-governance.spec.ts`, `10-approval.spec.ts`) or
+  `NEXUS_SEEDED_PROVIDER_STATUS=offline` (`11-provider-failure.spec.ts`).
+  Admission-level rejection is covered instead (`503` while paused, `409` on a
+  terminal request). Nothing here invents a failure: the provider key only
+  selects an existing health state, and the process keeps serving.
 * **Unsetting `NEXUS_BOOTSTRAP_CREDENTIAL` no longer removes an already-armed
   bootstrap credential.** The variable is still the only *source* for it, and
   every boot with it set overwrites the stored hash; but once a hash is on
@@ -165,7 +172,8 @@ timing luck.
 ## Conventions
 
 * Tests run serially (`fullyParallel: false`, one worker) against one gateway
-  instance per worker; specs are ordered `01`…`10`.
+  instance per worker; specs are ordered `01`…`11`. `11-provider-failure`
+  starts its own gateway because its configuration exists only at boot.
 * Timeouts are bounded everywhere; on failure the harness prints the request
   id, the last response body and the captured NEXUS stdout/stderr so a red run
   is diagnosable without reproducing it by hand.

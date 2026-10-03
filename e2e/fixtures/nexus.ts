@@ -112,6 +112,12 @@ function isFree(port: number): Promise<boolean> {
 interface StartOptions {
   dataDir?: string;
   ports?: { healthPort: number; gatewayPort: number };
+  /**
+   * Extra environment variables for the child process, merged over the
+   * harness defaults. Used for configuration that only exists at boot
+   * (PROVIDER_CONTRACTS §12): the harness still owns the credentials.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 /**
@@ -152,6 +158,7 @@ export async function startNexus(opts: StartOptions = {}): Promise<NexusHandle> 
     NEXUS_LOG_FORMAT: 'json',
     NEXUS_LOG_LEVEL: 'info',
     NEXUS_ENVIRONMENT: 'development',
+    ...(opts.extraEnv ?? {}),
   };
 
   const diagnostics = () =>
