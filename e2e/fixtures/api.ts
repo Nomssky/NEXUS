@@ -137,7 +137,14 @@ export interface StoredResult {
   status: string;
   constraints?: string[];
   outcome?: { summary?: string; artifacts?: string[]; metrics?: Record<string, unknown> };
-  error?: { code?: string; category?: string; message?: string };
+  error?: {
+    code?: string;
+    category?: string;
+    message?: string;
+    retryable?: boolean;
+    chain_step?: string;
+    details?: Record<string, string>;
+  };
   audit_trace?: unknown[];
   duration?: number;
 }
@@ -183,6 +190,53 @@ export async function pollResult(
       `last envelope: ${JSON.stringify(lastEnvelope)}\n` +
       `--- nexus stdout ---\n${nexus.stdout().slice(-4000)}\n` +
       `--- nexus stderr ---\n${nexus.stderr().slice(-4000)}`,
+  );
+}
+
+/**
+ * Policy control surface (contracts/SCHEMA_GOVERNANCE_ATTENTION.md §9).
+ * These are control-plane calls: X-API-Key, never an identity.
+ */
+export async function listPolicies(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+): Promise<APIResponse> {
+  return request.get(`${nexus.baseURL}/api/v1/control/policies`, {
+    headers: controlHeaders(nexus),
+  });
+}
+
+export async function getPolicy(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+  policyID: string,
+): Promise<APIResponse> {
+  return request.get(
+    `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
+    { headers: controlHeaders(nexus) },
+  );
+}
+
+export async function putPolicy(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+  policyID: string,
+  body: Record<string, unknown>,
+): Promise<APIResponse> {
+  return request.put(
+    `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
+    { headers: { ...controlHeaders(nexus), 'Content-Type': 'application/json' }, data: body },
+  );
+}
+
+export async function deletePolicy(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+  policyID: string,
+): Promise<APIResponse> {
+  return request.delete(
+    `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
+    { headers: controlHeaders(nexus) },
   );
 }
 

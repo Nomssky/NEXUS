@@ -79,6 +79,8 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | Cancel | `POST /api/v1/requests/{id}/cancel?business_id=` → `202 {request_id, correlation_id, status:"cancelling"}`; repeat on a `cancelled` result → `202` (idempotent); on a `completed` result → `409 CONFLICT`; unknown id → `404 VALIDATION`; foreign scope on a known id → `403`; missing `business_id` → `400`. |
 | SSE | `GET /events?business_id=` → `200 text/event-stream`, frames `event: <type>\ndata: <json>\n\n`. Missing `business_id` → `400`; non-member → `403`. Frames are the SCHEMA §2.2 Event Record (`schema_version`, `entity_type:"event"`, `event_id`, `event_type`, `nexus_id`, `business_id`, `occurred_at`, `emitted_at`, `producer{…}`, `correlation_id`, `payload`). `chain.*` events carry `correlation_id == request id` and `event_id == "<request id>-<event type>"`. |
 | Identity listing | `GET /api/v1/identities?business_id=` returns identities whose **record** is scoped to that business. The bootstrap record is global-scope (it is created before any business exists) so it is absent from its own business's listing while still being a member of it; it is individually readable at `GET /api/v1/identities/nx:human:bootstrap`. |
+| Policy control | `GET/PUT/DELETE /api/v1/control/policies[/{id}]`, gated by `X-API-Key` (no identity, no membership). The body *is* the §2 Policy Record: `effect` is the enum name (`ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE`), and server-derivable §2.2 fields (`schema_version`, `entity_type`, `nexus_id`, `created_at`, `created_by`, `effective_from`, `policy_version`, `provenance`) are stamped by the gateway. Missing/invalid required field → `400 VALIDATION`. Unknown id → `404 VALIDATION`. The seeded `default-allow` is read-only → `409 CONFLICT`. Policies are process-lifetime state: a restart reloads only the built-in. |
+| Governance decisions | A `DENY` reaches the client as a terminal `failed` whose `error` carries code/category `POLICY_DENIED`, `chain_step: "governance"`, `retryable: false` and a message naming the matched policy (`matched policy <id> (v<version>, precedence <n>)` — that is how the winning rule is observed). `ALLOW_WITH_CONSTRAINTS` is the only allowing outcome that leaves a mark: the terminal result carries `constraints: ["type:expression"]`, reported and not enforced. A policy pinned to another `business_id` never matches, and `status: "disabled"` is never active. |
 | Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json` and `<NEXUS_DATA_DIR>/business/<id>.json`; the bootstrap identity, credential and membership are re-armed on every boot from the environment. |
 
 ## Coverage
@@ -95,6 +97,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | SSE | `tests/06-sse.spec.ts` |
 | CANCEL | `tests/07-cancel.spec.ts` |
 | RESTART/PERSISTENCE | `tests/08-restart.spec.ts` |
+| GOVERNANCE | `tests/09-governance.spec.ts` |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than
@@ -119,27 +122,32 @@ timing luck.
 
 ## Known limitations (recorded, not "fixed" by this suite)
 
-* **Client constraints cannot be observed.** `constraints` in the submit body
-  reaches the executor, but `Response.constraints` is only populated from a
-  governance decision of `ALLOW_WITH_CONSTRAINTS`, and there is no public
-  endpoint (and no configuration surface) that installs a policy. Constraint
-  *enforcement* is intentionally out of scope for this milestone; the suite
-  asserts the result shape but never invents a policy endpoint.
-* **No `failed` terminal status is reachable over HTTP with the default
+* **Client constraints are still not observable.** `constraints` in the submit
+  body reaches the executor, but `Response.constraints` is only populated from
+  a governance decision of `ALLOW_WITH_CONSTRAINTS`. Installing a policy is now
+  possible (`/api/v1/control/policies`, covered by `09-governance.spec.ts`),
+  but the *client-supplied* list has no corresponding decision output, and
+  constraint *enforcement* remains out of scope — the decision's values are
+  reported, never applied.
+* **No `failed` terminal status is reachable through execution with the default
   configuration.** Every field `chainValidate` checks is validated by the
   gateway before admission, `findAgent` provisions an agent on demand, and the
   launcher seeds `simulated:default` when the model list is empty, so a
-  well-formed request always completes. Admission-level rejection is covered
-  instead (`503` while paused, `409` on a terminal request). The no-false-success
-  invariant for a failing provider is covered by Go tests, not by this suite.
+  well-formed request always completes — unless governance denies it, which
+  `09-governance.spec.ts` covers. Admission-level rejection is covered instead
+  (`503` while paused, `409` on a terminal request). The no-false-success
+  invariant for a *provider* failure is still covered by Go tests only; there
+  is no configuration surface that makes a provider fail deterministically.
 * **Credentials registered through the API do not survive a restart.** The
   local authenticator is in-memory only; only the bootstrap identity is
   re-armed at boot. Their *records* do persist (asserted), their credentials
   do not.
 * **Memberships are also re-armed only for bootstrap**, for the same reason.
-* **Approvals, escalations and divisions are not covered.** They have their own
-  semantic contracts (including a deliberately undefined `pending_approval`
-  response state) and this suite does not invent behaviour for them.
+* **Approvals and escalations are not covered.** Their endpoints exist and are
+  contract-defined; this suite does not yet drive them.
+* **Divisions are not covered** — the submit body carries no division field, so
+  a division-pinned policy can never match a request raised through the public
+  API and there is nothing observable to assert.
 * **No coverage of:** TLS/mTLS, multi-instance operation, rate limiting,
   the `failed`/oversized-response (`413 RESOURCE_LIMIT`) path, SSE client
   capacity (`503 RESOURCE_LIMIT`), and `GET /api/v1/control/{metrics,components}`.
@@ -147,7 +155,7 @@ timing luck.
 ## Conventions
 
 * Tests run serially (`fullyParallel: false`, one worker) against one gateway
-  instance per worker; specs are ordered `01`…`08`.
+  instance per worker; specs are ordered `01`…`09`.
 * Timeouts are bounded everywhere; on failure the harness prints the request
   id, the last response body and the captured NEXUS stdout/stderr so a red run
   is diagnosable without reproducing it by hand.
