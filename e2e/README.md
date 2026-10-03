@@ -162,12 +162,27 @@ timing luck.
   already-decided approval also depends on that index: once the resume has
   stored its terminal result the entry is cleaned up and a repeat decision
   answers `404`, not `409`.
+* **Identity lifecycle transitions are probed, not covered — and suspending
+  the only credential-bearing identity is a permanent self-lockout.** The suite
+  never calls `POST /api/v1/identities/{id}/{suspend,revoke,activate}`.
+  Status is enforced at authentication and `bootstrapIdentity` only *creates*
+  `nx:human:bootstrap` when it is missing, so a restart does not undo a
+  suspension: every identity-scoped endpoint answers `401` until the data dir
+  is reset, enforcement is relaxed, or a second identity created first
+  `activate`s it (verified by hand). This is the contract posture
+  (SCHEMA_IDENTITIES_ORG §10.2 — revocation is a status transition); it is
+  recorded because nothing warns the operator. Related open contract question:
+  the contract assigns no authority model to transitions, so the
+  implementation's membership-of-scope rule (any member, no role check) stands
+  unchallenged.
 * **Divisions are not covered** — the submit body carries no division field, so
   a division-pinned policy can never match a request raised through the public
   API and there is nothing observable to assert.
 * **No coverage of:** TLS/mTLS, multi-instance operation, rate limiting,
-  the `failed`/oversized-response (`413 RESOURCE_LIMIT`) path, SSE client
-  capacity (`503 RESOURCE_LIMIT`), and `GET /api/v1/control/{metrics,components}`.
+  the oversized-response (`413 RESOURCE_LIMIT`) path, and SSE client capacity
+  (`503 RESOURCE_LIMIT`). Division records (`POST/GET /api/v1/divisions…`) and
+  `GET /api/v1/control/{metrics,components}` were also checked by hand during
+  the final audit rather than by the suite.
 
 ## Conventions
 

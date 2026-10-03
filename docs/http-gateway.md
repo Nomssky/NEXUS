@@ -47,6 +47,20 @@ missing → `400 VALIDATION`, not a member → `403 AUTHORIZATION`.
 
 ## Endpoints
 
+Every route below is registered in `internal/gateway/server.go`. Two
+authentication groups cover all of them:
+
+* **Identity-scoped** — `/api/v1/requests…`, `/events`, `/api/v1/approvals…`,
+  `/api/v1/escalations…`, `/api/v1/identities…`, `/api/v1/businesses…`,
+  `/api/v1/divisions…`. Authenticated with `X-Actor-ID` + `X-Actor-Credential`
+  (or `Authorization: Basic …`) and, where a `business_id` is involved,
+  membership-checked. `401 UNAUTHORIZED` without credentials, `403
+  AUTHORIZATION` outside the scope. An `X-API-Key` does not authenticate these
+  paths.
+* **Control** — everything under `/api/v1/control/`, key-gated with `X-API-Key`
+  and no identity at all: `403 CONTROL_DISABLED` when no key is configured,
+  `401 UNAUTHORIZED` on a missing or wrong key.
+
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness check — always 200 if server running |
@@ -55,7 +69,36 @@ missing → `400 VALIDATION`, not a member → `403 AUTHORIZATION`.
 | `POST` | `/api/v1/requests` | Submit a new request |
 | `GET` | `/api/v1/requests/{id}` | Get request result (`202 pending` while running) |
 | `POST` | `/api/v1/requests/{id}/cancel` | Cancel an in-flight request (E-005) |
-| `GET` | `/events` | SSE stream of events |
+| `GET` | `/events` | SSE stream of events (scoped: `business_id` required) |
+| `GET` | `/api/v1/approvals` | List the scope's **pending** approvals |
+| `POST` | `/api/v1/approvals/{id}/approve` | Approve and resume the held request |
+| `POST` | `/api/v1/approvals/{id}/deny` | Deny — no resume |
+| `GET` | `/api/v1/escalations` | List the scope's escalation records |
+| `POST` | `/api/v1/escalations/{id}/ack` | Acknowledge an escalation |
+| `POST` | `/api/v1/escalations/{id}/resolve` | Resolve an escalation |
+| `GET` | `/api/v1/identities` | List a business's identities |
+| `POST` | `/api/v1/identities` | Create an identity (+ optional credential, + membership) |
+| `GET` | `/api/v1/identities/{id}` | Read one identity |
+| `POST` | `/api/v1/identities/{id}/suspend` | Suspend an identity |
+| `POST` | `/api/v1/identities/{id}/revoke` | Revoke an identity |
+| `POST` | `/api/v1/identities/{id}/activate` | Reactivate an identity |
+| `GET` | `/api/v1/businesses` | List the businesses the actor belongs to |
+| `POST` | `/api/v1/businesses` | Onboard a business (bootstrap: membership-free) |
+| `GET` | `/api/v1/businesses/{id}` | Read one business |
+| `POST` | `/api/v1/businesses/{id}/suspend` | Suspend a business |
+| `POST` | `/api/v1/businesses/{id}/archive` | Archive a business |
+| `POST` | `/api/v1/businesses/{id}/activate` | Reactivate a business |
+| `GET` | `/api/v1/divisions` | List a business's divisions |
+| `POST` | `/api/v1/divisions` | Create a division of the caller's business |
+| `GET` | `/api/v1/divisions/{id}` | Read one division |
+| `POST` | `/api/v1/divisions/{id}/suspend` | Suspend a division |
+| `POST` | `/api/v1/divisions/{id}/archive` | Archive a division |
+| `POST` | `/api/v1/divisions/{id}/activate` | Reactivate a division |
+| `GET` | `/api/v1/control/status` | Control status, uptime, components, request count |
+| `POST` | `/api/v1/control/pause` | Pause admission |
+| `POST` | `/api/v1/control/resume` | Resume admission |
+| `GET` | `/api/v1/control/metrics` | Executor / backpressure / circuit-breaker / recovery metrics |
+| `GET` | `/api/v1/control/components` | Component states (constructed vs running) |
 | `GET` | `/api/v1/control/policies` | List the effective policy set |
 | `GET` | `/api/v1/control/policies/{id}` | Read one policy record |
 | `PUT` | `/api/v1/control/policies/{id}` | Create or replace one policy record |
@@ -149,6 +192,126 @@ that reaches a terminal state first returns its real state).
 
 Repeat cancels are idempotent: an already-cancelled request returns `202`
 again (never `404`/`409`).
+
+### Approvals — `/api/v1/approvals`
+
+The human surface of a `REQUIRE_APPROVAL` policy: the policy holds the request
+as a terminal `failed` / `APPROVAL_REQUIRED` and puts a record here to decide.
+
+| Method | Path | Success | Notes |
+|---|---|---|---|
+| `GET` | `/api/v1/approvals?business_id=` | `200 {"approvals":[…]}` | **Pending only**; each record carries `entity_id`, `requester_id`, `policy_ref` and the projected `status:"PENDING"` |
+| `POST` | `/api/v1/approvals/{id}/approve?business_id=` | `202 {"approval_id","status":"approved"}` | Accepts first: the resume runs asynchronously, observed on `GET /api/v1/requests/{id}` |
+| `POST` | `/api/v1/approvals/{id}/deny?business_id=` | `200 {"approval_id","status":"denied"}` | No resume — the stored result stays `failed` / `APPROVAL_REQUIRED` |
+
+Decision body: `{"reason":"…"}` — required (SCHEMA_WORK §6.2
+`decision_rationale`).
+
+| Status | Category | When |
+|---|---|---|
+| `400` | `VALIDATION` | `business_id` missing, malformed body, or empty `reason` (`reason required (decision_rationale)`) |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, self-approval under `self_approval_prohibited`, or an approver outside `approver_ids` |
+| `404` | `VALIDATION` | unknown approval id — also what a repeat decision answers once the resume has stored its terminal result |
+| `409` | `CONFLICT` | `approval not pending` / `approval not resumable`, while the record is still actionable |
+
+### Escalations — `/api/v1/escalations`
+
+The human surface of an `ESCALATE` policy: the request fails with
+`ESCALATION_REQUIRED` / category `POLICY_DENIED` and `error.details.escalation_ref`,
+and the alert is queued asynchronously from the `governance.escalated` event —
+so the list must be **polled**.
+
+| Method | Path | Success | Notes |
+|---|---|---|---|
+| `GET` | `/api/v1/escalations?business_id=` | `200 {"escalations":[…]}` | Records answer `pending → acknowledged → resolved` (`expired` past `deadline`) |
+| `POST` | `/api/v1/escalations/{id}/ack?business_id=` | `200 {"escalation_id","status":"acknowledged","accepted":true}` | only from `pending` |
+| `POST` | `/api/v1/escalations/{id}/resolve?business_id=` | `200 {"escalation_id","status":"resolved","accepted":true}` | from `pending` or `acknowledged` |
+
+Decision body: `{"reasoning":"…"}` — required.
+
+| Status | Category | When |
+|---|---|---|
+| `400` | `VALIDATION` | `business_id` missing, malformed body, or empty `reasoning` |
+| `403` | `AUTHORIZATION` | not a member of `business_id` (foreign scope) |
+| `404` | `VALIDATION` | unknown escalation id |
+| `409` | `CONFLICT` | the record is not in a decidable state (`ack` only from `pending`) |
+
+### Organization records — `/api/v1/{identities,businesses,divisions}`
+
+CRUD and lifecycle transitions over the identity registry
+(`contracts/SCHEMA_IDENTITIES_ORG.md` §2–§4, §9). All three families are
+identity-scoped; the registry is required, so a process started without it
+answers `503 DEPENDENCY_FAILURE` rather than fabricating records.
+
+Common rules:
+
+* **Lists fail closed on scope.** `GET /api/v1/identities` and
+  `GET /api/v1/divisions` require `business_id` (`400 VALIDATION`); with
+  enforcement on, a non-member gets `403`. `GET /api/v1/businesses` takes no
+  parameter and is filtered to the actor's memberships — a non-member simply
+  sees an empty list (no cross-tenant directory).
+* **Creation is membership-bound.** Creating an identity or a division inside
+  a business requires membership in it. Creating a business does not: it is
+  bootstrap and the business does not exist yet.
+* **Foreign scope reads and transitions answer `404`**, not `403` — no
+  cross-tenant existence leak. The same `404 VALIDATION` covers an unknown id.
+* **`POST` returns `200` with the created record** (not `202`, not `201`).
+* Transitions answer `200 {"identity_id"|"business_id"|"division_id","status"}`;
+  an invalid transition or a duplicate is `409 CONFLICT`.
+* System identities cannot be created here: `identity_type: "system"` →
+  `400 VALIDATION` (`system identities are created by the runtime, not via the API`).
+
+> **Caution — self-lockout.** Status is enforced at authentication, and
+> `bootstrapIdentity` only *creates* `nx:human:bootstrap` when it does not
+> exist — so suspending or revoking it is **not** undone by a restart. Create a
+> second active identity first (`POST /api/v1/identities` with a `credential`);
+> that identity can `activate` the bootstrap one again. Without a second
+> identity every identity-scoped endpoint answers `401` until the data
+> directory is reset or enforcement is relaxed. The control API key and the
+> health surface are unaffected.
+>
+> The contract does not assign an authority model to these transitions: the
+> implementation's rule is membership of the record's business scope — any
+> member, no role check. Recorded as an open contract question, not changed.
+
+`POST /api/v1/identities` body: `entity_id?`, `identity_type` (required,
+canonical), `display_name`, `status` (`active`/`pending` only at creation),
+`business_id?`, `division_id?`, `parent_id?`, `expires_at?`, `metadata?`,
+`role?`, `credential?`, `credential_method?` (`token`/`password`/`service`/
+`device`). When `credential` is present it is registered in the same step, the
+identity joins its `business_id` with the given role, and the raw value is
+**never echoed back**; if credential registration fails the identity record is
+rolled back, so no identity exists without the credential the caller asked for.
+
+### Control surface — `/api/v1/control/{status,pause,resume,metrics,components}`
+
+Key-gated (no identity, no membership). See also *Policy control* below, which
+shares the prefix.
+
+| Method | Path | Success |
+|---|---|---|
+| `GET` | `/status` | `200 {status, uptime, components{engine,…}, request_count}` |
+| `POST` | `/pause` | `200 {status:"paused"}`; repeat → `409 ALREADY_PAUSED` |
+| `POST` | `/resume` | `200 {status:"resumed"}`; repeat → `409 ALREADY_RUNNING` |
+| `GET` | `/metrics` | `200 {executor{executed,failed,denied,cancelled,active}, backpressure{queue_size,rejected_count}, circuit_breaker{state}, recovery{failure_count}}` |
+| `GET` | `/components` | `200 {components:[{name,status,type}], count}` |
+
+`/components` reports **authoritative state where one exists** (`engine` → the
+lifecycle state, `circuit_breaker` → its state, `task_executor` →
+`running`/`stopped`) and `configured` for components that are constructed but
+have no start/stop lifecycle — never a blanket "active" claim.
+
+While paused: `GET /ready` → `503`, `POST /api/v1/requests` → `503
+RESOURCE_UNAVAILABLE` (never `202`).
+
+### Server-Sent Events — `/events`
+
+`GET /events?business_id=` → `200 text/event-stream`, frames
+`event: <type>\ndata: <json>\n\n`. `business_id` is **required**
+(`400 VALIDATION`): scoping cannot be bypassed by omitting it, and with
+enforcement on the subscriber must be an active member (`403`). Only events of
+that business scope are delivered. Each frame is the SCHEMA §2.2 Event Record;
+`chain.*` events carry `correlation_id` equal to the request id.
 
 ### Policy control — `/api/v1/control/policies`
 
@@ -284,18 +447,25 @@ not fail. Any other value for the variable is a `VALIDATION` boot error.
 
 ```
 internal/gateway/
-  server.go        HTTP server, routes, handlers
-  server_test.go   15 tests (TEST-GW-001..015)
+  server.go        HTTP server, routes, handlers, control surface, approvals,
+                   escalations, SSE
+  identity.go      identity middleware, credential extraction, scoped-path set
+  org.go           identities / businesses / divisions (SCHEMA_IDENTITIES_ORG
+                   §2–§4, §9 audit)
+  policies.go      policy control surface (SCHEMA_GOVERNANCE_ATTENTION §9)
+  *_test.go        120 tests
 ```
 
 ---
 
 ## Testing
 
-- 15 tests covering health, ready, status, submit, get result, validation, error handling
-- 11 cancellation tests (`TestCancel*`): 400/401/403/404/409 paths, 202
-  acceptance + final state via GET, idempotent repeat, no control API key,
-  additive `executor.cancelled` metrics, unauthenticated attribution
+- 120 tests in the package: health / ready / status / submit / result /
+  validation / error envelopes, cancellation (400/401/403/404/409, idempotent
+  repeat, attribution), identity and scope, approvals, escalations, policy
+  control, organization records, control pause/resume, SSE wire and lifetime
 - Core Runtime tests unchanged and passing
 - Foundation M0–M11 tests unchanged and passing
 - Race detector clean
+- The black-box HTTP suite lives in `e2e/` (46 Playwright tests driving the
+  compiled `cmd/nexus` binary)
