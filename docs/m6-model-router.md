@@ -81,9 +81,32 @@ tokens := router.GetAccounting().TotalTokens()
 
 ---
 
+## Configuration
+
+One key, and only one, feeds back into this layer from configuration:
+
+| Key | Env | Default | Values |
+|---|---|---|---|
+| `models.seeded_provider_status` | `NEXUS_SEEDED_PROVIDER_STATUS` | `""` | `""`, `healthy`, `offline` |
+
+It applies **only to the seed**: when no model is registered the launcher seeds
+`simulated:default` plus a `LocalProvider` named `simulated`, and this key picks
+the health that provider starts in. A registered model or provider is never
+touched. `""` and `healthy` are the shipped behaviour; `offline` makes the seed
+fail at the provider so a terminal `failed` outcome is reachable through the
+public API without registering a real provider. Any other value aborts boot with
+a `VALIDATION` configuration error — a typo must not silently mean `healthy`.
+
+A provider failure ends `status: failed` with `error.code=EXECUTION_FAILED`,
+`error.category=INTERNAL_FAILURE`, `error.chain_step=agent` and
+`outcome.metrics.executor_status=failed`; it is never reported as `completed`
+(no false success, E-008). See `contracts/PROVIDER_CONTRACTS.md` §12.
+
+---
+
 ## Testing
 
-- 22 new tests covering TEST-M6-001..022
+- 22 new tests covering TEST-M6-001..022 (plus TEST-M6-023..030)
 - M0–M5 tests unchanged and passing
 - Race detector clean
 - Locked-layer guard passes (no `contracts/` or `Core/` changes)

@@ -428,4 +428,47 @@ AGENT → TOOL RUNTIME → VALIDATE → AUTHORIZE → SCOPE CHECK → POLICY CHE
 
 ---
 
+## 12. Seeded Simulated Provider (ADDENDUM)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–11 are
+unchanged. This section defines the one configuration surface that makes a
+provider failure reachable through the shipped binary without registering a
+real provider, and pins the observable result of that failure. It adds no
+health state, no error category and no event.
+
+### 12.1 Configuration
+
+| Key | Type | Default | Values |
+|---|---|---|---|
+| `models.seeded_provider_status` (file) / `NEXUS_SEEDED_PROVIDER_STATUS` (env) | string | `""` | `""`, `healthy`, `offline` |
+
+| Rule | Detail |
+|---|---|
+| Applies to the seed only | The launcher seeds `simulated:default` and the `simulated` provider only when no model is registered. A registered model or provider is never touched by this key. |
+| Only the two implemented states are selectable | The simulator implements exactly `healthy` and `offline`; any other value is rejected at startup with a `VALIDATION` configuration error rather than silently meaning `healthy`. |
+| `""` and `healthy` are today's behaviour | The default path is unchanged. |
+| `offline` fails at the provider | `HealthCheck` and `Invoke` return `provider simulated is offline`. Routing bookkeeping and the health registry are unaffected — §4 health states are not repurposed by this key. |
+
+### 12.2 Observable result of a provider failure
+
+A request whose provider is `offline` ends terminal `failed` and never
+`completed` (the no-false-success rule, recorded as E-008 in
+`docs/FULL_SYSTEM_AUDIT.md`):
+
+| Field | Value |
+|---|---|
+| `status` | `failed` |
+| `error.code` | `EXECUTION_FAILED` |
+| `error.category` | `INTERNAL_FAILURE` (CORE §3) |
+| `error.chain_step` | `agent` |
+| `error.retryable` | `false` (CORE §3 allows "Maybe"; the chain resolves it to false) |
+| `error.message` | contains `provider invocation failed` |
+| `outcome.metrics.executor_status` | `failed` |
+
+The governance paths are untouched: `POLICY_DENIED`, `APPROVAL_REQUIRED` and
+`ESCALATION_REQUIRED` keep their own codes and categories and never carry
+`EXECUTION_FAILED`.
+
+---
+
 *This document defines provider abstraction contracts. Failure, reconciliation, and security contracts are in EXTERNAL_FAILURE_RECONCILIATION.md.*

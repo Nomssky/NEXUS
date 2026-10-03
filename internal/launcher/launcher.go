@@ -87,14 +87,27 @@ func New(opts Options) *Launcher {
 	}
 	// Seed the model layer when nothing is registered (docs/m6-model-router.md:
 	// callers register models and providers). The shipped binary has no other
-	// registration path — no config surface, no API endpoint — so without a
-	// seed every request fails honestly at model invocation (E-008, no model)
-	// and the documented submit → GET result lifecycle can never reach a
-	// completed terminal state. The seed uses modelrouter's simulated
-	// LocalProvider stub; real inference requires registering real models and
-	// providers per m6 (the warning below keeps the simulation explicit).
+	// registration path — no model API endpoint — so without a seed every
+	// request fails honestly at model invocation (E-008, no model) and the
+	// documented submit → GET result lifecycle can never reach a completed
+	// terminal state. The seed uses modelrouter's simulated LocalProvider
+	// stub; real inference requires registering real models and providers per
+	// m6 (the warning below keeps the simulation explicit).
+	//
+	// The seeded provider's starting health comes from
+	// models.seeded_provider_status (PROVIDER_CONTRACTS §12): ""/"healthy" is
+	// the shipped behaviour, "offline" makes the seed fail at the provider so
+	// a deterministic failed-provider run is reachable without registering a
+	// real provider. Only an existing ProviderStatus is selected here.
 	if engine.ModelRegistry().ModelCount() == 0 {
-		simProvider := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: "simulated"})
+		seedStatus := modelrouter.ProviderStatus(opts.Config.Models.SeededProviderStatus)
+		if seedStatus == "" {
+			seedStatus = modelrouter.ProviderStatusHealthy
+		}
+		simProvider := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{
+			ID:     "simulated",
+			Status: seedStatus,
+		})
 		if regErr := engine.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
 			ID:         "simulated:default",
 			ProviderID: simProvider.Identify(),
@@ -117,6 +130,7 @@ func New(opts Options) *Launcher {
 					Context: map[string]any{
 						"model_id": "simulated:default",
 						"provider": "simulated",
+						"status":   seedStatus,
 						"note":     "simulated execution via LocalProvider stub; register real models per docs/m6-model-router.md for real inference",
 					},
 				})

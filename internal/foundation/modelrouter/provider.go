@@ -26,6 +26,21 @@ type ProviderConfig struct {
 	Headers    map[string]string `json:"headers,omitempty"`
 	Timeout    time.Duration     `json:"timeout"`
 	MaxRetries int               `json:"max_retries"`
+
+	// Status is the health the provider starts in. Empty means healthy. It
+	// selects an existing ProviderStatus value (PROVIDER_CONTRACTS §12) — it
+	// introduces no new state — and is the only way the launcher-seeded
+	// simulator can be started as a deterministic provider failure.
+	Status ProviderStatus `json:"status,omitempty"`
+}
+
+// initialProviderStatus normalizes the configured starting health: an unset
+// status is healthy, exactly as before Status existed.
+func initialProviderStatus(status ProviderStatus) ProviderStatus {
+	if status == "" {
+		return ProviderStatusHealthy
+	}
+	return status
 }
 
 // Provider is the interface that all model providers must implement.
@@ -87,11 +102,12 @@ type LocalProvider struct {
 	mu     sync.RWMutex
 }
 
-// NewLocalProvider creates a new local provider.
+// NewLocalProvider creates a new local provider starting in config.Status
+// (healthy when unset).
 func NewLocalProvider(config ProviderConfig) *LocalProvider {
 	return &LocalProvider{
 		config: config,
-		status: ProviderStatusHealthy,
+		status: initialProviderStatus(config.Status),
 	}
 }
 
@@ -136,11 +152,12 @@ type RemoteProvider struct {
 	mu     sync.RWMutex
 }
 
-// NewRemoteProvider creates a new remote provider.
+// NewRemoteProvider creates a new remote provider starting in config.Status
+// (healthy when unset).
 func NewRemoteProvider(config ProviderConfig) *RemoteProvider {
 	return &RemoteProvider{
 		config: config,
-		status: ProviderStatusHealthy,
+		status: initialProviderStatus(config.Status),
 	}
 }
 

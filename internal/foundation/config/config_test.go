@@ -216,3 +216,90 @@ func TestStorageSnapshotSources(t *testing.T) {
 		t.Fatalf("expected storage source=environment, got %v", src)
 	}
 }
+
+// TEST-CONF-MODEL-01: models.seeded_provider_status defaults to empty, which
+// the launcher seed interprets as healthy — today's behaviour unchanged
+// (PROVIDER_CONTRACTS §12.1).
+func TestSeededProviderStatusDefaultEmpty(t *testing.T) {
+	cfg, err := Load(LoadOptions{Environ: func() []string { return nil }})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models.SeededProviderStatus != "" {
+		t.Fatalf("expected empty seeded_provider_status, got %q", cfg.Models.SeededProviderStatus)
+	}
+}
+
+// TEST-CONF-MODEL-02: models.seeded_provider_status loads from the config file.
+func TestSeededProviderStatusFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"models":{"seeded_provider_status":"offline"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(LoadOptions{FilePath: path, Environ: func() []string { return nil }})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models.SeededProviderStatus != "offline" {
+		t.Fatalf("expected file seeded_provider_status, got %q", cfg.Models.SeededProviderStatus)
+	}
+}
+
+// TEST-CONF-MODEL-03: NEXUS_SEEDED_PROVIDER_STATUS overrides the file
+// (defaults < file < env).
+func TestSeededProviderStatusEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"models":{"seeded_provider_status":"healthy"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(LoadOptions{
+		FilePath: path,
+		Environ:  func() []string { return []string{"NEXUS_SEEDED_PROVIDER_STATUS=offline"} },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Models.SeededProviderStatus != "offline" {
+		t.Fatalf("expected env to beat file, got %q", cfg.Models.SeededProviderStatus)
+	}
+}
+
+// TEST-CONF-MODEL-04: an unimplemented status fails closed with VALIDATION
+// instead of silently meaning healthy — a typo must not disable the very
+// failure the key was set to produce (PROVIDER_CONTRACTS §12.1).
+func TestSeededProviderStatusInvalidRejected(t *testing.T) {
+	_, err := Load(LoadOptions{
+		Environ: func() []string { return []string{"NEXUS_SEEDED_PROVIDER_STATUS=quarantined"} },
+	})
+	if err == nil {
+		t.Fatal("expected validation error for an unimplemented status")
+	}
+	if nerrors.CategoryOf(err) != nerrors.CategoryValidation {
+		t.Fatalf("expected VALIDATION category, got %s", nerrors.CategoryOf(err))
+	}
+}
+
+// TEST-CONF-MODEL-05: snapshot source metadata records where the seed status
+// came from, and the fingerprint covers it like any other effective setting.
+func TestSeededProviderStatusSnapshotSources(t *testing.T) {
+	_, snap, err := LoadSnapshot(LoadOptions{
+		Environ: func() []string { return []string{"NEXUS_SEEDED_PROVIDER_STATUS=offline"} },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if src := snap.Source("models"); src != SourceEnvironment {
+		t.Fatalf("expected models source=environment, got %q", src)
+	}
+	_, base, err := LoadSnapshot(LoadOptions{Environ: func() []string { return nil }})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if snap.Fingerprint() == base.Fingerprint() {
+		t.Fatal("fingerprint must change when the seeded provider status changes")
+	}
+}

@@ -253,6 +253,27 @@ pinned to a narrower scope never match a request submitted through this API.
 Policies are **process-lifetime state**: they are not written to disk, so a
 restart reloads only the seeded `default-allow`.
 
+#### What a provider failure looks like
+
+Admission does not depend on provider health: the request is accepted (`202`)
+and then ends honestly. `NEXUS_SEEDED_PROVIDER_STATUS=offline` starts the
+launcher-seeded `simulated` provider offline (`contracts/PROVIDER_CONTRACTS.md`
+§12; the default is healthy), and `GET /api/v1/requests/{id}` answers:
+
+| Field | Value |
+|---|---|
+| `status` | `failed` — never `completed`, and `outcome.summary` stays empty |
+| `error.code` | `EXECUTION_FAILED` |
+| `error.category` | `INTERNAL_FAILURE` |
+| `error.chain_step` | `agent` |
+| `error.retryable` | `false` |
+| `error.message` | contains `provider invocation failed` … `provider simulated is offline` |
+| `outcome.metrics.executor_status` | `failed` |
+| `audit_trace` | the `agent` step reads `status=failed …`, `verify` reads `status=failed` |
+
+`GET /ready` and the control plane keep answering normally — the gateway did
+not fail. Any other value for the variable is a `VALIDATION` boot error.
+
 ### Headers
 
 - `X-Correlation-ID`: Custom correlation ID (optional, auto-generated if not provided)

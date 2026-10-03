@@ -138,6 +138,7 @@ func fingerprint(c Config) string {
 		Egress      []string `json:"security_egress_allow_list"`
 		Sandbox     bool     `json:"security_sandbox_enabled"`
 		DataDir     string   `json:"storage_data_dir"`
+		SeedStatus  string   `json:"models_seeded_provider_status"`
 	}{
 		NexusID:     c.Nexus.ID,
 		Environment: c.Nexus.Environment,
@@ -154,6 +155,7 @@ func fingerprint(c Config) string {
 		Egress:      egress,
 		Sandbox:     c.Security.SandboxEnabled,
 		DataDir:     c.Storage.DataDir,
+		SeedStatus:  c.Models.SeededProviderStatus,
 	}
 
 	data, err := json.Marshal(canonical)
@@ -219,6 +221,9 @@ func markSources(sources map[string]Source, fc fileConfig, src Source) {
 	if fc.Storage != nil {
 		sources["storage"] = src
 	}
+	if fc.Models != nil {
+		sources["models"] = src
+	}
 }
 
 // markEnvSources records which sections the environment explicitly supplied.
@@ -251,6 +256,9 @@ func markEnvSources(sources map[string]Source, environ []string) {
 	}
 	if mark(EnvDataDir) {
 		sources["storage"] = SourceEnvironment
+	}
+	if mark(EnvSeededProviderStatus) {
+		sources["models"] = SourceEnvironment
 	}
 }
 

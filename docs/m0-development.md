@@ -108,6 +108,7 @@ defaults  <  file (JSON)  <  environment
 | `NEXUS_HEALTH_PORT` | bind port | `8080` |
 | `NEXUS_SHUTDOWN_TIMEOUT_SECONDS` | graceful drain budget | `30` |
 | `NEXUS_DATA_DIR` | durable-record root (`storage.data_dir`); empty = in-memory | `` |
+| `NEXUS_SEEDED_PROVIDER_STATUS` | health of the launcher-seeded simulated provider (`""`/`healthy`/`offline`); `offline` = deterministic provider failure (PROVIDER_CONTRACTS §12) | `` |
 | `NEXUS_SECURITY_AUDIT_ENABLED` | security audit trail | `true` |
 | `NEXUS_SECURITY_REQUIRE_AUTHENTICATION` | require an authenticated actor on scoped paths | `true` |
 | `NEXUS_SECURITY_ENFORCE_BUSINESS_SCOPE` | require membership of the requested `business_id` | `true` |

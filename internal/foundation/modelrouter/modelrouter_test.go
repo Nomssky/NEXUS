@@ -726,3 +726,74 @@ func TestRouterConcurrentInvokeAndRegisterProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TEST-M6-029: ProviderConfig.Status selects the health a provider starts in
+// (PROVIDER_CONTRACTS §12). Unset stays healthy — unchanged behaviour — and
+// "offline" makes both HealthCheck and Invoke fail at the provider, which is
+// the path the executor turns into a terminal failed outcome. No new status
+// value is introduced.
+func TestProviderStartingStatus(t *testing.T) {
+	healthy := NewLocalProvider(ProviderConfig{ID: "p-default"})
+	if err := healthy.HealthCheck(); err != nil {
+		t.Fatalf("unset status must stay healthy, got %v", err)
+	}
+	if _, err := healthy.Invoke(context.Background(), &GenerateRequest{RequestID: "r1"}); err != nil {
+		t.Fatalf("unset status must still invoke, got %v", err)
+	}
+
+	offline := NewLocalProvider(ProviderConfig{ID: "p-offline", Status: ProviderStatusOffline})
+	err := offline.HealthCheck()
+	if err == nil {
+		t.Fatal("expected HealthCheck error for an offline provider")
+	}
+	if !strings.Contains(err.Error(), "offline") {
+		t.Fatalf("expected an offline error, got %q", err.Error())
+	}
+	if _, err := offline.Invoke(context.Background(), &GenerateRequest{RequestID: "r1"}); err == nil {
+		t.Fatal("expected Invoke error for an offline provider")
+	}
+
+	remote := NewRemoteProvider(ProviderConfig{ID: "r-offline", Status: ProviderStatusOffline})
+	if err := remote.HealthCheck(); err == nil {
+		t.Fatal("expected HealthCheck error for an offline remote provider")
+	}
+	if _, err := remote.Invoke(context.Background(), &GenerateRequest{RequestID: "r1"}); err == nil {
+		t.Fatal("expected Invoke error for an offline remote provider")
+	}
+}
+
+// TEST-M6-030: an offline seeded provider fails the router Invoke with a
+// message that still identifies the provider and its state, so the terminal
+// error envelope stays diagnosable end to end.
+func TestInvokeFailsDeterministicallyWhenProviderOffline(t *testing.T) {
+	reg := NewModelRegistry()
+	if err := reg.RegisterModel(&ModelDefinition{
+		ID:         "simulated:default",
+		ProviderID: "simulated",
+		Capabilities: []ModelCapability{
+			CapabilityReasoning,
+			CapabilityToolCalling,
+		},
+		Runtime: RuntimeLocal,
+		Status:  ModelStatusActive,
+	}); err != nil {
+		t.Fatalf("register model: %v", err)
+	}
+	router := NewModelRouter(reg, RoutingPolicyLocalFirst)
+	router.RegisterProvider(NewLocalProvider(ProviderConfig{
+		ID:     "simulated",
+		Status: ProviderStatusOffline,
+	}))
+
+	_, _, err := router.Invoke(context.Background(), &RoutingRequest{
+		RequestID:    "req-offline",
+		RequiredCaps: []ModelCapability{CapabilityReasoning, CapabilityToolCalling},
+		PreferLocal:  true,
+	}, &GenerateRequest{RequestID: "req-offline"})
+	if err == nil {
+		t.Fatal("expected a deterministic provider failure")
+	}
+	if !strings.Contains(err.Error(), "provider simulated is offline") {
+		t.Fatalf("expected the offline cause to surface, got %q", err.Error())
+	}
+}

@@ -42,6 +42,20 @@ type Config struct {
 	Lifecycle LifecycleConfig `json:"lifecycle"`
 	Security  SecurityConfig  `json:"security"`
 	Storage   StorageConfig   `json:"storage"`
+	Models    ModelsConfig    `json:"models"`
+}
+
+// ModelsConfig configures the model layer's seeded simulated provider
+// (PROVIDER_CONTRACTS §12). It exists so a provider failure is reachable
+// through the shipped binary without registering a real provider; it cannot
+// add a health state, an error category or an event.
+type ModelsConfig struct {
+	// SeededProviderStatus is the health the simulated provider starts with
+	// when the launcher seeds it (no model registered). "" and "healthy" keep
+	// the shipped behaviour; "offline" makes every model invocation fail
+	// deterministically. Rejected values abort boot — a typo must not
+	// silently mean "healthy".
+	SeededProviderStatus string `json:"seeded_provider_status"`
 }
 
 // StorageConfig configures durable storage (C05). The default is empty:
@@ -156,6 +170,9 @@ func Defaults() Config {
 		Storage: StorageConfig{
 			DataDir: "", // in-memory records (no durability)
 		},
+		Models: ModelsConfig{
+			SeededProviderStatus: "", // seeded provider starts healthy (PROVIDER_CONTRACTS §12)
+		},
 	}
 }
 
@@ -232,6 +249,9 @@ type fileConfig struct {
 	Storage *struct {
 		DataDir *string `json:"data_dir"`
 	} `json:"storage"`
+	Models *struct {
+		SeededProviderStatus *string `json:"seeded_provider_status"`
+	} `json:"models"`
 }
 
 func loadFile(path string) (fileConfig, error) {
@@ -290,6 +310,9 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	if fc.Storage != nil && fc.Storage.DataDir != nil {
 		cfg.Storage.DataDir = *fc.Storage.DataDir
 	}
+	if fc.Models != nil && fc.Models.SeededProviderStatus != nil {
+		cfg.Models.SeededProviderStatus = *fc.Models.SeededProviderStatus
+	}
 	if fc.Security != nil {
 		s := fc.Security
 		if s.AuditEnabled != nil {
@@ -329,6 +352,12 @@ const (
 	// EnvDataDir overrides storage.data_dir. Non-secret operational setting:
 	// the root directory for durable records (empty = in-memory).
 	EnvDataDir = "NEXUS_DATA_DIR"
+
+	// EnvSeededProviderStatus overrides models.seeded_provider_status: the
+	// health the launcher-seeded simulated provider starts in ("" or
+	// "healthy" = today's behaviour, "offline" = deterministic provider
+	// failure). Non-secret operational setting; PROVIDER_CONTRACTS §12.
+	EnvSeededProviderStatus = "NEXUS_SEEDED_PROVIDER_STATUS"
 
 	// M1 security keys. Enforcement defaults on (Defaults() sets both true);
 	// outside production they may be relaxed through these variables, while
@@ -397,6 +426,9 @@ func applyEnv(cfg *Config, environ []string) error {
 	}
 	if v, ok := envMap[EnvDataDir]; ok {
 		cfg.Storage.DataDir = v
+	}
+	if v, ok := envMap[EnvSeededProviderStatus]; ok {
+		cfg.Models.SeededProviderStatus = v
 	}
 
 	// Security-sensitive environment values fail closed on malformed input: a
@@ -489,6 +521,15 @@ var validLogFormats = map[string]struct{}{
 	"json": {}, "text": {},
 }
 
+// validSeededProviderStatuses is deliberately closed and small: the seeded
+// simulator implements exactly healthy and offline, so any other spelling is
+// a configuration error rather than a silent no-op (PROVIDER_CONTRACTS §12.1).
+var validSeededProviderStatuses = map[string]struct{}{
+	"":        {},
+	"healthy": {},
+	"offline": {},
+}
+
 // Validate checks the effective configuration and returns a canonical
 // VALIDATION error on the first failure. Deterministic and side-effect free.
 func (c Config) Validate() error {
@@ -526,6 +567,11 @@ func (c Config) Validate() error {
 	if c.Lifecycle.ShutdownTimeoutSeconds < 0 {
 		return nerrors.Configuration("config.invalid", "lifecycle.shutdown_timeout_seconds must be >= 0").
 			WithDetail("value", c.Lifecycle.ShutdownTimeoutSeconds)
+	}
+	if !hasKey(validSeededProviderStatuses, c.Models.SeededProviderStatus) {
+		return nerrors.Configuration("config.invalid",
+			fmt.Sprintf("models.seeded_provider_status must be one of %s", keys(validSeededProviderStatuses))).
+			WithDetail("value", c.Models.SeededProviderStatus)
 	}
 	// Security-sensitive configuration fails closed (§18). These checks only
 	// ever reject unsafe combinations; none of them can grant authority.
