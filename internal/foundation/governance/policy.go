@@ -2,8 +2,17 @@ package governance
 
 import (
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 )
+
+// DefaultAllowPolicyID is the built-in policy the runtime seeds at boot.
+// It exists so an unconfigured installation allows requests instead of
+// failing every one on the engine's default-DENY fall-through (§2.8 step 6).
+// The HTTP control surface treats it as read-only (see contracts §9.4).
+const DefaultAllowPolicyID = "default-allow"
 
 // PolicyType classifies what a policy governs.
 type PolicyType string
@@ -29,6 +38,26 @@ const (
 	PolicyStatusDraft    PolicyStatus = "draft"
 	PolicyStatusArchived PolicyStatus = "archived"
 )
+
+// IsValid reports whether the policy type is one of the §2.2 enum values.
+func (t PolicyType) IsValid() bool {
+	switch t {
+	case PolicyTypeAccessControl, PolicyTypeDataGovernance, PolicyTypeModelUsage,
+		PolicyTypeToolUsage, PolicyTypeApprovalPolicy, PolicyTypeRetention,
+		PolicyTypeSecurity, PolicyTypeCompliance, PolicyTypeCustom:
+		return true
+	}
+	return false
+}
+
+// IsValid reports whether the status is one of the §2.2 enum values.
+func (s PolicyStatus) IsValid() bool {
+	switch s {
+	case PolicyStatusActive, PolicyStatusDisabled, PolicyStatusDraft, PolicyStatusArchived:
+		return true
+	}
+	return false
+}
 
 // ScopeLevel represents the hierarchical level of a policy scope.
 // Precedence: SYSTEM_SAFETY > GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK.
@@ -160,6 +189,111 @@ type Policy struct {
 	UpdatedAt         *time.Time `json:"updated_at,omitempty"`
 	CreatedBy         string     `json:"created_by"`
 	ApprovedBy        string     `json:"approved_by,omitempty"`
+	// Provenance is the §2.2 Universal Required origin record
+	// (SCHEMA_COMMON §4). It is evidence of where the policy came from and
+	// is never consulted during evaluation.
+	Provenance schema.ProvenanceRef `json:"provenance"`
+	// Metadata is the §2.2 optional extension map, round-tripped verbatim.
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// subjectTypes, actionTypes and resourceTypes are the §2.3 / §2.4 / §2.5
+// enums. Anything outside them is rejected at the boundary rather than
+// silently never matching (an unknown subject type falls through to a
+// non-match in matchesSubject, which would read as a policy that exists,
+// is active, and does nothing).
+var (
+	subjectTypes = map[string]bool{
+		"identity": true, "agent_type": true, "role": true, "all": true,
+	}
+	actionTypes = map[string]bool{
+		"execute_tool": true, "invoke_model": true, "access_data": true,
+		"create_workflow": true, "approve_action": true, "escalate": true,
+		"custom": true,
+	}
+	resourceTypes = map[string]bool{
+		"data": true, "tool": true, "model": true, "workflow": true,
+		"agent": true, "memory": true, "configuration": true, "all": true,
+	}
+	conditionTypes = map[string]bool{
+		"time": true, "scope": true, "attribute": true, "count": true,
+		"composite": true,
+	}
+)
+
+// Validate checks the §2.2 required fields and the §2.3–§2.7 enums, plus the
+// one conditional requirement §2.2 states: approval_config when the effect is
+// REQUIRE_APPROVAL. Server-derivable §2.2 fields (schema_version, nexus_id,
+// created_at, created_by, provenance, effective_from) are defaulted by the
+// caller before this runs, so they are asserted rather than optional here.
+// Evaluation semantics are untouched — this is a boundary check only.
+func (p *Policy) Validate() error {
+	if p == nil {
+		return fmt.Errorf("policy is required")
+	}
+	if strings.TrimSpace(p.PolicyID) == "" {
+		return fmt.Errorf("policy_id is required")
+	}
+	if p.EntityType != "policy" {
+		return fmt.Errorf("entity_type must be %q", "policy")
+	}
+	if strings.TrimSpace(p.SchemaVersion) == "" {
+		return fmt.Errorf("schema_version is required")
+	}
+	if strings.TrimSpace(p.NexusID) == "" {
+		return fmt.Errorf("nexus_id is required")
+	}
+	if !p.PolicyType.IsValid() {
+		return fmt.Errorf("policy_type must be one of access_control, data_governance, model_usage, tool_usage, approval_workflow, retention, security, compliance, custom")
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		return fmt.Errorf("name is required")
+	}
+	if strings.TrimSpace(p.Description) == "" {
+		return fmt.Errorf("description is required")
+	}
+	if !p.Status.IsValid() {
+		return fmt.Errorf("status must be one of active, disabled, draft, archived")
+	}
+	if !subjectTypes[p.Subject.SubjectType] {
+		return fmt.Errorf("subject.subject_type must be one of identity, agent_type, role, all")
+	}
+	if !actionTypes[p.Action.ActionType] {
+		return fmt.Errorf("action.action_type must be one of execute_tool, invoke_model, access_data, create_workflow, approve_action, escalate, custom")
+	}
+	if !resourceTypes[p.Resource.ResourceType] {
+		return fmt.Errorf("resource.resource_type must be one of data, tool, model, workflow, agent, memory, configuration, all")
+	}
+	if err := ValidateOutcome(p.Effect); err != nil {
+		return err
+	}
+	if p.Effect == REQUIRE_APPROVAL && p.ApprovalConfig == nil {
+		return fmt.Errorf("approval_config is required when effect is REQUIRE_APPROVAL")
+	}
+	for i, c := range p.Conditions {
+		if strings.TrimSpace(c.ConditionID) == "" {
+			return fmt.Errorf("conditions[%d].condition_id is required", i)
+		}
+		if !conditionTypes[c.ConditionType] {
+			return fmt.Errorf("conditions[%d].condition_type must be one of time, scope, attribute, count, composite", i)
+		}
+		if strings.TrimSpace(c.Expression) == "" {
+			return fmt.Errorf("conditions[%d].expression is required", i)
+		}
+	}
+	if p.EffectiveFrom.IsZero() {
+		return fmt.Errorf("effective_from is required")
+	}
+	if p.CreatedAt.IsZero() {
+		return fmt.Errorf("created_at is required")
+	}
+	if strings.TrimSpace(p.CreatedBy) == "" {
+		return fmt.Errorf("created_by is required")
+	}
+	if !p.Provenance.Valid() {
+		return fmt.Errorf("provenance requires origin, producer and produced_at")
+	}
+	return nil
 }
 
 // IsExpired returns true if the policy has passed its effective_until time.

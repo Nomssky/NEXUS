@@ -66,6 +66,42 @@ func (e *Engine) Policies() []*Policy {
 	return out
 }
 
+// PutPolicy creates or replaces the policy with the same policy_id and
+// reports whether it was created. The read-modify-write runs while e.mu is
+// held: a caller-side read (Policies) followed by a bulk write (SetPolicies)
+// would let two concurrent writers drop each other's policy, which for the
+// control API means a policy an operator just set silently never existed.
+// The record itself is replaced by pointer — nothing already handed out is
+// mutated in place, so an in-flight Evaluate keeps reading the policy it
+// matched.
+func (e *Engine) PutPolicy(p *Policy) (created bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, existing := range e.policies {
+		if existing != nil && existing.PolicyID == p.PolicyID {
+			e.policies[i] = p
+			return false
+		}
+	}
+	e.policies = append(e.policies, p)
+	return true
+}
+
+// RemovePolicy deletes the policy with the given id and reports whether one
+// existed. Which policy ids may be removed is the caller's policy: the control
+// API refuses the seeded built-in before reaching here (contracts §9.4).
+func (e *Engine) RemovePolicy(policyID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, existing := range e.policies {
+		if existing != nil && existing.PolicyID == policyID {
+			e.policies = append(e.policies[:i], e.policies[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // Evaluate evaluates a governance request against the loaded policies.
 // It always returns a valid Decision with exactly one of the 5 canonical outcomes.
 //

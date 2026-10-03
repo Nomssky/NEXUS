@@ -425,4 +425,92 @@ Audit Event
 
 ---
 
+## 9. Policy Control HTTP API (ADDENDUM)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–8 are
+unchanged. This section is the smallest contract addition needed to carry the
+§2 Policy Record over the gateway's control plane; the HTTP request/response
+examples live in `docs/http-gateway.md`.
+
+### 9.1 Scope
+
+Before this addendum §2 defined the Policy Record but no transport carried it —
+policies existed only inside the governance engine, seeded at boot. The control
+API makes them externally observable and settable. It does **not** add a sixth
+outcome, a new status, a new category, or a new event.
+
+### 9.2 Endpoints
+
+Authenticated with the control API key (`X-API-Key`), exactly like every other
+`/api/v1/control/*` surface. There is **no second authorization system** and no
+identity/business membership check on these paths — they are not identity-scoped
+API paths.
+
+| Method | Path | Purpose | Success |
+|---|---|---|---|
+| `GET` | `/api/v1/control/policies` | List the full effective policy set | `200 {"policies":[Policy]}` |
+| `GET` | `/api/v1/control/policies/{id}` | Read one policy | `200 Policy` |
+| `PUT` | `/api/v1/control/policies/{id}` | Create **or replace** one policy | `200 {"policy_id","policy_version","status"}` |
+| `DELETE` | `/api/v1/control/policies/{id}` | Remove one policy | `200 {"policy_id","deleted":true}` |
+
+`PUT` is create-or-replace (upsert) on `policy_id` — one route covering both
+cases, because the record identity is the path segment and no partial-update
+semantics exist in §2.
+
+### 9.3 Field disposition (§2.2 conformance)
+
+- The wire body **is** the §2 Policy Record. Every §2.2 field with a §2.3–§2.7
+  sub-record round-trips unchanged.
+- `provenance` (§2.2 required, SCHEMA_COMMON §4): **now represented** on
+  `Policy`. When the client omits it, the gateway stamps it with the standard
+  gateway producer reference (`origin=human`, `producer=gateway:http-api`,
+  `produced_at=now`), the same defaulting rule the identity registry applies.
+  When the client supplies it, it is stored verbatim.
+- `metadata` (§2.2 optional): now represented and round-tripped verbatim.
+- `agent_id` / `workflow_id` / `task_id`: narrower scope identifiers (D1) the
+  engine already honours; additive to §2.2, accepted and round-tripped.
+- Fields the gateway defaults when omitted or zero (all §2.2-required,
+  all server-derivable): `schema_version`, `entity_type="policy"`, `nexus_id`,
+  `created_at`, `created_by` (the authenticated caller), `effective_from`,
+  `policy_version`, `provenance`.
+- Everything the contract marks required and that cannot be derived is rejected
+  with `400 VALIDATION`: `policy_id`, `policy_type` (§2.2 enum), `name`,
+  `description`, `status` (§2.2 enum), `effect` (§2.1 five outcomes),
+  `subject.subject_type` (§2.3 enum), `action.action_type` (§2.4 enum),
+  `resource.resource_type` (§2.5 enum). `approval_config` (§2.7) is required
+  when `effect` is `REQUIRE_APPROVAL`.
+
+### 9.4 Protected built-in policy
+
+The runtime seeds `policy_id = "default-allow"` at boot (global, subject `all`,
+action `custom`, resource `all`, effect `ALLOW`, precedence 0) so an unconfigured
+installation allows requests instead of failing every one on the §2.8 default
+`DENY`. It is a **read-only built-in**: `GET` returns it, `PUT` and `DELETE`
+answer `409 CONFLICT`. This is the explicit, documented rule that satisfies
+"the built-in default-allow policy must never be silently dropped" — it cannot
+be removed or overwritten through the API, so the seeded behaviour of an
+unconfigured installation is preserved by construction.
+
+### 9.5 Evaluation and observability
+
+Evaluation semantics are §2.8 exactly as implemented: restrictiveness
+`DENY > ESCALATE > REQUIRE_APPROVAL > ALLOW_WITH_CONSTRAINTS > ALLOW`, ties by
+higher `precedence`, further ties by narrower scope, no match → `DENY`. The
+chosen policy is observable over HTTP because the `POLICY_DENIED` /
+`APPROVAL_REQUIRED` / `ESCALATION_REQUIRED` error message carries the decision
+reason (`matched policy <policy_id> (v<policy_version>, precedence <n>)`), and an
+`ALLOW_WITH_CONSTRAINTS` decision surfaces as the terminal result's
+`constraints` list (`type:expression`, reported not enforced).
+
+### 9.6 Persistence
+
+Policy records are **not** persisted (no `policy` record type exists). They live
+in the engine for the process lifetime: a restart reloads the seeded built-in
+and drops API-written policies. This is deliberate scope, not an oversight —
+persisting them requires a new store record type plus a hydration rule that
+re-creates `default-allow` first, otherwise a restart silently flips the
+installation to default-`DENY`. Deferred to a follow-up milestone.
+
+---
+
 *This document defines the governance and control domain of NEXUS. Governance is the highest authority. Attention manages interruption. Errors represent failures. Audit provides traceability.*

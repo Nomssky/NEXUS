@@ -20,6 +20,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/scheduler"
+	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/foundation/workflow"
@@ -203,17 +204,40 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	}
 	e.healthServer = health.NewServer()
 
-	// Governance — permissive default policy so the runtime can operate
+	// Governance — permissive default policy so the runtime can operate.
+	// It is a full §2.2 record because the control API reads it back verbatim;
+	// policy_id is the exported DefaultAllowPolicyID so the gateway can
+	// protect it (contracts §9.4) without a magic string. Tests construct the
+	// engine with a nil config, so the installation id is read defensively.
+	seededAt := e.now()
+	seededNexusID := ""
+	if cfg != nil {
+		seededNexusID = cfg.Nexus.ID
+	}
 	e.govEngine = governance.NewEngine([]*governance.Policy{
 		{
-			PolicyID:   "default-allow",
-			Name:       "Default Allow",
-			Status:     governance.PolicyStatusActive,
-			Effect:     governance.ALLOW,
-			Subject:    governance.Subject{SubjectType: "all"},
-			Action:     governance.Action{ActionType: "custom"},
-			Resource:   governance.Resource{ResourceType: "all"},
-			Precedence: 0,
+			SchemaVersion: schema.Version,
+			EntityType:    "policy",
+			PolicyID:      governance.DefaultAllowPolicyID,
+			PolicyVersion: "1",
+			NexusID:       seededNexusID,
+			PolicyType:    governance.PolicyTypeAccessControl,
+			Name:          "Default Allow",
+			Description:   "Seeded built-in policy: allows every request so an unconfigured installation does not fall through to the engine default-DENY (SCHEMA_GOVERNANCE §2.8).",
+			Status:        governance.PolicyStatusActive,
+			Subject:       governance.Subject{SubjectType: "all"},
+			Action:        governance.Action{ActionType: "custom"},
+			Resource:      governance.Resource{ResourceType: "all"},
+			Effect:        governance.ALLOW,
+			Precedence:    0,
+			EffectiveFrom: seededAt,
+			CreatedAt:     seededAt,
+			CreatedBy:     "system",
+			Provenance: schema.ProvenanceRef{
+				Origin:     "system",
+				Producer:   "core.engine",
+				ProducedAt: seededAt,
+			},
 		},
 	})
 	// Approval validator for REQUIRE_APPROVAL outcomes — shares the engine

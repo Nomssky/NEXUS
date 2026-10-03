@@ -56,6 +56,10 @@ missing → `400 VALIDATION`, not a member → `403 AUTHORIZATION`.
 | `GET` | `/api/v1/requests/{id}` | Get request result (`202 pending` while running) |
 | `POST` | `/api/v1/requests/{id}/cancel` | Cancel an in-flight request (E-005) |
 | `GET` | `/events` | SSE stream of events |
+| `GET` | `/api/v1/control/policies` | List the effective policy set |
+| `GET` | `/api/v1/control/policies/{id}` | Read one policy record |
+| `PUT` | `/api/v1/control/policies/{id}` | Create or replace one policy record |
+| `DELETE` | `/api/v1/control/policies/{id}` | Remove one policy record |
 
 ### POST /api/v1/requests
 
@@ -145,6 +149,109 @@ that reaches a terminal state first returns its real state).
 
 Repeat cancels are idempotent: an already-cancelled request returns `202`
 again (never `404`/`409`).
+
+### Policy control — `/api/v1/control/policies`
+
+The governance engine is seeded at boot with one built-in policy,
+`default-allow`, so an unconfigured installation allows requests instead of
+falling through to the contract default `DENY`. These endpoints expose that
+policy set (contracts/SCHEMA_GOVERNANCE_ATTENTION.md §9).
+
+Authentication is the **control API key**, not an identity:
+
+```http
+X-API-Key: <NEXUS_CONTROL_API_KEY>
+```
+
+No `X-Actor-ID` / `business_id` is required or honoured — this is a control-plane
+path, not an identity-scoped one. No key configured → `403 CONTROL_DISABLED`;
+wrong key → `401 UNAUTHORIZED`.
+
+```bash
+BASE=http://127.0.0.1:8081
+KEY=dev-control-key
+curl -fsS -H "X-API-Key: $KEY" "$BASE/api/v1/control/policies"
+```
+
+#### GET /api/v1/control/policies
+
+`200 {"policies":[ Policy, ... ]}` — the complete effective set, sorted by
+`policy_id`, including the built-in `default-allow`.
+
+#### GET /api/v1/control/policies/{id}
+
+`200` with the bare Policy record, or `404 VALIDATION` (`policy not found`).
+
+#### PUT /api/v1/control/policies/{id}
+
+Create-or-replace. The path `policy_id` wins: it is copied onto the record, and
+any `policy_id` in the body that disagrees is rejected (`400 VALIDATION`).
+
+```json
+{
+  "policy_version": "1",
+  "policy_type": "access_control",
+  "name": "deny billing writes",
+  "description": "billing intent is blocked in business biz-a",
+  "status": "active",
+  "business_id": "biz-a",
+  "subject": {"subject_type": "all"},
+  "action": {"action_type": "custom", "action_ids": []},
+  "resource": {"resource_type": "all"},
+  "effect": "DENY",
+  "precedence": 10,
+  "effective_from": "2026-01-01T00:00:00Z"
+}
+```
+
+Omitted server-derivable fields are defaulted: `schema_version`,
+`entity_type`, `nexus_id`, `created_at`, `created_by` (your identity), `provenance`,
+`effective_from`, `policy_version`. Everything else that the schema marks
+required must be present and valid — otherwise `400 VALIDATION` with the
+field-level reason.
+
+Response: `200`
+```json
+{"policy_id": "deny-billing", "policy_version": "1", "status": "active"}
+```
+
+Re-`PUT`ting an existing `policy_id` replaces the record in place: `created_at`
+and `created_by` are inherited from the existing record (a replace does not
+rewrite who created it or when) and `updated_at` is stamped. Omitting
+`policy_id` from the body is fine — the path is authoritative; a body that
+names a *different* `policy_id` is rejected.
+
+The built-in policy is read-only:
+
+| Status | Code | When |
+|---|---|---|
+| `400` | `VALIDATION` | malformed body, invalid enum/required field, `policy_id` mismatch |
+| `401` | `UNAUTHORIZED` | wrong or missing `X-API-Key` |
+| `403` | `CONTROL_DISABLED` | no control API key configured |
+| `404` | `VALIDATION` | unknown `policy_id` on GET/DELETE |
+| `409` | `CONFLICT` | `PUT`/`DELETE` targeting `default-allow` |
+
+#### DELETE /api/v1/control/policies/{id}
+
+`200 {"policy_id":"…","deleted":true}`, `404 VALIDATION` when unknown,
+`409 CONFLICT` for the built-in `default-allow`.
+
+#### What a policy does to a submitted request
+
+A policy only affects requests whose scope matches. The submit body carries
+`business_id` only — there is no division/workflow/task field — so policies
+pinned to a narrower scope never match a request submitted through this API.
+
+| Effect | Observed on `GET /api/v1/requests/{id}` |
+|---|---|
+| `ALLOW` | normal terminal result (also what `default-allow` does) |
+| `DENY` | `status:"failed"`, `error.category:"POLICY_DENIED"`, message names the matched policy |
+| `ALLOW_WITH_CONSTRAINTS` | terminal result carries `constraints:["type:expression"]` — reported, not enforced |
+| `REQUIRE_APPROVAL` | `status:"failed"`, `error.category:"APPROVAL_REQUIRED"`, `error.details.approval_id` |
+| `ESCALATE` | `status:"failed"`, `error.code:"ESCALATION_REQUIRED"`, `error.details.escalation_ref` |
+
+Policies are **process-lifetime state**: they are not written to disk, so a
+restart reloads only the seeded `default-allow`.
 
 ### Headers
 

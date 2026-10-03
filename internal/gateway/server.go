@@ -256,6 +256,13 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /api/v1/control/metrics", s.handleControlMetrics)
 	s.mux.HandleFunc("GET /api/v1/control/components", s.handleControlComponents)
 
+	// Policy control surface (SCHEMA_GOVERNANCE §9): under the control prefix
+	// so authMiddleware's existing X-API-Key check covers them unchanged.
+	s.mux.HandleFunc("GET /api/v1/control/policies", s.handleListPolicies)
+	s.mux.HandleFunc("GET /api/v1/control/policies/{id}", s.handleGetPolicy)
+	s.mux.HandleFunc("PUT /api/v1/control/policies/{id}", s.handlePutPolicy)
+	s.mux.HandleFunc("DELETE /api/v1/control/policies/{id}", s.handleDeletePolicy)
+
 	s.server = &http.Server{
 		Addr:              addr,
 		Handler:           s.mux,

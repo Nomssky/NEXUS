@@ -14,6 +14,7 @@
 package governance
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -64,6 +65,43 @@ func (o Outcome) String() string {
 // IsValid returns true if the outcome is one of the 5 canonical outcomes.
 func (o Outcome) IsValid() bool {
 	return o >= ALLOW && o <= ESCALATE
+}
+
+// MarshalJSON renders the outcome as its canonical enum name. SCHEMA_GOVERNANCE
+// §2.1 fixes the vocabulary ("Policy outcomes are exactly ... No competing
+// vocabulary") and §2.2/§3.1 type `effect`/`decision` as that enum, so the wire
+// form is the name, never the ordinal. An outcome outside the five has no
+// contract name — marshal fails rather than invent one.
+func (o Outcome) MarshalJSON() ([]byte, error) {
+	if !o.IsValid() {
+		return nil, ValidateOutcome(o)
+	}
+	return json.Marshal(o.String())
+}
+
+// UnmarshalJSON parses the canonical enum name. The numeric ordinal is
+// accepted as well so payloads encoded before the enum reached the wire still
+// load — a decode must never be stricter than the encoder it follows.
+func (o *Outcome) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err == nil {
+		parsed, err := ParseOutcome(name)
+		if err != nil {
+			return err
+		}
+		*o = parsed
+		return nil
+	}
+	var ordinal int
+	if err := json.Unmarshal(data, &ordinal); err != nil {
+		return &InvalidOutcomeError{}
+	}
+	candidate := Outcome(ordinal)
+	if !candidate.IsValid() {
+		return ValidateOutcome(candidate)
+	}
+	*o = candidate
+	return nil
 }
 
 // ParseOutcome converts a string to an Outcome.
