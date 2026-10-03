@@ -9,6 +9,7 @@ import {
   randomSuffix,
   submit,
 } from '../fixtures/api';
+import { policyBody, sweepE2ePolicies } from '../fixtures/policy';
 
 /**
  * Governance end-to-end — the contract-defined control surface plus the five
@@ -39,32 +40,9 @@ import {
 
 const suffix = randomSuffix();
 
-/** The §2.2 minimum the server does not derive, with per-test overrides. */
-function policyBody(overrides: Record<string, unknown>): Record<string, unknown> {
-  return {
-    policy_type: 'access_control',
-    name: `e2e policy ${suffix}`,
-    description: 'written by the governance e2e suite',
-    status: 'active',
-    subject: { subject_type: 'all' },
-    action: { action_type: 'custom' },
-    resource: { resource_type: 'all' },
-    effect: 'ALLOW',
-    precedence: 0,
-    ...overrides,
-  };
-}
-
 /** Sweep every policy this spec created, even when a test failed midway. */
 test.afterEach(async ({ request, nexus }) => {
-  const res = await listPolicies(request, nexus);
-  if (res.status() !== 200) return;
-  const { policies } = await res.json();
-  for (const p of policies ?? []) {
-    if (typeof p?.policy_id === 'string' && p.policy_id.startsWith('e2e-')) {
-      await deletePolicy(request, nexus, p.policy_id);
-    }
-  }
+  await sweepE2ePolicies(request, nexus);
 });
 
 test.describe('GOVERNANCE', () => {

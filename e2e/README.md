@@ -81,6 +81,8 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | Identity listing | `GET /api/v1/identities?business_id=` returns identities whose **record** is scoped to that business. The bootstrap record is global-scope (it is created before any business exists) so it is absent from its own business's listing while still being a member of it; it is individually readable at `GET /api/v1/identities/nx:human:bootstrap`. |
 | Policy control | `GET/PUT/DELETE /api/v1/control/policies[/{id}]`, gated by `X-API-Key` (no identity, no membership). The body *is* the §2 Policy Record: `effect` is the enum name (`ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE`), and server-derivable §2.2 fields (`schema_version`, `entity_type`, `nexus_id`, `created_at`, `created_by`, `effective_from`, `policy_version`, `provenance`) are stamped by the gateway. Missing/invalid required field → `400 VALIDATION`. Unknown id → `404 VALIDATION`. The seeded `default-allow` is read-only → `409 CONFLICT`. Policies are process-lifetime state: a restart reloads only the built-in. |
 | Governance decisions | A `DENY` reaches the client as a terminal `failed` whose `error` carries code/category `POLICY_DENIED`, `chain_step: "governance"`, `retryable: false` and a message naming the matched policy (`matched policy <id> (v<version>, precedence <n>)` — that is how the winning rule is observed). `ALLOW_WITH_CONSTRAINTS` is the only allowing outcome that leaves a mark: the terminal result carries `constraints: ["type:expression"]`, reported and not enforced. A policy pinned to another `business_id` never matches, and `status: "disabled"` is never active. |
+| Approvals | A `REQUIRE_APPROVAL` policy holds the request: terminal `failed` with code/category `APPROVAL_REQUIRED`, `retryable: false` and `error.details.approval_id`. `GET /api/v1/approvals?business_id=` lists only the **pending** records as `{approvals:[{entity_id, requester_id, policy_ref, status:"PENDING", …}]}` (missing `business_id` → `400`, non-member → `403`). `POST /api/v1/approvals/{id}/{approve,deny}?business_id=` requires a non-empty `reason` (`400 VALIDATION`, the §6.2 `decision_rationale`); `approve` → `202 {approval_id, status:"approved"}` and the original request resumes to `completed`, `deny` → `200 {approval_id, status:"denied"}` with **no** resume (the stored result stays `failed`/`APPROVAL_REQUIRED`). The approver must be a member of `business_id`; with `self_approval_prohibited` the requester is refused `403 AUTHORIZATION` (`core: self-approval prohibited`). Unknown id → `404 VALIDATION`. |
+| Escalations | An `ESCALATE` policy fails the request with code `ESCALATION_REQUIRED`, category `POLICY_DENIED` (CORE §3 has no escalation category), `retryable: false` and `error.details.escalation_ref`; the alert is queued asynchronously from the `governance.escalated` event, so `GET /api/v1/escalations?business_id=` must be polled. The record answers `pending → acknowledged → resolved` (`expired` past `deadline`). `POST /api/v1/escalations/{id}/{ack,resolve}?business_id=` requires non-empty `reasoning` (`400 VALIDATION`) and returns `{escalation_id, status, accepted: true}`; an `ack` that is not `pending` or a `resolve` that is not `pending`/`acknowledged` → `409 CONFLICT`. Unknown id → `404`, foreign scope → `403`. |
 | Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json` and `<NEXUS_DATA_DIR>/business/<id>.json`; the bootstrap identity, credential and membership are re-armed on every boot from the environment. |
 
 ## Coverage
@@ -98,6 +100,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | CANCEL | `tests/07-cancel.spec.ts` |
 | RESTART/PERSISTENCE | `tests/08-restart.spec.ts` |
 | GOVERNANCE | `tests/09-governance.spec.ts` |
+| APPROVAL/ESCALATION | `tests/10-approval.spec.ts` |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than
@@ -143,8 +146,13 @@ timing luck.
   re-armed at boot. Their *records* do persist (asserted), their credentials
   do not.
 * **Memberships are also re-armed only for bootstrap**, for the same reason.
-* **Approvals and escalations are not covered.** Their endpoints exist and are
-  contract-defined; this suite does not yet drive them.
+* **Approval/escalation state is in-memory only.** `10-approval.spec.ts` drives
+  both lifecycles over HTTP, but neither the pending approval index nor the
+  escalation queue is written to the file store, so a restart loses them (the
+  request's stored `failed`/`APPROVAL_REQUIRED` result survives). Deciding an
+  already-decided approval also depends on that index: once the resume has
+  stored its terminal result the entry is cleaned up and a repeat decision
+  answers `404`, not `409`.
 * **Divisions are not covered** — the submit body carries no division field, so
   a division-pinned policy can never match a request raised through the public
   API and there is nothing observable to assert.
@@ -155,7 +163,7 @@ timing luck.
 ## Conventions
 
 * Tests run serially (`fullyParallel: false`, one worker) against one gateway
-  instance per worker; specs are ordered `01`…`09`.
+  instance per worker; specs are ordered `01`…`10`.
 * Timeouts are bounded everywhere; on failure the harness prints the request
   id, the last response body and the captured NEXUS stdout/stderr so a red run
   is diagnosable without reproducing it by hand.
