@@ -471,9 +471,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // submitRequest is the JSON body for POST /api/v1/requests.
+//
+// DivisionID is CTR-AUTH-001's optional division_id: authority-resolution
+// input that narrows business scope to one division (SCHEMA_IDENTITIES_ORG
+// §4). It is optional — omitting it submits at business scope.
 type submitRequest struct {
 	Intent      string   `json:"intent"`
 	BusinessID  string   `json:"business_id"`
+	DivisionID  string   `json:"division_id,omitempty"`
 	ActorID     string   `json:"actor_id"`
 	Priority    int      `json:"priority,omitempty"`
 	Constraints []string `json:"constraints,omitempty"`
@@ -504,6 +509,10 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Identity-bound submit path (A6): actor_id must match the authenticated
 	// identity, and that identity must be an active member of business_id.
+	//
+	// Division scope is resolved and authorized here, after business
+	// membership, so a caller cannot probe division existence outside the
+	// scope they already belong to.
 	if s.identityEnforced() {
 		res, ok := actorFromContext(r.Context())
 		if !ok {
@@ -520,6 +529,26 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 				"access denied: actor is not a member of the requested business")
 			return
 		}
+		if req.DivisionID != "" {
+			// §4.3: a division-scoped membership may act only inside its own
+			// division. A business-wide membership covers every division.
+			if err := s.checkDivisionScope(req.BusinessID, req.DivisionID); err != nil {
+				s.writeDivisionScopeError(w, r, err)
+				return
+			}
+			if err := s.authorizeMembershipScope(res.IdentityID, req.BusinessID, req.DivisionID); err != nil {
+				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+					"access denied: actor is not a member of the requested division")
+				return
+			}
+		}
+	} else if req.DivisionID != "" {
+		// No trusted identity, but the input still has to satisfy §8: the
+		// division must exist and belong to the business it is claimed under.
+		if err := s.checkDivisionScope(req.BusinessID, req.DivisionID); err != nil {
+			s.writeDivisionScopeError(w, r, err)
+			return
+		}
 	}
 
 	// Extract correlation ID from header or generate one
@@ -532,10 +561,16 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	// client-asserted actor_id above is unauthenticated and is discarded.
 	actorID := s.submitActorID(req.ActorID)
 
-	// Create core request
+	// Create core request. The division scope reaches RequestContext here and
+	// is carried by chainAuthorization (membership) and chainGovernance
+	// (policy scope) — division-scoped work stays division-scoped end to end.
+	ctx := core.NewRequestContext(corrID, req.BusinessID, actorID)
+	if req.DivisionID != "" {
+		ctx = ctx.WithDivision(req.DivisionID)
+	}
 	coreReq := &core.Request{
 		ID:          corrID,
-		Context:     core.NewRequestContext(corrID, req.BusinessID, actorID),
+		Context:     ctx,
 		Intent:      req.Intent,
 		Priority:    req.Priority,
 		Constraints: req.Constraints,
@@ -573,7 +608,8 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Identity-bound membership check (A6): authenticated actor ∈ business_id.
-	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
 		return
 	}
 
@@ -596,6 +632,11 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
 				return
 			}
+			// §4.3: a division recorded at admission narrows the read.
+			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
+				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: division scope mismatch")
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Correlation-ID", pending.CorrelationID)
 			w.WriteHeader(http.StatusAccepted)
@@ -616,6 +657,11 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 	// Enforce scope match
 	if result.BusinessID != businessID {
 		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+		return
+	}
+	// §4.3: a division recorded at admission narrows the read.
+	if !s.authorizeDivisionRead(res.IdentityID, businessID, result.DivisionID) {
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: division scope mismatch")
 		return
 	}
 
@@ -691,6 +737,9 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, core.ErrScopeMismatch):
 		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
 			"access denied: business scope mismatch")
+	case errors.Is(err, core.ErrDivisionScopeMismatch):
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: division scope mismatch")
 	case errors.Is(err, core.ErrAlreadyCompleted):
 		msg := "request already in a non-cancellable terminal state"
 		var terminal *core.TerminalStateError
@@ -1075,7 +1124,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 // ControlStatusResponse is the detailed engine status.
 type ControlStatusResponse struct {
-	Status       string            `json:"status"`
+	Status string `json:"status"`
+	// Uptime is how long the gateway has been running, as a Go duration
+	// string (e.g. "1m30.5s"). Documented by docs/http-gateway.md.
 	Uptime       string            `json:"uptime"`
 	Components   map[string]string `json:"components"`
 	RequestCount int               `json:"request_count"`

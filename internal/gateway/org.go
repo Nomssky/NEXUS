@@ -75,6 +75,54 @@ func (s *Server) writeRegistryError(w http.ResponseWriter, r *http.Request, err 
 	}
 }
 
+// ---------- Division scope on submit ----------
+
+// Division-scope sentinels for a submitted division_id. They are never
+// returned to clients; writeDivisionScopeError maps them to the HTTP contract.
+var (
+	// errDivisionUnavailable: a division was claimed but no registry exists to
+	// verify it — fail closed rather than admit an unverified scope (RT-02).
+	errDivisionUnavailable = errors.New("division scope unavailable")
+	// errDivisionNotFound: SCHEMA_IDENTITIES_ORG §8 — the division id does not
+	// exist.
+	errDivisionNotFound = errors.New("division not found")
+	// errDivisionMismatch: SCHEMA_IDENTITIES_ORG §8 — the division belongs to
+	// a different business than the one claimed on the request.
+	errDivisionMismatch = errors.New("division does not belong to the requested business")
+)
+
+// checkDivisionScope validates a submitted division_id against §8: it must
+// exist and its parent business must equal the request's business_id. It is
+// input validation only — membership narrowing is the caller's step.
+func (s *Server) checkDivisionScope(businessID, divisionID string) error {
+	if s.registry == nil {
+		return errDivisionUnavailable
+	}
+	div, ok := s.registry.GetDivision(divisionID)
+	if !ok {
+		return errDivisionNotFound
+	}
+	if div.BusinessID != businessID {
+		return errDivisionMismatch
+	}
+	return nil
+}
+
+// writeDivisionScopeError maps a checkDivisionScope result to the error
+// envelope: 503 when the registry is missing, 400 for an unknown division or
+// one owned by a different business.
+func (s *Server) writeDivisionScopeError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, errDivisionUnavailable):
+		s.writeError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
+			"organization registry not configured")
+	case errors.Is(err, errDivisionMismatch):
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", errDivisionMismatch.Error())
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", errDivisionNotFound.Error())
+	}
+}
+
 // orgActor resolves the audit actor for a mutation (G-009 posture: only a
 // verified identity is attributed; otherwise the fixed marker is bound).
 func orgActor(res identity.AuthResult) string {

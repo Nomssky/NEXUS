@@ -212,6 +212,15 @@ func extractActorCredentials(r *http.Request) ([]actorCredential, bool) {
 // authorizeMembership fails closed unless actorID is an active member of
 // businessID. A nil membership store denies every request.
 func (s *Server) authorizeMembership(actorID, businessID string) error {
+	return s.authorizeMembershipScope(actorID, businessID, "")
+}
+
+// authorizeMembershipScope is authorizeMembership with division narrowing
+// (SCHEMA_IDENTITIES_ORG §4.3): an empty divisionID asks only "member of this
+// business"; a recorded division must additionally be covered by the actor's
+// membership — business-wide memberships cover every division, a
+// division-scoped membership covers only its own.
+func (s *Server) authorizeMembershipScope(actorID, businessID, divisionID string) error {
 	if actorID == "" || businessID == "" {
 		return errNotMember
 	}
@@ -221,7 +230,21 @@ func (s *Server) authorizeMembership(actorID, businessID string) error {
 	if !s.memberships.IsMember(actorID, businessID, "") {
 		return errNotMember
 	}
+	if divisionID != "" && !s.memberships.IsMember(actorID, businessID, divisionID) {
+		return errNotMember
+	}
 	return nil
+}
+
+// authorizeDivisionRead enforces §4.3 on a record that already carries a
+// recorded division, after the caller has passed the business-scope check.
+// Divisionless records and enforcement-off are never narrowed: narrowing
+// applies exactly where a division is recorded.
+func (s *Server) authorizeDivisionRead(actorID, businessID, divisionID string) bool {
+	if divisionID == "" || !s.identityEnforced() || s.memberships == nil {
+		return true
+	}
+	return s.memberships.IsMember(actorID, businessID, divisionID)
 }
 
 // requireActorMembership enforces identity-bound business scope on a scoped
