@@ -2811,7 +2811,7 @@ func TestApprovalApproveRequiresRunningEngine(t *testing.T) {
 	}
 }
 
-// TEST-CORE-054 (D3): chain-gate ESCALATE → failed / ESALATION_REQUIRED /
+// TEST-CORE-054 (D3): chain-gate ESCALATE → failed / ESCALATION_REQUIRED /
 // POLICY_DENIED with error.details.escalation_ref and the
 // governance.escalated handoff event (CTR-GOV-002 minimal artifact).
 func TestEscalationChainGateEnvelope(t *testing.T) {
@@ -2861,7 +2861,7 @@ func TestEscalationChainGateEnvelope(t *testing.T) {
 		t.Fatal("expected error envelope")
 	}
 	if result.Error.Code != "ESCALATION_REQUIRED" {
-		t.Errorf("expected code ESALATION_REQUIRED, got %s", result.Error.Code)
+		t.Errorf("expected code ESCALATION_REQUIRED, got %s", result.Error.Code)
 	}
 	if result.Error.Category != "POLICY_DENIED" {
 		t.Errorf("expected category POLICY_DENIED (CORE §3), got %s", result.Error.Category)
@@ -2960,7 +2960,7 @@ func TestEscalationExecutorGateEnvelope(t *testing.T) {
 		t.Fatal("expected error envelope")
 	}
 	if result.Error.Code != "ESCALATION_REQUIRED" || result.Error.Category != "POLICY_DENIED" {
-		t.Errorf("expected ESALATION_REQUIRED/POLICY_DENIED, got %s/%s",
+		t.Errorf("expected ESCALATION_REQUIRED/POLICY_DENIED, got %s/%s",
 			result.Error.Code, result.Error.Category)
 	}
 	if result.Error.Retryable {

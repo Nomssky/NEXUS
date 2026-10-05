@@ -1,6 +1,6 @@
 // Escalation queue (C: CTR-GOV-002 full handoff).
 //
-// D3 (`4266ba3`) surfaces ESCALATE as an ESALATION_REQUIRED envelope and
+// D3 (`4266ba3`) surfaces ESCALATE as an ESCALATION_REQUIRED envelope and
 // publishes governance.escalated — but nothing consumed that event, so the
 // handoff went nowhere. This file completes the contract:
 //
