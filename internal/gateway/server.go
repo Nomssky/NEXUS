@@ -110,6 +110,11 @@ type Server struct {
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
 	sseClients chan struct{}
+
+	// startedAt is the instant NewServer returned, recorded after options so a
+	// WithClock test seam is honoured. It feeds the documented `uptime` field
+	// of GET /api/v1/control/status.
+	startedAt time.Time
 }
 
 // ServerOption configures the gateway server.
@@ -174,6 +179,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+	s.startedAt = s.now()
 
 	// Registry audit trail (SCHEMA_IDENTITIES_ORG §9): bind the registry's
 	// event publisher to the engine bus so creates/transitions are observed
@@ -1143,9 +1149,15 @@ func (s *Server) handleControlStatus(w http.ResponseWriter, r *http.Request) {
 
 	executed, _, _ := s.engine.TaskExecutor().Metrics()
 
+	uptime := s.now().Sub(s.startedAt)
+	if uptime < 0 {
+		uptime = 0
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ControlStatusResponse{
 		Status:       string(s.engine.Status()),
+		Uptime:       uptime.String(),
 		Components:   components,
 		RequestCount: int(executed),
 	})
