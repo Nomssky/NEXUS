@@ -2,8 +2,9 @@
 
 **Milestone:** platform integrity audit to a production-ready baseline
 **Baseline:** `76ca08c` (Governance-to-Production Roadmap complete)
-**Status:** working audit record — findings, dispositions and the reconciliation
-that follows them.
+**Status:** complete — findings dispositioned, implementation and tests landed,
+documentation reconciled, full validation and the manual probe record below
+finished.
 
 This document is the Phase 0 audit matrix and the finding register that drives
 the implementation commits in this milestone. Every finding carries a
@@ -298,7 +299,77 @@ aborts boot. Record ids are namespaced by type (`credential:<id>`,
 | 413 / body limits | **REQUIRED — present** | `MaxBytesReader` 1 MB, response cap, SSE frame cap |
 | SSE capacity | **REQUIRED — present** | 10 concurrent clients → `503 RESOURCE_LIMIT` |
 | SSE failure behaviour | **REQUIRED — present** | write failure cancels the stream (G-011) |
-| control metrics / components | **REQUIRED — present** | documented and E2E covered |
+| control metrics / components | **REQUIRED — present** | documented; `/control/status` is E2E covered, `/control/{metrics,components}` probed manually (§9) |
 | readiness / health / status | **REQUIRED — present** | documented and E2E covered |
 | graceful shutdown | **REQUIRED — present** | `SIGTERM` drains close hooks under budget, exit 0 |
 | configuration validation | **REQUIRED — present** | blank/invalid config rejected at startup, e.g. seeded provider status |
+
+---
+
+## 9. Final validation and manual probe record
+
+### 9.1 Gate results
+
+| Gate | Result |
+|---|---|
+| `gofmt -l .` | clean (no files) |
+| `go vet ./...` | exit 0 |
+| `go test ./... -count=1` | every package `ok`, none failed |
+| `go test -race ./... -count=1` | exit 0, no data races, every package `ok` |
+| `git status --porcelain` | clean — the milestone is entirely in commits |
+| `npx playwright test` (×3 consecutive) | 56 passed, 0 failed, on each of the three runs |
+
+The suite grew from 46 to 56 tests across this milestone; no baseline test
+was weakened, deleted or relaxed.
+
+### 9.2 Manual black-box probes (Phase 14)
+
+`e2e/manual-probes.sh` boots the real compiled `cmd/nexus` on a throwaway
+`NEXUS_DATA_DIR` with a fresh bootstrap credential and control key, then
+drives it with `curl` + `jq` only — no Playwright, no Go imports. It targets
+the surfaces `e2e/README.md` recorded as "checked by hand rather than by the
+suite" (control `metrics`/`components`, division record read and transitions)
+and re-verifies the wire shape of the fixes in §2 on a live process.
+
+```
+PASS=90 FAIL=0
+```
+
+| Probe area | Count | What is asserted |
+|---|---:|---|
+| baseline | 3 | `/health`, `/ready`, `/status` answer `200` |
+| control status (F3) | 6 | `status=RUNNING`, `uptime` is a non-zero Go duration (`2.026781573s`), `request_count` is a number, `components` populated |
+| control metrics / components | 10 | `executor`/`backpressure`/`recovery` objects, `circuit_breaker.state` string, `components` is an array of `{name,status,type}` naming `engine`, and `401` with a missing or wrong `X-API-Key` |
+| division record | 21 | create `200` + echo, duplicate `409`, list with `business_id`, `400` without it, single read `200`, unknown `404`, `suspend`/`activate` `200` with the new status, duplicate `409`, `archived` terminal (`409` on re-activate and re-archive), unregistered transition path `404` |
+| division narrowing (F1, F2) | 21 | unknown division `400 division not found` with no request id issued; result echoes `division_id` + `business_id`; business-wide member reads `200`; sibling division `403 access denied: division scope mismatch` on read (error envelope, no outcome leaked) and on cancel; owner's cancel `202` → terminal `cancelled` still carrying `division_id`; raw credential never echoed |
+| policy control | 11 | seeded `default-allow` readable but `409` on `PUT`/`DELETE`; `PUT` creates, `GET` reads back, a second `PUT` replaces the effect to `ALLOW`, `DELETE` → `200`, then `GET`/`DELETE` → `404`; policy list `200` |
+| error envelope | 11 | unrouted `404` naming method and path, `X-Correlation-ID` honoured in body *and* header, `404` carries code/category `VALIDATION` (there is no `NOT_FOUND`), every required envelope field present, wrong method `405`, missing `business_id` `400`, missing/wrong credentials `401` |
+| pause / resume / readiness | 7 | pause `200`, `/ready` `503` while paused, submit `503` while paused, repeat pause/resume `409`, readiness restored after resume |
+
+Nothing in the probe run produced a new finding: every assertion held against
+the built binary.
+
+### 9.3 Commit sequence
+
+| Commit | Scope |
+|---|---|
+| `963e305` | `audit: map platform integrity gaps` |
+| `deb96f7` | `fix(core): record division scope on results, pending entries and cancel` |
+| `35b106a` | `fix(gateway): enforce division scope on submit, retrieval and cancel` |
+| `b9c38d3` | `test(gateway): cover division scope propagation and narrowing` |
+| `d78a51a` | `chore(core): correct stale escalation comments` |
+| `dc6124f` | `fix(control): populate the documented uptime field` |
+| `cc1842b` | `fix(governance): drop the nonexistent SYSTEM_SAFETY precedence level` |
+| `c961c42` | `test(e2e): cover division topology and division scope enforcement` |
+| `36bb746` | `test(e2e): cover identity lifecycle and bootstrap self-lockout recovery` |
+| `a1e5c38` | `test(e2e): cover policy replacement, removal and approver authority` |
+| `3783383` | `docs: reconcile the gateway contract with division scope and control uptime` |
+| `dfa3e98` | `docs: reconcile the e2e coverage record with specs 12 and 13` |
+| `92fb760` | `docs: reconcile governance evaluation semantics (locked 2.8 vs 9.5)` |
+| `0751f4b` | `docs: close the platform integrity audit register` |
+| `b93cfec` | `test(e2e): add the manual black-box probe script` |
+| *(this commit)* | `audit: finalize production baseline` |
+
+No contract file under `contracts/` was modified. The only new externally
+observable behaviour this milestone introduced is the `division_id` field that
+`CTR-AUTH-001` already required, so no contract addendum was needed.
