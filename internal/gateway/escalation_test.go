@@ -203,11 +203,11 @@ func TestEscalationScopeMismatch(t *testing.T) {
 	}
 
 	w := postEscalationDecision(srv, "esc-gw-1", "biz-2", "ack", "cross tenant")
-	if w.Code != http.StatusForbidden {
-		t.Errorf("cross-tenant ack: expected 403, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Errorf("cross-tenant ack: expected 404, got %d body=%s", w.Code, w.Body.String())
 	}
-	if errBody := decodeErrorBody(t, w); errBody["category"] != "AUTHORIZATION" {
-		t.Errorf("expected AUTHORIZATION, got %v", errBody["category"])
+	if errBody := decodeErrorBody(t, w); errBody["category"] != "VALIDATION" {
+		t.Errorf("expected VALIDATION, got %v", errBody["category"])
 	}
 }
 

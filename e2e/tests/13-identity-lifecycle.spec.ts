@@ -18,10 +18,11 @@ import type { NexusHandle } from '../fixtures/nexus';
  *   - a duplicate `entity_id` is 409 CONFLICT, malformed input is 400
  *     VALIDATION, and a rejected credential method leaves no identity behind
  *     (the record is rolled back);
- *   - the authority model for transitions is membership of the record's
- *     business: any member may transition it, and there is no role check.
- *     The contract defines no authority model for lifecycle transitions
- *     (audit §A1), so none is invented here.
+ *   - the authority model for transitions (audit §G1, now contract
+ *     SCHEMA_IDENTITIES_ORG §12.1) is membership of the record's business:
+ *     any business-wide member may transition it, including their own id,
+ *     with no role distinction. Division-scoped memberships never see org
+ *     records (G3), so their transitions are 404.
  *
  * Not reachable over HTTP, covered by internal/gateway: a *foreign* record's
  * `404` on read/transition. Creating an identity inside a business requires
@@ -276,5 +277,39 @@ test.describe('IDENTITY LIFECYCLE', () => {
       { headers: bootstrapHeaders(nexus) },
     );
     expect(restored.status(), 'bootstrap authenticates again').toBe(200);
+  });
+
+  test('self-mutation: an identity can transition its own record', async ({ request, nexus }) => {
+    const selfID = `lifecycle-self-${suffix}`;
+    const selfCredential = `cred-${suffix}-${Date.now().toString(36)}`;
+    expect(
+      (await createIdentity(request, nexus, selfID, selfCredential)).status(),
+      'create the self-mutating identity',
+    ).toBe(200);
+
+    const selfSuspend = await transition(
+      request,
+      nexus,
+      selfID,
+      'suspend',
+      actorHeaders(selfID, selfCredential),
+    );
+    expect(selfSuspend.status(), 'an identity may suspend its own record').toBe(200);
+    await expectLockedOut(request, nexus, selfID, selfCredential, 'self-suspended');
+
+    // Another business-wide member is required to bring the record back:
+    // the locked-out identity cannot transition itself while suspended.
+    const restored = await transition(
+      request,
+      nexus,
+      selfID,
+      'activate',
+      bootstrapHeaders(nexus),
+    );
+    expect(restored.status(), 'another member reactivates the suspended record').toBe(200);
+    const auth = await request.get(`${nexus.baseURL}/api/v1/identities/${selfID}`, {
+      headers: actorHeaders(selfID, selfCredential),
+    });
+    expect(auth.status(), 'record is usable again').toBe(200);
   });
 });

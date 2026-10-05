@@ -3098,7 +3098,7 @@ func TestAdmissionAuthorizationForeignBusiness(t *testing.T) {
 	if result.Error.Retryable {
 		t.Error("expected Retryable=false (§3 AUTHORIZATION = No)")
 	}
-	if !strings.Contains(result.Error.Message, "not an active member of business biz-2") {
+	if !strings.Contains(result.Error.Message, "business=biz-2") {
 		t.Errorf("message should name the business, got %q", result.Error.Message)
 	}
 }

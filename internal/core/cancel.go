@@ -23,7 +23,7 @@ import (
 
 // Cancellation sentinels mapped to HTTP semantics by the gateway:
 // ErrRequestNotFound → 404, ErrScopeMismatch → 403,
-// ErrDivisionScopeMismatch → 403,
+// ErrDivisionScopeMismatch → 404 (G5: invisible, never a revealing 403),
 // ErrAlreadyCompleted/ErrCompletionRace → 409.
 var (
 	// ErrRequestNotFound reports an unknown request ID.
@@ -49,10 +49,10 @@ var (
 // A divisionless request keeps the business-only check: narrowing applies
 // exactly where a division is recorded, never where it is absent.
 func (e *Engine) divisionCancelDenied(actorID, businessID, divisionID string) bool {
-	if !e.identityEnforceScope || e.identityMemberships == nil || divisionID == "" {
+	if !e.identityEnforceScope || e.identityMemberships == nil {
 		return false
 	}
-	return !e.identityMemberships.IsMember(actorID, businessID, divisionID)
+	return !e.identityMemberships.AllowsScope(actorID, businessID, divisionID)
 }
 
 // TerminalStateError reports the terminal status alongside ErrAlreadyCompleted.
@@ -174,9 +174,9 @@ func (e *Engine) isCancelRequested(requestID string) bool {
 //
 // Semantics (E-005):
 //   - unknown request → ErrRequestNotFound (404)
-//   - request of another business → ErrScopeMismatch (403), any state
+//   - request of another business → ErrScopeMismatch (404), any state
 //   - request whose recorded division the caller does not cover →
-//     ErrDivisionScopeMismatch (403), any state (SCHEMA_IDENTITIES_ORG §4.3)
+//     ErrDivisionScopeMismatch (404), any state (SCHEMA_IDENTITIES_ORG §4.3)
 //   - stored terminal result cancelled → nil (idempotent repeat)
 //   - stored terminal result otherwise → *TerminalStateError (409), including
 //     pending_approval (Category C 5d must revisit approval-state cancellation)

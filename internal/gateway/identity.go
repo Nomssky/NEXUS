@@ -209,17 +209,27 @@ func extractActorCredentials(r *http.Request) ([]actorCredential, bool) {
 	return []actorCredential{{identityID: actorID, credential: cred}}, true
 }
 
-// authorizeMembership fails closed unless actorID is an active member of
-// businessID. A nil membership store denies every request.
+// authorizeMembership fails closed unless actorID has any active membership
+// in businessID. It answers "inside the boundary" only; business-level
+// authority (AllowsScope with no division) is checked separately.
 func (s *Server) authorizeMembership(actorID, businessID string) error {
-	return s.authorizeMembershipScope(actorID, businessID, "")
+	if actorID == "" || businessID == "" {
+		return errNotMember
+	}
+	if s.memberships == nil {
+		return errNotMember
+	}
+	if !s.memberships.HasAnyMembership(actorID, businessID) {
+		return errNotMember
+	}
+	return nil
 }
 
-// authorizeMembershipScope is authorizeMembership with division narrowing
-// (SCHEMA_IDENTITIES_ORG §4.3): an empty divisionID asks only "member of this
-// business"; a recorded division must additionally be covered by the actor's
-// membership — business-wide memberships cover every division, a
-// division-scoped membership covers only its own.
+// authorizeMembershipScope enforces the G3 scope rule for an actor claiming
+// a scope: an empty divisionID requires business-wide membership; a recorded
+// division requires business-wide membership or that exact division
+// (SCHEMA_IDENTITIES_ORG §4.3). A division-scoped membership never covers
+// divisionless business-level scope.
 func (s *Server) authorizeMembershipScope(actorID, businessID, divisionID string) error {
 	if actorID == "" || businessID == "" {
 		return errNotMember
@@ -227,24 +237,47 @@ func (s *Server) authorizeMembershipScope(actorID, businessID, divisionID string
 	if s.memberships == nil {
 		return errNotMember
 	}
-	if !s.memberships.IsMember(actorID, businessID, "") {
+	if !s.memberships.HasAnyMembership(actorID, businessID) {
 		return errNotMember
 	}
-	if divisionID != "" && !s.memberships.IsMember(actorID, businessID, divisionID) {
+	if !s.memberships.AllowsScope(actorID, businessID, divisionID) {
 		return errNotMember
 	}
 	return nil
 }
 
-// authorizeDivisionRead enforces §4.3 on a record that already carries a
-// recorded division, after the caller has passed the business-scope check.
-// Divisionless records and enforcement-off are never narrowed: narrowing
-// applies exactly where a division is recorded.
+// authorizeDivisionRead enforces the G3 rule on a record that already carries
+// a recorded division, after the caller has passed the business-scope check.
+// Under Model B a division-scoped membership may only read resources of its
+// own division; divisionless (business-level) records require a business-wide
+// membership. Enforcement-off is never narrowed.
 func (s *Server) authorizeDivisionRead(actorID, businessID, divisionID string) bool {
-	if divisionID == "" || !s.identityEnforced() || s.memberships == nil {
+	if !s.identityEnforced() || s.memberships == nil {
 		return true
 	}
-	return s.memberships.IsMember(actorID, businessID, divisionID)
+	return s.memberships.AllowsScope(actorID, businessID, divisionID)
+}
+
+// requireBusinessWideMembership is the membership gate for business-level
+// surfaces: approvals, escalations, identity/business/division lists and
+// transitions, and the SSE stream all operate above any single division, so
+// a division-scoped membership is never sufficient. The scope itself stays
+// visible either way — failure is 403 (this actor may not use this surface
+// at this scope), not 404.
+func (s *Server) requireBusinessWideMembership(w http.ResponseWriter, r *http.Request, businessID string) (identity.AuthResult, bool) {
+	if !s.identityEnforced() {
+		return identity.AuthResult{}, false
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return res, true
+	}
+	if res.IdentityID != "" && !s.memberships.AllowsScope(res.IdentityID, businessID, "") {
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: this surface requires a business-wide membership")
+		return res, true
+	}
+	return res, false
 }
 
 // requireActorMembership enforces identity-bound business scope on a scoped

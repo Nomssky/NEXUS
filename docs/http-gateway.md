@@ -129,6 +129,8 @@ caller's membership must cover it:
 | `400` | `VALIDATION` | `division not found` |
 | `400` | `VALIDATION` | `division does not belong to the requested business` |
 | `403` | `AUTHORIZATION` | `access denied: actor is not a member of the requested division` |
+| `403` | `AUTHORIZATION` | `access denied: business-scope requests require a business-wide membership` (divisionless submit) |
+| `409` | `CONFLICT` | the business or the named division is not `active` (G2) |
 | `503` | `DEPENDENCY_FAILURE` | a division was claimed but no registry is wired to verify it |
 
 Response: `202 Accepted`
@@ -148,11 +150,10 @@ Query parameters:
 
 Authorization mirrors the cancel path: identity middleware, then identity-bound
 membership in `business_id`, then a scope match against the request's recorded
-business (`403 AUTHORIZATION`), then — when the request recorded a division —
-against that division (`403 AUTHORIZATION`, `access denied: division scope
-mismatch`). A divisionless request is never narrowed: SCHEMA_IDENTITIES_ORG
-§4.3 protects recorded division data, and the contract does not extend the
-narrowing to business-scope work (audit §G3).
+business and division. Visibility is the G3/G5 rule: a recorded division
+narrows the read to callers whose membership covers it; divisionless records
+are visible only to business-wide members; an id outside the caller's scope
+answers `404`, never a revealing `403`.
 
 The terminal result echoes the scope it was admitted under:
 
@@ -173,12 +174,12 @@ The terminal result echoes the scope it was admitted under:
 | `202` | — | `{"request_id","correlation_id","status":"pending"}` |
 | `400` | `VALIDATION` | `business_id` missing |
 | `401` | `UNAUTHORIZED` | enforcement on, no credentials |
-| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, or recorded-division mismatch |
-| `404` | `VALIDATION` | unknown request id |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, or a scope this actor cannot see expressed in the query |
+| `404` | `VALIDATION` | unknown request id — also the answer for any id outside the caller's scope (G5) |
 
-`404` stays the answer for an id that was never admitted, and `403` for an id
-that exists but the caller may not see — the two are deliberately distinct
-(audit §G5).
+`404` covers both an id that was never admitted and one that exists but is
+not visible to the caller — the two are deliberately indistinguishable
+(CORE_INTERFACE_CONTRACTS §11.2).
 
 `202 pending` is returned while the request is admitted but has not reached a
 terminal state. A result is only stored when the chain finishes, so without
@@ -204,9 +205,8 @@ Query parameters:
 Authorization mirrors `GET /api/v1/requests/{id}`: identity middleware (path is
 scope-protected → `401 UNAUTHORIZED` without credentials when enforcement is
 on), identity-bound membership in `business_id` (`403 AUTHORIZATION`), core
-ownership (`403` foreign scope, `404` unknown request), then the recorded
-division when one exists (`403`, `access denied: division scope mismatch`).
-It is an identity-scoped API path — a control API key is **not** required, and
+ownership (`404 unknown`, `404` for foreign or out-of-division scope), then the recorded
+division when one exists. It is an identity-scoped API path — a control API key is **not** required, and
 no governance re-evaluation happens at this boundary. The division check runs
 against the recorded scope, not the pending map, so it applies to admitted
 in-flight work as well as stored results.
@@ -228,8 +228,8 @@ that reaches a terminal state first returns its real state).
 |---|---|---|
 | `400` | `VALIDATION` | `business_id` missing |
 | `401` | `UNAUTHORIZED` | enforcement on, no credentials |
-| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, or — when the request recorded a division the caller's membership does not cover — `access denied: division scope mismatch` |
-| `404` | `VALIDATION` | unknown request |
+| `403` | `AUTHORIZATION` | not a member of `business_id` |
+| `404` | `VALIDATION` | unknown request, or an id outside the caller's scope (G5), or a recorded-division mismatch |
 | `409` | `CONFLICT` | already in a terminal state (`completed`/`failed`) |
 
 Repeat cancels are idempotent: an already-cancelled request returns `202`
@@ -252,8 +252,8 @@ Decision body: `{"reason":"…"}` — required (SCHEMA_WORK §6.2
 | Status | Category | When |
 |---|---|---|
 | `400` | `VALIDATION` | `business_id` missing, malformed body, or empty `reason` (`reason required (decision_rationale)`) |
-| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, self-approval under `self_approval_prohibited`, or an approver outside `approver_ids` |
-| `404` | `VALIDATION` | unknown approval id — also what a repeat decision answers once the resume has stored its terminal result |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, not a business-wide member, self-approval under `self_approval_prohibited`, or an approver outside `approver_ids` |
+| `404` | `VALIDATION` | unknown approval id, one outside the caller's business, or — once the resume has stored its terminal result — the now-closed record |
 | `409` | `CONFLICT` | `approval not pending` / `approval not resumable`, while the record is still actionable |
 
 ### Escalations — `/api/v1/escalations`
@@ -274,8 +274,8 @@ Decision body: `{"reasoning":"…"}` — required.
 | Status | Category | When |
 |---|---|---|
 | `400` | `VALIDATION` | `business_id` missing, malformed body, or empty `reasoning` |
-| `403` | `AUTHORIZATION` | not a member of `business_id` (foreign scope) |
-| `404` | `VALIDATION` | unknown escalation id |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, or no business-wide membership |
+| `404` | `VALIDATION` | unknown escalation id, or one outside the caller's business |
 | `409` | `CONFLICT` | the record is not in a decidable state (`ack` only from `pending`) |
 
 ### Organization records — `/api/v1/{identities,businesses,divisions}`
@@ -289,11 +289,13 @@ Common rules:
 
 * **Lists fail closed on scope.** `GET /api/v1/identities` and
   `GET /api/v1/divisions` require `business_id` (`400 VALIDATION`); with
-  enforcement on, a non-member gets `403`. `GET /api/v1/businesses` takes no
-  parameter and is filtered to the actor's memberships — a non-member simply
-  sees an empty list (no cross-tenant directory).
+  enforcement on, a non-member gets `403`, and a member holding only
+  division-scoped memberships gets `403` (business-level surface, G3).
+  `GET /api/v1/businesses` takes no parameter and is filtered to the
+  businesses where the actor holds a business-wide membership — otherwise
+  it sees an empty list (no cross-tenant directory).
 * **Creation is membership-bound.** Creating an identity or a division inside
-  a business requires membership in it. Creating a business does not: it is
+  a business requires a business-wide membership in it. Creating a business does not: it is
   bootstrap and the business does not exist yet.
 * **Foreign scope reads and transitions answer `404`**, not `403` — no
   cross-tenant existence leak. The same `404 VALIDATION` covers an unknown id.
@@ -303,6 +305,13 @@ Common rules:
 * System identities cannot be created here: `identity_type: "system"` →
   `400 VALIDATION` (`system identities are created by the runtime, not via the API`).
 
+> **Authority model (G1).** The contract defines (SCHEMA_IDENTITIES_ORG §12.1)
+> that lifecycle transitions are authorized by any business-wide member of the
+> record's business, with no role distinction; self-mutation is allowed;
+> suspended records reactivate through another member; revoked is terminal.
+> The bootstrap identity has no special privilege — its credential is simply
+> re-armed from `NEXUS_BOOTSTRAP_CREDENTIAL` at every boot.
+>
 > **Caution — self-lockout.** Status is enforced at authentication, and
 > `bootstrapIdentity` only *creates* `nx:human:bootstrap` when it does not
 > exist — so suspending or revoking it is **not** undone by a restart. Create a
@@ -312,9 +321,6 @@ Common rules:
 > directory is reset or enforcement is relaxed. The control API key and the
 > health surface are unaffected.
 >
-> The contract does not assign an authority model to these transitions: the
-> implementation's rule is membership of the record's business scope — any
-> member, no role check. Recorded as an open contract question, not changed.
 
 `POST /api/v1/identities` body: `entity_id?`, `identity_type` (required,
 canonical), `display_name`, `status` (`active`/`pending` only at creation),
@@ -356,7 +362,8 @@ RESOURCE_UNAVAILABLE` (never `202`).
 `GET /events?business_id=` → `200 text/event-stream`, frames
 `event: <type>\ndata: <json>\n\n`. `business_id` is **required**
 (`400 VALIDATION`): scoping cannot be bypassed by omitting it, and with
-enforcement on the subscriber must be an active member (`403`). Only events of
+enforcement on the subscriber must hold a business-wide membership (`403`
+  otherwise). Only events of
 that business scope are delivered. Each frame is the SCHEMA §2.2 Event Record;
 `chain.*` events carry `correlation_id` equal to the request id.
 
@@ -500,19 +507,19 @@ internal/gateway/
   org.go           identities / businesses / divisions (SCHEMA_IDENTITIES_ORG
                    §2–§4, §9 audit)
   policies.go      policy control surface (SCHEMA_GOVERNANCE_ATTENTION §9)
-  *_test.go        120 tests
+  *_test.go        130 tests
 ```
 
 ---
 
 ## Testing
 
-- 120 tests in the package: health / ready / status / submit / result /
+- 130 tests in the package: health / ready / status / submit / result /
   validation / error envelopes, cancellation (400/401/403/404/409, idempotent
   repeat, attribution), identity and scope, approvals, escalations, policy
   control, organization records, control pause/resume, SSE wire and lifetime
 - Core Runtime tests unchanged and passing
 - Foundation M0–M11 tests unchanged and passing
 - Race detector clean
-- The black-box HTTP suite lives in `e2e/` (46 Playwright tests driving the
+- The black-box HTTP suite lives in `e2e/` (60 Playwright tests driving the
   compiled `cmd/nexus` binary)

@@ -163,7 +163,12 @@ func (s *Server) orgScopeVisible(r *http.Request, businessID string) bool {
 	if !ok {
 		return false
 	}
-	return s.authorizeMembership(res.IdentityID, businessID) == nil
+	if s.memberships == nil {
+		return false
+	}
+	// G3: org records are business-level resources — only a business-wide
+	// membership makes them visible (a division membership is narrower).
+	return s.memberships.AllowsScope(res.IdentityID, businessID, "")
 }
 
 // ---------- Identity ----------
@@ -219,7 +224,7 @@ func (s *Server) handleCreateIdentity(w http.ResponseWriter, r *http.Request) {
 	// Membership boundary (A6): creating an identity inside a business
 	// requires being a member of that business.
 	if body.BusinessID != "" {
-		if _, stopped := s.requireActorMembership(w, r, body.BusinessID); stopped {
+		if _, stopped := s.requireBusinessWideMembership(w, r, body.BusinessID); stopped {
 			return
 		}
 	}
@@ -348,7 +353,7 @@ func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, businessID); stopped {
 		return
 	}
 
@@ -462,7 +467,7 @@ func (s *Server) handleListBusinesses(w http.ResponseWriter, r *http.Request) {
 	}
 	visible := make([]identity.Business, 0, len(all))
 	for _, b := range all {
-		if s.memberships != nil && s.memberships.IsMember(res.IdentityID, b.EntityID, "") {
+		if s.memberships != nil && s.memberships.AllowsScope(res.IdentityID, b.EntityID, "") {
 			visible = append(visible, b)
 		}
 	}
@@ -538,7 +543,7 @@ func (s *Server) handleCreateDivision(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	if _, stopped := s.requireActorMembership(w, r, body.BusinessID); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, body.BusinessID); stopped {
 		return
 	}
 
@@ -572,7 +577,7 @@ func (s *Server) handleListDivisions(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, businessID); stopped {
 		return
 	}
 

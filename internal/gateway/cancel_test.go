@@ -257,8 +257,9 @@ func TestCancelUnknownRequest(t *testing.T) {
 	}
 }
 
-// TEST-GW-E005-03: foreign business scope → 403 AUTHORIZATION (ownership
-// enforced by core against the recorded business, in any state).
+// TEST-GW-E005-03: foreign business scope → 404 (G5: outside the caller's
+// scope, ownership is enforced by core against the recorded business, in any
+// state — never a 403 that confirms the record exists).
 func TestCancelScopeMismatch(t *testing.T) {
 	engine := fastEngine(t)
 	srv := NewServer(engine, ":0")
@@ -266,15 +267,15 @@ func TestCancelScopeMismatch(t *testing.T) {
 	id := submitAndWait(t, srv, engine, "scope check", "biz-1", "user-1", false)
 
 	w := postCancel(srv, id, "biz-2")
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
 	}
 	errBody := decodeErrorBody(t, w)
-	if errBody["category"] != "AUTHORIZATION" {
-		t.Errorf("expected AUTHORIZATION, got %v", errBody["category"])
+	if errBody["category"] != "VALIDATION" {
+		t.Errorf("expected VALIDATION, got %v", errBody["category"])
 	}
-	if msg, _ := errBody["message"].(string); !bytes.Contains([]byte(msg), []byte("business scope mismatch")) {
-		t.Errorf("expected scope mismatch message, got %v", errBody["message"])
+	if msg, _ := errBody["message"].(string); !bytes.Contains([]byte(msg), []byte("not found")) {
+		t.Errorf("expected not-found message, got %v", errBody["message"])
 	}
 }
 

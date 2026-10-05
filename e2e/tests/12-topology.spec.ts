@@ -27,10 +27,10 @@ import type { NexusHandle } from '../fixtures/nexus';
  *   - a division that does not exist is a 400 VALIDATION failure, not a
  *     silent drop;
  *   - a division-scoped membership may act inside its own division and may
- *     not act in a sibling division, while a business-wide membership covers
- *     every division of its business;
+ *     not act in a sibling division, nor at business level at all, while a
+ *     business-wide membership covers every division of its business (G3);
  *   - a recorded division is enforced on retrieval and on cancel, so a
- *     sibling division's result answers 403 rather than leaking;
+ *     sibling division's result is invisible (404, G5) rather than leaking;
  *   - a governance policy pinned to a division matches only requests that
  *     carry that division — the case that was unreachable before
  *     `division_id` existed on submit.
@@ -198,9 +198,8 @@ test.describe('TOPOLOGY', () => {
     );
     expect(env.message).toBe('access denied: actor is not a member of the requested division');
 
-    // A business-wide request is not another division's data; the contract is
-    // silent on whether a division-scoped member may raise one, so today it
-    // is allowed and the narrowing applies wherever a division is recorded.
+    // G3: a division-scoped membership never covers business-level work —
+    // a divisionless submit by the narrow actor is a 403, not a silent pass.
     const businessWide = await submit(
       request,
       nexus,
@@ -211,7 +210,16 @@ test.describe('TOPOLOGY', () => {
       },
       narrowHeaders(),
     );
-    expect(businessWide.status(), 'divisionless submit stays business-scoped').toBe(202);
+    const bwEnv = await expectEnvelope(
+      businessWide,
+      403,
+      'AUTHORIZATION',
+      'AUTHORIZATION',
+      'narrow actor submits business-wide work',
+    );
+    expect(bwEnv.message).toBe(
+      'access denied: business-scope requests require a business-wide membership',
+    );
   });
 
   test('a recorded division is enforced on retrieval and on cancel', async ({
@@ -246,26 +254,26 @@ test.describe('TOPOLOGY', () => {
     );
     expect(ownRead.status(), 'narrow actor reads its own division').toBe(200);
 
-    // A sibling division is a scope denial, not a 404 and not a leak.
+    // G5: a sibling division's record is invisible — 404, not a 403 leak.
     const siblingRead = await request.get(
       `${nexus.baseURL}/api/v1/requests/${inB}?business_id=${nexus.businessID}`,
       { headers: narrowHeaders() },
     );
     const readEnv = await expectEnvelope(
       siblingRead,
-      403,
-      'AUTHORIZATION',
-      'AUTHORIZATION',
+      404,
+      'VALIDATION',
+      'VALIDATION',
       'narrow actor reads a sibling division',
     );
-    expect(readEnv.message).toBe('access denied: division scope mismatch');
+    expect(readEnv.message).toBe('request not found');
 
-    // Divisionless work is business scope and is not narrowed.
+    // G3: divisionless work is business scope, invisible to a narrow actor.
     const wideRead = await request.get(
       `${nexus.baseURL}/api/v1/requests/${businessWide}?business_id=${nexus.businessID}`,
       { headers: narrowHeaders() },
     );
-    expect(wideRead.status(), 'divisionless record is not narrowed').toBe(200);
+    expect(wideRead.status(), 'divisionless record is business-level').toBe(404);
 
     // The same narrowing governs cancel: scope is decided before terminal
     // state, so the sibling division never learns whether the request is done.
@@ -275,12 +283,59 @@ test.describe('TOPOLOGY', () => {
     );
     const cancelEnv = await expectEnvelope(
       siblingCancel,
-      403,
-      'AUTHORIZATION',
-      'AUTHORIZATION',
+      404,
+      'VALIDATION',
+      'VALIDATION',
       'narrow actor cancels a sibling division',
     );
-    expect(cancelEnv.message).toBe('access denied: division scope mismatch');
+    expect(cancelEnv.message).toBe('request not found');
+  });
+
+  test('business-level surfaces require a business-wide membership', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureSetup(request, nexus);
+
+    // Identity list: division membership never lists the whole business.
+    const identities = await request.get(
+      `${nexus.baseURL}/api/v1/identities?business_id=${nexus.businessID}`,
+      { headers: narrowHeaders() },
+    );
+    const idEnv = await expectEnvelope(identities, 403, 'AUTHORIZATION', 'AUTHORIZATION', 'narrow lists identities');
+    expect(idEnv.message).toBe('access denied: this surface requires a business-wide membership');
+
+    // Division list: same rule.
+    const divisions = await request.get(
+      `${nexus.baseURL}/api/v1/divisions?business_id=${nexus.businessID}`,
+      { headers: narrowHeaders() },
+    );
+    await expectEnvelope(divisions, 403, 'AUTHORIZATION', 'AUTHORIZATION', 'narrow lists divisions');
+
+    // Identity lifecycle transitions are business-level too: a division
+    // member's transition is indistinguishable from an unknown record.
+    const transition = await request.post(`${nexus.baseURL}/api/v1/identities/${narrowID}/suspend`, {
+      headers: { ...narrowHeaders(), 'Content-Type': 'application/json' },
+      data: {},
+    });
+    await expectEnvelope(transition, 404, 'VALIDATION', 'VALIDATION', 'narrow transitions an identity');
+
+    // Approvals and escalations are business-level governance surfaces.
+    const approvals = await request.get(`${nexus.baseURL}/api/v1/approvals?business_id=${nexus.businessID}`, {
+      headers: narrowHeaders(),
+    });
+    await expectEnvelope(approvals, 403, 'AUTHORIZATION', 'AUTHORIZATION', 'narrow lists approvals');
+
+    const escalations = await request.get(`${nexus.baseURL}/api/v1/escalations?business_id=${nexus.businessID}`, {
+      headers: narrowHeaders(),
+    });
+    await expectEnvelope(escalations, 403, 'AUTHORIZATION', 'AUTHORIZATION', 'narrow lists escalations');
+
+    // The business-wide event stream is closed to division members.
+    const sse = await request.get(`${nexus.baseURL}/events?business_id=${nexus.businessID}`, {
+      headers: narrowHeaders(),
+    });
+    await expectEnvelope(sse, 403, 'AUTHORIZATION', 'AUTHORIZATION', 'narrow subscribes to the business stream');
   });
 
   test('a policy pinned to a division matches only that division', async ({

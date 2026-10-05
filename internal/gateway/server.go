@@ -535,7 +535,15 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 				"access denied: actor is not a member of the requested business")
 			return
 		}
-		if req.DivisionID != "" {
+		if req.DivisionID == "" {
+			// G3: business-scope work is a business-wide resource — a
+			// division-scoped membership never covers it.
+			if !s.memberships.AllowsScope(res.IdentityID, req.BusinessID, "") {
+				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+					"access denied: business-scope requests require a business-wide membership")
+				return
+			}
+		} else {
 			// §4.3: a division-scoped membership may act only inside its own
 			// division. A business-wide membership covers every division.
 			if err := s.checkDivisionScope(req.BusinessID, req.DivisionID); err != nil {
@@ -554,6 +562,25 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 		if err := s.checkDivisionScope(req.BusinessID, req.DivisionID); err != nil {
 			s.writeDivisionScopeError(w, r, err)
 			return
+		}
+	}
+
+	// G2: admission is lifecycle-aware. New work is admitted only into an
+	// active business, and — when the request names a division — an active
+	// division. Existing work continues, results stay readable and cancels
+	// stay open regardless of status; this affects ADMISSION only.
+	if s.registry != nil {
+		if b, ok := s.registry.GetBusiness(req.BusinessID); ok && b.Status != identity.BusinessActive {
+			s.writeError(w, r, http.StatusConflict, "CONFLICT",
+				fmt.Sprintf("business %q is %s: no new work is admitted", req.BusinessID, b.Status))
+			return
+		}
+		if req.DivisionID != "" {
+			if d, ok := s.registry.GetDivision(req.DivisionID); ok && d.Status != identity.DivisionActive {
+				s.writeError(w, r, http.StatusConflict, "CONFLICT",
+					fmt.Sprintf("division %q is %s: no new work is admitted", req.DivisionID, d.Status))
+				return
+			}
 		}
 	}
 
@@ -635,12 +662,13 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		// client to observe. Known but running → 202 pending.
 		if pending, inFlight := s.engine.Pending(id); inFlight {
 			if pending.BusinessID != businessID {
-				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 				return
 			}
-			// §4.3: a division recorded at admission narrows the read.
+			// §4.3/G3: a division recorded at admission narrows the read;
+			// outside the caller's scope the request is invisible (404).
 			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
-				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: division scope mismatch")
+				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -660,14 +688,15 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Enforce scope match
+	// Enforce scope match: a request outside the caller's scope is
+	// indistinguishable from an unknown id (G5 visibility model).
 	if result.BusinessID != businessID {
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: business scope mismatch")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 		return
 	}
-	// §4.3: a division recorded at admission narrows the read.
+	// §4.3/G3: a division recorded at admission narrows the read.
 	if !s.authorizeDivisionRead(res.IdentityID, businessID, result.DivisionID) {
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION", "access denied: division scope mismatch")
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 		return
 	}
 
@@ -740,12 +769,11 @@ func (s *Server) handleCancelRequest(w http.ResponseWriter, r *http.Request) {
 		})
 	case errors.Is(err, core.ErrRequestNotFound):
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
-	case errors.Is(err, core.ErrScopeMismatch):
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
-			"access denied: business scope mismatch")
-	case errors.Is(err, core.ErrDivisionScopeMismatch):
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
-			"access denied: division scope mismatch")
+	case errors.Is(err, core.ErrScopeMismatch),
+		errors.Is(err, core.ErrDivisionScopeMismatch):
+		// G5: the request is outside this caller's scope — invisible (404),
+		// never a 403 that confirms its existence.
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 	case errors.Is(err, core.ErrAlreadyCompleted):
 		msg := "request already in a non-cancellable terminal state"
 		var terminal *core.TerminalStateError
@@ -767,7 +795,7 @@ func (s *Server) handleListApprovals(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, businessID); stopped {
 		return
 	}
 
@@ -803,7 +831,7 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	res, stopped := s.requireActorMembership(w, r, businessID)
+	res, stopped := s.requireBusinessWideMembership(w, r, businessID)
 	if stopped {
 		return
 	}
@@ -856,8 +884,8 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approve 
 	case errors.Is(err, core.ErrApprovalNotFound):
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "approval not found")
 	case errors.Is(err, core.ErrScopeMismatch):
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
-			"access denied: business scope mismatch")
+		// G5: outside the caller's scope → 404, not 403.
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "approval not found")
 	case errors.Is(err, core.ErrApprovalNotPending):
 		s.writeError(w, r, http.StatusConflict, "CONFLICT", "approval not pending")
 	case errors.Is(err, core.ErrSelfApprovalProhibited),
@@ -886,7 +914,7 @@ func (s *Server) handleListEscalations(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	if _, stopped := s.requireActorMembership(w, r, businessID); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, businessID); stopped {
 		return
 	}
 
@@ -913,7 +941,7 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
 		return
 	}
-	res, stopped := s.requireActorMembership(w, r, businessID)
+	res, stopped := s.requireBusinessWideMembership(w, r, businessID)
 	if stopped {
 		return
 	}
@@ -961,8 +989,8 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 	case errors.Is(err, core.ErrEscalationNotFound):
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "escalation not found")
 	case errors.Is(err, core.ErrEscalationScope):
-		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
-			"access denied: business scope mismatch")
+		// G5: outside the caller's scope → 404, not 403.
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "escalation not found")
 	case errors.Is(err, core.ErrEscalationNotDecidable):
 		s.writeError(w, r, http.StatusConflict, "CONFLICT", err.Error())
 	default:
@@ -987,7 +1015,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Identity-bound membership check (A6) before opening the stream.
-	if _, stopped := s.requireActorMembership(w, r, businessFilter); stopped {
+	if _, stopped := s.requireBusinessWideMembership(w, r, businessFilter); stopped {
 		return
 	}
 

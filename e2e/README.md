@@ -110,12 +110,13 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | PAUSE/RESUME | `tests/05-control.spec.ts` |
 | SSE | `tests/06-sse.spec.ts` |
 | CANCEL | `tests/07-cancel.spec.ts` |
-| RESTART/PERSISTENCE | `tests/08-restart.spec.ts` (records, credential **and** membership across a restart) |
+| RESTART/PERSISTENCE | `tests/08-restart.spec.ts` (records, credential **and** membership across a restart; G4 Level 1: a completed request's id 404s after restart) |
 | GOVERNANCE | `tests/09-governance.spec.ts` |
 | APPROVAL/ESCALATION | `tests/10-approval.spec.ts` |
 | PROVIDER FAILURE | `tests/11-provider-failure.spec.ts` (its own offline gateway; the shared one stays healthy) |
 | DIVISION TOPOLOGY | `tests/12-topology.spec.ts` (`division_id` validation/recording, division-scoped membership on submit, read and cancel, division-pinned policy) |
-| IDENTITY LIFECYCLE | `tests/13-identity-lifecycle.spec.ts` (suspend/revoke/activate, pending identities, malformed input rollback, duplicate `entity_id`, bootstrap self-lockout recovery) |
+| IDENTITY LIFECYCLE | `tests/13-identity-lifecycle.spec.ts` (suspend/revoke/activate, pending identities, malformed input rollback, duplicate `entity_id`, bootstrap self-lockout recovery, self-mutation) |
+| ADMISSION LIFECYCLE | `tests/14-admission.spec.ts` (G2: suspended/archived business/division rejects new submits `409`, reads/cancels continue, `active` reopens) |
 | POLICY LIFECYCLE | `tests/09-governance.spec.ts` (PUT upsert, DELETE, default-allow restored after removal) |
 | APPROVER AUTHORITY | `tests/10-approval.spec.ts` (`approval_config.approver_ids` refusal vs. self-approval vs. acceptance) |
 

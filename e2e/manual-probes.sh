@@ -174,8 +174,8 @@ check "result echoes the business" "$BIZ" "$(jq -r .business_id /tmp/opencode/pr
 check "business-wide member reads the divisional record" 200 \
   "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/requests/$RID?business_id=$BIZ")"
 SR=$(curl -s -o /tmp/opencode/probe-sibread.json -w '%{http_code}' "${SIB[@]}" "$BASE/api/v1/requests/$RID?business_id=$BIZ")
-check "sibling division is refused on read" 403 "$SR"
-contains "  -> documented message" "division scope mismatch" "$(cat /tmp/opencode/probe-sibread.json)"
+check "sibling division is invisible on read (G5)" 404 "$SR"
+contains "  -> documented message" '"message":"request not found"' "$(cat /tmp/opencode/probe-sibread.json)"
 check "refusal is an error envelope, not a result" "object" "$(jq -r '.error|type' /tmp/opencode/probe-sibread.json)"
 
 # A second request carries the cancel probes, so the terminal-state branch
@@ -198,8 +198,8 @@ RID2=$(jq -r .request_id /tmp/opencode/probe-sub2.json)
 # reports a terminal state.
 check "own division cancels" 202 "$(curl -s -o /dev/null -w '%{http_code}' "${NAR[@]}" -X POST "$BASE/api/v1/requests/$RID2/cancel?business_id=$BIZ")"
 XC=$(curl -s -o /tmp/opencode/probe-sibcancel.json -w '%{http_code}' "${SIB[@]}" -X POST "$BASE/api/v1/requests/$RID2/cancel?business_id=$BIZ")
-check "sibling division is refused on cancel" 403 "$XC"
-contains "  -> documented message" "division scope mismatch" "$(cat /tmp/opencode/probe-sibcancel.json)"
+check "sibling division is invisible on cancel (G5)" 404 "$XC"
+contains "  -> documented message" '"message":"request not found"' "$(cat /tmp/opencode/probe-sibcancel.json)"
 C2=000
 for _ in $(seq 1 300); do
   C2=$(curl -s -o /tmp/opencode/probe-r2.json -w '%{http_code}' "${NAR[@]}" "$BASE/api/v1/requests/$RID2?business_id=$BIZ")
@@ -209,6 +209,33 @@ done
 check "cancelled request reaches 200" 200 "$C2"
 check "  -> status cancelled" "cancelled" "$(jq -r .status /tmp/opencode/probe-r2.json)"
 check "  -> cancelled result keeps the division" "$DIV" "$(jq -r .division_id /tmp/opencode/probe-r2.json)"
+
+echo "== G3/G2/G5 wire posture =="
+# G3: a division-scoped membership never submits at business scope.
+NW=$(curl -s -o /tmp/opencode/probe-narwide.json -w '%{http_code}' "${NAR[@]}" -X POST "$BASE/api/v1/requests" \
+  -d "{\"intent\":\"narrow business-scope submit\",\"business_id\":\"$BIZ\",\"actor_id\":\"$SID\"}")
+check "narrow actor at business scope is 403" 403 "$NW"
+contains "  -> documented message" "business-scope requests require a business-wide membership" "$(cat /tmp/opencode/probe-narwide.json)"
+# G3+G5: a business-level record is invisible to a division member (404).
+W3=$(curl -s -o /tmp/opencode/probe-plain.json -w '%{http_code}' "${AUTH[@]}" -X POST "$BASE/api/v1/requests" \
+  -d "{\"intent\":\"business-scope probe\",\"business_id\":\"$BIZ\",\"actor_id\":\"nx:human:bootstrap\"}")
+check "business-level submit" 202 "$W3"
+RP=$(jq -r .request_id /tmp/opencode/probe-plain.json)
+sleep 2
+NR=$(curl -s -o /tmp/opencode/probe-narread.json -w '%{http_code}' "${NAR[@]}" "$BASE/api/v1/requests/$RP?business_id=$BIZ")
+check "division member reading business-level record gets 404" 404 "$NR"
+# G2: suspending the business closes admission; reads still work; activate reopens.
+curl -s -o /dev/null -X POST "$BASE/api/v1/businesses/$BIZ/suspend" -H "X-Actor-ID: nx:human:bootstrap" -H "X-Actor-Credential: $BOOT" -H 'Content-Type: application/json' -d '{}'
+SB=$(curl -s -o /tmp/opencode/probe-suspbiz.json -w '%{http_code}' "${NAR[@]}" -X POST "$BASE/api/v1/requests" \
+  -d "{\"intent\":\"blocked\",\"business_id\":\"$BIZ\",\"division_id\":\"$DIV\",\"actor_id\":\"$SID\"}")
+check "suspended business blocks submit (409)" 409 "$SB"
+contains "  -> documented message" "no new work is admitted" "$(cat /tmp/opencode/probe-suspbiz.json)"
+RB=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/requests/$RID2?business_id=$BIZ")
+check "existing record still readable while suspended" 200 "$RB"
+curl -s -o /dev/null -X POST "$BASE/api/v1/businesses/$BIZ/activate" -H "X-Actor-ID: nx:human:bootstrap" -H "X-Actor-Credential: $BOOT" -H 'Content-Type: application/json' -d '{}'
+SBO=$(curl -s -o /dev/null -w '%{http_code}' "${NAR[@]}" -X POST "$BASE/api/v1/requests" \
+  -d "{\"intent\":\"reopened\",\"business_id\":\"$BIZ\",\"division_id\":\"$DIV\",\"actor_id\":\"$SID\"}")
+check "activate reopens admission" 202 "$SBO"
 
 echo "== policy control lifecycle on the wire =="
 check "seeded default-allow GET" 200 "$(curl -s -o /dev/null -w '%{http_code}' "${CTL[@]}" "$BASE/api/v1/control/policies/default-allow")"

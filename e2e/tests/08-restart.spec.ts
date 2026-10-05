@@ -27,7 +27,11 @@ import {
  *     non-bootstrap identity authenticates and reaches scoped endpoints after
  *     a restart without being re-created;
  *   - the credential record carries a verification hash, never the raw value;
- *   - the gateway keeps serving authenticated requests afterwards.
+ *   - the gateway keeps serving authenticated requests afterwards;
+ *   - G4 Level 1: request/result records are process-local — a previously
+ *     completed request id answers 404 after a restart, like a never-admitted
+ *     id (CORE_INTERFACE_CONTRACTS §11.1). No crash recovery is claimed and
+ *     none is implied.
  */
 test.describe('RESTART/PERSISTENCE', () => {
   test('data, bootstrap credential and real traffic survive a restart', async ({
@@ -132,6 +136,14 @@ test.describe('RESTART/PERSISTENCE', () => {
     expect(persisted.status(), 'created identity record survives restart').toBe(200);
     expect((await persisted.json()).entity_id).toBe(secondActor);
     expect((await persisted.json()).status).toBe('active');
+
+    // 5b. G4: the request that completed before the restart is gone — its
+    // id now answers 404 exactly like an unknown id, never a fabricated
+    // recovery.
+    const lost = await request.get(`${nexus.baseURL}/api/v1/requests/${beforeId}?business_id=${nexus.businessID}`, {
+      headers: bootstrapHeaders(nexus),
+    });
+    expect(lost.status(), 'completed request does not survive restart').toBe(404);
 
     // 6. Real work still completes after the restart.
     const after = await submit(request, nexus, {

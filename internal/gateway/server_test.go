@@ -661,14 +661,14 @@ func TestGetResultCrossTenantDenied(t *testing.T) {
 	resultW := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(resultW, resultReq)
 
-	if resultW.Code != http.StatusForbidden {
-		t.Errorf("expected 403 for cross-tenant access, got %d", resultW.Code)
+	if resultW.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for cross-tenant access, got %d", resultW.Code)
 	}
 
 	var errResp map[string]map[string]interface{}
 	json.NewDecoder(resultW.Body).Decode(&errResp)
-	if errResp["error"]["category"] != "AUTHORIZATION" {
-		t.Errorf("expected AUTHORIZATION category, got %v", errResp["error"]["category"])
+	if errResp["error"]["category"] != "VALIDATION" {
+		t.Errorf("expected VALIDATION category, got %v", errResp["error"]["category"])
 	}
 }
 

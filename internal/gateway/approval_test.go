@@ -131,19 +131,19 @@ func TestApprovalDecisionMissingReason(t *testing.T) {
 	}
 }
 
-// TEST-GW-APR-04: foreign business scope → 403 AUTHORIZATION (core ownership
-// check against the record's business).
+// TEST-GW-APR-04: foreign business scope → 404 (G5: the record is outside
+// the caller's scope, indistinguishable from unknown).
 func TestApprovalScopeMismatch(t *testing.T) {
 	engine, srv := approvalGateway(t)
 	_, approvalID := submitGated(t, srv, engine, "gated", "biz-1")
 
 	w := postApprovalDecision(srv, approvalID, "biz-2", "approve", "because")
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
 	}
 	errBody := decodeErrorBody(t, w)
-	if errBody["category"] != "AUTHORIZATION" {
-		t.Errorf("expected AUTHORIZATION, got %v", errBody["category"])
+	if errBody["category"] != "VALIDATION" {
+		t.Errorf("expected VALIDATION, got %v", errBody["category"])
 	}
 }
 

@@ -66,8 +66,8 @@ func TestGetResultReportsPendingWhileInFlight(t *testing.T) {
 	}
 
 	// Scope and existence rules are unchanged while pending.
-	if w := getReqResult(srv, id, "biz-2"); w.Code != http.StatusForbidden {
-		t.Errorf("foreign scope while pending: expected 403, got %d", w.Code)
+	if w := getReqResult(srv, id, "biz-2"); w.Code != http.StatusNotFound {
+		t.Errorf("foreign scope while pending: expected 404, got %d", w.Code)
 	}
 	if w := getReqResult(srv, "req-nope", "biz-1"); w.Code != http.StatusNotFound {
 		t.Errorf("unknown id: expected 404, got %d", w.Code)

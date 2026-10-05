@@ -328,11 +328,15 @@ func TestDivisionScopeOnSubmitMembership(t *testing.T) {
 	})
 
 	t.Run("narrow actor submits business-wide work", func(t *testing.T) {
-		// A divisionless request is business-scope work; §G3 records that the
-		// contract is silent on whether a division-scoped member may raise it.
+		// G3: a divisionless request is business-scope work, which a
+		// division-scoped membership never covers.
 		w := f.submitDivision(t, f.narrowID, f.narrowCred, "")
-		if w.Code != http.StatusAccepted {
-			t.Fatalf("expected 202, got %d body=%s", w.Code, w.Body.String())
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+		}
+		code, msg := decodeError(t, w)
+		if code != "AUTHORIZATION" || msg != "access denied: business-scope requests require a business-wide membership" {
+			t.Errorf("got %q/%q", code, msg)
 		}
 	})
 }
@@ -372,19 +376,25 @@ func TestDivisionScopeOnResultRead(t *testing.T) {
 	})
 
 	t.Run("sibling division", func(t *testing.T) {
+		// G5: a record outside the caller's scope is invisible — 404.
 		w := get(f.narrowID, f.narrowCred, div2ID)
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
 		}
-		code, msg := decodeError(t, w)
-		if code != "AUTHORIZATION" || msg != "access denied: division scope mismatch" {
-			t.Errorf("got %q/%q", code, msg)
+		code, _ := decodeError(t, w)
+		if code != "VALIDATION" {
+			t.Errorf("code: got %q want VALIDATION", code)
 		}
 	})
 
-	t.Run("divisionless request is not narrowed", func(t *testing.T) {
-		if w := get(f.narrowID, f.narrowCred, plainID); w.Code != http.StatusOK {
-			t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	t.Run("divisionless request is business-level", func(t *testing.T) {
+		// G3: a division-scoped membership does not cover business-scope
+		// records, so a narrow actor gets 404 (invisible), never 200.
+		if w := get(f.narrowID, f.narrowCred, plainID); w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
+		}
+		if w := get(f.wideID, f.wideCred, plainID); w.Code != http.StatusOK {
+			t.Fatalf("business-wide member: expected 200, got %d body=%s", w.Code, w.Body.String())
 		}
 	})
 
@@ -415,12 +425,8 @@ func TestDivisionScopeOnCancel(t *testing.T) {
 		w := f.doAuth(t, http.MethodPost,
 			"/api/v1/requests/"+div2ID+"/cancel?business_id="+f.biz1, "{}",
 			f.narrowID, f.narrowCred)
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403, got %d body=%s", w.Code, w.Body.String())
-		}
-		code, msg := decodeError(t, w)
-		if code != "AUTHORIZATION" || msg != "access denied: division scope mismatch" {
-			t.Errorf("got %q/%q", code, msg)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d body=%s", w.Code, w.Body.String())
 		}
 	})
 
@@ -463,8 +469,9 @@ func TestCancelNarrowsPendingDivisionScope(t *testing.T) {
 	}
 }
 
-// A divisionless record is never narrowed — the business-only check governs.
-func TestCancelUnscopedRecordIsNotNarrowed(t *testing.T) {
+// G3: a divisionless record belongs to the business scope, so a narrow
+// actor's cancel is refused (ErrDivisionScopeMismatch), never admitted.
+func TestCancelUnscopedRecordDeniedForNarrowActor(t *testing.T) {
 	f := divisionFixture(t)
 
 	w := f.submitDivision(t, f.wideID, f.wideCred, "")
@@ -475,8 +482,8 @@ func TestCancelUnscopedRecordIsNotNarrowed(t *testing.T) {
 	if pending, ok := f.engine.Pending(id); ok && pending.DivisionID != "" {
 		t.Fatalf("divisionless submit recorded division %q", pending.DivisionID)
 	}
-	if err := f.engine.CancelRequest(id, f.biz1, f.narrowID); err != nil &&
-		!errors.Is(err, core.ErrAlreadyCompleted) {
-		t.Fatalf("narrow actor cancel of a divisionless request: %v", err)
+	err := f.engine.CancelRequest(id, f.biz1, f.narrowID)
+	if !errors.Is(err, core.ErrDivisionScopeMismatch) {
+		t.Fatalf("narrow actor cancel of a divisionless request: got %v want ErrDivisionScopeMismatch", err)
 	}
 }

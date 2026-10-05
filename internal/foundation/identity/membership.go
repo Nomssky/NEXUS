@@ -218,6 +218,45 @@ func (s *MembershipSet) IsMember(identityID, businessID, divisionID string) bool
 	return false
 }
 
+// AllowsScope reports whether an identity may act within the given scope
+// of a business (G3 canonical rule):
+//
+//   - divisionID == "" (business-level scope): the identity must hold a
+//     business-wide membership (DivisionID == "") in businessID. A
+//     division-scoped membership does NOT cover business-level resources.
+//   - divisionID != "": the identity must hold a business-wide membership
+//     (which covers every division) or a membership of exactly that
+//     division.
+//
+// This is the single rule the gateway and the core chain enforce for
+// admission, retrieval, cancel, governance and approvals — a division
+// membership is a strict sub-scope of business authority, never a
+// superset.
+func (s *MembershipSet) AllowsScope(identityID, businessID, divisionID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.byIdentity[identityID] {
+		if m.Status != StatusActive || m.BusinessID != businessID {
+			continue
+		}
+		if m.DivisionID == "" {
+			return true // business-wide membership covers every scope
+		}
+		if divisionID != "" && m.DivisionID == divisionID {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAnyMembership reports whether the identity holds any active membership
+// in the business at all, regardless of its division narrowing. It answers
+// "is this identity inside the business boundary", not "may it act at
+// business level" (that is AllowsScope).
+func (s *MembershipSet) HasAnyMembership(identityID, businessID string) bool {
+	return s.IsMember(identityID, businessID, "")
+}
+
 // CurrentBusiness resolves the active business context for an identity and
 // verifies the identity is a member of it. It fails closed when the identity is
 // not a member — an identity cannot silently act for a business it does not

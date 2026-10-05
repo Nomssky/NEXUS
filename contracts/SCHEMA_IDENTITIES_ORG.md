@@ -349,3 +349,78 @@ in the store's index. The shape mirrors the SCHEMA_COMMON §7
 ---
 
 *This document defines the structural foundation for who exists in NEXUS. Identity is the root; authority is resolved separately.*
+
+---
+
+## 12. Authority, Admission & Scope Addendum (G1–G3, G5)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–11
+are unchanged. This section resolves the audit gaps G1, G2, G3 and the
+org-side half of G5.
+
+### 12.1 Identity lifecycle authority (G1)
+
+* The authority boundary for identity/business/division lifecycle
+  transitions is **membership of the record's business**: any active
+  business-wide member of the record's business (which, per §12.3, is the
+  surface where org records are visible at all) may transition a record,
+  including a record of their own id. No role hierarchy is invented;
+  `Role` labels remain descriptive (§10.1 MEMBERSHIP != AUTHORITY).
+* Self-mutation is allowed — an identity may suspend/revoke/activate its
+  own record. The resulting lockout is the operator's responsibility.
+* A suspended or revoked identity is reactivated by any other authorized
+  member through `active` (suspension) per the §5-state matrix; `revoked`
+  is terminal and recoverable only by creating a new identity record.
+* The bootstrap identity carries **no permanent privilege**. It is a
+  normal business-wide member provisioned from `NEXUS_BOOTSTRAP_CREDENTIAL`;
+  the env variable only refreshes its credential hash at boot (§10.2).
+  Self-lockout of the bootstrap identity is reachable and intentional;
+  recovery is a second active identity, or resetting the data directory,
+  or the key-gated control surface.
+* Authentication enforces identity status on every call (§2.4), so a
+  suspended/revoked identity loses all API access immediately and keeps
+  no privilege across a restart.
+
+### 12.2 Lifecycle-aware admission (G2)
+
+Status gates **admission**, never existing work:
+
+| Status (business or division) | New submit | Existing execution | Read | Cancel | Governance evaluation |
+|---|---|---|---|---|---|
+| `active` | allowed | continues | allowed | allowed | evaluated |
+| `suspended` / `archived` | rejected `409 CONFLICT` | continues | allowed | allowed | not re-run (nothing new admitted) |
+
+* A request is rejected only when its **business** is not `active`, or —
+  when the request carries `division_id` — when that **division** is not
+  `active`. Division requests never enter a non-active division.
+* Lifecycle status is not an authorization status: a suspended business's
+  members keep authenticating, reading and cancelling.
+* Suspended/archived organizations' records remain mutable by
+  authorized members (suspend/archive/activate transitions and record
+  reads are unaffected).
+
+### 12.3 Division membership semantics (G3)
+
+Membership scope is a **strict sub-scope** of business authority:
+
+* A membership with `division_id` empty (business-wide) covers the whole
+  business, including every division.
+* A membership with `division_id == D` covers only division `D`'s
+  resources — submitting `division_id == D`, reading/cancelling D-recorded
+  results. It does **not** cover divisionless (business-level) resources:
+  business-scope submissions, business-level results, identity/business/
+  division records and transitions, approvals, escalations, and the SSE
+  event stream all require a business-wide membership.
+* Cross-division access is impossible by construction, not by an
+  exception list: sibling divisions are invisible (404) and unsubmittable
+  (403), per §12.4.
+* This is the single rule enforced at the gateway admission path, the
+  core chain's authorization stage, cancellation, and every org/approval/
+  escalation/SSE surface. There are no endpoint-specific exceptions.
+
+### 12.4 Visibility of foreign-scope records (G5, org half)
+
+404 means "not found or not visible"; 403 is reserved for "you queried a
+scope you cannot enter at all" (membership failure on the queried
+`business_id`) and for action-level denials on a visible scope. See
+`CORE_INTERFACE_CONTRACTS` §11.2.

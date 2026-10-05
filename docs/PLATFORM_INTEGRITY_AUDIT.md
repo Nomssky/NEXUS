@@ -151,7 +151,7 @@ is **not** rewritten; the relationship is documented in
 
 ## 3. Accepted — current behaviour is contract-consistent
 
-### §A1 — identity lifecycle transitions carry no authority model
+### §A1 — identity lifecycle transitions carry no authority model (finalized: §G1)
 
 `SCHEMA_IDENTITIES_ORG` §2.4 states "An identity does NOT carry authority … All
 four are resolved separately through Governance", and the contract defines no
@@ -164,7 +164,7 @@ pending → active, malformed-input rollback, duplicate `404`/`409`,
 bootstrap self-lockout recovery) and by `internal/gateway/org_test.go` for the
 foreign-record `404`, which is unreachable over HTTP (see §6).
 
-### §A2 — `403` on foreign-scope request reads vs `404` on org records
+### §A2 — `403` on foreign-scope request reads vs `404` on org records (superseded: G5 visibility model, `CORE §11.2`)
 
 `GET /api/v1/requests/{id}` answers `403 AUTHORIZATION` for a known id outside
 the caller's scope, while the org endpoints answer `404` for foreign records.
@@ -207,11 +207,11 @@ chain resolves it to `false`. Health vocabulary is internal: §12.1 allows only
 
 | Ref | Gap | Consequence | Status |
 |---|---|---|---|
-| **G1** | `SCHEMA_IDENTITIES_ORG` defines no authority model for identity lifecycle transitions | membership of the record's business is the only boundary; any member may suspend/revoke | documented in `docs/http-gateway.md`; no authority invented |
-| **G2** | No contract says whether a request is rejected when its business (or division) is not `active` | a suspended/archived business with active memberships still admits work | documented; not invented |
-| **G3** | No contract states whether a division-scoped *membership* grants business-level access when the caller presents no division | reads/cancels of divisionless requests stay business-scoped | narrowing applies wherever a division is recorded |
-| **G4** | Request durability is not specified; `C-019` makes `Store()` external-only | requests/results do not survive restart | documented in §7 |
-| **G5** | Foreign-scope status codes differ between request reads (`403`) and org reads (`404`) | mild cross-scope existence difference, both documented | accepted per §A2 |
+| **G1** | `SCHEMA_IDENTITIES_ORG` defines no authority model for identity lifecycle transitions | membership of the record's business is the only boundary; any member may suspend/revoke | **DECIDED**: business-wide membership authority is intentional — see `docs/ARCHITECTURE_DECISIONS.md` §G1, contract §12.1 |
+| **G2** | No contract says whether a request is rejected when its business (or division) is not `active` | a suspended/archived business with active memberships still admits work | **DECIDED**: admission-only `409 CONFLICT` for non-active business/division — see §G2 in `docs/ARCHITECTURE_DECISIONS.md`, contract §12.2 |
+| **G3** | No contract states whether a division-scoped *membership* grants business-level access when the caller presents no division | reads/cancels of divisionless requests stay business-scoped | **DECIDED**: narrow membership (business-wide required for business-level scope) — see §G3 in `docs/ARCHITECTURE_DECISIONS.md`, contract §12.3 |
+| **G4** | Request durability is not specified; `C-019` makes `Store()` external-only | requests/results do not survive restart | **DECIDED**: canonical Level 1 (durable record for org state, process-local execution state) — `CORE_INTERFACE_CONTRACTS` §11.1 |
+| **G5** | Foreign-scope status codes differ between request reads (`403`) and org reads (`404`) | mild cross-scope existence difference, both documented | **DECIDED**: 404 = not found/not visible, 403 = visible scope denied action — `CORE_INTERFACE_CONTRACTS` §11.2 |
 
 ---
 

@@ -681,11 +681,11 @@ func (e *Engine) chainAuthorization(_ context.Context, req *Request) (string, er
 		}
 	}
 	actor, business := req.Context.ActorID, req.Context.BusinessID
-	if !e.identityMemberships.IsMember(actor, business, req.Context.DivisionID) {
+	if !e.identityMemberships.AllowsScope(actor, business, req.Context.DivisionID) {
 		return "", &ChainError{
 			Code:      "AUTHORIZATION",
 			Category:  "AUTHORIZATION",
-			Message:   fmt.Sprintf("actor %s is not an active member of business %s", actor, business),
+			Message:   fmt.Sprintf("actor %s is not authorized for scope business=%s division=%s", actor, business, req.Context.DivisionID),
 			ChainStep: string(StepAuthorization),
 			Retryable: false,
 		}

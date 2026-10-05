@@ -691,3 +691,58 @@ MAJOR.MINOR.PATCH
 ---
 
 *This document is the authoritative reference for NEXUS core interface contracts. Architecture modules remain frozen; code implementation will reference this document.*
+
+---
+
+## 11. Durability and Visibility Addendum (G4, G5)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–10
+are unchanged. This section resolves two long-standing ambiguities recorded
+in the Platform Integrity Audit (G4, G5).
+
+### 11.1 Request durability — canonical level (G4)
+
+NEXUS's canonical durability level is **Level 1 — durable record**:
+
+| State | Class | Survives restart |
+|---|---|---|
+| identities, businesses, divisions, credentials, memberships | **Durable** | yes (store, fail-closed hydration) |
+| provider configuration | **Durable** | yes (config) |
+| requests (pending/in-flight), results, approvals, escalations, policies, runtime state | **Process-local** | no |
+
+Externally observable consequences:
+
+* A request ID has meaning only within the process that admitted it.
+* After a restart (graceful, crash, or machine restart) a previously
+  admitted or completed request answers `404 VALIDATION` from
+  `GET /api/v1/requests/{id}` — the ID is indistinguishable from one this
+  process never admitted. There is **no** crash recovery, resume, or
+  multi-instance coordination; the API must never imply one (`202` on
+  submit means acceptance by the current process only).
+* Clients that care about continuity re-submit after observing `404`;
+  admitted work that is lost is simply re-issued, mirroring the
+  original-request contract.
+
+### 11.2 Visibility model (G5)
+
+One visibility rule applies to every resource family (request, result,
+approval, escalation, identity, business, division, policy):
+
+* **404** means *not found or not visible to this actor*. The two are
+  deliberately indistinguishable: a record in a business the actor is not a
+  business-wide member of, or outside the actor's division scope, answers
+  the same `404 VALIDATION` as an id that never existed. Existence of
+  cross-tenant resources is never confirmed.
+* **403 AUTHORIZATION** means *the scope is visible but this specific
+  action is denied*: an actor querying a `business_id` they are not a
+  member of at all, a division-scoped membership attempting a business-level
+  submission, or an authority failure such as
+  `self_approval_prohibited`.
+* **409 CONFLICT** means *the target is visible but its state forbids the
+  transition* (terminal cancel, approval-not-pending, non-active lifecycle
+  admission — see SCHEMA_IDENTITIES_ORG §12).
+
+The category tables in §3 are unchanged; only the *status-code assignment*
+for foreign-scope records moved from `403` to `404` where the audit had
+split the two surfaces. All error envelopes continue to carry
+`code/category/message/retryable/correlation_id`.
