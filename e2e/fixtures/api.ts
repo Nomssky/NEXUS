@@ -101,6 +101,8 @@ export async function expectEnvelope(
 export interface SubmitBody {
   intent: string;
   business_id: string;
+  /** CTR-AUTH-001 optional division scope; omitting it submits at business scope. */
+  division_id?: string;
   actor_id: string;
   priority?: number;
   constraints?: string[];
@@ -134,6 +136,7 @@ export async function getResult(
 export interface StoredResult {
   request_id: string;
   business_id: string;
+  division_id?: string;
   status: string;
   constraints?: string[];
   outcome?: { summary?: string; artifacts?: string[]; metrics?: Record<string, unknown> };
