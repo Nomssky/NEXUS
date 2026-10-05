@@ -94,6 +94,45 @@ decision := governance.FailSafe(engine, req)
 
 ---
 
+## Evaluation semantics (contracts §2.8 ↔ §9.5)
+
+`contracts/SCHEMA_GOVERNANCE_ATTENTION.md` states the evaluation algorithm
+twice: procedurally in §2.8 (locked — never rewritten to match the code) and
+as a restatement in §9.5, which is the operative description of what
+`governance.Engine` actually does:
+
+1. collect active, in-scope, non-expired policies that match
+   subject/action/resource;
+2. order by restrictiveness `DENY > ESCALATE > REQUIRE_APPROVAL >
+   ALLOW_WITH_CONSTRAINTS > ALLOW`;
+3. break ties by higher `precedence`, then by narrower scope
+   (SCHEMA_COMMON: on ambiguity, choose the narrowest possible scope);
+4. no match → `DENY`.
+
+The two sections agree on deny-first and on the default `DENY`; §9.5 adds the
+tie-breaks §2.8 leaves implicit. Where they differ is step 5 of §2.8 ("if no
+deny, first explicit effect wins"): read literally that ranks non-deny effects
+by precedence alone, whereas the engine ranks them by restrictiveness *first*,
+so a lower-precedence `REQUIRE_APPROVAL` still beats a higher-precedence
+`ALLOW`. §9.5 states the implemented order, so §9.5 governs. §2.8's default
+`DENY` is likewise qualified by §9.4: an unconfigured installation allows
+because the read-only `default-allow` built-in is seeded at boot — without
+that carve-out §2.8 step 6 applies verbatim.
+
+The winning policy is observable on the wire: the `POLICY_DENIED` /
+`APPROVAL_REQUIRED` / `ESCALATION_REQUIRED` error message carries
+`matched policy <policy_id> (v<policy_version>, precedence <n>)`, and an
+`ALLOW_WITH_CONSTRAINTS` decision surfaces as the terminal result's
+`constraints` (`type:expression`, reported and never enforced).
+
+Precedence *levels* (`GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK`,
+`engine.go`) are a separate axis from a policy's numeric `precedence`: they
+disambiguate scope, not effect. There is no `SYSTEM_SAFETY` level — earlier
+comments named one, and the corrected list is now identical everywhere
+(`internal/foundation/governance/policy.go`).
+
+---
+
 ## Testing
 
 - 30 tests covering TEST-M2-001..030
