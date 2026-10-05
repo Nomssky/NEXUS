@@ -38,18 +38,35 @@ const (
 	EventTypeToolCompleted     EventType = "tool.completed"
 	// Agent execution layer v1 lifecycle events (mission's event model,
 	// additive to the existing vocabulary — same envelope).
-	EventTypeAgentSelected     EventType = "agent.selected"
-	EventTypeAgentStarted      EventType = "agent.started"
-	EventTypeAgentDelegated    EventType = "agent.delegated"
-	EventTypeAgentCompleted    EventType = "agent.completed"
-	EventTypeAgentFailed       EventType = "agent.failed"
-	EventTypeModelSelected     EventType = "model.selected"
-	EventTypeModelStarted      EventType = "model.started"
-	EventTypeToolRequested     EventType = "tool.requested"
-	EventTypeToolStarted       EventType = "tool.started"
-	EventTypeGovernanceDecided EventType = "governance.decided"
-	EventTypeApprovalRequested EventType = "approval.requested"
-	EventTypeApprovalResolved  EventType = "approval.resolved"
+	EventTypeAgentSelected  EventType = "agent.selected"
+	EventTypeAgentStarted   EventType = "agent.started"
+	EventTypeAgentDelegated EventType = "agent.delegated"
+	EventTypeAgentCompleted EventType = "agent.completed"
+	EventTypeAgentFailed    EventType = "agent.failed"
+	EventTypeModelSelected  EventType = "model.selected"
+	EventTypeModelStarted   EventType = "model.started"
+	EventTypeToolRequested  EventType = "tool.requested"
+	EventTypeToolStarted    EventType = "tool.started"
+	// Agent intelligence layer v1 (control loop) events. agent.thinking is
+	// TELEMETRY ONLY — phase/step/action-type/reason-category/attempt; never
+	// raw reasoning, never model prompts (AGENT_INTELLIGENCE_CONTRACTS §13).
+	EventTypeObjectiveStarted   EventType = "objective.started"
+	EventTypeObjectiveCompleted EventType = "objective.completed"
+	EventTypePlanCreated        EventType = "plan.created"
+	EventTypePlanValidated      EventType = "plan.validated"
+	EventTypePlanReplanned      EventType = "plan.replanned"
+	EventTypeStepStarted        EventType = "step.started"
+	EventTypeStepCompleted      EventType = "step.completed"
+	EventTypeActionProposed     EventType = "action.proposed"
+	EventTypeActionRejected     EventType = "action.rejected"
+	EventTypeObservationCreated EventType = "observation.created"
+	EventTypeMemoryRead         EventType = "memory.read"
+	EventTypeMemoryWritten      EventType = "memory.written"
+	EventTypeAgentThinking      EventType = "agent.thinking"
+	EventTypeBudgetExhausted    EventType = "budget.exhausted"
+	EventTypeGovernanceDecided  EventType = "governance.decided"
+	EventTypeApprovalRequested  EventType = "approval.requested"
+	EventTypeApprovalResolved   EventType = "approval.resolved"
 	// Contract-canonical decision events (SCHEMA_EVENTS_TRIGGERS approval
 	// domain; RUNTIME §16.2). approval.resolved predates them and is kept
 	// for compatibility, but new emissions use approved/denied/expired.

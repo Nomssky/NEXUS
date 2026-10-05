@@ -73,11 +73,19 @@ func BuiltinExecutor() map[string]func(ctx context.Context, input map[string]str
 
 // registerBuiltins seeds the registry with the deterministic example tool
 // definitions when they are not already there (idempotent by id).
+//
+// All three are pure functions with no side effects, so they are registered
+// under the READ category: the tool registry only accepts read-only tools in
+// the read category (ToolRegistry.RegisterTool) and only read tools are
+// executable on the M5 path. A pure computation therefore belongs here rather
+// than in a write/compute category it may never execute from. Definitions are
+// known-good, so a registration error can only mean a duplicate id (skipped
+// above).
 func registerBuiltins(tr *tool.ToolRegistry) {
 	defs := []*tool.ToolDefinition{
 		{ID: "echo", Name: "Echo", Version: "v1", Category: tool.ToolCategoryRead, RiskLevel: tool.RiskLevelLow, ReadOnly: true, Timeout: 2 * time.Second, Description: "Echo the input text back."},
-		{ID: "calculator", Name: "Calculator", Version: "v1", Category: tool.ToolCategoryCompute, RiskLevel: tool.RiskLevelLow, ReadOnly: true, Timeout: 2 * time.Second, Description: "Deterministic arithmetic: op in add|sub|mul|div."},
-		{ID: "transform", Name: "Transform", Version: "v1", Category: tool.ToolCategoryCompute, RiskLevel: tool.RiskLevelLow, ReadOnly: true, Timeout: 2 * time.Second, Description: "Deterministic string transform: op in upper|lower|reverse."},
+		{ID: "calculator", Name: "Calculator", Version: "v1", Category: tool.ToolCategoryRead, RiskLevel: tool.RiskLevelLow, ReadOnly: true, Timeout: 2 * time.Second, Description: "Deterministic arithmetic: op in add|sub|mul|div."},
+		{ID: "transform", Name: "Transform", Version: "v1", Category: tool.ToolCategoryRead, RiskLevel: tool.RiskLevelLow, ReadOnly: true, Timeout: 2 * time.Second, Description: "Deterministic string transform: op in upper|lower|reverse."},
 	}
 	for _, d := range defs {
 		if _, ok := tr.GetTool(d.ID); !ok {

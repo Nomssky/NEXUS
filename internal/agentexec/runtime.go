@@ -107,7 +107,7 @@ func NewRuntime(reg *Registry, tools *tool.ToolRegistry, router *modelrouter.Mod
 // handler is the executor.TaskHandler seam.
 func (r *Runtime) Handler() func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
 	return func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
-		return r.execute(ctx, req, ag, 0, map[string]*Spec{})
+		return r.execute(ctx, req, ag, 0)
 	}
 }
 
@@ -132,7 +132,7 @@ func (r *Runtime) emit(ev event.EventType, req *executor.WorkRequest, actor, out
 	})
 }
 
-func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent, depth int, cache map[string]*Spec) (*executor.Outcome, error) {
+func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent, depth int) (*executor.Outcome, error) {
 	start := r.now()
 	var spec Spec
 	if raw := req.Input["agent_execution"]; raw != "" {
@@ -147,7 +147,7 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 		if depth > r.maxDepth {
 			return failedOutcome(req, ag, start, "delegation depth exceeded"), nil
 		}
-		return r.runWorkflow(ctx, req, ag, &spec, start, depth, cache)
+		return r.runWorkflow(ctx, req, ag, &spec, start, depth, nil)
 	}
 
 	// Direct path: select agent → tools → model → delegates.
@@ -200,7 +200,7 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 			})},
 			Constraints: req.Constraints, Priority: req.Priority,
 		}
-		child, err := r.execute(childCtx, childReq, ag, depth+1, cache)
+		child, err := r.execute(childCtx, childReq, ag, depth+1)
 		if err != nil {
 			childFailures = append(childFailures, fmt.Sprintf("%s: %v", d.ID, err))
 			continue
@@ -431,6 +431,56 @@ func (r *Runtime) toolKnown(id string) bool {
 	return ok
 }
 
+// InvokeTool performs one mediated tool call under the *existing* tool
+// boundary: allowlist (agent-owned) → registry existence → deterministic
+// executor. Exported so the intelligence layer reuses this exact boundary
+// instead of introducing a second one. Errors are descriptive; every failure
+// is terminal for the caller (tool failure never becomes success).
+func (r *Runtime) InvokeTool(ctx context.Context, agentID string, allowedTools []string, businessID string, call ToolCallSpec) (map[string]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(call.ToolID) == "" {
+		return nil, fmt.Errorf("tool id is required")
+	}
+	if r.Tools == nil {
+		return nil, fmt.Errorf("tool %q is not registered", call.ToolID)
+	}
+	if _, ok := r.Tools.GetTool(call.ToolID); !ok {
+		return nil, fmt.Errorf("tool %q is not registered", call.ToolID)
+	}
+	if agentID != "" && len(allowedTools) > 0 && !stringIn(allowedTools, call.ToolID) {
+		return nil, fmt.Errorf("tool %q is not in the agent allowlist", call.ToolID)
+	}
+	execFn, ok := r.ToolExec[call.ToolID]
+	if !ok || execFn == nil {
+		return nil, fmt.Errorf("tool %q has no executor", call.ToolID)
+	}
+	return execFn(ctx, call.Input)
+}
+
+// DelegateChild runs one child execution through the existing delegation
+// primitive (AGENT_EXECUTION_CONTRACTS §10): the child inherits the parent's
+// business/division/actor/correlation/cancellation context, so it can never
+// widen authority. The intelligence layer uses this; it does not have a second
+// delegation mechanism.
+func (r *Runtime) DelegateChild(ctx context.Context, parent *executor.WorkRequest, ag *agent.Agent, child DelegateSpec, depth int) (*executor.Outcome, error) {
+	childReq := &executor.WorkRequest{
+		TaskID:        parent.TaskID + "/delegate/" + child.ID,
+		CorrelationID: parent.CorrelationID,
+		BusinessID:    parent.BusinessID,
+		DivisionID:    parent.DivisionID,
+		ActorID:       parent.ActorID,
+		Intent:        child.Intent,
+		Input: map[string]string{"agent_execution": mustMarshalSpec(&Spec{
+			AgentID: child.AgentID, RequiredCapabilities: child.Capabilities, Tools: child.Tools,
+		})},
+		Constraints: parent.Constraints,
+		Priority:    parent.Priority,
+	}
+	return r.execute(ctx, childReq, ag, depth+1)
+}
+
 // runWorkflow executes a WorkflowSpec sequentially or with a bounded
 // parallel pool. Sequential: first-failure wins. Parallel: all nodes
 // complete; workflow succeeds only if every node succeeds; node failures
@@ -516,7 +566,7 @@ func (r *Runtime) runNode(ctx context.Context, req *executor.WorkRequest, ag *ag
 		Input:       map[string]string{"agent_execution": mustMarshalSpec(sub)},
 		Constraints: req.Constraints, Priority: req.Priority,
 	}
-	out, err := r.execute(ctx, nodeReq, ag, depth, cache)
+	out, err := r.execute(ctx, nodeReq, ag, depth)
 	mu.Lock()
 	defer mu.Unlock()
 	if err != nil {
