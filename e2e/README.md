@@ -75,17 +75,17 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | --- | --- |
 | Auth | `X-Actor-ID` + `X-Actor-Credential`, or `Authorization: Basic base64(id:cred)`. Because SCHEMA §7 ids are `{nx}:{entity_type}:{unique}` and credentials are opaque, the Basic payload is split at **every** colon and each candidate is verified (see *Findings*). Missing → `401 UNAUTHORIZED` / category `AUTH` / `authentication required`; bad → `401 UNAUTHORIZED` / `AUTH` / `invalid credentials` (unknown id and wrong credential are byte-identical). Non-member or mismatched `actor_id` → `403 AUTHORIZATION` / category `AUTHORIZATION`. |
 | Control auth | `X-API-Key`. Missing/wrong → `401 UNAUTHORIZED` / `AUTH`. |
-| Submit | `POST /api/v1/requests` `{intent, business_id, actor_id, priority?, constraints?}` → `202 {request_id, correlation_id, status:"accepted", actor_id}`; `request_id == correlation_id` unless `X-Correlation-ID` is supplied (and then it is honoured). Missing fields → `400 VALIDATION`. While the engine is stopped → `503 RESOURCE_UNAVAILABLE` (never `202`). |
-| Result | `GET /api/v1/requests/{id}?business_id=` → `202 {request_id, correlation_id, status:"pending"}` while running, `200 {request_id, business_id, status, outcome?, error?, audit_trace, duration}` when terminal, `404` code `VALIDATION` for an unknown id, `403` for a foreign scope. Missing `business_id` → `400 VALIDATION`. |
+| Submit | `POST /api/v1/requests` `{intent, business_id, actor_id, division_id?, priority?, constraints?}` → `202 {request_id, correlation_id, status:"accepted", actor_id}`; `request_id == correlation_id` unless `X-Correlation-ID` is supplied (and then it is honoured). Missing fields → `400 VALIDATION`. While the engine is stopped → `503 RESOURCE_UNAVAILABLE` (never `202`). `division_id` is optional (CTR-AUTH-001): unknown → `400` `division not found`, not a division of `business_id` → `400` `division does not belong to the requested business`, membership not covering it → `403 AUTHORIZATION` `access denied: actor is not a member of the requested division`, registry claimed but not wired → `503 DEPENDENCY_FAILURE`. Omitting it submits at business scope. |
+| Result | `GET /api/v1/requests/{id}?business_id=` → `202 {request_id, correlation_id, status:"pending"}` while running, `200 {request_id, business_id, division_id?, status, outcome?, error?, audit_trace, duration}` when terminal (`division_id` echoed only when the request recorded one), `404` code `VALIDATION` for an unknown id, `403` for a foreign scope and, when the caller's membership does not cover the recorded division, `403` `access denied: division scope mismatch`. Missing `business_id` → `400 VALIDATION`. |
 | Errors | `{"error":{code, category, message, details?, retryable, correlation_id, timestamp}}` plus an `X-Correlation-ID` response header matching the body. Categories are the closed set of 14 in CORE §3 — there is no `NOT_FOUND`; a 404 carries code `VALIDATION`. |
 | Route errors | Unrouted path → `404` code `VALIDATION`, message `no such endpoint: <METHOD> <path>`. Wrong method → `405` code `METHOD_NOT_ALLOWED`, message `method <METHOD> not allowed for <path>` (the mux's own text), keeping the mux's `Allow` header. |
-| Control | `GET /api/v1/control/status` → `200 {status, uptime, components{engine,…}, request_count}`. `POST …/pause` → `200 {status:"paused"}`; repeat → `409 ALREADY_PAUSED`. `POST …/resume` → `200 {status:"resumed"}`; repeat → `409 ALREADY_RUNNING`. While paused: `GET /ready` → `503`, submit → `503 RESOURCE_UNAVAILABLE`. |
-| Cancel | `POST /api/v1/requests/{id}/cancel?business_id=` → `202 {request_id, correlation_id, status:"cancelling"}`; repeat on a `cancelled` result → `202` (idempotent); on a `completed` result → `409 CONFLICT`; unknown id → `404 VALIDATION`; foreign scope on a known id → `403`; missing `business_id` → `400`. |
+| Control | `GET /api/v1/control/status` → `200 {status, uptime, components{engine,…}, request_count}`; `uptime` is a Go duration string (`1m30.5s`) measured from gateway construction on the server clock and clamped at `0`. `POST …/pause` → `200 {status:"paused"}`; repeat → `409 ALREADY_PAUSED`. `POST …/resume` → `200 {status:"resumed"}`; repeat → `409 ALREADY_RUNNING`. While paused: `GET /ready` → `503`, submit → `503 RESOURCE_UNAVAILABLE`. |
+| Cancel | `POST /api/v1/requests/{id}/cancel?business_id=` → `202 {request_id, correlation_id, status:"cancelling"}`; repeat on a `cancelled` result → `202` (idempotent); on a `completed` result → `409 CONFLICT`; unknown id → `404 VALIDATION`; foreign scope on a known id → `403`; recorded division the caller's membership does not cover → `403` `access denied: division scope mismatch` (checked against the recorded scope, so in-flight work is covered too); missing `business_id` → `400`. |
 | SSE | `GET /events?business_id=` → `200 text/event-stream`, frames `event: <type>\ndata: <json>\n\n`. Missing `business_id` → `400`; non-member → `403`. Frames are the SCHEMA §2.2 Event Record (`schema_version`, `entity_type:"event"`, `event_id`, `event_type`, `nexus_id`, `business_id`, `occurred_at`, `emitted_at`, `producer{…}`, `correlation_id`, `payload`). `chain.*` events carry `correlation_id == request id` and `event_id == "<request id>-<event type>"`. |
 | Identity listing | `GET /api/v1/identities?business_id=` returns identities whose **record** is scoped to that business. The bootstrap record is global-scope (it is created before any business exists) so it is absent from its own business's listing while still being a member of it; it is individually readable at `GET /api/v1/identities/nx:human:bootstrap`. |
-| Policy control | `GET/PUT/DELETE /api/v1/control/policies[/{id}]`, gated by `X-API-Key` (no identity, no membership). The body *is* the §2 Policy Record: `effect` is the enum name (`ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE`), and server-derivable §2.2 fields (`schema_version`, `entity_type`, `nexus_id`, `created_at`, `created_by`, `effective_from`, `policy_version`, `provenance`) are stamped by the gateway. Missing/invalid required field → `400 VALIDATION`. Unknown id → `404 VALIDATION`. The seeded `default-allow` is read-only → `409 CONFLICT`. Policies are process-lifetime state: a restart reloads only the built-in. |
+| Policy control | `GET/PUT/DELETE /api/v1/control/policies[/{id}]`, gated by `X-API-Key` (no identity, no membership). The body *is* the §2 Policy Record: `effect` is the enum name (`ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE`), and server-derivable §2.2 fields (`schema_version`, `entity_type`, `nexus_id`, `created_at`, `created_by`, `effective_from`, `policy_version`, `provenance`) are stamped by the gateway. Missing/invalid required field → `400 VALIDATION`. Unknown id → `404 VALIDATION`. `PUT` is an upsert on `policy_id` (a second `PUT` replaces the effect and keeps the record readable back); `DELETE` → `200 {policy_id, deleted:true}`, a repeat or a deleted id → `404 VALIDATION`. The seeded `default-allow` is read-only → `409 CONFLICT`. Policies are process-lifetime state: a restart reloads only the built-in. |
 | Governance decisions | A `DENY` reaches the client as a terminal `failed` whose `error` carries code/category `POLICY_DENIED`, `chain_step: "governance"`, `retryable: false` and a message naming the matched policy (`matched policy <id> (v<version>, precedence <n>)` — that is how the winning rule is observed). `ALLOW_WITH_CONSTRAINTS` is the only allowing outcome that leaves a mark: the terminal result carries `constraints: ["type:expression"]`, reported and not enforced. A policy pinned to another `business_id` never matches, and `status: "disabled"` is never active. |
-| Approvals | A `REQUIRE_APPROVAL` policy holds the request: terminal `failed` with code/category `APPROVAL_REQUIRED`, `retryable: false` and `error.details.approval_id`. `GET /api/v1/approvals?business_id=` lists only the **pending** records as `{approvals:[{entity_id, requester_id, policy_ref, status:"PENDING", …}]}` (missing `business_id` → `400`, non-member → `403`). `POST /api/v1/approvals/{id}/{approve,deny}?business_id=` requires a non-empty `reason` (`400 VALIDATION`, the §6.2 `decision_rationale`); `approve` → `202 {approval_id, status:"approved"}` and the original request resumes to `completed`, `deny` → `200 {approval_id, status:"denied"}` with **no** resume (the stored result stays `failed`/`APPROVAL_REQUIRED`). The approver must be a member of `business_id`; with `self_approval_prohibited` the requester is refused `403 AUTHORIZATION` (`core: self-approval prohibited`). Unknown id → `404 VALIDATION`. |
+| Approvals | A `REQUIRE_APPROVAL` policy holds the request: terminal `failed` with code/category `APPROVAL_REQUIRED`, `retryable: false` and `error.details.approval_id`. `GET /api/v1/approvals?business_id=` lists only the **pending** records as `{approvals:[{entity_id, requester_id, policy_ref, status:"PENDING", …}]}` (missing `business_id` → `400`, non-member → `403`). `POST /api/v1/approvals/{id}/{approve,deny}?business_id=` requires a non-empty `reason` (`400 VALIDATION`, the §6.2 `decision_rationale`); `approve` → `202 {approval_id, status:"approved"}` and the original request resumes to `completed`, `deny` → `200 {approval_id, status:"denied"}` with **no** resume (the stored result stays `failed`/`APPROVAL_REQUIRED`). The approver must be a member of `business_id`; with `self_approval_prohibited` the requester is refused `403 AUTHORIZATION` (`core: self-approval prohibited`), and with `approval_config.approver_ids` set a member outside that list is refused `403 AUTHORIZATION` (`core: approver not authorized`). Membership is the read boundary, the policy list is the decision boundary: neither refusal resolves the approval, which stays actionable until the named approver decides. Unknown id → `404 VALIDATION`. |
 | Escalations | An `ESCALATE` policy fails the request with code `ESCALATION_REQUIRED`, category `POLICY_DENIED` (CORE §3 has no escalation category), `retryable: false` and `error.details.escalation_ref`; the alert is queued asynchronously from the `governance.escalated` event, so `GET /api/v1/escalations?business_id=` must be polled. The record answers `pending → acknowledged → resolved` (`expired` past `deadline`). `POST /api/v1/escalations/{id}/{ack,resolve}?business_id=` requires non-empty `reasoning` (`400 VALIDATION`) and returns `{escalation_id, status, accepted: true}`; an `ack` that is not `pending` or a `resolve` that is not `pending`/`acknowledged` → `409 CONFLICT`. Unknown id → `404`, foreign scope → `403`. |
 | Provider failure | The launcher seeds `simulated:default` + a `simulated` provider when no model is registered. `NEXUS_SEEDED_PROVIDER_STATUS=offline` starts that provider offline (PROVIDER_CONTRACTS §12); admission is unaffected (`202`) but the request ends `200` with `status:"failed"`, `error.code:"EXECUTION_FAILED"`, `error.category:"INTERNAL_FAILURE"`, `error.chain_step:"agent"`, `error.retryable:false`, a message containing `provider invocation failed` … `provider simulated is offline`, `outcome.metrics.executor_status:"failed"` and an audit trace whose `agent` step reads `status=failed`. It is never `completed` and never carries a summary (no false success). `/ready` and the control plane stay up — the gateway did not fail. Any other value for the variable is a `VALIDATION` boot error. |
 | Persistence | File store writes `<NEXUS_DATA_DIR>/identity/<id>.json`, `<NEXUS_DATA_DIR>/business/<id>.json`, `<NEXUS_DATA_DIR>/credential/credential:<identity id>.json` and `<NEXUS_DATA_DIR>/membership/membership:<identity id>.json`. The registry, the credential verifiers and the memberships all hydrate on boot and all fail closed on a corrupt record. Record ids are unique store-wide, hence the `<type>:` namespace on the last two. The bootstrap identity's credential is re-armed (overwritten) from `NEXUS_BOOTSTRAP_CREDENTIAL` on every boot; rotating the variable takes effect immediately, unsetting it stops refreshing rather than removing the stored hash. |
@@ -107,6 +107,10 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | GOVERNANCE | `tests/09-governance.spec.ts` |
 | APPROVAL/ESCALATION | `tests/10-approval.spec.ts` |
 | PROVIDER FAILURE | `tests/11-provider-failure.spec.ts` (its own offline gateway; the shared one stays healthy) |
+| DIVISION TOPOLOGY | `tests/12-topology.spec.ts` (`division_id` validation/recording, division-scoped membership on submit, read and cancel, division-pinned policy) |
+| IDENTITY LIFECYCLE | `tests/13-identity-lifecycle.spec.ts` (suspend/revoke/activate, pending identities, malformed input rollback, duplicate `entity_id`, bootstrap self-lockout recovery) |
+| POLICY LIFECYCLE | `tests/09-governance.spec.ts` (PUT upsert, DELETE, default-allow restored after removal) |
+| APPROVER AUTHORITY | `tests/10-approval.spec.ts` (`approval_config.approver_ids` refusal vs. self-approval vs. acceptance) |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than
@@ -162,32 +166,36 @@ timing luck.
   already-decided approval also depends on that index: once the resume has
   stored its terminal result the entry is cleaned up and a repeat decision
   answers `404`, not `409`.
-* **Identity lifecycle transitions are probed, not covered — and suspending
-  the only credential-bearing identity is a permanent self-lockout.** The suite
-  never calls `POST /api/v1/identities/{id}/{suspend,revoke,activate}`.
-  Status is enforced at authentication and `bootstrapIdentity` only *creates*
-  `nx:human:bootstrap` when it is missing, so a restart does not undo a
-  suspension: every identity-scoped endpoint answers `401` until the data dir
-  is reset, enforcement is relaxed, or a second identity created first
-  `activate`s it (verified by hand). This is the contract posture
-  (SCHEMA_IDENTITIES_ORG §10.2 — revocation is a status transition); it is
-  recorded because nothing warns the operator. Related open contract question:
-  the contract assigns no authority model to transitions, so the
-  implementation's membership-of-scope rule (any member, no role check) stands
-  unchallenged.
-* **Divisions are not covered** — the submit body carries no division field, so
-  a division-pinned policy can never match a request raised through the public
-  API and there is nothing observable to assert.
+* **Identity lifecycle transitions are covered; the authority model behind them
+  is not defined by any contract.** `13-identity-lifecycle.spec.ts` drives
+  `suspend`, `revoke`, `activate`, the `pending → active` admission path,
+  malformed-input rollback and the bootstrap self-lockout recovery (a second
+  identity created first, then `activate` restores the original). The
+  remaining open question is a *contract* gap, not a test gap: SCHEMA
+  §9/§10.2 assigns no authority model to a transition, so the implementation's
+  rule — membership in the record's own business, no role check — stands
+  unchallenged. Recorded as audit §G1 rather than invented here.
+* **Division records are covered at the edge that matters.**
+  `12-topology.spec.ts` creates divisions over `POST /api/v1/divisions`, pins
+  identities and policies to them, and asserts the narrowing on submit, result
+  retrieval and cancel. `GET`/`PATCH`/`DELETE` of a division record, the
+  suspend/activate transitions, and `GET /api/v1/control/{metrics,components}`
+  were still checked by hand rather than by the suite.
+* **Cross-business and foreign-record branches are Go-tested, not
+  HTTP-tested.** A caller can only be a member of one business over HTTP
+  (`docs/http-gateway.md`: nothing in the API creates the first membership for
+  a second business), so §8's cross-business `division_id` rejection and the
+  `404`-for-a-foreign-org-record asymmetry (audit §G5) are asserted in
+  `TestDivisionScopeOnSubmitValidation/division_of_another_business` and
+  `internal/gateway/org_test.go` instead of through the gateway.
 * **No coverage of:** TLS/mTLS, multi-instance operation, rate limiting,
   the oversized-response (`413 RESOURCE_LIMIT`) path, and SSE client capacity
-  (`503 RESOURCE_LIMIT`). Division records (`POST/GET /api/v1/divisions…`) and
-  `GET /api/v1/control/{metrics,components}` were also checked by hand during
-  the final audit rather than by the suite.
+  (`503 RESOURCE_LIMIT`).
 
 ## Conventions
 
 * Tests run serially (`fullyParallel: false`, one worker) against one gateway
-  instance per worker; specs are ordered `01`…`11`. `11-provider-failure`
+  instance per worker; specs are ordered `01`…`13`. `11-provider-failure`
   starts its own gateway because its configuration exists only at boot.
 * Timeouts are bounded everywhere; on failure the harness prints the request
   id, the last response body and the captured NEXUS stdout/stderr so a red run
