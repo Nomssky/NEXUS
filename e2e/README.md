@@ -120,6 +120,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | POLICY LIFECYCLE | `tests/09-governance.spec.ts` (PUT upsert, DELETE, default-allow restored after removal) |
 | APPROVER AUTHORITY | `tests/10-approval.spec.ts` (`approval_config.approver_ids` refusal vs. self-approval vs. acceptance) |
 | AGENT EXECUTION | `tests/15-agent-execution.spec.ts` (agent register/discover/lifecycle, executions + provider/model telemetry, bounded tools + allowlist denial, sequential/parallel workflows, delegation, cancellation, offline provider failure, governance denial, G2 admission, G4 restart 404, event correlation) |
+| AGENT INTELLIGENCE | `tests/16-agent-intelligence.spec.ts` (objective execution with plan → validate → tool → observe → complete, multiple tool calls, memory read/write, dynamic delegation, replanning, iteration/caller budgets, invalid model output, prompt injection in tool data, cancellation, provider failure, governance denial, G2/G3/G4/G5, event correlation; boots its own gateway with the deterministic scripted simulation provider) |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than
