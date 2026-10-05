@@ -25,6 +25,13 @@ npx playwright test  # or: npm test
 npx playwright show-report   # HTML report from the last run
 ```
 
+`./manual-probes.sh` is a separate, Playwright-free record: it boots the same
+binary on a throwaway data directory and drives it with `curl`/`jq` only. It
+exists for the surfaces this suite does not automate (control
+`metrics`/`components`, division record read and transitions) and for the
+Phase 14 wire spot-check; results are recorded in
+`docs/PLATFORM_INTEGRITY_AUDIT.md` §9.
+
 Useful variables:
 
 | Variable | Effect |
@@ -178,9 +185,10 @@ timing luck.
 * **Division records are covered at the edge that matters.**
   `12-topology.spec.ts` creates divisions over `POST /api/v1/divisions`, pins
   identities and policies to them, and asserts the narrowing on submit, result
-  retrieval and cancel. `GET`/`PATCH`/`DELETE` of a division record, the
-  suspend/activate transitions, and `GET /api/v1/control/{metrics,components}`
-  were still checked by hand rather than by the suite.
+  retrieval and cancel. Single-record `GET`, the duplicate-create `409`, the
+  `suspend`/`activate`/`archive` transitions (and `archived` being terminal),
+  plus `GET /api/v1/control/{metrics,components}`, are probed by
+  `manual-probes.sh` rather than by this suite.
 * **Cross-business and foreign-record branches are Go-tested, not
   HTTP-tested.** A caller can only be a member of one business over HTTP
   (`docs/http-gateway.md`: nothing in the API creates the first membership for
