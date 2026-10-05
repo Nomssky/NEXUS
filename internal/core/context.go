@@ -132,6 +132,12 @@ type Response struct {
 	// Used for authorization checks on result retrieval.
 	BusinessID string `json:"business_id"`
 
+	// DivisionID is the division the request was admitted under (CTR-AUTH-001
+	// division_id), empty for business-scope work. Used for authorization
+	// checks on result retrieval — a division-scoped membership covers this
+	// record only for its own division (SCHEMA_IDENTITIES_ORG §4.3).
+	DivisionID string `json:"division_id,omitempty"`
+
 	// Status is the final status of a stored result: completed, failed or
 	// cancelled — those are the only values executeChain writes (ESCALATE
 	// and REQUIRE_APPROVAL both land on failed with their own error code;

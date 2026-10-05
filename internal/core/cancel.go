@@ -23,18 +23,37 @@ import (
 
 // Cancellation sentinels mapped to HTTP semantics by the gateway:
 // ErrRequestNotFound → 404, ErrScopeMismatch → 403,
+// ErrDivisionScopeMismatch → 403,
 // ErrAlreadyCompleted/ErrCompletionRace → 409.
 var (
 	// ErrRequestNotFound reports an unknown request ID.
 	ErrRequestNotFound = errors.New("core: request not found")
 	// ErrScopeMismatch reports a request belonging to another business.
 	ErrScopeMismatch = errors.New("core: business scope mismatch")
+	// ErrDivisionScopeMismatch reports a division-scoped request whose
+	// division the caller's membership does not cover
+	// (SCHEMA_IDENTITIES_ORG §4.3).
+	ErrDivisionScopeMismatch = errors.New("core: division scope mismatch")
 	// ErrAlreadyCompleted reports a non-cancellable terminal state.
 	// Match with errors.Is; *TerminalStateError carries the status.
 	ErrAlreadyCompleted = errors.New("core: request already in a non-cancellable terminal state")
 	// ErrCompletionRace reports that a terminal state raced the cancellation.
 	ErrCompletionRace = errors.New("core: request reached a terminal state while cancelling")
 )
+
+// divisionCancelDenied reports whether the recorded division scope blocks
+// actorID from cancelling.
+//
+// Division narrowing runs only under scope enforcement — the same flag that
+// guards chainAuthorization — so the enforcement-off posture is unchanged.
+// A divisionless request keeps the business-only check: narrowing applies
+// exactly where a division is recorded, never where it is absent.
+func (e *Engine) divisionCancelDenied(actorID, businessID, divisionID string) bool {
+	if !e.identityEnforceScope || e.identityMemberships == nil || divisionID == "" {
+		return false
+	}
+	return !e.identityMemberships.IsMember(actorID, businessID, divisionID)
+}
 
 // TerminalStateError reports the terminal status alongside ErrAlreadyCompleted.
 type TerminalStateError struct {
@@ -66,6 +85,7 @@ const (
 type inflightRequest struct {
 	requestID       string
 	businessID      string
+	divisionID      string
 	correlationID   string
 	taskID          string // executor task ID (wf.ID); empty until submitted
 	state           inflightState
@@ -88,6 +108,7 @@ func (e *Engine) registerInflight(req *Request) {
 	e.inflight[req.ID] = &inflightRequest{
 		requestID:     req.ID,
 		businessID:    req.Context.BusinessID,
+		divisionID:    req.Context.DivisionID,
 		correlationID: req.Context.CorrelationID,
 		state:         inflightQueued,
 	}
@@ -107,6 +128,10 @@ type PendingInfo struct {
 	// BusinessID is the scope the request was submitted under, so a reader
 	// can authorize the same way it does for a stored result.
 	BusinessID string
+	// DivisionID is the division the request was submitted under, empty for
+	// business-scope work — readers narrow by it the same way they do for a
+	// stored result (SCHEMA_IDENTITIES_ORG §4.3).
+	DivisionID string
 	// CorrelationID is the request's correlation chain id, echoed back to a
 	// polling client.
 	CorrelationID string
@@ -130,7 +155,11 @@ func (e *Engine) Pending(requestID string) (PendingInfo, bool) {
 	if inf == nil {
 		return PendingInfo{}, false
 	}
-	return PendingInfo{BusinessID: inf.businessID, CorrelationID: inf.correlationID}, true
+	return PendingInfo{
+		BusinessID:    inf.businessID,
+		DivisionID:    inf.divisionID,
+		CorrelationID: inf.correlationID,
+	}, true
 }
 
 // isCancelRequested reports whether cancellation was requested for requestID.
@@ -146,6 +175,8 @@ func (e *Engine) isCancelRequested(requestID string) bool {
 // Semantics (E-005):
 //   - unknown request → ErrRequestNotFound (404)
 //   - request of another business → ErrScopeMismatch (403), any state
+//   - request whose recorded division the caller does not cover →
+//     ErrDivisionScopeMismatch (403), any state (SCHEMA_IDENTITIES_ORG §4.3)
 //   - stored terminal result cancelled → nil (idempotent repeat)
 //   - stored terminal result otherwise → *TerminalStateError (409), including
 //     pending_approval (Category C 5d must revisit approval-state cancellation)
@@ -157,7 +188,11 @@ func (e *Engine) isCancelRequested(requestID string) bool {
 // identity, or the fixed "unauthenticated" marker when enforcement is off).
 // Authorization itself — identity, membership, ownership — is enforced at the
 // API boundary; this method enforces ownership scope against the recorded
-// business only.
+// business, and division scope against the recorded division.
+//
+// Division narrowing runs outside inflightMu (leaf-lock rule: membership
+// lookups never happen under it) and only where a division is recorded — a
+// divisionless request keeps the business-only check.
 func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 	if requestID == "" {
 		return ErrRequestNotFound
@@ -172,6 +207,9 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 		if result.BusinessID != businessID {
 			return ErrScopeMismatch
 		}
+		if e.divisionCancelDenied(actorID, businessID, result.DivisionID) {
+			return ErrDivisionScopeMismatch
+		}
 		return terminalCancelError(result.Status)
 	}
 
@@ -184,6 +222,33 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 			if result.BusinessID != businessID {
 				return ErrScopeMismatch
 			}
+			if e.divisionCancelDenied(actorID, businessID, result.DivisionID) {
+				return ErrDivisionScopeMismatch
+			}
+			return terminalCancelError(result.Status)
+		}
+		return ErrRequestNotFound
+	}
+	if inf.businessID != businessID {
+		e.inflightMu.Unlock()
+		return ErrScopeMismatch
+	}
+	// Resolve the recorded division first: the cancel flag must never be set
+	// for an actor the division scope denies, and the membership lookup has
+	// to happen with no lock held.
+	divisionID := inf.divisionID
+	e.inflightMu.Unlock()
+
+	if e.divisionCancelDenied(actorID, businessID, divisionID) {
+		return ErrDivisionScopeMismatch
+	}
+
+	e.inflightMu.Lock()
+	inf = e.inflight[requestID]
+	if inf == nil {
+		e.inflightMu.Unlock()
+		// It became terminal between the two sections.
+		if result, ok := e.GetResult(requestID); ok {
 			return terminalCancelError(result.Status)
 		}
 		return ErrRequestNotFound

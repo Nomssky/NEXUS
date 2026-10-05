@@ -582,6 +582,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	return &Response{
 		RequestID:   req.ID,
 		BusinessID:  req.Context.BusinessID,
+		DivisionID:  req.Context.DivisionID,
 		Status:      status,
 		Constraints: governanceConstraints(govDecision),
 		Outcome:     outcomeResult,
@@ -1009,6 +1010,7 @@ func (e *Engine) chainCancelled(ctx context.Context, req *Request, audit []Audit
 	return &Response{
 		RequestID:  req.ID,
 		BusinessID: req.Context.BusinessID,
+		DivisionID: req.Context.DivisionID,
 		Status:     "cancelled",
 		Error:      chainErr,
 		AuditTrail: audit,
@@ -1050,6 +1052,7 @@ func (e *Engine) chainError(req *Request, err error, step ChainStep, audit []Aud
 	return &Response{
 		RequestID:  req.ID,
 		BusinessID: req.Context.BusinessID,
+		DivisionID: req.Context.DivisionID,
 		Status:     "failed",
 		Error:      chainErr,
 		AuditTrail: audit,
