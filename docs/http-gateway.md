@@ -110,11 +110,26 @@ authentication groups cover all of them:
 {
   "intent": "owner's intent",
   "business_id": "biz-1",
+  "division_id": "div-1",
   "actor_id": "user-1",
   "priority": 5,
   "constraints": ["budget:1000"]
 }
 ```
+
+`division_id` is optional (CORE_INTERFACE_CONTRACTS §4.2 `CTR-AUTH-001`).
+Omitting it submits at business scope; supplying it narrows the request to one
+division of `business_id` and that division is carried on the admitted entry,
+the stored result and the terminal result. It must exist and belong to
+`business_id` (SCHEMA_IDENTITIES_ORG §8), and when enforcement is on the
+caller's membership must cover it:
+
+| Status | Category | When |
+|---|---|---|
+| `400` | `VALIDATION` | `division not found` |
+| `400` | `VALIDATION` | `division does not belong to the requested business` |
+| `403` | `AUTHORIZATION` | `access denied: actor is not a member of the requested division` |
+| `503` | `DEPENDENCY_FAILURE` | a division was claimed but no registry is wired to verify it |
 
 Response: `202 Accepted`
 ```json
@@ -133,13 +148,37 @@ Query parameters:
 
 Authorization mirrors the cancel path: identity middleware, then identity-bound
 membership in `business_id`, then a scope match against the request's recorded
-business (`403 AUTHORIZATION`).
+business (`403 AUTHORIZATION`), then — when the request recorded a division —
+against that division (`403 AUTHORIZATION`, `access denied: division scope
+mismatch`). A divisionless request is never narrowed: SCHEMA_IDENTITIES_ORG
+§4.3 protects recorded division data, and the contract does not extend the
+narrowing to business-scope work (audit §G3).
+
+The terminal result echoes the scope it was admitted under:
+
+```json
+{
+  "request_id": "api-1234567890",
+  "business_id": "biz-1",
+  "division_id": "div-1",
+  "status": "completed"
+}
+```
+
+`division_id` is omitted when the request was submitted at business scope.
 
 | Status | Category | Body |
 |---|---|---|
 | `200` | — | the terminal result (`completed` / `failed` / `cancelled`) |
 | `202` | — | `{"request_id","correlation_id","status":"pending"}` |
+| `400` | `VALIDATION` | `business_id` missing |
+| `401` | `UNAUTHORIZED` | enforcement on, no credentials |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, or recorded-division mismatch |
 | `404` | `VALIDATION` | unknown request id |
+
+`404` stays the answer for an id that was never admitted, and `403` for an id
+that exists but the caller may not see — the two are deliberately distinct
+(audit §G5).
 
 `202 pending` is returned while the request is admitted but has not reached a
 terminal state. A result is only stored when the chain finishes, so without
@@ -164,10 +203,13 @@ Query parameters:
 
 Authorization mirrors `GET /api/v1/requests/{id}`: identity middleware (path is
 scope-protected → `401 UNAUTHORIZED` without credentials when enforcement is
-on), identity-bound membership in `business_id` (`403 AUTHORIZATION`), then
-core ownership (`403` foreign scope, `404` unknown request). It is an
-identity-scoped API path — a control API key is **not** required, and no
-governance re-evaluation happens at this boundary.
+on), identity-bound membership in `business_id` (`403 AUTHORIZATION`), core
+ownership (`403` foreign scope, `404` unknown request), then the recorded
+division when one exists (`403`, `access denied: division scope mismatch`).
+It is an identity-scoped API path — a control API key is **not** required, and
+no governance re-evaluation happens at this boundary. The division check runs
+against the recorded scope, not the pending map, so it applies to admitted
+in-flight work as well as stored results.
 
 Response: `202 Accepted`
 ```json
@@ -186,7 +228,7 @@ that reaches a terminal state first returns its real state).
 |---|---|---|
 | `400` | `VALIDATION` | `business_id` missing |
 | `401` | `UNAUTHORIZED` | enforcement on, no credentials |
-| `403` | `AUTHORIZATION` | not a member of `business_id`, or foreign scope |
+| `403` | `AUTHORIZATION` | not a member of `business_id`, foreign scope, or — when the request recorded a division the caller's membership does not cover — `access denied: division scope mismatch` |
 | `404` | `VALIDATION` | unknown request |
 | `409` | `CONFLICT` | already in a terminal state (`completed`/`failed`) |
 
@@ -295,6 +337,11 @@ shares the prefix.
 | `POST` | `/resume` | `200 {status:"resumed"}`; repeat → `409 ALREADY_RUNNING` |
 | `GET` | `/metrics` | `200 {executor{executed,failed,denied,cancelled,active}, backpressure{queue_size,rejected_count}, circuit_breaker{state}, recovery{failure_count}}` |
 | `GET` | `/components` | `200 {components:[{name,status,type}], count}` |
+
+`uptime` is the elapsed wall time since the gateway was constructed, as a Go
+duration string (`"1m30.5s"`, `"0s"` before the first tick), measured against
+the server clock — never a raw number and never negative. `request_count` is
+the executor's cumulative executed count, not the number of live requests.
 
 `/components` reports **authoritative state where one exists** (`engine` → the
 lifecycle state, `circuit_breaker` → its state, `task_executor` →
