@@ -27,24 +27,24 @@ either section being rewritten.
 
 | Subsystem | Contract | Implementation | HTTP exposure | Persistence | E2E | Gap |
 |---|---|---|---|---|---|---|
-| identities | `SCHEMA_IDENTITIES_ORG` §2, §9 | `foundation/identity/identity.go`, `registry.go` | `GET/POST /api/v1/identities`, `GET {id}` | durable (`storage.data_dir`) | `01`, `03`, `08` | lifecycle **authority model undefined** (§G1) |
+| identities | `SCHEMA_IDENTITIES_ORG` §2, §9 | `foundation/identity/identity.go`, `registry.go` | `GET/POST /api/v1/identities`, `GET {id}` | durable (`storage.data_dir`) | `01`, `03`, `08`, `13` | lifecycle **authority model undefined** (§G1) |
 | credentials | `SCHEMA_IDENTITIES_ORG` §10 | `identity/authenticate.go`, `persist.go` | never exposed | durable, verifier/hash only | `01`, `08` | — |
 | memberships | `SCHEMA_IDENTITIES_ORG` §10 | `identity/membership.go` | never exposed | durable | `03`, `08` | division narrowing only applied where a division is recorded (§G3) |
 | businesses | `SCHEMA_IDENTITIES_ORG` §3 | `identity/registry.go` | `GET/POST /api/v1/businesses` + transitions | durable | `03`, `08` | business status not checked at admission (§G2) |
-| divisions | `SCHEMA_IDENTITIES_ORG` §4 | `identity/registry.go` | `GET/POST /api/v1/divisions` + transitions | durable | none | **`division_id` absent from submit** (F1) |
-| requests | `CORE_INTERFACE_CONTRACTS` §4, `RUNTIME_EXECUTION_CONTRACTS` §3 | `core/engine.go`, `core/chain.go` | submit / result / cancel | ephemeral (C-019) | `02`, `04`, `07`, `08` | division scope dropped at the HTTP boundary (F1) |
-| scopes | `RUNTIME_EXECUTION_CONTRACTS` §3.2 | `core/context.go`, `chain.go` `chainAuthorization` | `business_id` query + body | — | `03` | admission is division-aware once a division reaches the context (F1) |
+| divisions | `SCHEMA_IDENTITIES_ORG` §4 | `identity/registry.go` | `GET/POST /api/v1/divisions` + transitions | durable | `12` | ~~`division_id` absent from submit~~ **FIXED (F1)** |
+| requests | `CORE_INTERFACE_CONTRACTS` §4, `RUNTIME_EXECUTION_CONTRACTS` §3 | `core/engine.go`, `core/chain.go` | submit / result / cancel | ephemeral (C-019) | `02`, `04`, `07`, `08`, `12` | ~~division scope dropped at the HTTP boundary~~ **FIXED (F1)** |
+| scopes | `RUNTIME_EXECUTION_CONTRACTS` §3.2 | `core/context.go`, `chain.go` `chainAuthorization` | `business_id` query + body | — | `03`, `12` | admission now division-aware: `division_id` reaches the context **FIXED (F1, F2)** |
 | governance policies | `SCHEMA_GOVERNANCE_ATTENTION` §2, §9 | `governance/engine.go`, `gateway/policies.go` | `GET/PUT/DELETE /api/v1/control/policies*` | process-lifetime (§9.6) | `09` | §2.8 text coarser than §9.5 (F4) |
-| governance decisions | `SCHEMA_GOVERNANCE_ATTENTION` §2.8, `CORE` §3 | `core/chain.go` `chainGovernance` | via terminal result | — | `09`, `10` | stale comments (F3) |
-| approvals | `SCHEMA_WORK_OBJECTIVES` §6 | `core/approval.go`, `governance/approval.go` | `GET /api/v1/approvals`, approve/deny | in-memory (P1) | `10` | no unauthorized-decision E2E |
+| governance decisions | `SCHEMA_GOVERNANCE_ATTENTION` §2.8, `CORE` §3 | `core/chain.go` `chainGovernance` | via terminal result | — | `09`, `10` | ~~stale comments~~ **FIXED (F3)** |
+| approvals | `SCHEMA_WORK_OBJECTIVES` §6 | `core/approval.go`, `governance/approval.go` | `GET /api/v1/approvals`, approve/deny | in-memory (P1) | `10` (incl. unauthorized / self-approval decisions) | — |
 | escalations | `SCHEMA_GOVERNANCE_ATTENTION` §4 | `core/escalation.go` | `GET /api/v1/escalations`, ack/resolve | in-memory (P1) | `10` | — |
 | executor | `RUNTIME_EXECUTION_CONTRACTS` §6.1 (worker machine) | `executor/executor.go` | via `outcome.metrics` | — | `02`, `11` | worker lifecycle ≠ process lifecycle (ACCEPTED, §A5) |
 | providers | `PROVIDER_CONTRACTS` §4, §7.3, §12 | `modelrouter/provider.go`, `router.go` | via result error | config-seeded | `11` | §7.3 vs §12.2 reconciled by addendum (§A6) |
-| cancellation | `CORE` §6.4, `core/cancel.go` | `core/cancel.go` | `POST /api/v1/requests/{id}/cancel` | — | `07` | division narrowing added at core boundary (F2) |
+| cancellation | `CORE` §6.4, `core/cancel.go` | `core/cancel.go` | `POST /api/v1/requests/{id}/cancel` | — | `07`, `12` | division narrowing added at the core boundary **FIXED (F2)** |
 | persistence | `store/store.go`, `filestore.go` | `foundation/store` | never exposed | identity/business/division/credential/membership durable | `08` | classification made explicit (§7) |
 | SSE / events | `SCHEMA_EVENTS_TRIGGERS` §2 | `foundation/event`, `gateway/server.go` | `GET /events` | — | `06` | — |
 | health / readiness | `docs/http-gateway.md` | `gateway/server.go` | `GET /health`, `/ready`, `/status` | — | `05` | — |
-| control API | `docs/http-gateway.md` | `gateway/server.go` | `/api/v1/control/*` | — | `05`, `09` | `uptime` documented but never populated (F3) |
+| control API | `docs/http-gateway.md` | `gateway/server.go` | `/api/v1/control/*` | — | `05`, `09` | ~~`uptime` documented but never populated~~ **FIXED (F3)** |
 | authentication | `SCHEMA_IDENTITIES_ORG` §2.4, §10 | `gateway/identity.go`, `identity/authenticate.go` | `X-Actor-ID` / `Basic` | hash only | `01`, `08` | — |
 | authorization | `CORE_INTERFACE_CONTRACTS` §4.2 | `gateway/identity.go` `authorizeMembership` | all identity-scoped paths | — | `03` | membership is the boundary, no role model (ACCEPTED) |
 | error envelopes | `CORE_INTERFACE_CONTRACTS` §3 | `gateway/server.go` `writeError` | every error path | — | `04` | — |
@@ -157,8 +157,11 @@ four are resolved separately through Governance", and the contract defines no
 authority model for lifecycle transitions. The implementation's rule is
 membership of the record's business scope — any member, no role check — and
 `404` for foreign scope. No role system is invented. The rule is documented
-precisely in `docs/http-gateway.md` and covered by E2E (member may transition,
-non-member gets `404`, bootstrap self-lockout and recovery).
+precisely in `docs/http-gateway.md`. Covered by E2E for what HTTP can reach
+(`13-identity-lifecycle.spec.ts`: member transitions suspend/revoke/activate,
+pending → active, malformed-input rollback, duplicate `404`/`409`,
+bootstrap self-lockout recovery) and by `internal/gateway/org_test.go` for the
+foreign-record `404`, which is unreachable over HTTP (see §6).
 
 ### §A2 — `403` on foreign-scope request reads vs `404` on org records
 
@@ -243,9 +246,18 @@ externally observable contract behaviour has black-box coverage:
 | approvals | `SCHEMA_WORK` §6 | `10` |
 | escalations | `SCHEMA_GOVERNANCE` §4 | `10` |
 | identities / businesses / divisions | `SCHEMA_IDENTITIES_ORG` §2–§4 | `01`, `03`, `08`, `13` (lifecycle), `12` (division) |
-| control surface | `docs/http-gateway.md` | `05` |
-| policy control | `SCHEMA_GOVERNANCE` §9 | `09`, `14` (lifecycle) |
+| control surface | `docs/http-gateway.md` | `05` (uptime populated, `TestControlStatusUptimePopulated`) |
+| policy control | `SCHEMA_GOVERNANCE` §9 | `09` (incl. `PUT` upsert / `DELETE` lifecycle) |
 | `/events` (SSE) | `SCHEMA_EVENTS` §2.2 | `06` |
+
+Two branches of the map are asserted in Go rather than over HTTP, because no
+caller can reach them through the public surface:
+
+* a `division_id` belonging to *another business* — a caller can only be a
+  member of one business, since nothing in the API creates the first
+  membership for a second one (`docs/http-gateway.md`) →
+  `TestDivisionScopeOnSubmitValidation/division_of_another_business`;
+* a `404` for a *foreign org record* (`§G5`) → `internal/gateway/org_test.go`.
 
 ---
 
