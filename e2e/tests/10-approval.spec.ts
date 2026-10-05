@@ -49,6 +49,11 @@ const approverCredential = `cred-${suffix}-${Date.now().toString(36)}`;
 
 let approverCreated = false;
 
+const requesterID = `requester-${suffix}`;
+const requesterCredential = `cred-${suffix}-${Date.now().toString(36)}-req`;
+
+let requesterCreated = false;
+
 /** Create a second active member of the home business, once per worker. */
 async function ensureApprover(request: APIRequestContext, nexus: NexusHandle): Promise<void> {
   if (approverCreated) return;
@@ -66,6 +71,25 @@ async function ensureApprover(request: APIRequestContext, nexus: NexusHandle): P
   const text = await res.text();
   expect(res.status(), `create approver identity: ${text}`).toBe(200);
   approverCreated = true;
+}
+
+/** Create the identity that raises the held request, once per worker. */
+async function ensureRequester(request: APIRequestContext, nexus: NexusHandle): Promise<void> {
+  if (requesterCreated) return;
+  const res = await request.post(`${nexus.baseURL}/api/v1/identities`, {
+    headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+    data: {
+      entity_id: requesterID,
+      identity_type: 'human',
+      display_name: 'E2E Requester',
+      business_id: nexus.businessID,
+      credential: requesterCredential,
+      credential_method: 'password',
+    },
+  });
+  const text = await res.text();
+  expect(res.status(), `create requester identity: ${text}`).toBe(200);
+  requesterCreated = true;
 }
 
 function approvalURL(nexus: NexusHandle, approvalID: string, decision: 'approve' | 'deny'): string {
@@ -382,5 +406,105 @@ test.describe('APPROVAL / ESCALATION', () => {
     expect(final.status).toBe('resolved');
     expect(final.resolved_by).toBe(nexus.actorID);
     expect(final.resolution).toBe('handled outside the platform');
+  });
+
+  test('only an approver named by the policy may decide; the requester may not', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureApprover(request, nexus);
+    await ensureRequester(request, nexus);
+
+    const id = `e2e-approver-list-${suffix}`;
+    const created = await putPolicy(
+      request,
+      nexus,
+      id,
+      policyBody({
+        business_id: nexus.businessID,
+        effect: 'REQUIRE_APPROVAL',
+        precedence: 4,
+        approval_config: {
+          approver_type: 'human',
+          approver_ids: [approverID],
+          timeout_seconds: 3600,
+          auto_deny_on_timeout: false,
+          self_approval_prohibited: true,
+          delegation_allowed: false,
+        },
+      }),
+    );
+    expect(created.status(), `create approver-list policy: ${await created.text()}`).toBe(200);
+
+    const submitted = await submit(
+      request,
+      nexus,
+      {
+        intent: 'work gated to one named approver',
+        business_id: nexus.businessID,
+        actor_id: requesterID,
+      },
+      actorHeaders(requesterID, requesterCredential),
+    );
+    expect(submitted.status()).toBe(202);
+    const { request_id } = await submitted.json();
+
+    const held = await pollResult(request, nexus, request_id, nexus.businessID);
+    expect(held.status).toBe('failed');
+    expect(held.error?.category).toBe('APPROVAL_REQUIRED');
+    const approvalID = held.error?.details?.approval_id;
+    expect(approvalID).toBeTruthy();
+
+    // A member of the business who is not on the approver list is refused:
+    // membership is the read boundary, the policy list is the decision
+    // boundary.
+    const notListed = await request.post(approvalURL(nexus, approvalID!, 'approve'), {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { reason: 'I am a member but not a named approver' },
+    });
+    const refused = await expectEnvelope(
+      notListed,
+      403,
+      'AUTHORIZATION',
+      'AUTHORIZATION',
+      'approver not on the policy list',
+    );
+    expect(refused.message).toContain('not authorized');
+
+    // The requester is refused for a different reason: self-approval.
+    const selfTried = await request.post(approvalURL(nexus, approvalID!, 'approve'), {
+      headers: { ...actorHeaders(requesterID, requesterCredential), 'Content-Type': 'application/json' },
+      data: { reason: 'approving my own request' },
+    });
+    const selfRefused = await expectEnvelope(
+      selfTried,
+      403,
+      'AUTHORIZATION',
+      'AUTHORIZATION',
+      'requester self-approval',
+    );
+    expect(selfRefused.message).toContain('self-approval');
+
+    // Both refusals left the approval actionable.
+    const listed = await request.get(
+      `${nexus.baseURL}/api/v1/approvals?business_id=${nexus.businessID}`,
+      { headers: bootstrapHeaders(nexus) },
+    );
+    const { approvals } = await listed.json();
+    expect(
+      (approvals ?? []).some((a: any) => a.entity_id === approvalID),
+      'a refused decision does not resolve the approval',
+    ).toBe(true);
+
+    // The named approver is accepted and the request resumes.
+    const approved = await request.post(approvalURL(nexus, approvalID!, 'approve'), {
+      headers: { ...actorHeaders(approverID, approverCredential), 'Content-Type': 'application/json' },
+      data: { reason: 'checked the change, go ahead' },
+    });
+    expect(approved.status(), `approve: ${await approved.text()}`).toBe(202);
+
+    const resumed = await pollResult(request, nexus, request_id, nexus.businessID);
+    expect(resumed.status, 'the held request resumes after a valid approval').toBe('completed');
+    expect(resumed.error).toBeUndefined();
   });
 });

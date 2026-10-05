@@ -292,4 +292,64 @@ test.describe('GOVERNANCE', () => {
     expect(result.status, 'disabled policies are not active').toBe('completed');
     expect(result.error).toBeUndefined();
   });
+
+  test('a policy is replaced by a PUT and removed by a DELETE, and both change decisions', async ({
+    request,
+    nexus,
+  }) => {
+    const id = `e2e-policy-lifecycle-${suffix}`;
+
+    const submitOnce = async (intent: string) => {
+      const res = await submit(request, nexus, {
+        intent,
+        business_id: nexus.businessID,
+        actor_id: nexus.actorID,
+      });
+      expect(res.status()).toBe(202);
+      const { request_id } = await res.json();
+      return pollResult(request, nexus, request_id, nexus.businessID);
+    };
+
+    // §9.5 is an upsert on policy_id: create.
+    const created = await putPolicy(
+      request,
+      nexus,
+      id,
+      policyBody({ business_id: nexus.businessID, effect: 'DENY', precedence: 5 }),
+    );
+    expect(created.status(), `create deny: ${await created.text()}`).toBe(200);
+    const denied = await submitOnce('denied by the created policy');
+    expect(denied.status).toBe('failed');
+    expect(denied.error?.category).toBe('POLICY_DENIED');
+    expect(denied.error?.message).toContain(id);
+
+    // …replace: the same id now carries a different effect.
+    const replaced = await putPolicy(
+      request,
+      nexus,
+      id,
+      policyBody({ business_id: nexus.businessID, effect: 'ALLOW', precedence: 5 }),
+    );
+    expect(replaced.status(), `replace policy: ${await replaced.text()}`).toBe(200);
+    const readBack = await getPolicy(request, nexus, id);
+    expect((await readBack.json()).effect, 'the replacement is readable back').toBe('ALLOW');
+    const allowed = await submitOnce('allowed by the replaced policy');
+    expect(allowed.status, 'the replaced effect governs the next decision').toBe('completed');
+    expect(allowed.error).toBeUndefined();
+
+    // …delete: the record is gone and the seeded default-allow governs again.
+    const removed = await deletePolicy(request, nexus, id);
+    expect(removed.status(), `delete: ${await removed.text()}`).toBe(200);
+    expect((await removed.json()).deleted).toBe(true);
+    const gone = await getPolicy(request, nexus, id);
+    await expectEnvelope(gone, 404, 'VALIDATION', 'VALIDATION', 'deleted policy');
+
+    const afterRemoval = await submitOnce('allowed after the policy is removed');
+    expect(afterRemoval.status).toBe('completed');
+    expect(afterRemoval.error).toBeUndefined();
+
+    // Removing what is not there is a 404, not a silent success.
+    const again = await deletePolicy(request, nexus, id);
+    await expectEnvelope(again, 404, 'VALIDATION', 'VALIDATION', 'second delete');
+  });
 });
