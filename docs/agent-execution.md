@@ -138,7 +138,16 @@ telemetry is carried in `outcome.metrics` and the summary:
   retry is transient-only and bounded to one extra attempt.
 * Agent definitions are managed over HTTP only; no bulk import/CLI.
 
-## 8. Testing
+## 8. What sits above this layer
+
+Agent Intelligence Layer v1 (`docs/agent-intelligence.md`) turns one declared
+composition into an **objective** pursued through a bounded control loop. It
+runs *inside* this execution boundary: the runtime is wired as the request's
+handler, and it reuses this layer's tool boundary (`InvokeTool`) and
+delegation primitive (`DelegateChild`). Nothing in this layer's semantics —
+selection, scope, tools, delegation, cancellation, durability — changed.
+
+## 9. Testing
 
 * Go unit: `internal/agentexec` (registry CRUD/lifecycle/durability, selection
   determinism + explainability, offline-no-retry, transient-retry,

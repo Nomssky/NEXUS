@@ -52,7 +52,8 @@ authentication groups cover all of them:
 
 * **Identity-scoped** — `/api/v1/requests…`, `/events`, `/api/v1/approvals…`,
   `/api/v1/escalations…`, `/api/v1/identities…`, `/api/v1/businesses…`,
-  `/api/v1/divisions…`, `/api/v1/agents…`, `/api/v1/executions…`. Authenticated with `X-Actor-ID` + `X-Actor-Credential`
+  `/api/v1/divisions…`, `/api/v1/agents…`, `/api/v1/executions…`,
+  `/api/v1/intelligence…`. Authenticated with `X-Actor-ID` + `X-Actor-Credential`
   (or `Authorization: Basic …`) and, where a `business_id` is involved,
   membership-checked. `401 UNAUTHORIZED` without credentials, `403
   AUTHORIZATION` outside the scope. An `X-API-Key` does not authenticate these
@@ -104,6 +105,9 @@ authentication groups cover all of them:
 | `POST` | `/api/v1/executions` | Submit an agent execution |
 | `GET` | `/api/v1/executions/{id}` | Get an execution result (`202` pending) |
 | `POST` | `/api/v1/executions/{id}/cancel` | Cancel an in-flight execution (E-005) |
+| `POST` | `/api/v1/intelligence/execute` | Submit an objective execution (Agent Intelligence Layer v1) |
+| `GET` | `/api/v1/intelligence/{id}` | Get an objective execution result (`202` pending) |
+| `POST` | `/api/v1/intelligence/{id}/cancel` | Cancel an objective execution (E-005) |
 | `GET` | `/api/v1/control/status` | Control status, uptime, components, request count |
 | `POST` | `/api/v1/control/pause` | Pause admission |
 | `POST` | `/api/v1/control/resume` | Resume admission |
@@ -287,6 +291,58 @@ Decision body: `{"reasoning":"…"}` — required.
 | `403` | `AUTHORIZATION` | not a member of `business_id`, or no business-wide membership |
 | `404` | `VALIDATION` | unknown escalation id, or one outside the caller's business |
 | `409` | `CONFLICT` | the record is not in a decidable state (`ack` only from `pending`) |
+
+### Objectives — `/api/v1/intelligence`
+
+Agent Intelligence Layer v1 (`docs/agent-intelligence.md`,
+`contracts/AGENT_INTELLIGENCE_CONTRACTS.md`). An objective execution is an
+ordinary admitted request whose handler is the bounded control loop, so
+identity, scope (G3), active-org admission (G2), governance/approval,
+cancellation and visibility (G5) behave exactly as everywhere else.
+
+`POST /api/v1/intelligence/execute` body:
+
+```json
+{
+  "business_id": "biz-1",
+  "division_id": "div-1",
+  "actor_id": "user-1",
+  "objective": {
+    "description": "multiply six by seven with the calculator",
+    "success_criteria": ["the product is reported"],
+    "context": {"agent_id": "analyst"},
+    "budget": {"max_iterations": 4}
+  }
+}
+```
+
+`description` is required; `budget` may only **tighten** the server caps
+(iterations 8, model calls 16, tool calls 8, delegations 3, replans 2, steps 12,
+depth 2, 60s). Response `202 {execution_id, correlation_id, status:"accepted"}`.
+
+`GET /api/v1/intelligence/{id}?business_id=` returns the standard request
+response; the loop's terminal state and counters ride in `outcome.summary`:
+
+```
+state=completed | objective=… | agent=analyst | iterations=2 tool_calls=1
+delegations=0 model_calls=2 replans=0 observations=1 | result=…
+```
+
+Non-`completed` states are `failed` results whose `error.message` starts with
+`state=<state>:` — one of `failed`, `cancelled`, `budget_exhausted`,
+`deadline_exceeded`. Cancellation uses the same E-005 semantics
+(`202`/`409`/`404`). After a restart an objective execution id answers `404`:
+objective state is process-local (G4 Level 1); agent definitions and agent
+memory are the durable parts.
+
+| Status | Category | When |
+|---|---|---|
+| `400` | `VALIDATION` | missing `business_id`/`actor_id`, malformed body, empty objective |
+| `401` | `UNAUTHORIZED` | enforcement on, no/invalid credentials |
+| `403` | `AUTHORIZATION` | actor mismatch, out-of-scope membership (incl. G3 division rules) |
+| `404` | `VALIDATION` | unknown or out-of-scope execution id |
+| `409` | `CONFLICT` | business/division not `active` (G2) |
+| `503` | `DEPENDENCY_FAILURE` | intelligence runtime not configured |
 
 ### Agent definitions — `/api/v1/agents`
 
@@ -594,20 +650,20 @@ internal/gateway/
   org.go           identities / businesses / divisions (SCHEMA_IDENTITIES_ORG
                    §2–§4, §9 audit)
   policies.go      policy control surface (SCHEMA_GOVERNANCE_ATTENTION §9)
-  *_test.go        134 tests
+  *_test.go        136 tests
 ```
 
 ---
 
 ## Testing
 
-- 134 tests in the package: health / ready / status / submit / result /
+- 136 tests in the package: health / ready / status / submit / result /
   validation / error envelopes, cancellation (400/401/403/404/409, idempotent
   repeat, attribution), identity and scope, approvals, escalations, policy
-  control, organization records, agent definitions and executions, control
-  pause/resume, SSE wire and lifetime
+  control, organization records, agent definitions, executions and objective
+  executions, control pause/resume, SSE wire and lifetime
 - Core Runtime tests unchanged and passing
 - Foundation M0–M11 tests unchanged and passing
 - Race detector clean
-- The black-box HTTP suite lives in `e2e/` (71 Playwright tests driving the
+- The black-box HTTP suite lives in `e2e/` (85 Playwright tests driving the
   compiled `cmd/nexus` binary)
