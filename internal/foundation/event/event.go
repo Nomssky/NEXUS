@@ -36,6 +36,17 @@ const (
 	EventTypeModelCompleted    EventType = "model.completed"
 	EventTypeToolInvoked       EventType = "tool.invoked"
 	EventTypeToolCompleted     EventType = "tool.completed"
+	// Agent execution layer v1 lifecycle events (mission's event model,
+	// additive to the existing vocabulary — same envelope).
+	EventTypeAgentSelected     EventType = "agent.selected"
+	EventTypeAgentStarted      EventType = "agent.started"
+	EventTypeAgentDelegated    EventType = "agent.delegated"
+	EventTypeAgentCompleted    EventType = "agent.completed"
+	EventTypeAgentFailed       EventType = "agent.failed"
+	EventTypeModelSelected     EventType = "model.selected"
+	EventTypeModelStarted      EventType = "model.started"
+	EventTypeToolRequested     EventType = "tool.requested"
+	EventTypeToolStarted       EventType = "tool.started"
 	EventTypeGovernanceDecided EventType = "governance.decided"
 	EventTypeApprovalRequested EventType = "approval.requested"
 	EventTypeApprovalResolved  EventType = "approval.resolved"

@@ -119,6 +119,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | ADMISSION LIFECYCLE | `tests/14-admission.spec.ts` (G2: suspended/archived business/division rejects new submits `409`, reads/cancels continue, `active` reopens) |
 | POLICY LIFECYCLE | `tests/09-governance.spec.ts` (PUT upsert, DELETE, default-allow restored after removal) |
 | APPROVER AUTHORITY | `tests/10-approval.spec.ts` (`approval_config.approver_ids` refusal vs. self-approval vs. acceptance) |
+| AGENT EXECUTION | `tests/15-agent-execution.spec.ts` (agent register/discover/lifecycle, executions + provider/model telemetry, bounded tools + allowlist denial, sequential/parallel workflows, delegation, cancellation, offline provider failure, governance denial, G2 admission, G4 restart 404, event correlation) |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than

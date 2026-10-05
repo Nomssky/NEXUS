@@ -100,6 +100,7 @@ func run() int {
 		Authenticator:         auth,
 		Memberships:           a.Memberships(),
 		Registry:              a.Registry(),
+		Store:                 a.Store(),
 		RequireAuthentication: cfg.Security.RequireAuthentication,
 		EnforceBusinessScope:  cfg.Security.EnforceBusinessScope,
 	})

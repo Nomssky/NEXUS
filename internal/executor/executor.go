@@ -123,6 +123,14 @@ type Outcome struct {
 	CreatedAt time.Time `json:"created_at"`
 	// CompletedAt records when execution finished.
 	CompletedAt time.Time `json:"completed_at"`
+
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
+	RoutingReason   string `json:"routing_reason,omitempty"`
+	Fallback        bool   `json:"fallback,omitempty"`
+	ToolsExecuted   int    `json:"tools_executed,omitempty"`
+	ChildExecutions int    `json:"child_executions,omitempty"`
+	Retries         int    `json:"retries,omitempty"`
 }
 
 // WorkRequest is a request submitted to the executor for processing.
@@ -620,6 +628,16 @@ func (e *Executor) executeWork(req *WorkRequest) {
 		outcome.Status = result.Status
 		outcome.Output = result.Output
 		outcome.Evidence = result.Evidence
+		if result.Error != "" {
+			outcome.Error = result.Error
+		}
+		outcome.Provider = result.Provider
+		outcome.Model = result.Model
+		outcome.RoutingReason = result.RoutingReason
+		outcome.Fallback = result.Fallback
+		outcome.ToolsExecuted = result.ToolsExecuted
+		outcome.ChildExecutions = result.ChildExecutions
+		outcome.Retries = result.Retries
 	}
 
 	if outcome.Status == "" {

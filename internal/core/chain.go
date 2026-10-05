@@ -520,6 +520,27 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		if execOutcome.AgentID != "" {
 			outcomeResult.Metrics["agent_id"] = execOutcome.AgentID
 		}
+		if execOutcome.Provider != "" {
+			outcomeResult.Metrics["provider"] = execOutcome.Provider
+		}
+		if execOutcome.Model != "" {
+			outcomeResult.Metrics["model"] = execOutcome.Model
+		}
+		if execOutcome.RoutingReason != "" {
+			outcomeResult.Metrics["routing_reason"] = execOutcome.RoutingReason
+		}
+		if execOutcome.Fallback {
+			outcomeResult.Metrics["fallback"] = true
+		}
+		if execOutcome.ToolsExecuted > 0 {
+			outcomeResult.Metrics["tools_executed"] = execOutcome.ToolsExecuted
+		}
+		if execOutcome.ChildExecutions > 0 {
+			outcomeResult.Metrics["child_executions"] = execOutcome.ChildExecutions
+		}
+		if execOutcome.Retries > 0 {
+			outcomeResult.Metrics["retries"] = execOutcome.Retries
+		}
 	} else if execOutcome != nil {
 		// Fail closed: any other executor outcome (failed, unknown — e.g. an
 		// E-008 provider failure or "no agent available" — or a handler-
@@ -886,6 +907,7 @@ func (e *Engine) chainSchedule(_ context.Context, req *Request, wf *workflow.Wor
 // chainExecute submits the work to the task executor and waits for completion.
 func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Workflow) (*executor.Outcome, error) {
 	workReq := &executor.WorkRequest{
+		Handler:       req.Handler,
 		TaskID:        wf.ID,
 		CorrelationID: req.Context.CorrelationID,
 		BusinessID:    req.Context.BusinessID,
@@ -898,6 +920,7 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 		Intent:      req.Intent,
 		Priority:    req.Priority,
 		Constraints: req.Constraints,
+		Input:       req.Input,
 		// Approval resume: carries an approved approval into the executor
 		// gate so its REQUIRE_APPROVAL policy is satisfied on the re-run.
 		ApprovalState: e.approvalStateFor(req.ID),

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
@@ -20,6 +21,8 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
+	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/gateway"
 )
 
@@ -60,6 +63,12 @@ type Options struct {
 	// Registry is the organization entity registry (Identity/Business/
 	// Division). Optional: nil leaves the org endpoints fail-closed (503).
 	Registry *identity.Registry
+
+	// Store is the durable record store used for the agent registry too
+	// (durable agent definitions across restarts, G4 Level 1). Nil makes
+	// the agent definitions in-memory (Level 0 durability) and the agent
+	// surface cap its guarantees on that — matching registry's Posture).
+	Store store.Store
 
 	// GatewayOptions are passed through to the gateway server (L-002 test
 	// seam for deterministic listen behavior). Nil/empty in production.
@@ -145,6 +154,15 @@ func New(opts Options) *Launcher {
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
 	}
+	// Agent execution layer v1: durable agent definitions + runtime wired
+	// through the canonical request path (governance inherits unchanged).
+	agentTools := tool.NewToolRegistry()
+	agentReg, err := agentexec.OpenRegistry(opts.Config.Nexus.ID, opts.Registry, agentTools, opts.Store)
+	if err != nil {
+		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
+	}
+	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
+	gwOpts = append(gwOpts, gateway.WithAgentExecution(agentReg, agentRt))
 	gwOpts = append(gwOpts, opts.GatewayOptions...)
 	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)
 

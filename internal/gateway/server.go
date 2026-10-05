@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -96,6 +97,11 @@ type Server struct {
 	// Organization entity registry (SCHEMA_IDENTITIES_ORG §2–§4). Nil makes
 	// the org endpoints fail closed (503).
 	registry *identity.Registry
+
+	// Agent execution layer (v1): durable definitions + the runtime the
+	// execution surface plugs into the request pipeline.
+	agents      *agentexec.Registry
+	agentRunner *agentexec.Runtime
 
 	// nexusID stamps the installation identity onto external event
 	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
@@ -254,6 +260,18 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		})
 
 	s.mux.HandleFunc("GET /events", s.handleSSE)
+
+	// Agent execution layer v1 (§12 in docs/agent-execution.md).
+	s.mux.HandleFunc("GET /api/v1/agents", s.handleListAgents)
+	s.mux.HandleFunc("POST /api/v1/agents", s.handleCreateAgent)
+	s.mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGetAgent)
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/update", s.handleUpdateAgent)
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/suspend", s.handleAgentTransitionSuspend)
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/archive", s.handleAgentTransitionArchive)
+	s.mux.HandleFunc("POST /api/v1/agents/{id}/activate", s.handleAgentTransitionActivate)
+	s.mux.HandleFunc("POST /api/v1/executions", s.handleSubmitExecution)
+	s.mux.HandleFunc("GET /api/v1/executions/{id}", s.handleGetExecution)
+	s.mux.HandleFunc("POST /api/v1/executions/{id}/cancel", s.handleCancelExecution)
 
 	// Control surface endpoints
 	s.mux.HandleFunc("GET /api/v1/control/status", s.handleControlStatus)

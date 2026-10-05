@@ -18,6 +18,8 @@ package core
 import (
 	"fmt"
 	"time"
+
+	"github.com/Nomssky/NEXUS/internal/executor"
 )
 
 // RequestContext carries context through the entire execution chain.
@@ -119,8 +121,24 @@ type Request struct {
 	// Constraints are any constraints on how this request should be fulfilled.
 	Constraints []string `json:"constraints,omitempty"`
 
+	// Input carries task-specific parameters from the HTTP surface down to
+	// the executor's handler (executor.WorkRequest.Input). The agent
+	// execution layer uses the "agent_execution" key; other surfaces can
+	// stay nil — the default handler ignores it.
+	Input map[string]string `json:"input,omitempty"`
+
 	// Deadline is when this request must be completed by.
 	Deadline *time.Time `json:"deadline,omitempty"`
+
+	// Handler, when set on a request, overrides the executor's default
+	// task handler for that one request. It is the seam through which the
+	// agent execution layer supplies agentic work to the canonical chain
+	// (audit, governance, approval, cancellation and admission stay the
+	// request-path's responsibility); a request arriving without it keeps
+	// the default simulated executor (existing behaviour unchanged).
+	// Approval resume re-admits the identical *Request, so the handler
+	// carried here is what an approved resume re-executes.
+	Handler executor.TaskHandler `json:"-"`
 }
 
 // Response represents the outcome of processing a request through the chain.

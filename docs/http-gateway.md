@@ -52,7 +52,7 @@ authentication groups cover all of them:
 
 * **Identity-scoped** — `/api/v1/requests…`, `/events`, `/api/v1/approvals…`,
   `/api/v1/escalations…`, `/api/v1/identities…`, `/api/v1/businesses…`,
-  `/api/v1/divisions…`. Authenticated with `X-Actor-ID` + `X-Actor-Credential`
+  `/api/v1/divisions…`, `/api/v1/agents…`, `/api/v1/executions…`. Authenticated with `X-Actor-ID` + `X-Actor-Credential`
   (or `Authorization: Basic …`) and, where a `business_id` is involved,
   membership-checked. `401 UNAUTHORIZED` without credentials, `403
   AUTHORIZATION` outside the scope. An `X-API-Key` does not authenticate these
@@ -94,6 +94,16 @@ authentication groups cover all of them:
 | `POST` | `/api/v1/divisions/{id}/suspend` | Suspend a division |
 | `POST` | `/api/v1/divisions/{id}/archive` | Archive a division |
 | `POST` | `/api/v1/divisions/{id}/activate` | Reactivate a division |
+| `POST` | `/api/v1/agents` | Register an agent definition (Agent Execution Layer v1) |
+| `GET` | `/api/v1/agents` | List a business's agents (optionally `division_id`) |
+| `GET` | `/api/v1/agents/{id}` | Read one agent definition |
+| `POST` | `/api/v1/agents/{id}/update` | Update name/description/capabilities/tools/memory |
+| `POST` | `/api/v1/agents/{id}/suspend` | Suspend an agent |
+| `POST` | `/api/v1/agents/{id}/archive` | Archive an agent (terminal) |
+| `POST` | `/api/v1/agents/{id}/activate` | Reactivate an agent |
+| `POST` | `/api/v1/executions` | Submit an agent execution |
+| `GET` | `/api/v1/executions/{id}` | Get an execution result (`202` pending) |
+| `POST` | `/api/v1/executions/{id}/cancel` | Cancel an in-flight execution (E-005) |
 | `GET` | `/api/v1/control/status` | Control status, uptime, components, request count |
 | `POST` | `/api/v1/control/pause` | Pause admission |
 | `POST` | `/api/v1/control/resume` | Resume admission |
@@ -277,6 +287,83 @@ Decision body: `{"reasoning":"…"}` — required.
 | `403` | `AUTHORIZATION` | not a member of `business_id`, or no business-wide membership |
 | `404` | `VALIDATION` | unknown escalation id, or one outside the caller's business |
 | `409` | `CONFLICT` | the record is not in a decidable state (`ack` only from `pending`) |
+
+### Agent definitions — `/api/v1/agents`
+
+Agent Execution Layer v1; full semantics in `docs/agent-contract.md` and
+`contracts/AGENT_EXECUTION_CONTRACTS.md`. Definitions are durable organization
+records; they are visible under the same rules as the rest of the org surface
+(business-wide membership for mutation/listing, G3 visibility for reads, `404`
+for foreign/unknown).
+
+`POST /api/v1/agents` body:
+
+```json
+{
+  "entity_id": "researcher",
+  "name": "Researcher",
+  "description": "reads and summarizes",
+  "business_id": "biz-1",
+  "division_id": "div-1",
+  "capabilities": ["research", "analysis"],
+  "allowed_tools": ["echo", "calculator"],
+  "model": { "prefer_local": true, "tool_calling": true },
+  "memory": { "mode": "business" },
+  "parameters": { "tone": "concise" }
+}
+```
+
+`entity_id`, `business_id` and `capabilities` are required; a referenced
+business/division must exist and be `active`; unknown tool ids are rejected.
+Response is `200` with the stored definition.
+
+| Status | Category | When |
+|---|---|---|
+| `400` | `VALIDATION` | malformed body, missing field, unknown tool id |
+| `401` | `UNAUTHORIZED` | no credentials (enforcement on) |
+| `403` | `AUTHORIZATION` | not a business-wide member, or the scope query denied |
+| `404` | `VALIDATION` | unknown or not visible agent |
+| `409` | `CONFLICT` | duplicate `entity_id`, illegal transition (e.g. `archived → active`), or a non-active business/division |
+
+### Executions — `/api/v1/executions`
+
+An execution is an ordinary request instrumented with the agent runtime, so
+governance, approvals, escalations, cancellation and every G1–G5 rule apply
+unchanged.
+
+`POST /api/v1/executions` body (request body fields plus):
+
+```json
+{
+  "intent": "research the quarterly report",
+  "business_id": "biz-1",
+  "division_id": "div-1",
+  "actor_id": "user-1",
+  "agent_id": "researcher",
+  "required_capabilities": ["research"],
+  "optional_capabilities": ["summarization"],
+  "tools": [{"tool_id": "echo", "input": {"text": "hi"}}],
+  "delegates": [{"id": "sub", "intent": "verify numbers"}],
+  "workflow": { "strategy": "sequential", "nodes": [{"id": "a", "intent": "..."}] }
+}
+```
+
+Admission mirrors `POST /api/v1/requests` (actor must equal the authenticated
+identity, membership must cover the declared scope, non-active business or
+division → `409 CONFLICT` (G2), divisionless business-scope executions require a
+business-wide membership (G3)). Response `202`:
+
+```json
+{ "execution_id": "api-…-e", "correlation_id": "api-…-e", "status": "accepted", "actor_id": "user-1" }
+```
+
+`GET /api/v1/executions/{id}?business_id=` returns the canonical request
+response, with agent telemetry in `outcome.metrics` (`provider`, `model`,
+`routing_reason`, `tools_executed`, `child_executions`, `retries`) and
+`202`/`404` following the same rules as request results (§G5: unknown or
+out-of-scope id → `404`). Cancellation follows E-005 exactly
+(`202`/`409`/`404`). Execution ids are correlation ids: an execution can also be
+observed through `GET /api/v1/requests/{id}`.
 
 ### Organization records — `/api/v1/{identities,businesses,divisions}`
 
@@ -507,19 +594,20 @@ internal/gateway/
   org.go           identities / businesses / divisions (SCHEMA_IDENTITIES_ORG
                    §2–§4, §9 audit)
   policies.go      policy control surface (SCHEMA_GOVERNANCE_ATTENTION §9)
-  *_test.go        130 tests
+  *_test.go        134 tests
 ```
 
 ---
 
 ## Testing
 
-- 130 tests in the package: health / ready / status / submit / result /
+- 134 tests in the package: health / ready / status / submit / result /
   validation / error envelopes, cancellation (400/401/403/404/409, idempotent
   repeat, attribution), identity and scope, approvals, escalations, policy
-  control, organization records, control pause/resume, SSE wire and lifetime
+  control, organization records, agent definitions and executions, control
+  pause/resume, SSE wire and lifetime
 - Core Runtime tests unchanged and passing
 - Foundation M0–M11 tests unchanged and passing
 - Race detector clean
-- The black-box HTTP suite lives in `e2e/` (60 Playwright tests driving the
+- The black-box HTTP suite lives in `e2e/` (71 Playwright tests driving the
   compiled `cmd/nexus` binary)
