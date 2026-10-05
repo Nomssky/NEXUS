@@ -24,7 +24,7 @@ These are structural, tested properties — not conventions:
 - **Governance outcomes exactly 5:** `ALLOW`, `DENY`, `REQUIRE_APPROVAL`, `ALLOW_WITH_CONSTRAINTS`, `ESCALATE`. No other outcomes exist.
 - **Fail-safe default deny:** when no policy matches or governance is unavailable, the outcome is `DENY`.
 - **More-restrictive-wins:** when policies conflict, the most restrictive outcome takes precedence.
-- **Precedence hierarchy:** `SYSTEM_SAFETY > GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK`.
+- **Precedence hierarchy:** `GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK`. (An earlier draft listed a `SYSTEM_SAFETY` level above `GLOBAL`; no such level exists in the contract or the implementation and it has been removed.)
 - **No self-approval:** requesters cannot approve their own actions.
 - **Governance never bypassed:** enforcement lives outside the model.
 

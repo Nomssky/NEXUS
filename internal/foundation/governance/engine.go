@@ -16,7 +16,7 @@ import (
 //   - Outcome is always exactly one of the 5 canonical outcomes.
 //   - Default when no policy matches is DENY (fail-safe).
 //   - More-restrictive-wins when policies conflict.
-//   - Precedence: SYSTEM_SAFETY > GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK.
+//   - Precedence: GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK.
 //   - No self-approval: requesters cannot approve their own actions.
 //   - Fail-safe: when governance is unavailable, default to DENY.
 type Engine struct {

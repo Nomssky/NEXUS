@@ -60,7 +60,7 @@ func (s PolicyStatus) IsValid() bool {
 }
 
 // ScopeLevel represents the hierarchical level of a policy scope.
-// Precedence: SYSTEM_SAFETY > GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK.
+// Precedence: GLOBAL > BUSINESS > DIVISION > AGENT > WORKFLOW > TASK.
 type ScopeLevel int
 
 const (
