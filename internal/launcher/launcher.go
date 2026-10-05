@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
+	"github.com/Nomssky/NEXUS/internal/agentintel"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
@@ -113,16 +114,33 @@ func New(opts Options) *Launcher {
 		if seedStatus == "" {
 			seedStatus = modelrouter.ProviderStatusHealthy
 		}
-		simProvider := modelrouter.NewLocalProvider(modelrouter.ProviderConfig{
-			ID:     "simulated",
-			Status: seedStatus,
-		})
+		// Provider selection: the plain simulator answers with empty
+		// completions (today's shipped behaviour); the scripted decision-table
+		// provider is the deterministic simulation used to exercise the agent
+		// intelligence control loop without a real LLM
+		// (AGENT_INTELLIGENCE_CONTRACTS §16). Both are simulations behind the
+		// provider abstraction; neither is a production provider.
+		seedID := "simulated"
+		var simProvider modelrouter.Provider
+		if opts.Config.Models.SeededProviderMode == "scripted" {
+			seedID = "scripted"
+			simProvider = modelrouter.NewScriptedProvider(modelrouter.ProviderConfig{ID: seedID, Status: seedStatus})
+		} else {
+			simProvider = modelrouter.NewLocalProvider(modelrouter.ProviderConfig{ID: seedID, Status: seedStatus})
+		}
 		if regErr := engine.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
-			ID:         "simulated:default",
+			ID:         seedID + ":default",
 			ProviderID: simProvider.Identify(),
 			Capabilities: []modelrouter.ModelCapability{
 				modelrouter.CapabilityReasoning,
 				modelrouter.CapabilityToolCalling,
+				// Structured output: the agent intelligence loop asks for a
+				// JSON decision (AGENT_INTELLIGENCE_CONTRACTS §6). The plain
+				// simulator still answers with an empty completion — the loop
+				// then fails honestly at the protocol check — while the
+				// scripted simulation provider answers with a structured plan
+				// or action.
+				modelrouter.CapabilityStructuredOutput,
 			},
 			Runtime: modelrouter.RuntimeLocal,
 			Status:  modelrouter.ModelStatusActive,
@@ -137,8 +155,8 @@ func New(opts Options) *Launcher {
 			if opts.Logger != nil {
 				opts.Logger.Warn("no model registered: seeded simulated default model", logging.Fields{
 					Context: map[string]any{
-						"model_id": "simulated:default",
-						"provider": "simulated",
+						"model_id": seedID + ":default",
+						"provider": seedID,
 						"status":   seedStatus,
 						"note":     "simulated execution via LocalProvider stub; register real models per docs/m6-model-router.md for real inference",
 					},
@@ -163,6 +181,17 @@ func New(opts Options) *Launcher {
 	}
 	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
 	gwOpts = append(gwOpts, gateway.WithAgentExecution(agentReg, agentRt))
+
+	// Agent intelligence layer v1: the bounded control loop. It runs inside
+	// the same admitted request pipeline and reuses the agent execution
+	// primitives (tool boundary + delegation) rather than a second framework.
+	intelMem, err := agentintel.OpenMemory(opts.Store)
+	if err != nil {
+		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
+	}
+	intelRt := agentintel.New(agentReg, agentRt,
+		&agentintel.Decision{Router: engine.ModelRouter()}, engine.EventBus(), intelMem)
+	gwOpts = append(gwOpts, gateway.WithIntelligence(intelRt))
 	gwOpts = append(gwOpts, opts.GatewayOptions...)
 	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)
 

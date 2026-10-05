@@ -106,7 +106,14 @@ func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/agents" || strings.HasPrefix(path, "/api/v1/agents/") {
 		return true
 	}
-	return path == "/api/v1/executions" || strings.HasPrefix(path, "/api/v1/executions/")
+	if path == "/api/v1/executions" || strings.HasPrefix(path, "/api/v1/executions/") {
+		return true
+	}
+	// Agent intelligence layer v1 (objective executions).
+	if path == "/api/v1/intelligence" || strings.HasPrefix(path, "/api/v1/intelligence/") {
+		return true
+	}
+	return false
 }
 
 // identityMiddleware authenticates scoped requests when enforcement is on and

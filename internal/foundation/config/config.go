@@ -56,6 +56,15 @@ type ModelsConfig struct {
 	// deterministically. Rejected values abort boot — a typo must not
 	// silently mean "healthy".
 	SeededProviderStatus string `json:"seeded_provider_status"`
+
+	// SeededProviderMode selects *which* simulation provider the launcher
+	// seeds when nothing is registered: "" (default) = the plain simulated
+	// provider (empty completions, today's behaviour); "scripted" = the
+	// deterministic decision-table provider used to exercise the agent
+	// intelligence control loop without a real LLM
+	// (AGENT_INTELLIGENCE_CONTRACTS §16/§17). It adds no health state, no
+	// error category and no event; rejected values abort boot.
+	SeededProviderMode string `json:"seeded_provider_mode"`
 }
 
 // StorageConfig configures durable storage (C05). The default is empty:
@@ -251,6 +260,7 @@ type fileConfig struct {
 	} `json:"storage"`
 	Models *struct {
 		SeededProviderStatus *string `json:"seeded_provider_status"`
+		SeededProviderMode   *string `json:"seeded_provider_mode"`
 	} `json:"models"`
 }
 
@@ -313,6 +323,9 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	if fc.Models != nil && fc.Models.SeededProviderStatus != nil {
 		cfg.Models.SeededProviderStatus = *fc.Models.SeededProviderStatus
 	}
+	if fc.Models != nil && fc.Models.SeededProviderMode != nil {
+		cfg.Models.SeededProviderMode = *fc.Models.SeededProviderMode
+	}
 	if fc.Security != nil {
 		s := fc.Security
 		if s.AuditEnabled != nil {
@@ -358,6 +371,12 @@ const (
 	// "healthy" = today's behaviour, "offline" = deterministic provider
 	// failure). Non-secret operational setting; PROVIDER_CONTRACTS §12.
 	EnvSeededProviderStatus = "NEXUS_SEEDED_PROVIDER_STATUS"
+
+	// EnvSeededProviderMode overrides models.seeded_provider_mode: which
+	// simulation provider the launcher seeds ("" = plain simulated provider,
+	// "scripted" = deterministic decision-table provider for the agent
+	// intelligence control loop). Non-secret operational setting.
+	EnvSeededProviderMode = "NEXUS_SEEDED_PROVIDER_MODE"
 
 	// M1 security keys. Enforcement defaults on (Defaults() sets both true);
 	// outside production they may be relaxed through these variables, while
@@ -429,6 +448,9 @@ func applyEnv(cfg *Config, environ []string) error {
 	}
 	if v, ok := envMap[EnvSeededProviderStatus]; ok {
 		cfg.Models.SeededProviderStatus = v
+	}
+	if v, ok := envMap[EnvSeededProviderMode]; ok {
+		cfg.Models.SeededProviderMode = v
 	}
 
 	// Security-sensitive environment values fail closed on malformed input: a
@@ -530,6 +552,16 @@ var validSeededProviderStatuses = map[string]struct{}{
 	"offline": {},
 }
 
+// validSeededProviderModes selects which simulation provider is seeded:
+// "" keeps the plain simulated provider (empty completions — today's
+// behaviour), "scripted" seeds the deterministic decision-table provider used
+// to exercise the agent intelligence control loop without a real LLM
+// (AGENT_INTELLIGENCE_CONTRACTS §16). Closed set; typos abort boot.
+var validSeededProviderModes = map[string]struct{}{
+	"":         {},
+	"scripted": {},
+}
+
 // Validate checks the effective configuration and returns a canonical
 // VALIDATION error on the first failure. Deterministic and side-effect free.
 func (c Config) Validate() error {
@@ -572,6 +604,11 @@ func (c Config) Validate() error {
 		return nerrors.Configuration("config.invalid",
 			fmt.Sprintf("models.seeded_provider_status must be one of %s", keys(validSeededProviderStatuses))).
 			WithDetail("value", c.Models.SeededProviderStatus)
+	}
+	if !hasKey(validSeededProviderModes, c.Models.SeededProviderMode) {
+		return nerrors.Configuration("config.invalid",
+			fmt.Sprintf("models.seeded_provider_mode must be one of %s", keys(validSeededProviderModes))).
+			WithDetail("value", c.Models.SeededProviderMode)
 	}
 	// Security-sensitive configuration fails closed (§18). These checks only
 	// ever reject unsafe combinations; none of them can grant authority.
