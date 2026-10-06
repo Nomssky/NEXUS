@@ -126,8 +126,8 @@ func NewAssembler(b ContextBudget) *Assembler {
 	if b.MaxToolChars <= 0 {
 		b.MaxToolChars = d.MaxToolChars
 	}
-	if b.ReserveChars < 0 {
-		b.ReserveChars = 0
+	if b.ReserveChars <= 0 {
+		b.ReserveChars = d.ReserveChars
 	}
 	return &Assembler{budget: b}
 }

@@ -132,19 +132,29 @@ func (p *Platform) authorize(id Identity, divisionID string) error {
 	return nil
 }
 
-// visible reports whether a stored record may be returned to this caller.
-func (p *Platform) visible(r *Record, id Identity) bool {
+// canRead is the read-side authorization of one stored record. The answers are
+// deliberately different:
+//
+//   - a record in another business answers NOT FOUND, because confirming it would
+//     leak that the id exists at all (G5);
+//   - an identity without the membership for the record's own division answers
+//     SCOPE, which leaks nothing the caller could not already know;
+//   - another agent's private record answers NOT FOUND.
+func (p *Platform) canRead(id Identity, r *Record) error {
 	if r.BusinessID != id.BusinessID {
-		return false
+		return fmt.Errorf("%w: %s", ErrNotFound, r.ID)
 	}
-	if r.Scope == ScopeDivision && r.DivisionID != id.DivisionID {
-		// A division record needs the caller to hold that division's scope.
-		return p.scopes != nil && p.scopes.AllowsScope(id.ActorID, r.BusinessID, r.DivisionID)
+	division := r.DivisionID
+	if division == "" {
+		division = id.DivisionID
+	}
+	if p.scopes == nil || !p.scopes.AllowsScope(id.ActorID, r.BusinessID, division) {
+		return fmt.Errorf("%w: actor is not a member of this memory scope", ErrScope)
 	}
 	if r.Scope == ScopeAgent && r.AgentID != id.AgentID {
-		return false // agent memory is private to its agent
+		return fmt.Errorf("%w: %s", ErrNotFound, r.ID)
 	}
-	return true
+	return nil
 }
 
 // active reports whether a record may be returned by normal retrieval: it must
@@ -335,8 +345,8 @@ func (p *Platform) Update(id Identity, memID string, expectedVersion int, c Cand
 	if err != nil {
 		return Record{}, err
 	}
-	if !p.visible(rec, id) {
-		return Record{}, fmt.Errorf("%w: %s", ErrNotFound, memID)
+	if err := p.canRead(id, rec); err != nil {
+		return Record{}, err
 	}
 	if expectedVersion <= 0 || expectedVersion != rec.Version {
 		return Record{}, fmt.Errorf("%w: expected version %d, stored %d", ErrConflict, expectedVersion, rec.Version)
@@ -407,8 +417,8 @@ func (p *Platform) Delete(id Identity, memID string) error {
 	if err != nil {
 		return err
 	}
-	if !p.visible(rec, id) {
-		return fmt.Errorf("%w: %s", ErrNotFound, memID)
+	if err := p.canRead(id, rec); err != nil {
+		return err
 	}
 	if p.st != nil {
 		if err := p.st.Delete(memID); err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -431,8 +441,8 @@ func (p *Platform) Expire(id Identity, memID string, at time.Time) error {
 	if err != nil {
 		return err
 	}
-	if !p.visible(rec, id) {
-		return fmt.Errorf("%w: %s", ErrNotFound, memID)
+	if err := p.canRead(id, rec); err != nil {
+		return err
 	}
 	if !at.After(p.nowTime()) {
 		return fmt.Errorf("%w: expiry must be in the future", ErrValidation)
@@ -457,8 +467,8 @@ func (p *Platform) Get(id Identity, memID string) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	if !p.visible(rec, id) {
-		return Record{}, fmt.Errorf("%w: %s", ErrNotFound, memID)
+	if err := p.canRead(id, rec); err != nil {
+		return Record{}, err
 	}
 	return *rec, nil
 }
@@ -478,7 +488,9 @@ func (p *Platform) Query(id Identity, q Query) (Result, error) {
 	now := p.nowTime()
 	out := Result{Scope: q.Scope}
 	for _, r := range recs {
-		if r.BusinessID != id.BusinessID || !p.visible(&r, id) || !p.active(&r, now) {
+		// Only records this caller may see are ever considered; the rest never
+		// enter the result, let alone the model context.
+		if p.canRead(id, &r) != nil || !p.active(&r, now) {
 			continue
 		}
 		if !matchesQuery(&r, id, q) {
@@ -677,7 +689,7 @@ func (p *Platform) markConflicts(rec *Record) []string {
 	// Mark the peers too, so the marker is symmetric and stable.
 	for _, pid := range peers {
 		peer, prev, err := p.load(pid)
-		if err != nil || !peer.Conflict {
+		if err != nil {
 			continue
 		}
 		peer.Conflict = true
