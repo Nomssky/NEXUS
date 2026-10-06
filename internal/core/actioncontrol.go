@@ -69,16 +69,20 @@ func (i *actionApprovalIndex) drop(requestID, fingerprint string) {
 // proposal's own governance request, and the entry carries the fingerprint that
 // binds the approval to exactly one action.
 func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decision) (string, error) {
-	requestID := p.CorrelationID
-	if requestID == "" {
-		requestID = p.ExecutionID
-	}
-	req := e.requestRef(requestID)
+	req := e.requestRef(proposalRequestKey(p))
 	if req == nil {
 		// An approval has nothing to resume without its parent request, so the
 		// proposal is refused rather than recorded into the void.
-		return "", fmt.Errorf("%w: %s", ErrActionProposalUnbound, requestID)
+		key := proposalRequestKey(p)
+		if key == "" {
+			key = "<unbound>"
+		}
+		return "", fmt.Errorf("%w: %s", ErrActionProposalUnbound, key)
 	}
+	// The entry is keyed by the CANONICAL request id: the resume path
+	// (ApproveRequest) re-submits that request, whatever correlation the
+	// proposal carried.
+	requestID := req.ID
 
 	fingerprint := p.Fingerprint()
 	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
@@ -123,22 +127,32 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 // bound record reports false, so governance re-evaluates the approval gate
 // instead of trusting a flag (contract §5).
 func (e *Engine) ApprovedState(p control.Proposal, fingerprint string) (governance.ApprovalState, bool) {
-	requestID := p.CorrelationID
-	if requestID == "" {
-		requestID = p.ExecutionID
-	}
 	// INV-16: a timed-out approval is not approvable, so a timed-out one is not
 	// an approved one either. The sweep is the same one the decision path uses.
 	e.expireApprovals()
-	id, ok := e.actionApprovals.get(requestID, fingerprint)
+	req := e.requestRef(proposalRequestKey(p))
+	if req == nil {
+		return "", false
+	}
+	id, ok := e.actionApprovals.get(req.ID, fingerprint)
 	if !ok {
 		return "", false
 	}
 	entry := e.approvalEntry(id)
-	if entry == nil || entry.actionFingerprint != fingerprint {
+	if entry == nil || entry.actionFingerprint != fingerprint || entry.requestID != req.ID {
 		return "", false
 	}
 	return entry.ar.Status, true
+}
+
+// proposalRequestKey is the proposal field the parent request is looked up by:
+// the correlation id of the admitted request (the execution id is the same value
+// on every path the runtime establishes).
+func proposalRequestKey(p control.Proposal) string {
+	if p.CorrelationID != "" {
+		return p.CorrelationID
+	}
+	return p.ExecutionID
 }
 
 // requestRef returns the parent request an action proposal belongs to.
@@ -152,6 +166,10 @@ func (e *Engine) requestRef(requestID string) *Request {
 // action-level approval raised inside it has something to resume. It is a plain
 // reference index: no lifecycle, no authorization, no durability (G4 — a
 // restart loses it exactly like the approval records).
+//
+// The request is indexed under its own id AND its correlation id, because a
+// proposal carries the correlation the runtime established while the resume
+// path re-submits the canonical request id.
 func (e *Engine) trackRequestRef(req *Request) {
 	if req == nil {
 		return
@@ -159,12 +177,22 @@ func (e *Engine) trackRequestRef(req *Request) {
 	e.requestRefsMu.Lock()
 	defer e.requestRefsMu.Unlock()
 	e.requestRefs[req.ID] = req
+	if req.Context != nil && req.Context.CorrelationID != "" && req.Context.CorrelationID != req.ID {
+		e.requestRefs[req.Context.CorrelationID] = req
+	}
 }
 
-func (e *Engine) untrackRequestRef(requestID string) {
+// untrackRequestRef drops both index keys of a finished request.
+func (e *Engine) untrackRequestRef(req *Request) {
+	if req == nil {
+		return
+	}
 	e.requestRefsMu.Lock()
 	defer e.requestRefsMu.Unlock()
-	delete(e.requestRefs, requestID)
+	delete(e.requestRefs, req.ID)
+	if req.Context != nil && req.Context.CorrelationID != "" {
+		delete(e.requestRefs, req.Context.CorrelationID)
+	}
 }
 
 // approvalRecord returns the engine record for an approval id.

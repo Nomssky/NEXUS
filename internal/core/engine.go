@@ -515,6 +515,11 @@ func (e *Engine) processRequests(ctx context.Context) {
 			// terminal result, the index entry has served its purpose.
 			e.cleanupResumeApproval(req.ID)
 
+			// The reference index has served its purpose too: an action-level
+			// approval raised inside this run is already bound to it, and any
+			// later admission resolves its own request.
+			e.untrackRequestRef(req)
+
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{
 				ID:         req.ID,

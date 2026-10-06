@@ -118,8 +118,9 @@ type Controller struct {
 	now      func() time.Time
 	maxDur   time.Duration
 
-	mu       sync.Mutex
-	consumed map[string]bool // executionID|fingerprint: one admission per approval
+	mu            sync.Mutex
+	consumed      map[string]struct{} // executionID|fingerprint: one admission per approval
+	consumedOrder []string            // FIFO of consumed keys, bounding the ledger
 }
 
 // New builds a controller. A nil engine is allowed to be constructed but every
@@ -134,7 +135,7 @@ func New(opts Options) *Controller {
 		maxDur = 30 * time.Second
 	}
 	return &Controller{engine: opts.Engine, approver: opts.Approver, escalatr: opts.Escalator,
-		pub: opts.Publisher, now: now, maxDur: maxDur, consumed: map[string]bool{}}
+		pub: opts.Publisher, now: now, maxDur: maxDur, consumed: map[string]struct{}{}}
 }
 
 // Admit evaluates one proposal through the authoritative engine and performs the
@@ -167,6 +168,9 @@ func (c *Controller) Admit(p Proposal) (Admission, error) {
 	decision := c.engine.Evaluate(p.GovernanceRequest(c.approvalFor(p, fp)))
 
 	adm := Admission{Decision: decision, Proposal: p, Fingerprint: fp, Enforceable: true}
+	// The decision itself is a fact on the existing event vocabulary: one
+	// governance.decided per admission, correlated to the proposal that caused it.
+	c.publishDecision(p, decision)
 
 	switch decision.Outcome {
 	case governance.ALLOW, governance.ALLOW_WITH_CONSTRAINTS:
@@ -210,6 +214,47 @@ func (c *Controller) Admit(p Proposal) (Admission, error) {
 	}
 }
 
+// publishDecision records the admission decision as a metadata-only fact on the
+// existing governance.decided event. It carries ids, scope, action, resource,
+// the outcome and the matched policy provenance — never prompts, tool output or
+// credential material, and never chain-of-thought.
+func (c *Controller) publishDecision(p Proposal, d governance.Decision) {
+	if c.pub == nil {
+		return
+	}
+	fields := map[string]string{
+		"proposal_id":   p.ProposalID,
+		"action":        p.Action,
+		"resource":      p.Resource,
+		"resource_type": p.ResourceType,
+		"decision":      d.Outcome.String(),
+		"tool_id":       p.ToolID,
+		"operation":     p.Operation,
+		"agent_id":      p.AgentID,
+		"objective_id":  p.ObjectiveID,
+		"execution_id":  p.ExecutionID,
+		"actor_id":      p.ActorID,
+		"division_id":   p.DivisionID,
+		"risk_level":    string(p.RiskLevel),
+	}
+	if d.MatchedPolicyID != "" {
+		fields["policy_id"] = d.MatchedPolicyID
+	}
+	if d.MatchedPolicyVersion != "" {
+		fields["policy_version"] = d.MatchedPolicyVersion
+	}
+	if len(d.Constraints) > 0 {
+		fields["constraints"] = fmt.Sprint(len(d.Constraints))
+	}
+	c.pub.Publish(EventGovernanceDecided, p.CorrelationID, p.BusinessID, fields)
+}
+
+// maxConsumedApprovals bounds the single-use ledger of spent approvals. It is a
+// cache of "this exact proposal was already admitted under this approval": a
+// dropped key can only cost one extra admission, which still requires a fresh
+// approval, so eviction never widens authority.
+const maxConsumedApprovals = 4096
+
 // approvalFor returns the approval state for this proposal when — and only when
 // — an approved record exists for the EXACT same fingerprint and has not already
 // been consumed by this execution. Everything else leaves approval nil, so the
@@ -225,12 +270,17 @@ func (c *Controller) approvalFor(p Proposal, fingerprint string) *governance.App
 	key := p.ExecutionID + "|" + fingerprint
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.consumed[key] {
+	if _, spent := c.consumed[key]; spent {
 		// One approval authorizes one admission after the resume. A repeated
 		// identical proposal must earn fresh approval.
 		return nil
 	}
-	c.consumed[key] = true
+	c.consumed[key] = struct{}{}
+	c.consumedOrder = append(c.consumedOrder, key)
+	for len(c.consumedOrder) > maxConsumedApprovals {
+		delete(c.consumed, c.consumedOrder[0])
+		c.consumedOrder = c.consumedOrder[1:]
+	}
 	approved := governance.ApprovalStateApproved
 	return &approved
 }
@@ -238,9 +288,18 @@ func (c *Controller) approvalFor(p Proposal, fingerprint string) *governance.App
 // MarkConsumed is exported for hosts that resolve approvals outside this
 // package's Admit path (an approval-driven resume that never re-proposes).
 func (c *Controller) MarkConsumed(executionID, fingerprint string) {
+	key := executionID + "|" + fingerprint
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.consumed[executionID+"|"+fingerprint] = true
+	if _, spent := c.consumed[key]; spent {
+		return
+	}
+	c.consumed[key] = struct{}{}
+	c.consumedOrder = append(c.consumedOrder, key)
+	for len(c.consumedOrder) > maxConsumedApprovals {
+		delete(c.consumed, c.consumedOrder[0])
+		c.consumedOrder = c.consumedOrder[1:]
+	}
 }
 
 func constraintKinds(cs []EffectiveConstraint) string {
@@ -254,6 +313,10 @@ func constraintKinds(cs []EffectiveConstraint) string {
 // Event names published by the controller (the rest are reused from the
 // existing vocabulary).
 const (
-	EventActionProposed    = "governance.action_proposed"
+	EventActionProposed = "governance.action_proposed"
+	// EventGovernanceDecided is the EXISTING vocabulary type
+	// (SCHEMA_EVENTS_TRIGGERS) that until now was declared but never
+	// published. Admission is its producer.
+	EventGovernanceDecided = "governance.decided"
 	EventConstraintApplied = "governance.constraint_applied"
 )

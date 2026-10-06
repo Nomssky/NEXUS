@@ -12,6 +12,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
+	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
@@ -367,6 +368,24 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				rn.transition(StateCancelled, nil)
 				return cancelledOutcome(req, start, r.now()), nil
 			}
+			// Governance terminal states keep their own status: a denial, a
+			// pending approval and an escalation are not failures
+			// (AGENT_GOVERNANCE_CONTROL_CONTRACTS §3, §8).
+			if termState == StateDenied || termState == StatePendingApproval || termState == StateEscalated {
+				approvalID, escalationRef := "", ""
+				if obs != nil {
+					approvalID, escalationRef = obs.Result["approval_id"], obs.Result["escalation_id"]
+				}
+				rn.transition(termState, map[string]string{"reason": termMsg})
+				switch termState {
+				case StateDenied:
+					return deniedOutcome(req, start, r.now(), termMsg), nil
+				case StatePendingApproval:
+					return pendingApprovalOutcome(req, start, r.now(), termMsg, approvalID), nil
+				default:
+					return escalatedOutcome(req, start, r.now(), termMsg, escalationRef), nil
+				}
+			}
 			rn.transition(termState, map[string]string{"reason": termMsg})
 			return failedOutcome(req, start, r.now(), termState, termMsg), nil
 		}
@@ -486,6 +505,43 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		}, agentID, agentexec.ToolCallSpec{ToolID: a.Tool, Operation: a.Operation, Input: a.Input})
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
+			// A governance refusal is NOT a tool failure. It reports its own
+			// observation status and terminal state, so approval-pending is never
+			// collapsed into failure, a denial is never a side effect, and
+			// escalation is never a failure (AGENT_GOVERNANCE_CONTROL_CONTRACTS
+			// §3, §8).
+			var ae *agentexec.AdmissionError
+			if errors.As(err, &ae) {
+				obs.Text = ae.Error()
+				obs.Result = map[string]string{
+					"governance_outcome": ae.Outcome.String(),
+					"action":             ae.Action,
+					"tool_id":            ae.ToolID,
+				}
+				if ae.Operation != "" {
+					obs.Result["operation"] = ae.Operation
+				}
+				if ae.ApprovalID != "" {
+					obs.Result["approval_id"] = ae.ApprovalID
+				}
+				if ae.EscalationID != "" {
+					obs.Result["escalation_id"] = ae.EscalationID
+				}
+				if ae.PolicyID != "" {
+					obs.Result["policy_id"] = ae.PolicyID
+				}
+				switch ae.Outcome {
+				case governance.REQUIRE_APPROVAL:
+					obs.Status = "pending_approval"
+					return obs, usage, StatePendingApproval, ae.Error()
+				case governance.ESCALATE:
+					obs.Status = "escalated"
+					return obs, usage, StateEscalated, ae.Error()
+				default:
+					obs.Status = "denied"
+					return obs, usage, StateDenied, ae.Error()
+				}
+			}
 			obs.Status, obs.Text = "failed", err.Error()
 			var oe *agentexec.OutcomeError
 			if errors.As(err, &oe) {
@@ -687,7 +743,8 @@ func stateEvent(s State) event.EventType {
 		return event.EventTypeObservationCreated
 	case StateReplanning:
 		return event.EventTypePlanReplanned
-	case StateCompleted, StateFailed, StateCancelled, StateBudgetExhausted, StateDeadlineExceeded:
+	case StateCompleted, StateFailed, StateCancelled, StateBudgetExhausted, StateDeadlineExceeded,
+		StateDenied, StatePendingApproval, StateEscalated:
 		return event.EventTypeObjectiveCompleted
 	default:
 		return event.EventTypeObjectiveStarted

@@ -646,6 +646,11 @@ func (e *Executor) executeWork(req *WorkRequest) {
 		outcome.ToolsExecuted = result.ToolsExecuted
 		outcome.ChildExecutions = result.ChildExecutions
 		outcome.Retries = result.Retries
+		// A handler that opened its own approval / escalation for a
+		// governance-gated ACTION owns the record: the chain must reuse these
+		// ids instead of opening duplicates (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5).
+		outcome.ApprovalID = result.ApprovalID
+		outcome.EscalationRef = result.EscalationRef
 	}
 
 	if outcome.Status == "" {

@@ -288,6 +288,11 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 		return fmt.Errorf("%w: engine shutting down during resume", ErrApprovalNotResumable)
 	}
 	e.registerInflight(entry.req)
+	// The resumed run re-proposes the gated ACTION, so the reference index must
+	// be live for the admission that consumes this approval
+	// (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5). It was dropped when the first run
+	// stored its terminal result.
+	e.trackRequestRef(entry.req)
 
 	select {
 	case e.requests <- entry.req:
@@ -367,19 +372,32 @@ func (e *Engine) DenyRequest(approvalID, businessID, approver, reason string) er
 // resume run stored its terminal result — the record has served its purpose
 // (both gates consulted it during the run). Pending/denied entries are
 // untouched: pending waits for a decision, denied was already dropped.
+//
+// Action-level approvals (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5) are cleaned up
+// the same way, and their fingerprint index entry is dropped with them, so a
+// spent approval cannot authorize anything later.
 func (e *Engine) cleanupResumeApproval(requestID string) {
+	var fingerprints []string
 	e.approvalMu.Lock()
-	defer e.approvalMu.Unlock()
 	id, ok := e.approvalByReq[requestID]
-	if !ok {
-		return
-	}
 	entry := e.approvals[id]
-	if entry == nil || entry.ar.Status != governance.ApprovalStateApproved {
-		return
+	if ok && entry != nil && entry.ar.Status == governance.ApprovalStateApproved {
+		delete(e.approvals, id)
+		delete(e.approvalByReq, requestID)
 	}
-	delete(e.approvals, id)
-	delete(e.approvalByReq, requestID)
+	for approvalID, aEntry := range e.approvals {
+		if aEntry.requestID != requestID || aEntry.actionFingerprint == "" {
+			continue
+		}
+		if aEntry.ar.Status == governance.ApprovalStateApproved {
+			delete(e.approvals, approvalID)
+			fingerprints = append(fingerprints, aEntry.actionFingerprint)
+		}
+	}
+	e.approvalMu.Unlock()
+	for _, fp := range fingerprints {
+		e.actionApprovals.drop(requestID, fp)
+	}
 }
 
 // dropApproval removes an index entry (both maps).
