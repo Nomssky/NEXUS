@@ -92,11 +92,14 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 //  2. "malformed"                  -> prose without JSON (protocol error)
 //  3. "delegate", not yet observed -> delegate action
 //  4. "memory"                     -> memory_write, then memory_read
-//  5. named tool, not yet observed -> tool_call for that tool
+//  6. named tool, not yet observed -> tool_call for that tool
 //     (calculator, echo, http.request, web.search, filesystem.*, git, data);
 //     "post via http" / "delete via http" select a mutating HTTP method
-//  6. "replan" with replans == 0    -> replan action
-//  7. otherwise                    -> complete
+//  7. "promote" with a tool observation in the block -> memory_write of THAT
+//     observation (content, outcome and provenance come from the runtime), then
+//     complete
+//  8. "replan" with replans == 0    -> replan action
+//  9. otherwise                    -> complete
 //
 // "already observed" is read from the observation block the runtime echoes
 // into the prompt, and the replan counter is read from the budget line, so the
@@ -177,11 +180,37 @@ func scriptedAnswer(prompt string) string {
 		return `{"type":"tool_call","tool":"github.issue.list","operation":"execute","input":{"repo":"owner/repo"}}`
 	case (strings.Contains(subject, "json") || strings.Contains(subject, "structured data") || strings.Contains(subject, "data.json")) && !observedTool("data"):
 		return `{"type":"tool_call","tool":"data","operation":"json.parse","input":{"payload":"{\"a\":1}"}}`
+	case strings.Contains(subject, "promote") && observed("memory_write"):
+		// The promotion already happened; finish deterministically.
+		return `{"type":"complete","result":"observation promoted"}`
+	case strings.Contains(subject, "promote") && observationID(obsBlock) != "":
+		// Promotion names an observation the RUNTIME produced in this execution.
+		// The model supplies no content: the platform takes it from the
+		// observation, together with its outcome and provenance.
+		return fmt.Sprintf(`{"type":"memory_write","key":"promoted-observation","observation_id":%q}`,
+			observationID(obsBlock))
 	case strings.Contains(subject, "replan") && budgetUsed(budgetLine, "replans") == 0:
 		return `{"type":"replan","reason":"the first approach was not sufficient"}`
 	default:
 		return `{"type":"complete","result":"objective pursued deterministically"}`
 	}
+}
+
+// observationID returns the id of the newest observation in the block, so a
+// deterministic provider can ask the runtime to promote a record it actually
+// produced. It reads the runtime's own observation framing only.
+func observationID(obsBlock string) string {
+	const marker = "[obs-"
+	i := strings.LastIndex(obsBlock, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := obsBlock[i+len(marker):]
+	end := strings.IndexAny(rest, " \n\t]")
+	if end < 0 {
+		return ""
+	}
+	return "obs-" + rest[:end]
 }
 
 // extractObservations returns only the observation block of the prompt (the

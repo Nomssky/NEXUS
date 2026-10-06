@@ -89,8 +89,17 @@ A record is visible to a caller iff **all** hold:
    (`none` → no durable memory; `business` → business/agent; `division` →
    division/agent).
 
-**A narrower record never becomes visible to a broader scope.** Requests are
-authorized *before* retrieval (`authorized query → store`), never
+Concretely, with the canonical membership rules:
+
+| record scope | who may see it |
+|---|---|
+| `business` | any active member of the business |
+| `division` | identities whose membership covers that division (a business-wide member covers every division of its business, exactly as everywhere else in NEXUS) |
+| `agent` | the writing agent only |
+
+**A caller at a narrower scope never sees a record outside it**: a `div-1`
+member cannot read `div-2` memory, and no scope can ever be widened by asking.
+Requests are authorized *before* retrieval (`authorized query → store`), never
 `read everything → filter`.
 
 Foreign or invisible records answer exactly like any other not-found surface

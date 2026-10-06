@@ -550,6 +550,15 @@ func (p *Platform) list(businessID string) ([]Record, error) {
 		if err := json.Unmarshal(rec.Data, &r); err != nil {
 			continue // corrupt records were rejected at hydrate; skip defensively
 		}
+		// The store envelope is authoritative for version and creation time: the
+		// payload was serialized before the store applied its bump.
+		r.Version = rec.Version
+		if !rec.CreatedAt.IsZero() {
+			r.CreatedAt = rec.CreatedAt
+		}
+		if rec.ExpiresAt != nil && r.ExpiresAt == nil {
+			r.ExpiresAt = rec.ExpiresAt
+		}
 		out = append(out, r)
 	}
 	return out, nil
@@ -576,7 +585,9 @@ func (p *Platform) load(memID string) (*Record, *store.Record, error) {
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, memID)
 	}
 	rec, err := p.st.Get(memID)
-	if err != nil || rec == nil {
+	if err != nil || rec == nil || rec.Status == store.RecordStatusDeleted {
+		// A soft-deleted record is invisible to normal reads, whichever store
+		// holds it (contract §10).
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, memID)
 	}
 	var r Record
