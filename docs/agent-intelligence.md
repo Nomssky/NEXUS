@@ -64,6 +64,7 @@ authorization path.
 | What if the plan is bad? | Rejected before any action (`failed`, `plan rejected: …`). |
 | What if the action is bad? | Rejected before any executor sees it (`failed`, `action rejected: …`). |
 | What if a tool fails? | Terminal failure with the tool id. Tool failure never becomes success. |
+| What if governance refuses an action? | `denied`, `pending_approval` or `escalated` — never `failed`, and never a side effect. See [agent-governance-control.md](agent-governance-control.md). |
 | What if a child fails? | Terminal failure naming the child. |
 | What if it is cancelled? | Loop stops at the next boundary and the request ends `cancelled`. |
 | What survives a restart? | Agent definitions and agent memory (durable records). Objectives, plans, observations, working memory: **nothing** — the execution id answers `404` (G4). |
@@ -76,6 +77,14 @@ state is carried in `outcome.summary` as `state=<state>` plus counters
 `observations`), and every non-`completed`/`cancelled` state is a `failed`
 result whose `error.message` starts with `state=<state>:`. A model asserting
 "everything is fine" cannot overturn any of it.
+
+Three of those states come from governance rather than from the work itself and
+keep their own status, so a denial is never mistaken for a tool failure:
+`denied` (`POLICY_DENIED`), `pending_approval` (`APPROVAL_REQUIRED`, with
+`error.details.approval_id`) and `escalated` (`ESCALATION_REQUIRED`, with
+`error.details.escalation_ref`). The governance state and the execution outcome
+remain separate axes — an `unknown` tool outcome is still `unknown` and is still
+never re-dispatched.
 
 ## 5. Prompt-injection boundary
 

@@ -191,6 +191,17 @@ memory_delete  { "type": "memory_delete", "key": "notes" }
 on the existing bus, metadata only (ids, scope, type, provenance, counts,
 outcome). Never content, never secrets, never reasoning.
 
+## Memory is not authority
+
+A memory record — whatever it claims about permissions, approvals or scope — can
+never admit an action. Every consequential agent action passes through
+governance admission before the capability platform, and nothing retrieved from
+memory participates in that decision. The governance side of that boundary is
+documented in [agent-governance-control.md](agent-governance-control.md); the
+memory side is covered by the "poisoned memory grants nothing" cases in
+`e2e/tests/19-agent-memory-context.spec.ts` and
+`e2e/tests/20-agent-governance-control.spec.ts`.
+
 ## Out of scope
 
 No vector database, no embeddings, no semantic retrieval, no external RAG, no
