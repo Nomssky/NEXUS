@@ -56,6 +56,7 @@ NEXUS_HEALTH_HOST=127.0.0.1 NEXUS_HEALTH_PORT="$HP" \
 NEXUS_BOOTSTRAP_CREDENTIAL="$BOOT" NEXUS_BOOTSTRAP_BUSINESS="$BIZ" \
 NEXUS_CONTROL_API_KEY="$KEY" NEXUS_LOG_FORMAT=json NEXUS_LOG_LEVEL=info \
 NEXUS_ENVIRONMENT=development \
+NEXUS_CAPABILITY_WEB=scripted NEXUS_TOOL_HTTP_ALLOW_INSECURE=true \
   "$BIN" >"$LOG" 2>&1 &
 NEXUS_PID=$!
 
@@ -267,6 +268,28 @@ check "wrong method" 405 "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${
 check "missing business_id on read" 400 "$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/requests/req-1?business_id=")"
 check "no credentials with enforcement on" 401 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/requests/req-1?business_id=$BIZ")"
 check "wrong credential" 401 "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Actor-ID: nx:human:bootstrap' -H 'X-Actor-Credential: wrong' "$BASE/api/v1/requests/req-1?business_id=$BIZ")"
+
+echo "== capability & tool platform =="
+# The manifests endpoint is membership-bound (scoped API path) and lists
+# the registered tool manifests — informational catalog, no secrets.
+T=$(curl -s -o /tmp/opencode/probe-tools.json -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/tools?business_id=$BIZ")
+check "GET /api/v1/tools" 200 "$T"
+contains "catalog lists http.request" '"http.request"' "$(jq -c '[.tools[].tool_id]' /tmp/opencode/probe-tools.json)"
+contains "catalog lists filesystem.read" '"filesystem.read"' "$(jq -c '[.tools[].tool_id]' /tmp/opencode/probe-tools.json)"
+contains "catalog lists git" '"git"' "$(jq -c '[.tools[].tool_id]' /tmp/opencode/probe-tools.json)"
+contains "catalog lists web.search" '"web.search"' "$(jq -c '[.tools[].tool_id]' /tmp/opencode/probe-tools.json)"
+contains "catalog lists data" '"data"' "$(jq -c '[.tools[].tool_id]' /tmp/opencode/probe-tools.json)"
+contains "catalog declares side_effect_class" '"side_effect_class"' "$(cat /tmp/opencode/probe-tools.json)"
+contains "catalog declares supported_operations" '"supported_operations"' "$(cat /tmp/opencode/probe-tools.json)"
+NOBUS=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/tools")
+check "GET /api/v1/tools missing business_id -> 400" 400 "$NOBUS"
+NOAUTH=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/v1/tools?business_id=$BIZ")
+check "GET /api/v1/tools without auth" 401 "$NOAUTH"
+FOREIGN=$(curl -s -o /dev/null -w '%{http_code}' "${AUTH[@]}" "$BASE/api/v1/tools?business_id=other-biz-$RANDOM")
+check "GET /api/v1/tools foreign business -> 403" 403 "$FOREIGN"
+CONTENT=$(cat /tmp/opencode/probe-tools.json)
+absent "catalog carries no secrets" 'Bearer ' "$CONTENT"
+contains "catalog marks http security_class network" '"network"' "$(jq -c '[.tools[]|select(.tool_id=="http.request")|.security_class]' /tmp/opencode/probe-tools.json)"
 
 echo "== pause / resume / readiness =="
 check "pause" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${CTL[@]}" "$BASE/api/v1/control/pause")"
