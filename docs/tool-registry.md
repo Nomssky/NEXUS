@@ -58,6 +58,38 @@ type Adapter interface {
 (for single-op manifests, the wrapped adapter can be projected to one op via
 `opScopedAdapter`).
 
+`Invocation` also carries the reliability identity of the call it belongs to —
+`CallID` (the logical call), `AttemptIndex` (0-based physical attempt) and
+`IdempotencyKey` (stable per logical call). The platform fills all three; an
+adapter must never invent or regenerate them, and must propagate the idempotency
+key to the remote system when it supports that
+([tool-idempotency.md](tool-idempotency.md)).
+
+An adapter may also implement the optional capability interfaces the platform
+reads (never assumes):
+
+```go
+type IdempotencyCapable interface{ SupportsIdempotency() bool }       // mutations carry Idempotency-Key
+type ReconciliationCapable interface{ SupportsReconciliation() bool } // can resolve an unknown outcome
+type OperationSideEffects interface{ OperationSideEffect(op string) (tool.SideEffectClass, bool) }
+```
+
+`OperationSideEffects` may only narrow a class to `read` for one declared
+operation; it can never widen the manifest's class.
+
+## Result
+
+`RawResult` is the adapter's unnormalized output. `tool.Result` is the
+canonical one, and carries the reliability fields alongside the bounded payload:
+
+```go
+Outcome                 string // completed | failed | cancelled | timed_out | unknown
+Attempts                int    // physical attempts made for this logical call
+CapabilityState         string // enabled | deprecated at dispatch time
+RetryRecommended        bool   // class verdict; always false for an unknown outcome
+ReconciliationAvailable bool   // only when the capability can resolve one
+```
+
 `Invocation` carries: tool id, operation, input, scope (business/division/actor/agent),
 a `CredentialHandle` (opaque; the raw secret only through `handle.Secret()`),
 and clamped per-invocation `ResourceLimits`.

@@ -39,10 +39,18 @@ OBJECTIVE → INTELLIGENCE → tool_call{tool, input} → CAPABILITY PLATFORM
 6. permission-emitted audit (`tool.permission.denied`)
 7. budget clamp (`Caps` / manifest runtime limits — manifest may only tighten)
 8. credential resolution (manifest declared requirements only; handle resolved for adapters only)
-9. adapter invocation with `context.Context` (cancellation must propagate)
-10. normalization → bounds/truncation (`truncated=true`, never silent)
-11. secret redaction on results *and* errors *and* headers (metadata + audit data)
-12. observation path back to the loop — no raw adapter payload ever leaves the boundary
+9. capability lifecycle gate (`enabled` runs, `deprecated` runs and is surfaced,
+   `disabled` is refused *before* any dispatch)
+10. bounded attempts under **one** call deadline: `tool.attempt.started` /
+   `tool.attempt.completed` per attempt, `tool.retry.scheduled` when a retry is
+   admitted, and one terminal frame chosen by outcome
+11. normalization → bounds/truncation (`truncated=true`, never silent)
+12. secret redaction on results *and* errors *and* headers (metadata + audit data)
+13. observation path back to the loop — no raw adapter payload ever leaves the boundary
+
+Steps 9–10 are the reliability layer; they are specified in
+[Operational Reliability & Tool Semantics v1](tool-reliability.md) and
+implemented once, in `internal/capability/semantics.go` + `runAttempts`.
 
 There is **no second invocation path**. `agentintel`, workflows, and delegated
 children all reuse `InvokeToolScoped` on `agentexec.Runtime`, which uses the
@@ -52,19 +60,32 @@ same platform when one is wired, and the same allowlist/manifest gates otherwise
 
 Manifest-declared; the runtime never infers them from the name:
 
-* `read` — may be automatically retried by AGENTS (adapter-marked)
+* `read` — may be automatically retried (transport transients only)
 * `write` — no automatic retry
 * `external_mutation` — never automatic
 * `credentialed_external_mutation` — never automatic
+
+The class that governs one invocation is the **effective** class: the manifest's
+tool-level class, unless the adapter narrows it to `read` for one operation it
+declares itself (`http.request`: GET/HEAD read, POST/PUT/PATCH/DELETE mutate).
+An adapter can never widen the class. Retry decisions live in exactly one place
+([tool-retries.md](tool-retries.md)).
 
 ## Events on the existing bus
 
 `tool.registered`, `tool.invocation.started`, `tool.invocation.completed`,
 `tool.invocation.failed`, `tool.invocation.rejected`, `tool.permission.denied`,
-`tool.credential.denied`, `tool.result.truncated`. Every payload carries
-`correlation_id`, `business_id`, and fields (tool_id, operation, agent_id,
-status, duration_ms, credential *reference* if required, result bytes,
-truncated), never secret material.
+`tool.credential.denied`, `tool.result.truncated`.
+
+Reliability adds, on the same bus: `tool.attempt.started`,
+`tool.attempt.completed`, `tool.retry.scheduled`, `tool.invocation.cancelled`,
+`tool.invocation.timed_out`, `tool.invocation.unknown`,
+`tool.capability.disabled`, `tool.capability.deprecated`,
+`tool.reconciliation.available`. Every payload carries `correlation_id`,
+`business_id` and metadata-only fields (tool_id, operation, agent_id, call_id,
+attempt, outcome, error_class, duration_ms, credential *reference* if required,
+result bytes, truncated), never secret material
+([tool-observability.md](tool-observability.md)).
 
 ## Credential boundary
 
@@ -84,10 +105,24 @@ Order: `NEXUS_TOOL_FS_ROOT` env var → `<data_dir>/workspaces/<business_id>`.
 
 ## Failure semantics
 
-Tool errors are distinguishable and map to the existing error model; the loop
-turns them into `state=failed: <message>` observations. Adapter failures never
-become success. Permission (allowlist/scope) is evaluated *before* the adapter
-runs, so no data flows from a denied invocation — the failure is audit-only.
+Every call ends in exactly one explicit outcome: `completed`, `failed`,
+`cancelled`, `timed_out` or `unknown` (`Result.Outcome`). Adapter failures never
+become success, and `unknown` — a mutation whose remote result cannot be
+observed — is never downgraded to `failed`, never retried automatically, and
+always surfaces a reconciliation requirement to the loop.
+
+Permission (allowlist/scope) is evaluated *before* the adapter runs, so no data
+flows from a denied invocation — the failure is audit-only. The
+`capability_disabled` refusal is checked in the same pre-dispatch region.
+
+## Capability lifecycle
+
+`registered → enabled → disabled | deprecated`, with `disabled → enabled` and
+`deprecated → disabled | enabled`. Transitions are applied by an operator through
+`POST /api/v1/control/capabilities/{id}/state` (X-API-Key); anything outside the
+graph answers `409`. A disable only removes invocations — it never unregisters a
+capability, never widens scope, and never interrupts a dispatch that was already
+authorized. See [tool-reliability.md](tool-reliability.md).
 
 ## G1–G5 inheritance
 
