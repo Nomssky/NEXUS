@@ -705,3 +705,45 @@ func rejectionSummary(res ValidationResult) string {
 	}
 	return strings.Join(parts, "; ")
 }
+
+// ---- governance terminal outcomes -------------------------------------------
+
+// deniedOutcome is a governance refusal of one proposed action. It is its own
+// state, never StateFailed: the action was blocked before any side effect, and
+// the objective may still replan within its remaining authority.
+func deniedOutcome(req *executor.WorkRequest, start, now time.Time, message string) *executor.Outcome {
+	return &executor.Outcome{
+		TaskID: req.TaskID, Status: "denied",
+		Error:    fmt.Sprintf("state=%s: %s", StateDenied, message),
+		Output:   fmt.Sprintf("state=%s", StateDenied),
+		Duration: now.Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
+		CreatedAt: start, CompletedAt: now,
+	}
+}
+
+// pendingApprovalOutcome stops the execution BEFORE the consequential side
+// effect and exposes the approval id so the existing approval surface can decide
+// it. Approval is not execution: nothing ran.
+func pendingApprovalOutcome(req *executor.WorkRequest, start, now time.Time, message, approvalID string) *executor.Outcome {
+	return &executor.Outcome{
+		TaskID: req.TaskID, Status: "pending_approval",
+		Error:      fmt.Sprintf("state=%s: %s", StatePendingApproval, message),
+		Output:     fmt.Sprintf("state=%s", StatePendingApproval),
+		ApprovalID: approvalID,
+		Duration:   now.Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
+		CreatedAt: start, CompletedAt: now,
+	}
+}
+
+// escalatedOutcome hands the action to the existing escalation → attention
+// path. The action stays blocked; attention never authorizes it.
+func escalatedOutcome(req *executor.WorkRequest, start, now time.Time, message, escalationID string) *executor.Outcome {
+	return &executor.Outcome{
+		TaskID: req.TaskID, Status: "escalated",
+		Error:         fmt.Sprintf("state=%s: %s", StateEscalated, message),
+		Output:        fmt.Sprintf("state=%s", StateEscalated),
+		EscalationRef: escalationID,
+		Duration:      now.Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
+		CreatedAt: start, CompletedAt: now,
+	}
+}

@@ -469,7 +469,13 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 					Timestamp: e.now(),
 				}
 			}
-			if ar, err := e.createApproval(req, decision, govReq); err == nil {
+			// A handler that already opened an approval for a governance-gated
+			// ACTION (agent intelligence, AGENT_GOVERNANCE_CONTROL_CONTRACTS §5)
+			// owns the record: reuse its id instead of opening a second one for
+			// the same work.
+			if execOutcome.ApprovalID != "" {
+				respErr.Details = map[string]string{"approval_id": execOutcome.ApprovalID}
+			} else if ar, err := e.createApproval(req, decision, govReq); err == nil {
 				respErr.Details = map[string]string{"approval_id": ar.DecisionID}
 			}
 		}
@@ -494,7 +500,10 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		if message == "" {
 			message = "governance escalation required"
 		}
-		escRef := fmt.Sprintf("esc-%s-%d", req.Context.ActorID, e.now().UnixNano())
+		escRef := execOutcome.EscalationRef
+		if escRef == "" {
+			escRef = fmt.Sprintf("esc-%s-%d", req.Context.ActorID, e.now().UnixNano())
+		}
 		respErr = &ChainError{
 			Code:      "ESCALATION_REQUIRED",
 			Category:  "POLICY_DENIED",

@@ -29,6 +29,12 @@ const (
 	StateCancelled        State = "cancelled"
 	StateBudgetExhausted  State = "budget_exhausted"
 	StateDeadlineExceeded State = "deadline_exceeded"
+	// Governance terminal states (AGENT_GOVERNANCE_CONTROL_CONTRACTS §3).
+	// They are NOT collapsed into StateFailed: a governance decision is a
+	// different axis from an execution outcome.
+	StateDenied          State = "denied"
+	StatePendingApproval State = "pending_approval"
+	StateEscalated       State = "escalated"
 )
 
 // Terminal reports whether s is a terminal loop state.

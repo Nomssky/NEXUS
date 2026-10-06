@@ -83,6 +83,12 @@ type Request struct {
 	AgentTools []string
 	// CorrelationID ties events/audit to the execution.
 	CorrelationID string
+	// MaxDuration is the EFFECTIVE call budget for this invocation. It may only
+	// TIGHTEN the platform caps and the manifest limit: it can never widen them
+	// (clampLimits takes the smaller of the two). It carries the governance
+	// ALLOW_WITH_CONSTRAINTS bound so a constrained call cannot outrun its
+	// restriction (AGENT_GOVERNANCE_CONTROL_CONTRACTS §4).
+	MaxDuration time.Duration
 }
 
 // Auditor records capability invocations on the existing event bus. It is
@@ -248,8 +254,12 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	}
 
 	// 7: budgets — the manifest may request less than the runtime cap; the
-	// runtime cap always wins.
+	// runtime cap always wins. An effective (governance-constrained) duration may
+	// only tighten it further.
 	limits := clampLimits(manifest.ResourceLimits, p.Caps)
+	if req.MaxDuration > 0 && req.MaxDuration < limits.MaxDuration {
+		limits.MaxDuration = req.MaxDuration
+	}
 
 	// 8: credential resolution (fail closed; never reached for tools without a
 	// credential requirement).

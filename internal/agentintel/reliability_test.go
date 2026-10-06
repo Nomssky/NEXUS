@@ -84,6 +84,11 @@ func newReliabilityFixture(t *testing.T, adapter tool.Adapter, class tool.SideEf
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Admission is mandatory for mediated tool calls (fail closed), so the
+	// fixture wires the shipped permissive policy.
+	exec.Platform = platform
+	ctl, _, _ := allowAllController()
+	exec.Controller = ctl
 	return New(agents, exec, &scriptedDecider{plan: goodPlan}, nil, mem), agents
 }
 

@@ -124,6 +124,14 @@ type Outcome struct {
 	// CompletedAt records when execution finished.
 	CompletedAt time.Time `json:"completed_at"`
 
+	// ApprovalID is set by a handler that opened an approval itself for a
+	// governance-gated action (AGENT_GOVERNANCE_CONTROL_CONTRACTS 5). The
+	// chain reuses it instead of opening a second record for the same work.
+	ApprovalID string `json:"approval_id,omitempty"`
+	// EscalationRef is set by a handler that already handed the action to the
+	// escalation -> attention path, so the chain does not escalate twice.
+	EscalationRef string `json:"escalation_ref,omitempty"`
+
 	Provider        string `json:"provider,omitempty"`
 	Model           string `json:"model,omitempty"`
 	RoutingReason   string `json:"routing_reason,omitempty"`

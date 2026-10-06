@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/capability"
+	"github.com/Nomssky/NEXUS/internal/control"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -98,9 +99,17 @@ type Runtime struct {
 	ToolExec map[string]func(ctx context.Context, input map[string]string) (map[string]string, error)
 	Router   *modelrouter.ModelRouter
 	Bus      *event.MemBus
-	now      func() time.Time
-	maxDepth int
-	maxFan   int
+	// Controller is the governance admission boundary
+	// (contracts/AGENT_GOVERNANCE_CONTROL_CONTRACTS.md). Every mediated tool
+	// invocation passes through it BEFORE Platform.Invoke. A nil controller
+	// fails closed: governance is never bypassed.
+	Controller *control.Controller
+	now        func() time.Time
+	maxDepth   int
+	maxFan     int
+	mu         sync.Mutex
+	// proposalSeq numbers runtime proposal identities (never model supplied).
+	proposalSeq int
 }
 
 // NewRuntime builds a runtime with deterministic builtin tools registered
@@ -510,10 +519,20 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 		if corr == "" {
 			corr = correlationOf(ctx)
 		}
+		// ---- governance admission, strictly BEFORE the capability platform
+		// (AGENT_GOVERNANCE_CONTROL_CONTRACTS §6). A refused proposal never
+		// reaches Platform.Invoke, and an allowing decision may tighten the call.
+		effective, aerr := r.Admit(call, scope, corr, agentID, Limits{MaxDuration: capabilityMaxDuration})
+		if aerr != nil {
+			return nil, aerr
+		}
 		res := r.Platform.Invoke(ctx, capability.Request{
 			ToolID: call.ToolID, Operation: call.Operation, Input: call.Input,
 			AgentID: agentID, ActorID: scope.ActorID, BusinessID: businessID,
 			DivisionID: scope.DivisionID, AgentTools: allowedTools, CorrelationID: corr,
+			// The effective request carries what governance allowed: a
+			// constraint may tighten this call and nothing else may widen it.
+			MaxDuration: effective.MaxDuration,
 		})
 		if res.Status != tool.StatusSuccess {
 			return nil, &OutcomeError{

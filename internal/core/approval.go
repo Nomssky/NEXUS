@@ -60,6 +60,17 @@ type approvalEntry struct {
 	businessID string
 	req        *Request
 	ar         *governance.ApprovalRequest
+	// actionFingerprint binds an ACTION-level approval to exactly one proposal
+	// (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5). Empty for the
+	// task/request-level approvals this file already handled.
+	actionFingerprint string
+}
+
+// approvalEntry returns the entry for an approval id, or nil.
+func (e *Engine) approvalEntry(approvalID string) *approvalEntry {
+	e.approvalMu.Lock()
+	defer e.approvalMu.Unlock()
+	return e.approvals[approvalID]
 }
 
 // ApprovalRecord is the contract-shaped projection of an approval

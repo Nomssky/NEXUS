@@ -72,6 +72,16 @@ type Engine struct {
 	approvalMu     sync.Mutex
 	approvals      map[string]*approvalEntry // approvalID → entry
 	approvalByReq  map[string]string         // requestID → approvalID
+	// actionApprovals indexes action-level approvals by
+	// "requestID|fingerprint" -> approvalID. It is separate from approvalByReq
+	// because one objective may need several distinct action approvals
+	// (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5).
+	actionApprovals *actionApprovalIndex
+	// requestRefs is a plain reference index of admitted/in-flight requests, so
+	// an action-level approval raised inside one has something to resume. No
+	// lifecycle, no authorization, no durability (G4).
+	requestRefs   map[string]*Request
+	requestRefsMu sync.RWMutex
 
 	// Cognition
 	objectiveEng *cognition.ObjectiveEngine
@@ -174,18 +184,20 @@ func WithExecutorConfig(cfg executor.Config) EngineOption {
 // NewEngine creates a new Core Runtime engine with all foundation components wired.
 func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 	e := &Engine{
-		config:        cfg,
-		status:        lifecycle.StateCreated,
-		now:           time.Now,
-		requests:      make(chan *Request, 100),
-		results:       make(map[string]*Response),
-		resultOrder:   make([]string, 0, maxResults),
-		inflight:      make(map[string]*inflightRequest),
-		approvals:     make(map[string]*approvalEntry),
-		approvalByReq: make(map[string]string),
-		shutdownCh:    make(chan struct{}),
-		loopDone:      make(chan struct{}),
-		execConfig:    executor.DefaultConfig(),
+		config:          cfg,
+		status:          lifecycle.StateCreated,
+		now:             time.Now,
+		requests:        make(chan *Request, 100),
+		results:         make(map[string]*Response),
+		resultOrder:     make([]string, 0, maxResults),
+		inflight:        make(map[string]*inflightRequest),
+		approvals:       make(map[string]*approvalEntry),
+		approvalByReq:   make(map[string]string),
+		actionApprovals: newActionApprovalIndex(),
+		requestRefs:     make(map[string]*Request),
+		shutdownCh:      make(chan struct{}),
+		loopDone:        make(chan struct{}),
+		execConfig:      executor.DefaultConfig(),
 	}
 
 	for _, opt := range opts {
@@ -432,6 +444,9 @@ func (e *Engine) SubmitRequest(req *Request) error {
 	// E-005: register before the channel send so a cancellation can always
 	// find the request (queued or executing) from the moment it is admitted.
 	e.registerInflight(req)
+	// Index the request so an action-level approval raised inside it can bind
+	// to it and resume it (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5).
+	e.trackRequestRef(req)
 
 	select {
 	case e.requests <- req:
