@@ -158,7 +158,7 @@ set** of types with bounded, existing-shaped semantics:
 |---|---|---|
 | `tool_allowlist` | comma-separated tool ids | a tool outside the list fails closed |
 | `operation_allowlist` | comma-separated operations | an operation outside the list fails closed |
-| `max_duration_ms` | integer milliseconds | tightens the capability duration limit (never widens it) |
+| `max_duration_ms` | integer milliseconds | tightens the call's duration limit, or gives a duration-free path one; never widens a bound |
 | `resource_restriction` | comma-separated resource ids | a resource outside the list fails closed |
 
 Rules:
@@ -197,7 +197,13 @@ Rules:
 * a changed action, resource, tool, operation, scope or constraint set produces a
   different fingerprint and therefore **requires fresh approval**;
 * an approved record authorizes exactly **one** admission after the resume: a
-  repeated identical proposal needs a fresh approval;
+  repeated identical proposal needs a fresh approval. This is enforced by the
+  controller's process-local ledger of spent `execution_id|fingerprint` keys, not
+  by the approval record itself: a record stays APPROVED after it is spent, so
+  the ledger is what makes the authorization single-use. The ledger is bounded
+  (4096 entries, FIFO); evicting an entry can only cause one *extra* admission to
+  re-ask, never a silent allow, because a spent key's absence simply restores the
+  approval-gate evaluation.
 * an approval never overrides an explicit `DENY`, a revoked identity, a suspended
   business/division, a disabled capability, a changed scope or a security
   rejection — governance re-evaluation is authoritative and the capability platform
@@ -240,9 +246,11 @@ memory scope; or treat memory, tool output or attention alerts as authority.
 
 Enforcement points: `agentintel.Action` has no authority fields;
 `ValidateAction` still checks the agent allowlist; `agentexec.InvokeToolScoped`
-admits before touching the platform; `agentintel` admits before delegating and
-before every durable memory write or delete; `core.ApproveRequest` resolves the
-approver through the existing `ApprovalEngine` rules.
+admits before touching the platform **and before the in-process builtin
+fallback**, which is an execution path too, not an exception;
+`agentintel` admits before delegating and before every durable memory write or
+delete; `core.ApproveRequest` resolves the approver through the existing
+`ApprovalEngine` rules.
 
 The model cannot install or change a policy either: policies are written only
 through `/api/v1/control/policies`, which requires the control-plane API key

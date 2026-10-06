@@ -138,16 +138,14 @@ func Constrain(toolID, operation string, limits Limits, adm Admission) (Constrai
 					ErrConstraintUnenforceable, toolID)
 			}
 		case ConstraintMaxDuration:
-			// Tighten only.
+			// Tighten only. A zero caller limit means the call is not duration
+			// budgeted at all (the pre-platform builtin path), and a constraint
+			// still gives it a bound — it never removes one.
 			if c.MaxDuration > 0 && (cr.MaxDuration <= 0 || c.MaxDuration < cr.MaxDuration) {
 				cr.MaxDuration = c.MaxDuration
 			}
 		}
 		cr.Constraints = append(cr.Constraints, c)
-	}
-	if cr.MaxDuration <= 0 {
-		return cr, fmt.Errorf("%w: constraints left the call without a duration bound",
-			ErrConstraintUnenforceable)
 	}
 	return cr, nil
 }

@@ -25,10 +25,12 @@ ESCALATE        → blocked, existing escalation → attention
 One admission point per consequential effect. For tool calls it is
 `agentexec.Runtime.Admit` on `InvokeToolScoped` — the single mediated tool path —
 so the intelligence loop, delegated children and workflow steps are all admitted
-before `Platform.Invoke`. Delegation and durable memory writes/deletes are
-admitted in the loop immediately before the effect. `model_call`, `memory_read`
-and the loop-control actions are not admitted: they have no side effect beyond
-work the request was already admitted for.
+before `Platform.Invoke`. That includes the in-process builtin fallback used when
+no capability platform is configured: it is an execution path too, so it is
+admitted rather than treated as an exception. Delegation and durable memory
+writes/deletes are admitted in the loop immediately before the effect.
+`model_call`, `memory_read` and the loop-control actions are not admitted: they
+have no side effect beyond work the request was already admitted for.
 
 `Platform.Invoke` is unreachable for a refused tool call, no child execution
 starts for a refused delegation, and no record is written or deleted for a

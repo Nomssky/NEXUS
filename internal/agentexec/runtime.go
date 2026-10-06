@@ -554,6 +554,16 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 	if _, ok := r.Tools.GetTool(call.ToolID); !ok {
 		return nil, fmt.Errorf("tool %q is not registered", call.ToolID)
 	}
+	// The pre-platform builtin path is still an execution path, so it is still
+	// admitted. Without a platform this is the only gate an action gets, and a
+	// fallback that skipped governance would be a bypass (contract §6).
+	corr := scope.CorrelationID
+	if corr == "" {
+		corr = correlationOf(ctx)
+	}
+	if _, aerr := r.Admit(call, scope, corr, agentID, Limits{}); aerr != nil {
+		return nil, aerr
+	}
 	if agentID != "" && len(allowedTools) > 0 && !stringIn(allowedTools, call.ToolID) {
 		return nil, fmt.Errorf("tool %q is not in the agent allowlist", call.ToolID)
 	}

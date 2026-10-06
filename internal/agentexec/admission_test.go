@@ -276,6 +276,55 @@ func TestToolAllowlistConstraintBlocksOtherTools(t *testing.T) {
 	}
 }
 
+func TestBuiltinPathIsAdmittedToo(t *testing.T) {
+	// With no capability platform the runtime falls back to the in-process
+	// builtins. That fallback is still an execution path, so it must still pass
+	// governance: skipping it would be a bypass, not a simplification.
+	g := newGovernedRuntime(t, allowPolicy(),
+		testPolicy("p-deny", governance.DENY, control.ActionToolCall, nil, nil, 1000))
+	g.rt.Platform = nil
+	g.rt.ToolExec = map[string]func(context.Context, map[string]string) (map[string]string, error){
+		"echo.tool": func(context.Context, map[string]string) (map[string]string, error) {
+			return map[string]string{"output": "ran"}, nil
+		},
+	}
+	s := scope()
+	c := ToolCallSpec{ToolID: "echo.tool", Operation: "execute", Input: map[string]string{"text": "hi"}}
+
+	_, err := g.rt.InvokeToolScoped(context.Background(), s, "agent-1", c)
+	var ae *AdmissionError
+	if !errors.As(err, &ae) || ae.Outcome != governance.DENY {
+		t.Fatalf("the builtin path must be governed too, got %v", err)
+	}
+
+	// And an allowing decision still lets it through.
+	g2 := newGovernedRuntime(t, allowPolicy())
+	g2.rt.Platform = nil
+	g2.rt.ToolExec = map[string]func(context.Context, map[string]string) (map[string]string, error){
+		"echo.tool": func(context.Context, map[string]string) (map[string]string, error) {
+			return map[string]string{"output": "ran"}, nil
+		},
+	}
+	out, err := g2.rt.InvokeToolScoped(context.Background(), s, "agent-1", c)
+	if err != nil {
+		t.Fatalf("an allowed builtin must still execute: %v", err)
+	}
+	if out["output"] != "ran" {
+		t.Fatalf("the builtin must run: %+v", out)
+	}
+}
+
+func TestBuiltinPathFailsClosedWithoutAController(t *testing.T) {
+	g := newGovernedRuntime(t, allowPolicy())
+	g.rt.Platform = nil
+	g.rt.Controller = nil
+	_, err := g.rt.InvokeToolScoped(context.Background(), scope(), "agent-1", call())
+	var ae *AdmissionError
+	if !errors.As(err, &ae) || ae.Outcome != governance.DENY {
+		t.Fatalf("a missing controller must fail closed on the builtin path too, got %v", err)
+	}
+}
+
 func TestWithoutControllerToolCallsFailClosed(t *testing.T) {
 	g := newGovernedRuntime(t, allowPolicy())
 	g.rt.Controller = nil // governance unavailable

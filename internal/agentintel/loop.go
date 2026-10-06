@@ -804,10 +804,14 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource,
 		return obs, StateDenied, obs.Text, true
 	}
 	adm, err := r.Exec.Controller.Admit(control.Proposal{
-		ProposalID:    newID("prop"),
-		CorrelationID: rn.req.CorrelationID,
-		ExecutionID:   rn.req.CorrelationID,
-		ObjectiveID:   rn.req.CorrelationID,
+		ProposalID: newID("prop"),
+		// execID is the identity the loop itself runs under (correlation id,
+		// falling back to the task id) — the same value the objective, the plan
+		// and the events use, so an approval binds to THIS execution and to
+		// nothing else.
+		CorrelationID: rn.execID,
+		ExecutionID:   rn.execID,
+		ObjectiveID:   rn.execID,
 		StepID:        rn.req.TaskID,
 		ActorID:       rn.req.ActorID,
 		AgentID:       agentID,

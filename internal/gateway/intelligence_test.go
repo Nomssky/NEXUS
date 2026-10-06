@@ -62,6 +62,9 @@ func newIntelFixture(t *testing.T, providerStatus modelrouter.ProviderStatus) *i
 	tools := tool.NewToolRegistry()
 	agents := agentexec.NewRegistry("nx:nexus:test", orgs, tools)
 	exec := agentexec.NewRuntime(agents, tools, router, engine.EventBus())
+	// Admission is mandatory and fails closed without a controller, so the
+	// fixture uses the engine's own — the same wiring the launcher performs.
+	exec.Controller = engine.Controller()
 	mem, err := agentintel.OpenMemory(nil, agentintel.Deps{
 		Scopes: memmemory.NewMembershipScopes(members.AllowsScope)})
 	if err != nil {
