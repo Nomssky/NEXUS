@@ -30,7 +30,10 @@ binary on a throwaway data directory and drives it with `curl`/`jq` only. It
 exists for the surfaces this suite does not automate (control
 `metrics`/`components`, division record read and transitions) and for the
 Phase 14 wire spot-check; results are recorded in
-`docs/PLATFORM_INTEGRITY_AUDIT.md` §9.
+`docs/PLATFORM_INTEGRITY_AUDIT.md` §9. It also probes the operational
+reliability surface by hand: the reliability discovery metadata, the capability
+lifecycle control plane, and one mutation whose remote response is deliberately
+lost to show that an `unknown` outcome is never re-dispatched.
 
 Useful variables:
 
@@ -122,6 +125,7 @@ Endpoints are registered in `internal/gateway/server.go`. The chain is
 | AGENT EXECUTION | `tests/15-agent-execution.spec.ts` (agent register/discover/lifecycle, executions + provider/model telemetry, bounded tools + allowlist denial, sequential/parallel workflows, delegation, cancellation, offline provider failure, governance denial, G2 admission, G4 restart 404, event correlation) |
 | AGENT INTELLIGENCE | `tests/16-agent-intelligence.spec.ts` (objective execution with plan → validate → tool → observe → complete, multiple tool calls, memory read/write, dynamic delegation, replanning, iteration/caller budgets, invalid model output, prompt injection in tool data, cancellation, provider failure, governance denial, G2/G3/G4/G5, event correlation; boots its own gateway with the deterministic scripted simulation provider) |
 | CAPABILITY TOOLS | `tests/17-capability-tools.spec.ts` (manifest catalog, discovery boundedness, retained builtins, http read/SSRF/redirect boundary, filesystem sandbox + traversal refusal, git status + escape refusal, web research + injected-content inertness, structured data, allowlist denial, result-truncation event, cancellation, external failure, event correlation, audit payload integrity, G3/G5/G4 posture; boots with the scripted provider + scripted research provider) |
+| OPERATIONAL RELIABILITY | `tests/18-operational-reliability.spec.ts` (reliability discovery metadata, one bounded retry of a lost read response, idempotency-keyed mutation, an indeterminate mutation that is never re-dispatched, unknown-outcome telemetry, duplicate suppression across logical calls, cancellation, retries sharing one call deadline, disable blocking new invocations, disable during an in-flight run, budgets across replanning, structured per-attempt observations, secret-free telemetry, injected-content inertness, governance still deciding first, lifecycle control key gate; boots with the scripted provider and a loopback fixture that fails in the exact ways the contract distinguishes) |
 
 The core executes admitted requests serially, so the pending-state, cancel and
 "SSE outlives the 30s write timeout" assertions are deterministic rather than

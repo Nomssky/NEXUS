@@ -3,6 +3,10 @@
 # Targets what e2e/README.md records as "checked by hand": control
 # metrics/components, division record read + transitions — plus a wire spot
 # check of division narrowing, the error envelope and admission controls.
+# It also probes the operational reliability surface by hand: the reliability
+# discovery metadata, the capability lifecycle control plane, and one mutation
+# whose remote outcome is deliberately lost (an `unknown` outcome must never be
+# re-dispatched).
 set -u
 
 REPO=/home/pc/NEXUS
@@ -45,7 +49,12 @@ absent() { # absent <label> <needle> <haystack>
 }
 
 NEXUS_PID=""
-cleanup() { [ -n "$NEXUS_PID" ] && kill "$NEXUS_PID" 2>/dev/null; wait 2>/dev/null; }
+FIXTURE_PID=""
+cleanup() {
+  [ -n "$FIXTURE_PID" ] && kill "$FIXTURE_PID" 2>/dev/null
+  [ -n "$NEXUS_PID" ] && kill "$NEXUS_PID" 2>/dev/null
+  wait 2>/dev/null
+}
 trap cleanup EXIT
 
 echo "== boot =="
@@ -56,7 +65,9 @@ NEXUS_HEALTH_HOST=127.0.0.1 NEXUS_HEALTH_PORT="$HP" \
 NEXUS_BOOTSTRAP_CREDENTIAL="$BOOT" NEXUS_BOOTSTRAP_BUSINESS="$BIZ" \
 NEXUS_CONTROL_API_KEY="$KEY" NEXUS_LOG_FORMAT=json NEXUS_LOG_LEVEL=info \
 NEXUS_ENVIRONMENT=development \
-NEXUS_CAPABILITY_WEB=scripted NEXUS_TOOL_HTTP_ALLOW_INSECURE=true \
+NEXUS_CAPABILITY_WEB=scripted NEXUS_SEEDED_PROVIDER_MODE=scripted \
+NEXUS_TOOL_HTTP_ALLOW_INSECURE=true NEXUS_TOOL_HTTP_ALLOW_LOOPBACK=true \
+NEXUS_TOOL_HTTP_ALLOWED_HOSTS=127.0.0.1 \
   "$BIN" >"$LOG" 2>&1 &
 NEXUS_PID=$!
 
@@ -290,6 +301,102 @@ check "GET /api/v1/tools foreign business -> 403" 403 "$FOREIGN"
 CONTENT=$(cat /tmp/opencode/probe-tools.json)
 absent "catalog carries no secrets" 'Bearer ' "$CONTENT"
 contains "catalog marks http security_class network" '"network"' "$(jq -c '[.tools[]|select(.tool_id=="http.request")|.security_class]' /tmp/opencode/probe-tools.json)"
+
+
+echo "== operational reliability & tool semantics =="
+# Discovery states the reliability posture of each capability. It is
+# informational: it grants nothing and reveals no topology or credentials.
+REL=$(jq -c '.tools[]|select(.tool_id=="http.request")|{capability_state,supports_idempotency,supports_reconciliation,retry_policy,max_attempts}' /tmp/opencode/probe-tools.json)
+contains "discovery reports capability_state" '"capability_state":"enabled"' "$REL"
+contains "discovery reports idempotency support" '"supports_idempotency":true' "$REL"
+contains "discovery advertises no reconciliation it does not implement" '"supports_reconciliation":false' "$REL"
+contains "discovery reports the retry policy" '"retry_policy":"not_sent_retry"' "$REL"
+contains "discovery reports the attempt bound" '"max_attempts":2' "$REL"
+contains "a declared read capability reports the read retry policy" '"retry_policy":"bounded_read_retry"' \
+  "$(jq -c '.tools[]|select(.tool_id=="git")|{side_effect_class,retry_policy,max_attempts}' /tmp/opencode/probe-tools.json)"
+
+# Lifecycle control is an operator action under the control prefix: no key and
+# a wrong key are both refused before any handler runs.
+check "lifecycle without a key" 401 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -d '{"state":"disabled"}' "$BASE/api/v1/control/capabilities/http.request/state")"
+check "lifecycle with a wrong key" 401 "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'X-API-Key: not-the-key' -H 'Content-Type: application/json' -d '{"state":"disabled"}' \
+  "$BASE/api/v1/control/capabilities/http.request/state")"
+check "lifecycle on an unregistered capability" 404 "$(curl -s -o /dev/null -w '%{http_code}' "${CTL[@]}" -X POST \
+  -d '{"state":"disabled"}' "$BASE/api/v1/control/capabilities/not.registered/state")"
+check "lifecycle with an unknown state" 400 "$(curl -s -o /dev/null -w '%{http_code}' "${CTL[@]}" -X POST \
+  -d '{"state":"sideways"}' "$BASE/api/v1/control/capabilities/http.request/state")"
+check "disable a capability" "disabled" "$(curl -s "${CTL[@]}" -X POST -d '{"state":"disabled"}' \
+  "$BASE/api/v1/control/capabilities/http.request/state" | jq -r .capability_state)"
+check "catalog reports the new state" "disabled" "$(curl -s "${AUTH[@]}" "$BASE/api/v1/tools?business_id=$BIZ" \
+  | jq -r '.tools[]|select(.tool_id=="http.request")|.capability_state')"
+check "disabled -> deprecated is outside the graph" 409 "$(curl -s -o /dev/null -w '%{http_code}' "${CTL[@]}" -X POST \
+  -d '{"state":"deprecated"}' "$BASE/api/v1/control/capabilities/http.request/state")"
+check "disabled -> deprecated leaves the state alone" "disabled" "$(curl -s "${AUTH[@]}" "$BASE/api/v1/tools?business_id=$BIZ" \
+  | jq -r '.tools[]|select(.tool_id=="http.request")|.capability_state')"
+check "re-enable the capability" "enabled" "$(curl -s "${CTL[@]}" -X POST -d '{"state":"enabled"}' \
+  "$BASE/api/v1/control/capabilities/http.request/state" | jq -r .capability_state)"
+check "enabled -> deprecated" "deprecated" "$(curl -s "${CTL[@]}" -X POST -d '{"state":"deprecated"}' \
+  "$BASE/api/v1/control/capabilities/http.request/state" | jq -r .capability_state)"
+check "deprecated still executes (re-enable)" "enabled" "$(curl -s "${CTL[@]}" -X POST -d '{"state":"enabled"}' \
+  "$BASE/api/v1/control/capabilities/http.request/state" | jq -r .capability_state)"
+
+# A mutation whose response is lost has an UNKNOWN outcome: the objective fails,
+# the outcome stays distinguishable, and the remote mutation happens exactly
+# once — no retry, no duplicate.
+if command -v python3 >/dev/null 2>&1; then
+  FIXPORT=38220
+  FIXLOG=/tmp/opencode/probe-fixture.log
+  : >"$FIXLOG"
+  python3 - "$FIXPORT" "$FIXLOG" <<'PY' &
+import socket, sys, threading
+port, log = int(sys.argv[1]), sys.argv[2]
+def handle(conn):
+    try:
+        data = conn.recv(65536)
+        parts = data.split(b" ")
+        with open(log, "a") as fh:
+            fh.write(parts[0].decode() + " " + (parts[1] if len(parts) > 1 else "") .decode() + "\n")
+        if len(parts) > 1 and parts[1].startswith(b"/lost-response"):
+            conn.close()  # dispatched, response never observed
+            return
+        body = b"nexus-probe-fixture"
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+        conn.close()
+    except Exception:
+        pass
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(16)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=handle, args=(c,), daemon=True).start()
+PY
+  FIXTURE_PID=$!
+  sleep 0.3
+  RAGENT="probe-reliability-$$"
+  curl -s -o /dev/null "${AUTH[@]}" -X POST "$BASE/api/v1/agents" \
+    -d "{\"entity_id\":\"$RAGENT\",\"name\":\"Probe Reliability\",\"business_id\":\"$BIZ\",\"capabilities\":[\"analysis\"],\"allowed_tools\":[\"http.request\"]}"
+  SUB=$(curl -s "${AUTH[@]}" -X POST "$BASE/api/v1/intelligence/execute" \
+    -d "{\"business_id\":\"$BIZ\",\"actor_id\":\"nx:human:bootstrap\",\"objective\":{\"description\":\"post via http request to http://127.0.0.1:$FIXPORT/lost-response\"}}")
+  EID=$(echo "$SUB" | jq -r .execution_id)
+  RES=""
+  for _ in $(seq 1 600); do
+    RES=$(curl -s "${AUTH[@]}" "$BASE/api/v1/intelligence/$EID?business_id=$BIZ")
+    ST=$(echo "$RES" | jq -r .status)
+    case "$ST" in completed|failed|cancelled) break ;; esac
+    sleep 0.1
+  done
+  check "an indeterminate mutation fails the objective" "failed" "$(echo "$RES" | jq -r .status)"
+  contains "the unknown outcome stays distinguishable" "unknown outcome" \
+    "$(echo "$RES" | jq -r '.error.message // .outcome.summary')"
+  check "the remote mutation happened exactly once" "1" "$(grep -c '^POST /lost-response' "$FIXLOG")"
+  check "no read was issued for it" "0" "$(grep -c '^GET /lost-response' "$FIXLOG")"
+else
+  echo "  skip python3 unavailable: the unknown-outcome wire probe did not run"
+fi
 
 echo "== pause / resume / readiness =="
 check "pause" 200 "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${CTL[@]}" "$BASE/api/v1/control/pause")"
