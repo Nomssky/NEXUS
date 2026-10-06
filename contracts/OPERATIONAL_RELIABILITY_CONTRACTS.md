@@ -50,6 +50,16 @@ Retryability is a side-effect-class decision, never a name guess:
 | `external_mutation` | only when the error is a confirmed-not-sent failure |
 | `credentialed_external_mutation` | same as `external_mutation`; no extra retries |
 
+The class that governs one invocation is its **effective class**: the manifest's
+tool-level class, unless the adapter itself declares a narrower class for that
+one operation. Narrowing is allowed only to `read` (e.g. `http.request`: GET and
+HEAD read, POST/PUT/PATCH/DELETE mutate); a capability may never widen the
+manifest's class, and the model may never influence it.
+
+`MaxAttempts(call)` is 2 for every class — exactly one retry. Whether that retry
+is *admitted* is the matrix above; a mutation additionally needs the capability
+to support idempotency keys, so a replay is de-duplicated rather than repeated.
+
 Persistent non-retryable classes:
 
 | error class | retryable |
@@ -59,6 +69,7 @@ Persistent non-retryable classes:
 | `cancelled` | never (an explicit cancel is not a retry condition) |
 | `timeout` | read: yes; mutating external: only if classified as not-sent |
 | `external error` / network-denied | read: yes; mutations: only if definitively not sent |
+| `not sent` (DNS or connect failure: provably nothing left the process) | read: yes; mutation: only with idempotency support |
 | `unknown` (remote-side response unknown) | **never** |
 
 Mutation retries are gated by idempotency:
@@ -124,9 +135,11 @@ call deadline = min(ctx deadline, now + Caps.MaxDuration (+ manifest))
 attempt N uses the remaining time, never a fresh deadline
 ```
 
-A retry may only be scheduled if it fits entirely inside the remaining
-call deadline. An attempt that would exceed the deadline is skipped, not
-started.
+A retry may only be scheduled if it fits inside the remaining call deadline. That
+is structural, not advisory: every attempt context is a child of the call
+context and its budget is a share of the call deadline, so a retry can never
+outlive the call even when less than a full share remains. An attempt is never
+started at all once the call deadline has passed.
 
 ## 6. Cancellation
 
