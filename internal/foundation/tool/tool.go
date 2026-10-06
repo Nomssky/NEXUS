@@ -17,6 +17,7 @@ package tool
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -84,24 +85,33 @@ type ToolResponse struct {
 
 // ToolRegistry manages tool definitions and execution.
 // It validates and authorizes tool requests before execution.
+//
+// Registry v2 (contracts/CAPABILITY_TOOL_CONTRACTS.md §5) extends this same
+// registry with validated manifests and bound adapters; there is no second
+// registry. mu guards both maps: definitions are written at boot and read by
+// every invocation.
 type ToolRegistry struct {
-	tools map[string]*ToolDefinition
-	now   func() time.Time
+	mu        sync.RWMutex
+	tools     map[string]*ToolDefinition
+	manifests map[string]registration
+	now       func() time.Time
 }
 
 // NewToolRegistry creates a new tool registry.
 func NewToolRegistry() *ToolRegistry {
 	return &ToolRegistry{
-		tools: make(map[string]*ToolDefinition),
-		now:   time.Now,
+		tools:     make(map[string]*ToolDefinition),
+		manifests: make(map[string]registration),
+		now:       time.Now,
 	}
 }
 
 // NewToolRegistryWithClock creates a new tool registry with an injectable clock.
 func NewToolRegistryWithClock(now func() time.Time) *ToolRegistry {
 	return &ToolRegistry{
-		tools: make(map[string]*ToolDefinition),
-		now:   now,
+		tools:     make(map[string]*ToolDefinition),
+		manifests: make(map[string]registration),
+		now:       now,
 	}
 }
 
@@ -114,6 +124,8 @@ func (tr *ToolRegistry) RegisterTool(def *ToolDefinition) error {
 		return fmt.Errorf("read-only tools must have read category")
 	}
 
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	tr.tools[def.ID] = def
 	return nil
 }
@@ -124,7 +136,7 @@ func (tr *ToolRegistry) RegisterTool(def *ToolDefinition) error {
 // library, violating the zero-dependency policy. Business isolation and
 // tool existence checks are the enforced boundaries.
 func (tr *ToolRegistry) ValidateRequest(req *ToolRequest) error {
-	def, ok := tr.tools[req.ToolID]
+	def, ok := tr.GetTool(req.ToolID)
 	if !ok {
 		return fmt.Errorf("tool %s not found", req.ToolID)
 	}
@@ -149,7 +161,7 @@ func (tr *ToolRegistry) ValidateRequest(req *ToolRequest) error {
 // ExecuteTool validates and executes a tool request.
 // For M5, this only supports read-only tools.
 func (tr *ToolRegistry) ExecuteTool(req *ToolRequest) (*ToolResponse, error) {
-	def, ok := tr.tools[req.ToolID]
+	def, ok := tr.GetTool(req.ToolID)
 	if !ok {
 		return nil, fmt.Errorf("tool %s not found", req.ToolID)
 	}
@@ -192,11 +204,15 @@ func (tr *ToolRegistry) ExecuteTool(req *ToolRequest) (*ToolResponse, error) {
 
 // GetTool returns a tool definition by ID.
 func (tr *ToolRegistry) GetTool(toolID string) (*ToolDefinition, bool) {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
 	def, ok := tr.tools[toolID]
 	return def, ok
 }
 
 // ToolCount returns the total number of registered tools.
 func (tr *ToolRegistry) ToolCount() int {
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
 	return len(tr.tools)
 }
