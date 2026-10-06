@@ -84,11 +84,21 @@ const (
 	EventTypeObservationCreated EventType = "observation.created"
 	EventTypeMemoryRead         EventType = "memory.read"
 	EventTypeMemoryWritten      EventType = "memory.written"
-	EventTypeAgentThinking      EventType = "agent.thinking"
-	EventTypeBudgetExhausted    EventType = "budget.exhausted"
-	EventTypeGovernanceDecided  EventType = "governance.decided"
-	EventTypeApprovalRequested  EventType = "approval.requested"
-	EventTypeApprovalResolved   EventType = "approval.resolved"
+	// Agent Memory & Context Platform v1 (AGENT_MEMORY_CONTEXT_CONTRACTS §16).
+	// Metadata only: ids, scope, type, provenance, trust, counts, outcome.
+	EventTypeMemoryCreated     EventType = "memory.created"
+	EventTypeMemoryUpdated     EventType = "memory.updated"
+	EventTypeMemoryDeleted     EventType = "memory.deleted"
+	EventTypeMemoryExpired     EventType = "memory.expired"
+	EventTypeMemoryRetrieved   EventType = "memory.retrieved"
+	EventTypeMemoryConflict    EventType = "memory.conflict"
+	EventTypeContextAssembled  EventType = "context.assembled"
+	EventTypeContextTruncated  EventType = "context.truncated"
+	EventTypeAgentThinking     EventType = "agent.thinking"
+	EventTypeBudgetExhausted   EventType = "budget.exhausted"
+	EventTypeGovernanceDecided EventType = "governance.decided"
+	EventTypeApprovalRequested EventType = "approval.requested"
+	EventTypeApprovalResolved  EventType = "approval.resolved"
 	// Contract-canonical decision events (SCHEMA_EVENTS_TRIGGERS approval
 	// domain; RUNTIME §16.2). approval.resolved predates them and is kept
 	// for compatibility, but new emissions use approved/denied/expired.

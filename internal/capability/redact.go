@@ -44,6 +44,12 @@ const redactedMarker = "[redacted]"
 // redact removes registered secrets and secret-shaped patterns from s.
 func (p *Platform) redact(s string) string { return p.redactString(s) }
 
+// Redactor exposes the platform's mandatory redaction to other boundaries that
+// must not become a place where a secret survives (AGENT_MEMORY_CONTEXT_CONTRACTS
+// §16/§31 of the Capability contract: "before durable memory"). It is the same
+// implementation, with the same registered secrets — never a second redactor.
+func (p *Platform) Redactor(s string) string { return p.redactString(s) }
+
 func (p *Platform) redactString(s string) string {
 	if s == "" {
 		return s
