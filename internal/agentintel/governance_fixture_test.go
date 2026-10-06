@@ -17,7 +17,8 @@ import (
 
 // seededAllowPolicy mirrors the engine's shipped built-in (core seeds exactly
 // this one so an unconfigured installation does not fall through to DENY).
-func seededAllowPolicy(now time.Time) *governance.Policy {
+func seededAllowPolicy() *governance.Policy {
+	now := time.Now().UTC()
 	return &governance.Policy{
 		SchemaVersion: schema.Version,
 		EntityType:    "policy",
@@ -87,6 +88,28 @@ func (s *stubApprover) Approve(fingerprint string) {
 	s.approved[fingerprint] = true
 }
 
+// approveAll decides every pending request, simulating the approver deciding
+// before the resume re-runs the objective.
+func (s *stubApprover) approveAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for fp := range s.pending {
+		s.approved[fp] = true
+		delete(s.pending, fp)
+	}
+}
+
+// pendingSnapshot reports the fingerprints still awaiting a decision.
+func (s *stubApprover) pendingSnapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.pending))
+	for fp := range s.pending {
+		out = append(out, fp)
+	}
+	return out
+}
+
 // stubEscalator records escalations without an event bus.
 type stubEscalator struct {
 	mu   sync.Mutex
@@ -99,6 +122,12 @@ func (s *stubEscalator) Escalate(p control.Proposal, _ string) (string, error) {
 	ref := "esc-test-" + p.ProposalID
 	s.refs = append(s.refs, ref)
 	return ref, nil
+}
+
+func (s *stubEscalator) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.refs)
 }
 
 // newTestController builds an admission controller over an explicit policy set.
@@ -115,12 +144,12 @@ func newTestController(policies ...*governance.Policy) (*control.Controller, *st
 // allowAllController is the permissive default used by fixtures that are not
 // about governance.
 func allowAllController() (*control.Controller, *stubApprover, *stubEscalator) {
-	return newTestController(seededAllowPolicy(time.Now()))
+	return newTestController(seededAllowPolicy())
 }
 
 // denyPolicy denies one action (optionally scoped to a resource) for tests.
 func denyPolicy(action, resource string) *governance.Policy {
-	now := time.Now()
+	now := time.Now().UTC()
 	p := &governance.Policy{
 		SchemaVersion: schema.Version, EntityType: "policy",
 		PolicyID: "test-deny-" + action, PolicyVersion: "1",
@@ -141,7 +170,7 @@ func denyPolicy(action, resource string) *governance.Policy {
 
 // approvalPolicy requires an approval for one action (optionally one resource).
 func approvalPolicy(action, resource string) *governance.Policy {
-	now := time.Now()
+	now := time.Now().UTC()
 	p := &governance.Policy{
 		SchemaVersion: schema.Version, EntityType: "policy",
 		PolicyID: "test-approval-" + action, PolicyVersion: "1",
@@ -166,7 +195,7 @@ func approvalPolicy(action, resource string) *governance.Policy {
 
 // escalatePolicy escalates one action.
 func escalatePolicy(action, resource string) *governance.Policy {
-	now := time.Now()
+	now := time.Now().UTC()
 	p := &governance.Policy{
 		SchemaVersion: schema.Version, EntityType: "policy",
 		PolicyID: "test-escalate-" + action, PolicyVersion: "1",
@@ -187,7 +216,7 @@ func escalatePolicy(action, resource string) *governance.Policy {
 
 // constraintsPolicy allows one action with mandatory constraints.
 func constraintsPolicy(action string, constraints ...governance.Constraint) *governance.Policy {
-	now := time.Now()
+	now := time.Now().UTC()
 	return &governance.Policy{
 		SchemaVersion: schema.Version, EntityType: "policy",
 		PolicyID: "test-constraints-" + action, PolicyVersion: "1",
