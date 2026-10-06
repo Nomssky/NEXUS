@@ -34,6 +34,11 @@ The milestone invariant (one sentence):
 | constraints | `governance.Constraint{type, expression, severity}` — previously rendered as text and otherwise ignored | **given enforceable semantics** (bounded closed set, fail closed) |
 | events | `governance.decided` (declared, never published), `approval.*`, `governance.escalated` | reused; only `governance.action_proposed` and `governance.constraint_applied` are new |
 
+`Evaluate` is called in exactly three places in the whole runtime — the chain
+gate, the task gate, and admission — and all three go through the same
+`governance.Engine`. There is no second policy evaluator and no per-adapter
+check.
+
 ### The gap this milestone closes
 
 An intelligence execution is an ordinary admitted `core.Request`, so it passes the
@@ -231,6 +236,11 @@ Enforcement points: `agentintel.Action` has no authority fields;
 admits before touching the platform; `agentintel` admits before delegating and
 before every durable memory write or delete; `core.ApproveRequest` resolves the
 approver through the existing `ApprovalEngine` rules.
+
+The model cannot install or change a policy either: policies are written only
+through `/api/v1/control/policies`, which requires the control-plane API key
+(`X-API-Key`), a separate credential from the actor identity. That is the existing
+control-plane boundary, not a new authorization layer.
 
 ## 9. Scope, identity and durability
 
