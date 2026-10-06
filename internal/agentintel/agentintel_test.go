@@ -71,6 +71,11 @@ func (s *scriptedDecider) Decide(_ context.Context, _ DecisionPrompt) (string, e
 	return s.answers[len(s.answers)-1], nil
 }
 
+// newIntelFixture wires the loop with the SHIPPED permissive policy, because
+// admission is mandatory for every consequential action (delegation, durable
+// memory writes, mediated tool calls) and fails closed without it — exactly as
+// the launcher wires the real controller. Specs about governance install their
+// own policy set on top.
 func newIntelFixture(t *testing.T, st store.Store, decider DecisionRequester) (*Runtime, *agentexec.Registry) {
 	orgs := testOrg(t)
 	// One tool registry for both the agent registry (allowlist validation at
@@ -89,6 +94,8 @@ func newIntelFixture(t *testing.T, st store.Store, decider DecisionRequester) (*
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctl, _, _ := allowAllController()
+	exec.Controller = ctl
 	return New(agents, exec, decider, nil, mem), agents
 }
 

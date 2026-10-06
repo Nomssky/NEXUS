@@ -20,6 +20,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
@@ -98,7 +99,9 @@ func newGovernedFixture(t *testing.T, policies ...*governance.Policy) *governedF
 	}
 	ctl, approver, escalator := newTestController(policies...)
 	exec.Controller = ctl
-	mem, err := OpenMemory(nil, Deps{Scopes: memory.NewMembershipScopes(memberships.AllowsScope)})
+	// A durable store, so a refused memory write or delete is provable by the
+	// ABSENCE of its side effect rather than by a status string.
+	mem, err := OpenMemory(store.NewMemStore(), Deps{Scopes: memory.NewMembershipScopes(memberships.AllowsScope)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,5 +341,110 @@ func TestGovernanceDenialIsObservableWithItsReason(t *testing.T) {
 	}
 	if !strings.Contains(out.Error, "state=denied") {
 		t.Fatalf("the denial must carry its governance state: %s", out.Error)
+	}
+}
+
+func TestLoopDelegationIsAdmitted(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), denyPolicy(control.ActionDelegate, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"delegate","agent_id":"governed-agent","objective":"gather detail"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "delegate the detail work"}, ""), nil)
+	if out == nil || out.Status != "denied" {
+		t.Fatalf("a denied delegation must be its own state: %+v", out)
+	}
+	if !strings.Contains(out.Error, "state=denied") {
+		t.Fatalf("the denial must be explicit: %s", out.Error)
+	}
+}
+
+func TestLoopDelegationRunsWhenAllowed(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	g.rt.Exec.Router = seededRouter(t)
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"delegate","objective":"gather supporting detail"}`,
+			`{"type":"complete","result":"delegated"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "delegate the detail work"}, ""), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("an allowed delegation must run: %+v", out)
+	}
+	if !strings.Contains(out.Output, "delegations=1") {
+		t.Fatalf("the delegation must be counted: %s", out.Output)
+	}
+}
+
+func TestLoopDurableMemoryWriteIsAdmitted(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), denyPolicy(control.ActionMemoryWrite, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_write","key":"notes","value":"stored","memory_type":"fact"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "remember the notes"}, ""), nil)
+	if out == nil || out.Status != "denied" {
+		t.Fatalf("a denied memory write must be its own state: %+v", out)
+	}
+	// Nothing was stored: a refused write has no side effect.
+	if _, err := g.rt.Memory.Get(
+		memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.MemoryID("biz-1", "", "governed-agent", "notes")); err == nil {
+		t.Fatal("a denied memory write must not persist a record")
+	}
+	if n := g.approver.pendingSnapshot(); len(n) != 0 {
+		t.Fatalf("a denied write must not open an approval: %v", n)
+	}
+}
+
+func TestLoopDurableMemoryWriteRunsWhenAllowed(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"memory_write","key":"notes","value":"stored","memory_type":"fact"}`,
+		`{"type":"complete","result":"remembered"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "remember the notes"}, ""), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("an allowed memory write must run: %+v", out)
+	}
+}
+
+func TestLoopMemoryWritePendingApprovalStopsTheExecution(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionMemoryWrite, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_write","key":"notes","value":"stored","memory_type":"fact"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "remember the notes"}, ""), nil)
+	if out == nil || out.Status != "pending_approval" || out.ApprovalID == "" {
+		t.Fatalf("a gated memory write must stop pending approval: %+v", out)
+	}
+	if _, err := g.rt.Memory.Get(
+		memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.MemoryID("biz-1", "", "governed-agent", "notes")); err == nil {
+		t.Fatal("approval-pending must not persist a record")
+	}
+}
+
+func TestLoopMemoryDeleteIsAdmitted(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), denyPolicy(control.ActionMemoryDelete, ""))
+	owner := memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"}
+	written, err := g.rt.Memory.Write(owner, memory.WriterUser, memory.Candidate{
+		Key: "doomed", Value: "still here", Type: memory.TypeFact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_delete","key":"doomed"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "forget the doomed note"}, ""), nil)
+	if out == nil || out.Status != "denied" {
+		t.Fatalf("a denied memory delete must be its own state: %+v", out)
+	}
+	// The record is still there: a refused delete has no side effect. Query is
+	// the read path that sees a user-written business-scoped record.
+	res, err := g.rt.Memory.Query(owner, memory.Query{BusinessID: "biz-1", Key: "doomed"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(res.Records) != 1 || res.Records[0].ID != written.ID {
+		t.Fatalf("a denied delete must leave exactly the record it was asked to remove: %+v", res.Records)
 	}
 }

@@ -16,16 +16,23 @@ control.Proposal built by the runtime   ← authority fields are not model-suppl
         ↓
 governance.Engine.Evaluate             ← the one authoritative decision point
         ↓
-ALLOW / ALLOW_WITH_CONSTRAINTS → constrained request → Platform.Invoke → adapter
+ALLOW / ALLOW_WITH_CONSTRAINTS → the constrained effect happens
 DENY            → blocked, structured `denied` observation, replan only
 REQUIRE_APPROVAL→ blocked, approval record, execution pending
 ESCALATE        → blocked, existing escalation → attention
 ```
 
-One admission point, `agentexec.Runtime.Admit`, sits on `InvokeToolScoped` — the
-single mediated tool path. Every caller of it is admitted: the intelligence loop,
-delegated children, workflow steps. `Platform.Invoke` is unreachable for a
-refused proposal, and no adapter knows governance exists.
+One admission point per consequential effect. For tool calls it is
+`agentexec.Runtime.Admit` on `InvokeToolScoped` — the single mediated tool path —
+so the intelligence loop, delegated children and workflow steps are all admitted
+before `Platform.Invoke`. Delegation and durable memory writes/deletes are
+admitted in the loop immediately before the effect. `model_call`, `memory_read`
+and the loop-control actions are not admitted: they have no side effect beyond
+work the request was already admitted for.
+
+`Platform.Invoke` is unreachable for a refused tool call, no child execution
+starts for a refused delegation, and no record is written or deleted for a
+refused memory action. No adapter knows governance exists.
 
 ## What the model may and may not say
 
@@ -74,6 +81,20 @@ Any of the five canonical effects works the same way: `DENY`,
 own rules apply unchanged — more-restrictive-wins, scope precedence, default
 `DENY` when nothing matches. Governance never becomes more permissive than the
 policies you wrote.
+
+The `action_ids` and `resource_ids` above gate tool calls. To gate a
+delegation or a durable memory write, use its own action and resource type:
+
+| what you want to gate | `action_ids` | `resource_type` | `resource_ids` |
+|---|---|---|---|
+| a capability | `["tool_call"]` | `tool` | the tool id, e.g. `http.request` |
+| delegation | `["delegate"]` | `agent` | the child agent id |
+| durable memory writes | `["memory_write"]` | `memory` | leave empty to cover every key |
+| durable memory deletes | `["memory_delete"]` | `memory` | leave empty to cover every key |
+
+Memory writes are admitted on their own merits rather than trusted because they
+are in memory, so a record claiming authority is refused exactly like any other
+action would be.
 
 ## Enforceable constraints
 

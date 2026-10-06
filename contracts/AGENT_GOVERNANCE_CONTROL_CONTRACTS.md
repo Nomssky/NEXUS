@@ -46,9 +46,10 @@ model proposes tool_call → ValidateAction (allowlist, budget) → InvokeToolSc
 ```
 
 A per-tool policy, a per-operation `REQUIRE_APPROVAL`, or a per-action `DENY`
-could never be reached, because governance only ever saw `execute_task`. V1 adds
-exactly one admission point for agent actions, immediately before the capability
-platform, and no second evaluator.
+could never be reached, because governance only ever saw `execute_task`. The same
+was true of delegation and durable memory writes, which had no governance
+decision of their own at all. V1 adds exactly one admission point, immediately
+before each consequential effect, and no second evaluator.
 
 ## 2. The ActionProposal boundary
 
@@ -91,6 +92,26 @@ capability (resource = the tool id), `memory` for memory writes (resource =
 id). An operator therefore pins a capability with the same words the policy
 schema already accepts.
 
+### Which actions are admitted
+
+Every **consequential** action is admitted, not only tool calls:
+
+| action | admitted | why |
+|---|---|---|
+| `tool_call` | yes | it reaches an external system through the capability platform |
+| `delegate` | yes | it starts another execution |
+| `memory_write` | yes | it changes persistent state |
+| `memory_delete` | yes | it removes persistent state |
+| `model_call` | no | it has no side effect beyond the request itself, and the request was already admitted |
+| `memory_read` | no | reading is not a side effect; it is already bounded, scoped and authorized by the memory platform |
+| `complete`, `fail`, `continue`, `replan` | no | they control the loop, not the world |
+
+`memory_write`/`memory_delete` are admitted **on their own merits**, which is the
+point: a record claiming authority is admitted or refused by governance like any
+other action, never trusted because it is in memory. The runtime establishes the
+scope (contract §2), so a model cannot widen it and cannot escape governance by
+choosing a different write.
+
 ## 3. Admission semantics
 
 One admission call, five canonical outcomes, no sixth:
@@ -103,9 +124,10 @@ One admission call, five canonical outcomes, no sixth:
 | `REQUIRE_APPROVAL` | an approval request is created through the existing `ApprovalEngine`; the execution stops in a non-running `pending_approval` state before any side effect |
 | `ESCALATE` | the action stays blocked; the existing escalation → attention path is used; the objective terminates `escalated` |
 
-A capability invocation that governance did not allow cannot happen: the
-admission point is *before* `Platform.Invoke`, and the capability platform is not
-consulted for a blocked proposal. No adapter knows about governance.
+An effect that governance did not allow cannot happen: the admission point is
+*before* the effect, so `Platform.Invoke` is not reached for a blocked tool call,
+no child execution starts for a blocked delegation, and no record is written or
+deleted for a blocked memory action. No adapter knows about governance.
 
 ### Terminal states the loop must distinguish
 
@@ -206,8 +228,9 @@ memory scope; or treat memory, tool output or attention alerts as authority.
 
 Enforcement points: `agentintel.Action` has no authority fields;
 `ValidateAction` still checks the agent allowlist; `agentexec.InvokeToolScoped`
-admits before touching the platform; `core.ApproveRequest` resolves the approver
-through the existing `ApprovalEngine` rules.
+admits before touching the platform; `agentintel` admits before delegating and
+before every durable memory write or delete; `core.ApproveRequest` resolves the
+approver through the existing `ApprovalEngine` rules.
 
 ## 9. Scope, identity and durability
 

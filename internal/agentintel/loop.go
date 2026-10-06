@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
+	"github.com/Nomssky/NEXUS/internal/control"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -562,6 +563,13 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		usage.Delegations++
 		obs := &Observation{ObservationID: newID("obs"), Source: "delegate", ActionType: ActionDelegate,
 			Status: "ok", Timestamp: r.now()}
+		// Delegation is a consequential action: it starts another execution. It
+		// passes through the same admission point as a tool call, with the child
+		// agent as the resource (contract §2).
+		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionDelegate,
+			control.ResourceTypeAgent, a.AgentID, a.Objective); done {
+			return obs, usage, st, msg
+		}
 		rn.emit(event.EventTypeAgentDelegated, map[string]string{"agent_id": a.AgentID, "depth": "1"})
 		out, err := r.Exec.DelegateChild(ctx, rn.req, rn.ag, agentexec.DelegateSpec{
 			ID: newID("child"), Intent: a.Objective, AgentID: a.AgentID,
@@ -581,6 +589,13 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	case ActionMemoryWrite:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryWrite,
 			Status: "ok", Timestamp: r.now()}
+		// A durable write is a consequential action. Memory is DATA, never
+		// authority — so the record is admitted on its own merits rather than
+		// being trusted, and the runtime establishes the scope (contract §2, §14).
+		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionMemoryWrite,
+			control.ResourceTypeMemory, control.MemoryResource(string(a.MemoryScope), a.Key), a.Value); done {
+			return obs, usage, st, msg
+		}
 		rec, err := r.memoryWrite(rn, agentID, a, observationsFor(working))
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
@@ -615,6 +630,10 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	case ActionMemoryDelete:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryDelete,
 			Status: "ok", Timestamp: r.now()}
+		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionMemoryDelete,
+			control.ResourceTypeMemory, control.MemoryResource(string(a.MemoryScope), a.Key), ""); done {
+			return obs, usage, st, msg
+		}
 		n, err := r.memoryDelete(rn, agentID, a.Key)
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
@@ -761,6 +780,89 @@ func rejectionSummary(res ValidationResult) string {
 		}
 	}
 	return strings.Join(parts, "; ")
+}
+
+// admitNonTool runs governance admission for a consequential action that is not
+// a mediated tool call: delegation (it starts another execution) and durable
+// memory writes/deletes (they change persistent state). The same controller, the
+// same five outcomes and the same fail-closed rule apply, so no consequential
+// agent action reaches its side effect un-admitted.
+//
+// It returns done=false when the action may proceed. The caller keeps its own
+// observation so the status, source and action type stay correct; a refused
+// action returns the observation with the governance state instead.
+func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource, detail string) (
+	*Observation, State, string, bool) {
+	obs := &Observation{ObservationID: newID("obs"), Timestamp: r.now(),
+		Source: "governance", ActionType: ActionType(action)}
+
+	if r.Exec == nil || r.Exec.Controller == nil {
+		// Fail closed: governance unavailable is a denial, never a silent allow.
+		obs.Status = "denied"
+		obs.Text = "no governance controller configured (fail closed)"
+		obs.Result = map[string]string{"governance_outcome": governance.DENY.String(), "action": action}
+		return obs, StateDenied, obs.Text, true
+	}
+	adm, err := r.Exec.Controller.Admit(control.Proposal{
+		ProposalID:    newID("prop"),
+		CorrelationID: rn.req.CorrelationID,
+		ExecutionID:   rn.req.CorrelationID,
+		ObjectiveID:   rn.req.CorrelationID,
+		StepID:        rn.req.TaskID,
+		ActorID:       rn.req.ActorID,
+		AgentID:       agentID,
+		BusinessID:    rn.businessID,
+		DivisionID:    rn.divisionID,
+		Action:        action,
+		Resource:      resource,
+		ResourceType:  resourceType,
+	})
+	if err != nil {
+		obs.Status = "denied"
+		obs.Text = err.Error()
+		obs.Result = map[string]string{"governance_outcome": governance.DENY.String(), "action": action}
+		return obs, StateDenied, obs.Text, true
+	}
+	if adm.Allowed() {
+		return nil, "", "", false
+	}
+	obs.Text = admissionMessage(adm)
+	obs.Status = "denied"
+	obs.Result = map[string]string{"governance_outcome": adm.Decision.Outcome.String(), "action": action}
+	if adm.ApprovalID != "" {
+		obs.Result["approval_id"] = adm.ApprovalID
+	}
+	if adm.EscalationID != "" {
+		obs.Result["escalation_id"] = adm.EscalationID
+	}
+	if adm.Decision.MatchedPolicyID != "" {
+		obs.Result["policy_id"] = adm.Decision.MatchedPolicyID
+	}
+	switch adm.Decision.Outcome {
+	case governance.REQUIRE_APPROVAL:
+		obs.Status = "pending_approval"
+		return obs, StatePendingApproval, obs.Text, true
+	case governance.ESCALATE:
+		obs.Status = "escalated"
+		return obs, StateEscalated, obs.Text, true
+	default:
+		obs.Status = "denied"
+		return obs, StateDenied, obs.Text, true
+	}
+}
+
+func admissionMessage(adm control.Admission) string {
+	switch adm.Decision.Outcome {
+	case governance.REQUIRE_APPROVAL:
+		return fmt.Sprintf("governance requires approval for %s on %s (approval_id=%s)",
+			adm.Proposal.Action, adm.Proposal.Resource, adm.ApprovalID)
+	case governance.ESCALATE:
+		return fmt.Sprintf("governance escalated %s on %s (escalation_id=%s): %s",
+			adm.Proposal.Action, adm.Proposal.Resource, adm.EscalationID, adm.Decision.Reason)
+	default:
+		return fmt.Sprintf("governance denied %s on %s: %s",
+			adm.Proposal.Action, adm.Proposal.Resource, adm.Decision.Reason)
+	}
 }
 
 // ---- governance terminal outcomes -------------------------------------------

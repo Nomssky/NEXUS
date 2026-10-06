@@ -749,6 +749,26 @@ check "an unknown mandatory constraint fails closed" "failed" "$GOV_STATUS"
 check "an unknown constraint never reaches the adapter" "0" "$(gov_hits)"
 gov_unpolicy "probe-gov-constraint3-$$"
 
+echo "== governance: memory write is admitted before it is persisted =="
+gov_policy_json() { # gov_policy_json <id> <action-id> <resource-type> <effect>
+  curl -s -o /dev/null "${CTL[@]}" -X PUT "$BASE/api/v1/control/policies/$1" \
+    -d "{\"policy_type\":\"access_control\",\"name\":\"$1\",\"description\":\"probe governance\",\"status\":\"active\",\"subject\":{\"subject_type\":\"all\"},\"action\":{\"action_type\":\"custom\",\"action_ids\":[\"$2\"]},\"resource\":{\"resource_type\":\"$3\"},\"effect\":\"$4\",\"precedence\":1000}"
+}
+gov_memory_hits() {
+  curl -s "${AUTH[@]}" -X POST "$BASE/api/v1/memory/query?business_id=$BIZ" \
+    -d "{\"key\":\"notes\",\"agent_id\":\"$GOVAGENT\"}" | jq -r .count
+}
+gov_policy_json "probe-gov-memdeny-$$" memory_write memory DENY
+gov_run "remember the meeting notes in memory"
+check "a denied memory write fails the objective" "failed" "$GOV_STATUS"
+check "a denied memory write is POLICY_DENIED" "POLICY_DENIED" "$(gov_code)"
+check "a denied memory write persists nothing" 0 "$(gov_memory_hits)"
+gov_unpolicy "probe-gov-memdeny-$$"
+
+gov_run "remember the meeting notes in memory"
+check "an allowed memory write still persists" "completed" "$GOV_STATUS"
+check "the allowed write stored exactly one record" 1 "$(gov_memory_hits)"
+
 echo "== governance: UNKNOWN_OUTCOME =="
 gov_run "post via http request to http://127.0.0.1:$GOVPORT/gov-lost"
 check "an indeterminate mutation fails the objective" "failed" "$GOV_STATUS"

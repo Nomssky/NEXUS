@@ -185,6 +185,15 @@ function toolPolicy(effect: string, extra: Record<string, unknown> = {}): Record
   };
 }
 
+/** A policy scoped to durable memory writes: no side effect, no record. */
+function memoryWritePolicy(effect: string): Record<string, unknown> {
+  return {
+    action: { action_type: 'custom', action_ids: ['memory_write'] },
+    resource: { resource_type: 'memory' },
+    effect,
+  };
+}
+
 async function runObjective(
   request: APIRequestContext,
   nexus: NexusHandle,
@@ -715,6 +724,38 @@ test.describe('AGENT GOVERNANCE & CONTROL', () => {
     expect(decided.status(), `the authorized approver still decides it: ${await decided.text()}`).toBe(
       202,
     );
+  });
+
+  test('a durable memory write is admitted before it is persisted', async ({ request, nexus }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    await putPolicy(request, nexus, `e2e-gov-memory-${suffix}`, memoryWritePolicy('DENY'));
+
+    const { result } = await runObjective(request, nexus, 'remember the meeting notes in memory');
+    expect(result.status).toBe('failed');
+    expect(result.error.code).toBe('POLICY_DENIED');
+    expect(result.error.message).toContain('state=denied');
+
+    // A denied write has no side effect: nothing is retrievable afterwards.
+    const query = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', agent_id: agentID },
+    });
+    expect(query.status(), `memory query: ${await query.text()}`).toBe(200);
+    expect((await query.json()).count, 'a denied write must persist nothing').toBe(0);
+  });
+
+  test('an allowed durable memory write still persists', async ({ request, nexus }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    const { result } = await runObjective(request, nexus, 'remember the meeting notes in memory');
+    expect(result.status).toBe('completed');
+    const query = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', agent_id: agentID },
+    });
+    expect(query.status()).toBe(200);
+    expect((await query.json()).count, 'the allowed write must persist').toBe(1);
   });
 
   test('an unknown outcome stays unknown with no automatic redispatch', async ({ request, nexus }) => {
