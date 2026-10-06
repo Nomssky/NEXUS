@@ -205,11 +205,11 @@ func TestCapabilityDiscoveryReportsReliabilityPosture(t *testing.T) {
 	if entry["supports_idempotency"] != true {
 		t.Fatalf("the HTTP capability must advertise idempotency support, got %v", entry)
 	}
-	if entry["retry_policy"] != "none" {
-		t.Fatalf("an external mutation capability must not advertise an automatic retry policy, got %v", entry["retry_policy"])
+	if entry["retry_policy"] != "not_sent_retry" {
+		t.Fatalf("an idempotent mutation capability must advertise only the not-sent retry policy, got %v", entry["retry_policy"])
 	}
-	if entry["max_attempts"] != float64(1) {
-		t.Fatalf("a mutation capability must advertise a single attempt, got %v", entry["max_attempts"])
+	if entry["max_attempts"] != float64(2) {
+		t.Fatalf("the attempt bound is one retry, got %v", entry["max_attempts"])
 	}
 	if entry["supports_reconciliation"] == true {
 		t.Fatalf("no capability may advertise reconciliation without implementing it")
