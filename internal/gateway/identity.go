@@ -117,6 +117,12 @@ func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/tools" || strings.HasPrefix(path, "/api/v1/tools/") {
 		return true
 	}
+	// Agent Memory & Context Platform v1: durable memory is business-scoped
+	// data and is identity-bound for exactly the same reasons (AGENT_MEMORY_
+	// CONTEXT_CONTRACTS §15).
+	if path == "/api/v1/memory" || strings.HasPrefix(path, "/api/v1/memory/") {
+		return true
+	}
 	return false
 }
 

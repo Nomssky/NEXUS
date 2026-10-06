@@ -20,6 +20,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
+	memmemory "github.com/Nomssky/NEXUS/internal/memory"
 )
 
 type intelFixture struct {
@@ -61,7 +62,8 @@ func newIntelFixture(t *testing.T, providerStatus modelrouter.ProviderStatus) *i
 	tools := tool.NewToolRegistry()
 	agents := agentexec.NewRegistry("nx:nexus:test", orgs, tools)
 	exec := agentexec.NewRuntime(agents, tools, router, engine.EventBus())
-	mem, err := agentintel.OpenMemory(nil)
+	mem, err := agentintel.OpenMemory(nil, agentintel.Deps{
+		Scopes: memmemory.NewMembershipScopes(members.AllowsScope)})
 	if err != nil {
 		t.Fatal(err)
 	}

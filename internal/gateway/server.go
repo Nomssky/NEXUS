@@ -44,6 +44,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // G-010 response bounds. Defaults match the gateway's existing 1 MB
@@ -110,6 +111,9 @@ type Server struct {
 	// capability is the Capability & Tool Platform seam (nil ⇒ the discovery
 	// surface fails closed with 503).
 	capability *capability.Platform
+	// memoryPlatform is the single durable agent-memory platform
+	// (AGENT_MEMORY_CONTEXT_CONTRACTS §15). Nil fails every memory endpoint closed.
+	memoryPlatform *memory.Platform
 
 	// nexusID stamps the installation identity onto external event
 	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
@@ -286,6 +290,14 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	// Capability lifecycle control (OPERATIONAL_RELIABILITY_CONTRACTS §10):
 	// under the control prefix so the existing X-API-Key gate covers it.
 	s.mux.HandleFunc("POST /api/v1/control/capabilities/{id}/state", s.handleSetCapabilityState)
+
+	// Agent Memory & Context Platform v1 (§15): the minimal memory surface, on
+	// the same identity + membership gates as every other business-scoped path.
+	s.mux.HandleFunc("POST /api/v1/memory", s.handleCreateMemory)
+	s.mux.HandleFunc("POST /api/v1/memory/query", s.handleQueryMemory)
+	s.mux.HandleFunc("GET /api/v1/memory/{id}", s.handleGetMemory)
+	s.mux.HandleFunc("PATCH /api/v1/memory/{id}", s.handleUpdateMemory)
+	s.mux.HandleFunc("DELETE /api/v1/memory/{id}", s.handleDeleteMemory)
 
 	// Agent intelligence layer v1.
 	s.mux.HandleFunc("POST /api/v1/intelligence/execute", s.handleSubmitIntelligence)

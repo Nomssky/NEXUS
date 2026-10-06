@@ -268,7 +268,14 @@ func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, err
 			return Record{}, fmt.Errorf("memory: read before write %q: %w", rec.ID, err)
 		}
 		prev = existing
+		if prev == nil {
+			// Get answers NotFound for a soft-deleted record too. Recover the
+			// deleted envelope so re-creating a key is not mistaken for a
+			// concurrent modification (contract §10).
+			prev = p.deletedEnvelope(rec.ID, id.BusinessID)
+		}
 	}
+	created := true
 	if prev != nil {
 		var old Record
 		if err := json.Unmarshal(prev.Data, &old); err != nil {
@@ -277,12 +284,24 @@ func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, err
 		if err := p.validateStored(&old, rec.ID); err != nil {
 			return Record{}, err
 		}
+		if prev.Status == store.RecordStatusDeleted {
+			// Re-creating a deleted key starts a new record: the deleted one is
+			// not resurrected (contract §10).
+			old = Record{}
+		}
+		created = prev.Status == store.RecordStatusDeleted
 		rec.CreatedAt = old.CreatedAt
+		if rec.CreatedAt.IsZero() {
+			rec.CreatedAt = now
+		}
 		if old.Conflict {
 			rec.Conflict, rec.ConflictWith = old.Conflict, append([]string(nil), old.ConflictWith...)
 		}
-	} else if err := p.checkRecordCount(rec); err != nil {
-		return Record{}, err
+	}
+	if created {
+		if err := p.checkRecordCount(rec); err != nil {
+			return Record{}, err
+		}
 	}
 
 	stored, err := p.persist(&rec, prevVersion(prev))
@@ -291,7 +310,7 @@ func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, err
 	}
 	peers := p.markConflicts(stored)
 	evType := EventCreated
-	if prev != nil {
+	if prev != nil && !created {
 		evType = EventUpdated
 	}
 	p.emit(evType, *stored, map[string]string{
@@ -522,6 +541,21 @@ func (p *Platform) list(businessID string) ([]Record, error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// deletedEnvelope finds the soft-deleted envelope of a record id, if any.
+func (p *Platform) deletedEnvelope(memID, businessID string) *store.Record {
+	recs, err := p.st.List(store.Filter{Type: store.RecordTypeMemory,
+		Status: store.RecordStatusDeleted, BusinessID: businessID})
+	if err != nil {
+		return nil
+	}
+	for _, rec := range recs {
+		if rec.ID == memID {
+			return rec
+		}
+	}
+	return nil
 }
 
 // load returns one stored record with its store envelope (for versioning).

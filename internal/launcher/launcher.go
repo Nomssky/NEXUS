@@ -26,6 +26,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/gateway"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // Launcher wires the Core Runtime and HTTP Gateway into a running system.
@@ -213,7 +214,21 @@ func New(opts Options) *Launcher {
 	// Agent intelligence layer v1: the bounded control loop. It runs inside
 	// the same admitted request pipeline and reuses the agent execution
 	// primitives (tool boundary + delegation) rather than a second framework.
-	intelMem, err := agentintel.OpenMemory(opts.Store)
+	//
+	// Agent Memory & Context Platform v1: the durable memory is bound to the
+	// SAME scope authority the rest of the system uses (MembershipSet
+	// .AllowsScope — no memory-specific permission model), the same event bus,
+	// and the capability platform's redaction layer, so a secret cannot survive
+	// in durable memory just because another boundary redacted it.
+	memDeps := agentintel.Deps{
+		Scopes:   memory.NewMembershipScopes(opts.Memberships.AllowsScope),
+		Redactor: memory.RedactorFunc(nil),
+		Bus:      engine.EventBus(),
+	}
+	if platform != nil {
+		memDeps.Redactor = memory.RedactorFunc(platform.Redactor)
+	}
+	intelMem, err := agentintel.OpenMemory(opts.Store, memDeps)
 	if err != nil {
 		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
 	}
@@ -225,6 +240,9 @@ func New(opts Options) *Launcher {
 		intelRt.Catalog = capabilityCatalog{platform: platform}
 	}
 	gwOpts = append(gwOpts, gateway.WithIntelligence(intelRt))
+	// Agent Memory & Context Platform v1: the same platform the loop uses, over
+	// the same identity and membership gates.
+	gwOpts = append(gwOpts, gateway.WithMemory(intelMem))
 	gwOpts = append(gwOpts, opts.GatewayOptions...)
 	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)
 

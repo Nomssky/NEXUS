@@ -3,6 +3,7 @@ package agentintel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // ---- fixtures --------------------------------------------------------------
@@ -27,6 +29,23 @@ func testOrg(t *testing.T) *identity.Registry {
 	reg.CreateDivision(identity.Division{EntityID: "div-1", BusinessID: "biz-1", Name: "d", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
 	reg.CreateDivision(identity.Division{EntityID: "other", BusinessID: "biz-1", Name: "other", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
 	return reg
+}
+
+// testMemberships is the canonical scope authority used by the fixture: the
+// actor is a business member of biz-1 and of division div-1, and a member of no
+// other business. Memory authorization binds to this exact mechanism.
+func testMemberships(t *testing.T) *identity.MembershipSet {
+	t.Helper()
+	ms := identity.NewMembershipSet()
+	must := func(m identity.Membership) {
+		t.Helper()
+		if err := ms.Add(m); err != nil {
+			t.Fatalf("membership %v: %v", m, err)
+		}
+	}
+	must(identity.Membership{IdentityID: "owner-1", BusinessID: "biz-1", Role: identity.RoleMember, Status: identity.StatusActive})
+	must(identity.Membership{IdentityID: "owner-1", BusinessID: "biz-1", DivisionID: "div-1", Role: identity.RoleMember, Status: identity.StatusActive})
+	return ms
 }
 
 // scriptedDecider returns canned model answers in order; the last one repeats.
@@ -66,7 +85,7 @@ func newIntelFixture(t *testing.T, st store.Store, decider DecisionRequester) (*
 	}, "t"); err != nil {
 		t.Fatal(err)
 	}
-	mem, err := OpenMemory(st)
+	mem, err := OpenMemory(st, Deps{Scopes: memory.NewMembershipScopes(testMemberships(t).AllowsScope)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,30 +385,42 @@ func TestMemoryDurableAndScoped(t *testing.T) {
 		t.Fatalf("status=%s err=%s", out.Status, out.Error)
 	}
 	// A reopen (restart analogue) still sees the record: memory is durable.
-	mem2, err := OpenMemory(st)
+	mem2, err := OpenMemory(st, Deps{Scopes: memory.NewMembershipScopes(testMemberships(t).AllowsScope)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, err := mem2.Read("biz-1", "helper", "notes")
-	if err != nil || v != "remembered" {
-		t.Fatalf("durable memory read failed: %q %v", v, err)
+	owner := memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "helper"}
+	rec, err := mem2.Get(owner, memory.MemoryID("biz-1", "", "helper", "notes"))
+	if err != nil || rec.Value != "remembered" {
+		t.Fatalf("durable memory read failed: %+v %v", rec, err)
+	}
+	// A model-proposed write is never trusted: the platform assigns provenance.
+	if rec.Trust != memory.TrustUnverified || rec.Source != memory.SourceValidatedAgentOutput {
+		t.Fatalf("agent writes must be unverified, got trust=%q source=%q", rec.Trust, rec.Source)
 	}
 	// Foreign business/agent cannot read it.
-	if _, err := mem2.Read("biz-2", "helper", "notes"); err == nil {
-		t.Fatal("foreign business must not read memory")
+	foreign := memory.Identity{ActorID: "owner-1", BusinessID: "biz-2", AgentID: "helper"}
+	if _, err := mem2.Get(foreign, rec.ID); !errors.Is(err, memory.ErrScope) && !errors.Is(err, memory.ErrNotFound) {
+		t.Fatalf("foreign business must not read memory: %v", err)
 	}
-	if _, err := mem2.Read("biz-1", "other-agent", "notes"); err == nil {
-		t.Fatal("foreign agent must not read memory")
+	other := memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "other-agent"}
+	if _, err := mem2.Get(other, rec.ID); !errors.Is(err, memory.ErrNotFound) {
+		t.Fatalf("foreign agent must not read memory: %v", err)
 	}
-	keys, _ := mem2.List("biz-1", "helper")
-	if len(keys) != 1 || keys[0] != "notes" {
-		t.Fatalf("list=%v", keys)
+	keys, err := mem2.Keys(owner)
+	if err != nil || len(keys) != 1 || keys[0] != "notes" {
+		t.Fatalf("keys=%v err=%v", keys, err)
 	}
-	_ = rt
+	// A sibling agent of the same business sees nothing of the private memory.
+	sibling, err := mem2.Query(other, memory.Query{BusinessID: "biz-1"})
+	if err != nil || len(sibling.Records) != 0 {
+		t.Fatalf("agent memory must stay private: %+v %v", sibling.Records, err)
+	}
 }
 
 func TestMemoryDelete(t *testing.T) {
 	st := store.NewMemStore()
+	startOfTest := time.Now().UTC()
 	rt, _ := newIntelFixture(t, st, &scriptedDecider{plan: goodPlan, answers: []string{
 		`{"type":"memory_write","key":"k","value":"v"}`,
 		`{"type":"memory_delete","key":"k"}`,
@@ -399,8 +430,21 @@ func TestMemoryDelete(t *testing.T) {
 	if out.Status != "completed" {
 		t.Fatalf("status=%s err=%s", out.Status, out.Error)
 	}
-	if _, err := rt.Memory.Read("biz-1", "helper", "k"); err == nil {
+	owner := memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "helper"}
+	if _, err := rt.Memory.Get(owner, memory.MemoryID("biz-1", "", "helper", "k")); err == nil {
 		t.Fatal("memory_delete must remove the entry")
+	}
+	// Deletion is immediate for normal reads, and re-writing the key starts a
+	// new record rather than resurrecting the deleted one.
+	if _, err := rt.Memory.Write(owner, memory.WriterAgent, memory.Candidate{Key: "k", Value: "again"}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := rt.Memory.Get(owner, memory.MemoryID("biz-1", "", "helper", "k"))
+	if err != nil || rec.Value != "again" || rec.Status != memory.StatusActive {
+		t.Fatalf("a re-created record must be active and fresh: %+v %v", rec, err)
+	}
+	if rec.CreatedAt.Before(startOfTest) {
+		t.Fatalf("a re-created record must not inherit the deleted record's creation time")
 	}
 }
 

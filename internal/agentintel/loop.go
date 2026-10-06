@@ -13,6 +13,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // Decision is the runtime's bounded adapter over the model provider: it is
@@ -89,7 +90,13 @@ type Runtime struct {
 	Bus      *event.MemBus
 	Caps     Caps
 	Now      func() time.Time
-	Memory   *MemoryStore
+	// Memory is the single durable agent-memory platform
+	// (AGENT_MEMORY_CONTEXT_CONTRACTS). Optional: without it the loop performs no
+	// memory operation and assembles context from execution state only.
+	Memory *MemoryPlatform
+	// Assembler is the single context-assembly boundary. Optional: the shipped
+	// default is used when nil.
+	Assembler *memory.Assembler
 	// Catalog provides the bounded capability catalog for the prompt
 	// (CAPABILITY_TOOL_CONTRACTS §4). Optional: without it the prompt carries
 	// no catalog and tool calls are still validated by the platform.
@@ -100,11 +107,20 @@ type Runtime struct {
 }
 
 // New wires a runtime with the shipped bounded defaults.
-func New(reg *agentexec.Registry, exec *agentexec.Runtime, decider DecisionRequester, bus *event.MemBus, mem *MemoryStore) *Runtime {
+func New(reg *agentexec.Registry, exec *agentexec.Runtime, decider DecisionRequester, bus *event.MemBus, mem *MemoryPlatform) *Runtime {
 	return &Runtime{
 		Registry: reg, Exec: exec, Decider: decider, Bus: bus, Caps: DefaultCaps(),
-		Now: time.Now, Memory: mem, states: map[string]State{},
+		Now: time.Now, Memory: mem, Assembler: memory.NewAssembler(memory.DefaultContextBudget()),
+		states: map[string]State{},
 	}
+}
+
+// assembler returns the effective context assembler.
+func (r *Runtime) assembler() *memory.Assembler {
+	if r.Assembler != nil {
+		return r.Assembler
+	}
+	return memory.NewAssembler(memory.DefaultContextBudget())
 }
 
 func (r *Runtime) now() time.Time {
@@ -220,9 +236,16 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 
 	agentID := r.resolveAgent(obj, req)
 	usage := BudgetUsage{}
+	// Working memory is process-local scratch state for THIS objective: bounded,
+	// never persisted, and discarded when the execution ends (contract §2, §36).
 	working := NewWorkingMemory()
+	working.Bind(obj.Description)
+	working.SetDeadline(deadline)
+	memIdentity := r.memoryIdentity(rn, agentID)
 	observations := []Observation{}
 	stepIdx := 0
+	contextAnnounced := false
+	contextTruncatedAnnounced := false
 
 	// ---- execute ⇄ observe ---------------------------------------------
 	for {
@@ -248,14 +271,41 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		}
 		rn.transition(StateExecuting, map[string]string{"step": step.StepID, "iteration": fmt.Sprint(usage.Iterations)})
 		rn.emit(event.EventTypeStepStarted, map[string]string{"step": step.StepID, "intent": step.Intent})
+		working.SetStep(step.StepID, step.Intent)
 
 		// ---- decide (model proposes) ------------------------------------
 		rn.emit(event.EventTypeAgentThinking, map[string]string{"phase": "decide", "step": step.StepID,
 			"reason_category": "awaiting_model_proposal", "iteration": fmt.Sprint(usage.Iterations)})
+		// Context assembly is the single bounded boundary: the objective and the
+		// current step are reserved first, memory can never crowd them out, and
+		// the result is a pure function of (objective, memory, observations,
+		// budget) so a deterministic provider sees identical context every run
+		// (contract §12, §38).
+		assembled := r.assembler().Assemble(
+			r.contextInputs(rn, memIdentity, obj, step, observations, r.toolHints(req, agentID)))
+		if !contextAnnounced {
+			contextAnnounced = true
+			rn.emit(event.EventTypeContextAssembled, map[string]string{
+				"memory_records": fmt.Sprint(len(assembled.MemoryBlocks)),
+				"observations":   fmt.Sprint(len(assembled.ObsBlocks)),
+				"memory_chars":   fmt.Sprint(assembled.MemoryChars),
+				"obs_chars":      fmt.Sprint(assembled.ObsChars),
+			})
+		}
+		if assembled.Truncated() && !contextTruncatedAnnounced {
+			contextTruncatedAnnounced = true
+			for _, drop := range assembled.Dropped {
+				rn.emit(event.EventTypeContextTruncated, map[string]string{
+					"kind": drop.Kind, "dropped": fmt.Sprint(drop.Count), "reason": drop.Reason,
+				})
+			}
+		}
 		raw, derr := r.Decider.Decide(loopCtx, DecisionPrompt{
 			Objective: obj.Description, StepID: step.StepID, StepIntent: step.Intent,
 			Observations: observations, BudgetUsage: usage, Budget: budget,
-			Tools: r.toolHints(req, agentID),
+			Tools:   r.toolHints(req, agentID),
+			Memory:  assembledMemoryRecords(assembled),
+			Context: assembled.Text,
 		})
 		if derr != nil {
 			if ctx.Err() != nil {
@@ -294,11 +344,13 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		rn.emit(event.EventTypeActionProposed, map[string]string{"action": string(action.Type), "step": step.StepID})
 
 		// ---- act --------------------------------------------------------
+		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
 		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, agentID, working, usage, budget)
 		usage = next
 		if obs != nil {
 			observations = append(observations, *obs)
-			working.Put(obs.ObservationID, obs.Source+": "+obs.Status)
+			working.AddObservation(*obs)
+			_ = working.Put(obs.ObservationID, obs.Source+": "+obs.Status)
 			rn.transition(StateObserving, map[string]string{"observation": obs.ObservationID, "status": obs.Status})
 			rn.emit(event.EventTypeObservationCreated, map[string]string{"observation_id": obs.ObservationID,
 				"source": obs.Source, "action_type": string(obs.ActionType), "status": obs.Status})
@@ -473,29 +525,46 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	case ActionMemoryWrite:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryWrite,
 			Status: "ok", Timestamp: r.now()}
-		if err := r.Memory.Write(rn.businessID, agentID, a.Key, a.Value); err != nil {
+		rec, err := r.memoryWrite(rn, agentID, a, observationsFor(working))
+		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
 			return obs, usage, StateFailed, "memory_write failed: " + err.Error()
 		}
-		rn.emit(event.EventTypeMemoryWritten, map[string]string{"key": a.Key, "agent_id": agentID})
-		obs.Text = "wrote " + a.Key
+		rn.emit(event.EventTypeMemoryWritten, map[string]string{
+			"key": rec.Key, "agent_id": agentID, "scope": string(rec.Scope),
+			"trust": string(rec.Trust), "version": fmt.Sprint(rec.Version),
+		})
+		obs.Text = "wrote " + rec.Key + " (v" + fmt.Sprint(rec.Version) + ", trust=" + string(rec.Trust) + ")"
+		obs.Result = map[string]string{"memory_id": rec.ID, "scope": string(rec.Scope),
+			"trust": string(rec.Trust), "version": fmt.Sprint(rec.Version)}
 		return obs, usage, "", ""
 	case ActionMemoryRead:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryRead,
 			Status: "ok", Timestamp: r.now()}
-		v, err := r.Memory.Read(rn.businessID, agentID, a.Key)
-		rn.emit(event.EventTypeMemoryRead, map[string]string{"key": a.Key, "agent_id": agentID, "found": fmt.Sprint(err == nil)})
-		if err != nil {
-			obs.Status, obs.Text = "notfound", err.Error()
+		rec, found := r.memoryRead(rn, agentID, a.Key)
+		rn.emit(event.EventTypeMemoryRead, map[string]string{
+			"key": a.Key, "agent_id": agentID, "found": fmt.Sprint(found)})
+		if !found {
+			obs.Status, obs.Text = "notfound", "no memory for key "+a.Key
 			return obs, usage, "", "" // a missing key is data, not a failure
 		}
-		obs.Text = v
+		obs.Text = rec.Value
+		obs.Outcome = rec.Outcome
+		obs.Attempts = rec.Attempts
+		obs.RetryRecommended = rec.RetryRecommended
+		obs.ReconciliationRequired = rec.ReconciliationRequired
+		obs.Result = map[string]string{"memory_id": rec.ID, "scope": string(rec.Scope),
+			"trust": string(rec.Trust), "source": string(rec.Source), "type": string(rec.Type)}
 		return obs, usage, "", ""
 	case ActionMemoryDelete:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryDelete,
 			Status: "ok", Timestamp: r.now()}
-		_ = r.Memory.Delete(rn.businessID, agentID, a.Key)
-		obs.Text = "deleted " + a.Key
+		n, err := r.memoryDelete(rn, agentID, a.Key)
+		if err != nil {
+			obs.Status, obs.Text = "failed", err.Error()
+			return obs, usage, StateFailed, "memory_delete failed: " + err.Error()
+		}
+		obs.Text = fmt.Sprintf("deleted %d record(s) for key %s", n, a.Key)
 		return obs, usage, "", ""
 	default:
 		return nil, usage, StateFailed, "unsupported action " + string(a.Type)

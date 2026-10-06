@@ -22,6 +22,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // outcomeStubAdapter answers with one scripted error so the platform produces a
@@ -79,7 +80,7 @@ func newReliabilityFixture(t *testing.T, adapter tool.Adapter, class tool.SideEf
 	}, "t"); err != nil {
 		t.Fatal(err)
 	}
-	mem, err := OpenMemory(nil)
+	mem, err := OpenMemory(nil, Deps{Scopes: memory.NewMembershipScopes(memberships.AllowsScope)})
 	if err != nil {
 		t.Fatal(err)
 	}

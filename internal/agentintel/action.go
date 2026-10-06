@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // ActionType is the closed set of things a model may propose (§6). There is no
@@ -51,6 +53,19 @@ type Action struct {
 	// memory_*
 	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
+	// MemoryType classifies a proposed memory record
+	// (AGENT_MEMORY_CONTEXT_CONTRACTS §3). It is a closed vocabulary and only
+	// ever narrows what may be written.
+	MemoryType string `json:"memory_type,omitempty"`
+	// MemoryScope is the requested visibility class. It is a request, never an
+	// authority: the platform clamps it to the caller's membership and to the
+	// acting agent's declared memory mode (contract §4, §7).
+	MemoryScope string `json:"memory_scope,omitempty"`
+	// ObservationID requests PROMOTION of a real observation this execution
+	// produced into durable observation memory (contract §7, §37). The content
+	// then comes from the runtime's observation, never from the model, and the
+	// outcome travels with it (§13).
+	ObservationID string `json:"observation_id,omitempty"`
 	// complete / fail / replan
 	Result string `json:"result,omitempty"`
 	Reason string `json:"reason,omitempty"`
@@ -226,17 +241,17 @@ func ValidateAction(a Action, c *ActionContext, r ScopeResolver, caps Caps) erro
 		if strings.TrimSpace(a.Key) == "" {
 			return fmt.Errorf("rejected: memory_read needs a key")
 		}
-		return nil
+		return validateMemoryFields(a, false)
 	case ActionMemoryWrite:
 		if strings.TrimSpace(a.Key) == "" {
 			return fmt.Errorf("rejected: memory_write needs a key")
 		}
-		return nil
+		return validateMemoryFields(a, true)
 	case ActionMemoryDelete:
 		if strings.TrimSpace(a.Key) == "" {
 			return fmt.Errorf("rejected: memory_delete needs a key")
 		}
-		return nil
+		return validateMemoryFields(a, false)
 	default:
 		return fmt.Errorf("protocol: unknown action type %q", a.Type)
 	}
@@ -277,22 +292,37 @@ type Observation struct {
 	ReconciliationRequired bool `json:"reconciliation_required,omitempty"`
 }
 
-// WorkingMemory is per-execution, process-local scratch state (§11). It dies
-// with the execution and is never persisted.
-type WorkingMemory struct {
-	entries map[string]string
+// canonicalMemoryTypes/Scopes are the closed vocabularies a model may propose
+// for memory. Anything else is a protocol rejection, and even a valid value is
+// only a REQUEST: the platform clamps scope and assigns provenance and trust.
+var canonicalMemoryTypes = map[string]bool{
+	"fact": true, "instruction": true, "preference": true, "observation": true,
 }
 
-func NewWorkingMemory() *WorkingMemory {
-	return &WorkingMemory{entries: map[string]string{}}
+var canonicalMemoryScopes = map[string]bool{
+	"business": true, "division": true, "agent": true,
 }
 
-func (m *WorkingMemory) Put(k, v string) { m.entries[k] = v }
-func (m *WorkingMemory) Get(k string) (string, bool) {
-	v, ok := m.entries[k]
-	return v, ok
+// validateMemoryFields rejects malformed or out-of-vocabulary memory metadata
+// before anything touches the platform (contract §7).
+func validateMemoryFields(a Action, write bool) error {
+	if a.MemoryType != "" && !canonicalMemoryTypes[a.MemoryType] {
+		return fmt.Errorf("rejected: memory_type %q is not canonical", a.MemoryType)
+	}
+	if a.MemoryScope != "" && !canonicalMemoryScopes[a.MemoryScope] {
+		return fmt.Errorf("rejected: memory_scope %q is not canonical", a.MemoryScope)
+	}
+	if !write && a.ObservationID != "" {
+		return fmt.Errorf("rejected: observation promotion is only valid on memory_write")
+	}
+	if a.ObservationID != "" && strings.TrimSpace(a.Value) != "" {
+		return fmt.Errorf("rejected: a promoted observation takes its content from the runtime, not the model")
+	}
+	if write && a.ObservationID == "" && strings.TrimSpace(a.Value) == "" {
+		return fmt.Errorf("rejected: memory_write needs a value or an observation to promote")
+	}
+	return nil
 }
-func (m *WorkingMemory) Delete(k string) { delete(m.entries, k) }
 
 // DecisionRequester is the model boundary: the only way the loop "thinks".
 // Implementations must return structured decisions; the seeded simulation
@@ -317,6 +347,15 @@ type DecisionPrompt struct {
 	// or authorization internals, and it grants nothing — every invocation is
 	// validated again by the capability platform.
 	Tools []ToolHint
+	// Memory is the bounded, ranked durable memory this decision may see. It is
+	// already scope-authorized and provenance-labelled by the memory platform
+	// (AGENT_MEMORY_CONTEXT_CONTRACTS §11).
+	Memory []memory.Record
+	// Context is the assembled, budgeted context block. It is produced by the
+	// single context-assembly boundary (internal/memory.Assembler), so the
+	// objective and the current step are always reserved and memory can never
+	// crowd them out (contract §12).
+	Context string
 }
 
 // ToolHint is one entry of the bounded capability catalog.

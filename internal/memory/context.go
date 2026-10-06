@@ -86,6 +86,8 @@ type DropReason struct {
 
 // Context is the assembled, bounded result.
 type Context struct {
+	// Assembled are the memory records that were admitted, in assembly order.
+	Assembled    []Record
 	Objective    string
 	Step         string
 	MemoryBlocks []string
@@ -158,6 +160,7 @@ func (a *Assembler) Assemble(in Input) Context {
 			continue
 		}
 		ctx.MemoryBlocks = append(ctx.MemoryBlocks, block)
+		ctx.Assembled = append(ctx.Assembled, rec)
 		memChars += len(block)
 	}
 	ctx.MemoryChars = memChars
