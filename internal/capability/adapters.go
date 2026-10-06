@@ -385,6 +385,10 @@ func (t *GitHubTool) Operations() []string {
 	return []string{"issue.comment", "issue.create", "issue.list", "issue.read", "repository.read"}
 }
 
+// SupportsIdempotency reports that issue mutations carry the logical call id
+// as their idempotency key (OPERATIONAL_RELIABILITY_CONTRACTS §7).
+func (t *GitHubTool) SupportsIdempotency() bool { return true }
+
 // Invoke implements tool.Adapter. Reads are `read`; issue creation and comments
 // are external mutations and are never automatically retried.
 func (t *GitHubTool) Invoke(ctx context.Context, inv tool.Invocation) (tool.RawResult, error) {
@@ -450,6 +454,9 @@ func (t *GitHubTool) Invoke(ctx context.Context, inv tool.Invocation) (tool.RawR
 	raw, err := t.HTTP.request(ctx, request{
 		Method: method, URL: url, Body: body["body"], ContentType: body["content_type"],
 		Token: token, MaxRequestBytes: inv.Limits.MaxRequestByt,
+		// Issue mutations carry the logical call id as their idempotency key,
+		// so a replayed comment is de-duplicated instead of double-posted.
+		IdempotencyKey: inv.IdempotencyKey,
 	})
 	if err != nil {
 		return tool.RawResult{}, err

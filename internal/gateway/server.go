@@ -283,6 +283,9 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 
 	// Capability & Tool Platform v1: informational capability discovery.
 	s.mux.HandleFunc("GET /api/v1/tools", s.handleListTools)
+	// Capability lifecycle control (OPERATIONAL_RELIABILITY_CONTRACTS §10):
+	// under the control prefix so the existing X-API-Key gate covers it.
+	s.mux.HandleFunc("POST /api/v1/control/capabilities/{id}/state", s.handleSetCapabilityState)
 
 	// Agent intelligence layer v1.
 	s.mux.HandleFunc("POST /api/v1/intelligence/execute", s.handleSubmitIntelligence)

@@ -15,6 +15,7 @@ package gateway
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
@@ -41,6 +42,21 @@ type toolCatalogEntry struct {
 	ScopeRequirement string   `json:"scope_requirement"`
 	MaxDurationMS    int64    `json:"max_duration_ms,omitempty"`
 	MaxOutputBytes   int      `json:"max_output_bytes,omitempty"`
+	// Operational reliability posture (OPERATIONAL_RELIABILITY_CONTRACTS §8).
+	// Descriptive only: it states what a caller may expect, grants nothing.
+	CapabilityState        string `json:"capability_state"`
+	SupportsIdempotency    bool   `json:"supports_idempotency"`
+	SupportsReconciliation bool   `json:"supports_reconciliation"`
+	RetryPolicy            string `json:"retry_policy"`
+	MaxAttempts            int    `json:"max_attempts"`
+}
+
+// capabilityStateBody is the lifecycle transition request body. Only the
+// contract states are accepted; anything else is a validation failure.
+type capabilityStateBody struct {
+	State string `json:"state"`
+	// Reason is optional, bounded operator context echoed into telemetry.
+	Reason string `json:"reason,omitempty"`
 }
 
 // handleListTools serves the capability catalog for one business scope. A
@@ -64,7 +80,7 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 	manifests := s.capability.Catalog(businessID, divisionID)
 	entries := make([]toolCatalogEntry, 0, len(manifests))
 	for _, m := range manifests {
-		entries = append(entries, catalogEntry(m))
+		entries = append(entries, s.catalogEntry(m))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -75,7 +91,8 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func catalogEntry(m tool.ToolManifest) toolCatalogEntry {
+func (s *Server) catalogEntry(m tool.ToolManifest) toolCatalogEntry {
+	rel := capability.ReliabilityFor(m, s.capability.CapabilityState(m.ID), s.capability.Adapter(m.ID))
 	return toolCatalogEntry{
 		ID: m.ID, Version: m.Version, Name: m.Name, Description: m.Description,
 		Category: string(m.Category), Operations: m.SortedOperations(),
@@ -85,5 +102,57 @@ func catalogEntry(m tool.ToolManifest) toolCatalogEntry {
 		ScopeRequirement: string(m.ScopeRequirement),
 		MaxDurationMS:    m.ResourceLimits.MaxDuration.Milliseconds(),
 		MaxOutputBytes:   m.ResourceLimits.MaxOutputByte,
+
+		CapabilityState:        string(rel.State),
+		SupportsIdempotency:    rel.SupportsIdempotency,
+		SupportsReconciliation: rel.SupportsReconciliation,
+		RetryPolicy:            rel.RetryPolicy,
+		MaxAttempts:            rel.MaxAttempts,
 	}
+}
+
+// handleSetCapabilityState applies one capability lifecycle transition
+// (OPERATIONAL_RELIABILITY_CONTRACTS §10). It lives under the control prefix,
+// so the existing X-API-Key gate covers it: lifecycle is an operator action,
+// never a model action, and never a way to widen scope — disabling can only
+// remove invocations, and re-enabling restores an already-registered
+// capability rather than creating anything new.
+func (s *Server) handleSetCapabilityState(w http.ResponseWriter, r *http.Request) {
+	if s.capability == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
+			"capability platform not configured")
+		return
+	}
+	toolID := r.PathValue("id")
+	if _, ok := s.capability.Manifest(toolID); !ok {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "capability not found")
+		return
+	}
+	var body capabilityStateBody
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid JSON body")
+		return
+	}
+	next := capability.CapabilityState(strings.ToLower(strings.TrimSpace(body.State)))
+	switch next {
+	case capability.CapabilityEnabled, capability.CapabilityDisabled,
+		capability.CapabilityDeprecated:
+	default:
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
+			"state must be one of enabled, disabled, deprecated")
+		return
+	}
+	if err := s.capability.SetCapabilityState(toolID, next); err != nil {
+		// A disallowed transition is a conflict with the current state, never a
+		// silent no-op.
+		s.writeError(w, r, http.StatusConflict, "VALIDATION", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"tool_id":          toolID,
+		"capability_state": string(next),
+		"reason":           body.Reason,
+		"note":             "lifecycle transitions are operator-scoped; every invocation is audited",
+	})
 }

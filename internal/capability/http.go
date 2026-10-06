@@ -147,6 +147,12 @@ func (t *HTTPTool) Operations() []string {
 	return []string{"delete", "get", "patch", "post", "put"}
 }
 
+// SupportsIdempotency reports that mutating operations carry the stable
+// Idempotency-Key header derived from the logical call id
+// (OPERATIONAL_RELIABILITY_CONTRACTS §7): a re-issued identical mutation is
+// de-duplicated by the remote system rather than duplicated by us.
+func (t *HTTPTool) SupportsIdempotency() bool { return true }
+
 // dialGuarded validates the *resolved address* it is asked to dial, which is the
 // DNS-rebinding defence: a hostname that resolves to a private/loopback address
 // is refused at connect time, not only at parse time.
@@ -312,6 +318,7 @@ func (t *HTTPTool) Invoke(ctx context.Context, inv tool.Invocation) (tool.RawRes
 		Method: method, URL: strings.TrimSpace(inv.Input["url"]),
 		Body: inv.Input["body"], ContentType: inv.Input["content_type"],
 		MaxRequestBytes: inv.Limits.MaxRequestByt,
+		IdempotencyKey:  inv.IdempotencyKey,
 	})
 }
 
@@ -325,6 +332,7 @@ type request struct {
 	ContentType     string
 	Token           string
 	MaxRequestBytes int
+	IdempotencyKey  string
 }
 
 // request performs the policy-checked exchange and normalizes the response
@@ -359,6 +367,12 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 	if rq.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+rq.Token)
 	}
+	// Idempotency key propagates alongside the logical call identity so a
+	// mutation is reproducible and de-duplicated rather than duplicated
+	// (contract §7). Reads never claim mutation idempotency.
+	if rq.IdempotencyKey != "" && !isReadMethod(rq.Method) {
+		req.Header.Set("Idempotency-Key", rq.IdempotencyKey)
+	}
 	client := t.client
 	if client == nil {
 		return tool.RawResult{}, fmt.Errorf("%w: http client unavailable", ErrInternal)
@@ -373,6 +387,13 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 		if errors.Is(err, ErrNetworkBlocked) {
 			return tool.RawResult{}, err
 		}
+		// For a non-idempotent mutation class operation, a transport failure
+		// after the request was dispatched means we cannot prove whether the
+		// remote side received and committed the mutation — this is the
+		// contractual "unknown outcome", never a plain failure.
+		if !isReadMethod(rq.Method) {
+			return tool.RawResult{}, fmt.Errorf("%w: mutation outcome unobserved on %s (%v)", ErrUnknownOutcome, rq.Method, err)
+		}
 		return tool.RawResult{}, fmt.Errorf("%w: request failed: %v", ErrExternal, err)
 	}
 	defer resp.Body.Close()
@@ -382,6 +403,9 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 	limited := io.LimitReader(resp.Body, int64(t.Policy.MaxResponseByte)+1)
 	raw, err := io.ReadAll(limited)
 	if err != nil {
+		if !isReadMethod(rq.Method) {
+			return tool.RawResult{}, fmt.Errorf("%w: mutation outcome unobserved while reading response (%v)", ErrUnknownOutcome, err)
+		}
 		return tool.RawResult{}, fmt.Errorf("%w: reading response failed: %v", ErrExternal, err)
 	}
 	truncated := false
@@ -416,6 +440,16 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 		Headers:  headers,
 		Metadata: map[string]string{"duration_ms": "0"},
 	}, nil
+}
+
+// isReadMethod reports whether the HTTP operation is an idempotent read.
+func isReadMethod(method string) bool {
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD":
+		return true
+	default:
+		return false
+	}
 }
 
 func portInt(p string) int {
