@@ -211,9 +211,11 @@ pipeline already authorized. A foreign business or division is invisible (G5), a
 suspended or archived scopes still admit no new work (G2). There is no RBAC, no
 owner or superuser behaviour, and no model-controlled permission (G1).
 
-## Not in this milestone
+## Deferred / out of scope (written down, not implemented)
 
-Scheduler, event-triggered automation, browser or shell execution, arbitrary
-code execution, distributed execution, durable execution recovery, persistent
-approval workflow, RBAC, multi-instance governance, autonomous privilege
-escalation, vector DB / embeddings / RAG / knowledge graph, UI, virtual office.
+Scheduler, event-triggered automation, browser automation, unrestricted shell,
+arbitrary code/WASM execution, distributed execution, durable execution recovery,
+persistent (durable) approval workflow, RBAC, multi-instance governance,
+autonomous privilege escalation, a general-purpose policy DSL or expression
+evaluator, tool self-installation or modification, vector DB / embeddings / RAG /
+knowledge graph, UI, virtual office.

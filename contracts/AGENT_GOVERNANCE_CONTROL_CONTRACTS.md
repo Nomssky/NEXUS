@@ -272,10 +272,17 @@ control-plane boundary, not a new authorization layer.
   unavailable (`404`) and must be re-requested. This milestone does not add
   durable approval or durable execution recovery, and does not claim otherwise.
 
-## 10. Non-goals
+## 10. Deferred / not implemented
 
-No second policy engine, no RBAC, no model-driven policy, no autonomous
-privilege escalation, no persistent approval workflow, no multi-instance
-governance, no durable execution recovery, no distributed coordination, no new
-event bus, no new memory store, no shell/browser/code execution, no vector DB,
-embeddings or RAG, no UI.
+Recorded rather than implied: scheduler; event-triggered automation; browser
+automation; unrestricted shell; arbitrary code/WASM execution; distributed
+execution; durable execution recovery; persistent (durable) approval workflow;
+RBAC; multi-instance governance; autonomous privilege escalation; a
+general-purpose policy DSL or expression evaluator; tool self-installation or
+modification; a second policy engine; a second authorization layer; a new event
+bus; a new memory store; vector DB, embeddings or RAG; UI; virtual office.
+
+Also not implemented, deliberately: a governance decision at the request or task
+gate still only *reports* its `ALLOW_WITH_CONSTRAINTS` values. Enforcement
+(contract §4) applies to agent actions, which are the ones that reach a
+consequential effect.
