@@ -163,7 +163,7 @@ func denyPolicy(action, resource string) *governance.Policy {
 		Provenance: schema.ProvenanceRef{Origin: "system", Producer: "test", ProducedAt: now},
 	}
 	if resource != "" {
-		p.Resource = governance.Resource{ResourceType: "capability", ResourceIDs: []string{resource}}
+		p.Resource = governance.Resource{ResourceType: "tool", ResourceIDs: []string{resource}}
 	}
 	return p
 }
@@ -188,7 +188,7 @@ func approvalPolicy(action, resource string) *governance.Policy {
 		Provenance: schema.ProvenanceRef{Origin: "system", Producer: "test", ProducedAt: now},
 	}
 	if resource != "" {
-		p.Resource = governance.Resource{ResourceType: "capability", ResourceIDs: []string{resource}}
+		p.Resource = governance.Resource{ResourceType: "tool", ResourceIDs: []string{resource}}
 	}
 	return p
 }
@@ -209,7 +209,7 @@ func escalatePolicy(action, resource string) *governance.Policy {
 		Provenance: schema.ProvenanceRef{Origin: "system", Producer: "test", ProducedAt: now},
 	}
 	if resource != "" {
-		p.Resource = governance.Resource{ResourceType: "capability", ResourceIDs: []string{resource}}
+		p.Resource = governance.Resource{ResourceType: "tool", ResourceIDs: []string{resource}}
 	}
 	return p
 }

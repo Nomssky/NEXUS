@@ -516,7 +516,12 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 			respErr.CorrelationID = req.Context.CorrelationID
 		}
 		respErr.Timestamp = e.now()
-		e.emitEscalation(req, escRef, execOutcome.Error, "executor")
+		// A handler that already handed the action to the escalation → attention
+		// path owns that event (AGENT_GOVERNANCE_CONTROL_CONTRACTS §6): emitting
+		// a second one would queue a duplicate human item for the same action.
+		if execOutcome.EscalationRef == "" {
+			e.emitEscalation(req, escRef, execOutcome.Error, "executor")
+		}
 	} else if execOutcome != nil && execOutcome.Status == "completed" {
 		outcomeResult = &Outcome{
 			Summary: execOutcome.Output,

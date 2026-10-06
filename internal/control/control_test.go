@@ -105,7 +105,7 @@ func policy(id string, effect governance.Outcome, action string, resourceIDs []s
 		Subject: governance.Subject{SubjectType: "all"},
 		Action:  governance.Action{ActionType: "custom", ActionIDs: []string{action}},
 		Resource: governance.Resource{
-			ResourceType: "capability", ResourceIDs: resourceIDs,
+			ResourceType: "tool", ResourceIDs: resourceIDs,
 		},
 		Effect: effect, Precedence: precedence,
 		Constraints: constraints, ApprovalConfig: approval,

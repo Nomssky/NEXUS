@@ -153,7 +153,10 @@ const (
 	ActionMemoryDelete = "memory_delete"
 	ActionModelCall    = "model_call"
 
-	ResourceTypeCapability = "capability"
+	// Resource types reuse the EXISTING policy vocabulary
+	// (SCHEMA_GOVERNANCE_ATTENTION §2.4 resource_type), so an operator pins a
+	// capability with the same words the policy schema already accepts.
+	ResourceTypeCapability = "tool"
 	ResourceTypeMemory     = "memory"
 	ResourceTypeAgent      = "agent"
 )

@@ -84,10 +84,12 @@ missing or contradictory is rejected before governance is consulted.
 ### Action and resource vocabulary
 
 `action` is derived from the closed action vocabulary: `tool_call`,
-`delegate`, `memory_write`, `memory_delete`, `model_call`. `resource_type` is
-`capability` for tool calls (resource = the tool id) and `memory` for memory
-writes (resource = `memory:<scope>`), `agent` for delegation (resource = the child
-agent id).
+`delegate`, `memory_write`, `memory_delete`, `model_call`. `resource_type` reuses
+the EXISTING policy vocabulary (`SCHEMA_GOVERNANCE_ATTENTION` §2.4): `tool` for a
+capability (resource = the tool id), `memory` for memory writes (resource =
+`memory:<scope>/<key>`) and `agent` for delegation (resource = the child agent
+id). An operator therefore pins a capability with the same words the policy
+schema already accepts.
 
 ## 3. Admission semantics
 

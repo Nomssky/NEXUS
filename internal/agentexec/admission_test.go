@@ -90,7 +90,7 @@ func testPolicy(id string, effect governance.Outcome, action string, resourceIDs
 		Status:   governance.PolicyStatusActive,
 		Subject:  governance.Subject{SubjectType: "all"},
 		Action:   governance.Action{ActionType: "custom", ActionIDs: []string{action}},
-		Resource: governance.Resource{ResourceType: "capability", ResourceIDs: resourceIDs},
+		Resource: governance.Resource{ResourceType: "tool", ResourceIDs: resourceIDs},
 		Effect:   effect, Precedence: precedence, Constraints: constraints,
 		ApprovalConfig: &governance.ApprovalConfig{ApproverType: "human", TimeoutSeconds: 60,
 			SelfApprovalProhibited: true},

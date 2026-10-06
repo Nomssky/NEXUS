@@ -186,6 +186,12 @@ func New(opts Options) *Launcher {
 		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
 	}
 	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
+	// Agent Governance & Control Integration v1: the admission controller is
+	// built by the engine that OWNS the policy engine, the approval index, the
+	// escalation queue and the bus, so admission reuses the authoritative
+	// decision path instead of duplicating it. Every mediated agent tool call
+	// passes through it before Platform.Invoke (contract §6).
+	agentRt.Controller = engine.Controller()
 	gwOpts = append(gwOpts, gateway.WithAgentExecution(agentReg, agentRt))
 
 	// Capability & Tool Platform v1 (contracts/CAPABILITY_TOOL_CONTRACTS.md):
