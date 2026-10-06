@@ -797,3 +797,48 @@ func TestInvokeFailsDeterministicallyWhenProviderOffline(t *testing.T) {
 		t.Fatalf("expected the offline cause to surface, got %q", err.Error())
 	}
 }
+
+// The scripted decision table documents explicit mutating HTTP rules so the
+// black-box reliability suite can exercise idempotency keys and unknown
+// outcomes without a real model. Reads must stay reads.
+func TestScriptedProviderHTTPMethodSelection(t *testing.T) {
+	cases := map[string]struct{ objective, wantOp string }{
+		"read":            {"fetch http://127.0.0.1:1/read via http request", "get"},
+		"explicit post":   {"post via http request to http://127.0.0.1:1/write", "post"},
+		"explicit delete": {"delete via http request from http://127.0.0.1:1/write", "delete"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := NewScriptedProvider(ProviderConfig{ID: "scripted"})
+			msg := []Message{{Role: "user", Content: "SYSTEM: you are the decision maker.\nOBJECTIVE: " + c.objective + "\n"}}
+			res, err := p.Invoke(context.Background(), &GenerateRequest{Messages: msg})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var action struct {
+				Type      string `json:"type"`
+				Tool      string `json:"tool"`
+				Operation string `json:"operation"`
+				Input     struct {
+					URL  string `json:"url"`
+					Body string `json:"body"`
+				} `json:"input"`
+			}
+			if err := json.Unmarshal([]byte(res.Content), &action); err != nil {
+				t.Fatalf("decision must be JSON: %s (%v)", res.Content, err)
+			}
+			if action.Type != "tool_call" || action.Tool != "http.request" {
+				t.Fatalf("expected an http.request tool call, got %+v", action)
+			}
+			if action.Operation != c.wantOp {
+				t.Fatalf("operation = %q, want %q", action.Operation, c.wantOp)
+			}
+			if c.wantOp == "post" && action.Input.Body == "" {
+				t.Fatalf("a scripted mutation must carry a body")
+			}
+			if c.wantOp == "get" && action.Input.Body != "" {
+				t.Fatalf("a scripted read must not carry a mutation body: %q", action.Input.Body)
+			}
+		})
+	}
+}

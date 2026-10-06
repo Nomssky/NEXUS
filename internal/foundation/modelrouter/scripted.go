@@ -93,7 +93,8 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 //  3. "delegate", not yet observed -> delegate action
 //  4. "memory"                     -> memory_write, then memory_read
 //  5. named tool, not yet observed -> tool_call for that tool
-//     (calculator, echo, http.request, web.search, filesystem.*, git, data)
+//     (calculator, echo, http.request, web.search, filesystem.*, git, data);
+//     "post via http" / "delete via http" select a mutating HTTP method
 //  6. "replan" with replans == 0    -> replan action
 //  7. otherwise                    -> complete
 //
@@ -146,7 +147,19 @@ func scriptedAnswer(prompt string) string {
 		} else if i := strings.Index(lower, "https://"); i >= 0 {
 			url = subjectURL(lower, i)
 		}
-		return fmt.Sprintf(`{"type":"tool_call","tool":"http.request","operation":"get","input":{"url":%q}}`, url)
+		// Mutation methods are opt-in per objective so the deterministic table
+		// can exercise idempotency keys and unknown outcomes without ever
+		// mutating anything the objective did not explicitly ask to mutate.
+		method, body := "get", ""
+		if strings.Contains(subject, "post via http") {
+			method, body = "post", `{"entry":"nexus-e2e-mutation"}`
+		}
+		if strings.Contains(subject, "delete via http") {
+			method = "delete"
+		}
+		return fmt.Sprintf(
+			`{"type":"tool_call","tool":"http.request","operation":%q,"input":{"url":%q,"body":%q,"content_type":"application/json"}}`,
+			method, url, body)
 	case (strings.Contains(subject, "search the web") || strings.Contains(subject, "web research") || strings.Contains(subject, "web.search")) && !observedTool("web.search"):
 		return `{"type":"tool_call","tool":"web.search","input":{"query":"nexus"}}`
 	case strings.Contains(subject, "filesystem") && strings.Contains(subject, "..") && !observedTool("filesystem"):
