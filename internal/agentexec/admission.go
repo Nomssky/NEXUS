@@ -19,6 +19,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/control"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
 // AdmissionError is returned when an action is refused BEFORE the capability
@@ -114,7 +115,11 @@ func (r *Runtime) Admit(call ToolCallSpec, scope ToolScope, correlationID, agent
 		ResourceType:  control.ResourceTypeCapability,
 		ToolID:        call.ToolID,
 		Operation:     call.Operation,
-		CreatedAt:     r.now(),
+		// Risk is derived from the manifest the runtime already validated, never
+		// from anything the model said. An unknown tool reports the highest
+		// risk, so a missing manifest cannot make an action look harmless.
+		RiskLevel: r.riskFor(call.ToolID),
+		CreatedAt: r.now(),
 	}
 	adm, err := r.Controller.Admit(proposal)
 	if err != nil {
@@ -144,6 +149,21 @@ func (r *Runtime) Admit(call ToolCallSpec, scope ToolScope, correlationID, agent
 		}
 	}
 	return effective, nil
+}
+
+// riskFor derives the risk level governance evaluates with, from the manifest
+// the runtime already loaded. Fail-closed: a tool whose manifest is not
+// available is reported as an external mutation, the highest class, so a policy
+// that requires approval for consequential work still applies.
+func (r *Runtime) riskFor(toolID string) governance.RiskLevel {
+	if r.Tools == nil {
+		return control.RiskFor(string(tool.SideEffectExternalMutation))
+	}
+	manifest, ok := r.Tools.Manifest(toolID)
+	if !ok {
+		return control.RiskFor(string(tool.SideEffectExternalMutation))
+	}
+	return control.RiskFor(string(manifest.SideEffectClass))
 }
 
 // newProposalID mints a runtime proposal identity. It is never model supplied.

@@ -345,3 +345,59 @@ func TestApprovalResumeAdmitsTheIdenticalActionOnce(t *testing.T) {
 		t.Fatalf("the approved action must have run once, got %d", g.adapter.count())
 	}
 }
+
+func TestRiskIsDerivedFromTheManifestNotTheModel(t *testing.T) {
+	// A read-only capability is low risk; an external mutation is high. The level
+	// is read from the manifest the runtime already validated, so a policy
+	// condition on risk sees the truth about the tool rather than a claim.
+	g := newGovernedRuntime(t, allowPolicy())
+	m, ok := g.rt.Tools.Manifest("echo.tool")
+	if !ok {
+		t.Fatal("the fixture must register a manifest")
+	}
+	if got := g.rt.riskFor("echo.tool"); got != control.RiskFor(string(m.SideEffectClass)) {
+		t.Fatalf("risk must follow the manifest: got %s want %s",
+			got, control.RiskFor(string(m.SideEffectClass)))
+	}
+	if got := g.rt.riskFor("echo.tool"); got != governance.RiskLevelLow {
+		t.Fatalf("a read capability is low risk, got %s", got)
+	}
+	// Fail closed: an unregistered tool is treated as an external mutation, so a
+	// risk-based policy cannot be evaded by naming a tool that has no manifest.
+	if got := g.rt.riskFor("not.registered"); got != governance.RiskLevelHigh {
+		t.Fatalf("an unknown tool must be treated as high risk, got %s", got)
+	}
+}
+
+func TestRiskTravelsIntoTheGovernanceRequest(t *testing.T) {
+	g := newGovernedRuntime(t, allowPolicy())
+	// A policy conditional on risk: the runtime-derived level is what decides.
+	now := time.Now().UTC()
+	g.rt.Controller = control.New(control.Options{
+		Engine: governance.NewEngine([]*governance.Policy{{
+			SchemaVersion: "1.0.0", EntityType: "policy", PolicyID: "p-risk",
+			PolicyVersion: "1", PolicyType: governance.PolicyTypeAccessControl,
+			Name: "risk", Description: "risk", Status: governance.PolicyStatusActive,
+			Subject:  governance.Subject{SubjectType: "all"},
+			Action:   governance.Action{ActionType: "custom", ActionIDs: []string{control.ActionToolCall}},
+			Resource: governance.Resource{ResourceType: "tool"},
+			Effect:   governance.ALLOW_WITH_CONSTRAINTS, Precedence: 10,
+			Conditions: []governance.Condition{{ConditionID: "c-risk",
+				ConditionType: "attribute", Expression: "risk=low"}},
+			Constraints: []governance.Constraint{{ConstraintID: "c-tools",
+				ConstraintType: control.ConstraintToolAllowlist, Expression: "echo.tool",
+				Severity: "mandatory"}},
+			EffectiveFrom: now, CreatedAt: now, CreatedBy: "test",
+		}}),
+		Approver:  g.host,
+		Escalator: g.host,
+	})
+	// The condition matches only because the runtime reported a low-risk read.
+	_, err := g.rt.InvokeToolScoped(context.Background(), scope(), "agent-1", call())
+	if err != nil {
+		t.Fatalf("a low-risk read must satisfy a risk=low condition: %v", err)
+	}
+	if g.adapter.count() != 1 {
+		t.Fatalf("the adapter must have run once, got %d", g.adapter.count())
+	}
+}

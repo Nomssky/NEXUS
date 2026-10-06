@@ -70,6 +70,13 @@ ActionProposal {
 }
 ```
 
+`risk_level` is derived from the tool manifest the runtime already validated
+(`external_mutation`/`credentialed_external_mutation` → high, `write` → medium,
+otherwise low), never from the payload. A tool with no available manifest is
+reported as an external mutation, so a risk-conditioned policy cannot be evaded
+by naming a tool the runtime does not know. It is evaluation context, not a
+privilege: it can make a policy match, never make one stop matching.
+
 **The model may propose only `action`, `resource`, `resource_type`, `tool_id`,
 `operation` and request input.** Every other field is established by the runtime
 from the admitted request, the resolved agent and the executing loop:
