@@ -133,6 +133,9 @@ type Platform struct {
 	// redaction. Values never leave this struct (contract §7, §11).
 	secretMu sync.RWMutex
 	secrets  []string
+	// lifecycleMu guards the capability lifecycle map: id -> CapabilityState.
+	lifecycleMu sync.RWMutex
+	lifecycle   map[string]CapabilityState
 }
 
 // New wires a platform with the shipped defaults.
@@ -140,6 +143,7 @@ func New(reg *tool.ToolRegistry, members *identity.MembershipSet, creds Credenti
 	return &Platform{
 		Registry: reg, Memberships: members, Credentials: creds,
 		Auditor: Auditor{Bus: bus}, Caps: DefaultCaps(), Now: time.Now,
+		lifecycle: map[string]CapabilityState{},
 	}
 }
 
@@ -160,6 +164,21 @@ func (p *Platform) RegisterSecret(secret string) {
 	p.secretMu.Lock()
 	defer p.secretMu.Unlock()
 	p.secrets = append(p.secrets, secret)
+}
+
+// Manifest returns one registered manifest (contract §4). It is the
+// registration lookup used by the lifecycle control surface; it grants
+// nothing and reveals nothing beyond the manifest itself.
+func (p *Platform) Manifest(toolID string) (tool.ToolManifest, bool) {
+	return p.Registry.Manifest(toolID)
+}
+
+// Adapter returns the adapter registered for one capability, or nil when the
+// tool has no implementation bound. Discovery uses it only to read the
+// reliability posture an adapter advertises for itself.
+func (p *Platform) Adapter(toolID string) tool.Adapter {
+	a, _ := p.Registry.Adapter(toolID)
+	return a
 }
 
 // Catalog returns the bounded capability catalog for one scope (contract §4).
@@ -254,18 +273,56 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 		return p.deny(req, res, start, ErrInternal, fmt.Sprintf("tool %q has no adapter", req.ToolID), "tool.invocation.failed")
 	}
 
-	// 9: adapter dispatch under a bounded context.
+	// Capability lifecycle (OPERATIONAL_RELIABILITY_CONTRACTS §10). A disabled
+	// capability is refused before any adapter dispatch; a deprecated one still
+	// executes but is surfaced in telemetry. A tool an operator has never
+	// touched is enabled.
+	state := p.CapabilityState(req.ToolID)
+	if state == CapabilityDisabled {
+		p.Auditor.emit(event.EventTypeToolCapabilityDisabled, req, map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "agent_id": req.AgentID,
+		})
+		return p.deny(req, res, start, ErrCapabilityDisabled,
+			fmt.Sprintf("capability %q is disabled", req.ToolID), "tool.invocation.rejected")
+	}
+	if state == CapabilityDeprecated {
+		p.Auditor.emit(event.EventTypeToolCapabilityDeprecated, req, map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "agent_id": req.AgentID,
+		})
+	}
+
+	// 9: adapter dispatch under ONE call deadline shared by every physical
+	// attempt of this logical call (contract §1, §5, §7).
+	callID := req.CorrelationID
+	if strings.TrimSpace(callID) == "" {
+		callID = fmt.Sprintf("%s-%d", req.ToolID, p.now().UnixNano())
+	}
 	callCtx, cancel := context.WithTimeout(ctx, limits.MaxDuration)
 	defer cancel()
 	p.Auditor.emit(event.EventTypeToolInvocationStarted, req, map[string]string{
 		"tool_id": req.ToolID, "operation": req.Operation, "agent_id": req.AgentID,
-		"side_effect_class": string(manifest.SideEffectClass),
+		"side_effect_class": string(manifest.SideEffectClass), "call_id": callID,
+		"capability_state": string(state),
 	})
-	raw, err := adapter.Invoke(callCtx, tool.Invocation{
+	raw, attempts, err := p.runAttempts(callCtx, adapter, manifest, limits, tool.Invocation{
 		ToolID: req.ToolID, Operation: req.Operation, Input: input,
 		BusinessID: req.BusinessID, DivisionID: req.DivisionID, ActorID: req.ActorID,
 		AgentID: req.AgentID, Credential: handle, Limits: limits,
-	})
+		CallID: callID, IdempotencyKey: callID,
+	}, req, callID)
+	res.Attempts = attempts
+	res.CapabilityState = string(state)
+	res.Outcome = classifyOutcome(err, ctx.Err())
+	// The surfaced verdict combines the class decision with the remaining
+	// budget: a spent attempt budget never recommends another attempt, and an
+	// unknown outcome never does either (§3).
+	res.RetryRecommended = RetryRecommended(err, manifest) && attempts < attemptBound(manifest)
+	if res.Outcome == "unknown" {
+		// An unknown outcome is never re-driven automatically (§9). It only
+		// surfaces a reconciliation requirement when the capability advertises
+		// a read-back path; NEXUS runs no background reconcilers (G4 Level 1).
+		res.ReconciliationAvailable = adapterSupportsReconciliation(adapter)
+	}
 	elapsed := p.now().Sub(start)
 	if err != nil {
 		kind := adapterErrorKind(ctx, err)
@@ -277,10 +334,19 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 		}
 		res.Duration = elapsed
 		res.Status = tool.StatusError
-		p.Auditor.emit(event.EventTypeToolInvocationFailed, req, map[string]string{
-			"tool_id": req.ToolID, "operation": req.Operation, "error_kind": kind.Error(),
-			"duration_ms": fmt.Sprint(elapsed.Milliseconds()),
+		p.Auditor.emit(invocationEventForOutcome(res.Outcome), req, map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "error_kind": errorClass(kind),
+			"outcome": res.Outcome, "attempts": fmt.Sprint(res.Attempts),
+			"duration_ms": fmt.Sprint(elapsed.Milliseconds()), "call_id": callID,
+			"capability_state":  string(state),
+			"retry_recommended": fmt.Sprint(res.RetryRecommended),
 		})
+		if res.ReconciliationAvailable {
+			p.Auditor.emit(event.EventTypeToolReconciliationAvailable, req, map[string]string{
+				"tool_id": req.ToolID, "operation": req.Operation, "call_id": callID,
+				"outcome": res.Outcome,
+			})
+		}
 		return res
 	}
 
@@ -290,6 +356,9 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	normalized.Operation = req.Operation
 	normalized.Status = tool.StatusSuccess
 	normalized.Duration = elapsed
+	normalized.Outcome = "completed"
+	normalized.Attempts = attempts
+	normalized.CapabilityState = string(state)
 	if truncated {
 		normalized.Truncated = true
 		p.Auditor.emit(event.EventTypeToolResultTruncated, req, map[string]string{
@@ -300,7 +369,9 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 		"tool_id": req.ToolID, "operation": req.Operation, "agent_id": req.AgentID,
 		"status": normalized.Status, "duration_ms": fmt.Sprint(elapsed.Milliseconds()),
 		"result_bytes": fmt.Sprint(normalized.Bytes), "truncated": fmt.Sprint(normalized.Truncated),
-		"side_effect_class": string(manifest.SideEffectClass),
+		"side_effect_class": string(manifest.SideEffectClass), "outcome": "completed",
+		"attempts": fmt.Sprint(attempts), "capability_state": string(state),
+		"call_id": callID,
 	}
 	if manifest.CredentialRequirement.Required {
 		// The audit records the *reference*, never the value.
@@ -308,6 +379,79 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	}
 	p.Auditor.emit(event.EventTypeToolInvocationCompleted, req, auditFields)
 	return normalized
+}
+
+// runAttempts dispatches one logical call as bounded physical attempts that all
+// share the single call deadline (contract §1, §2, §5). It is the only place
+// that may retry anything: the verdict comes from DecideRetry, the bound from
+// the side-effect class, and a retry is only started when a whole attempt
+// still fits inside the remaining deadline.
+func (p *Platform) runAttempts(callCtx context.Context, adapter tool.Adapter, manifest tool.ToolManifest,
+	limits tool.ResourceLimits, inv tool.Invocation, req Request, callID string) (tool.RawResult, int, error) {
+	deadline, hasDeadline := callCtx.Deadline()
+	bound := attemptBound(manifest)
+	var raw tool.RawResult
+	var err error
+	attempts := 0
+	for attempts < bound {
+		if hasDeadline {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if err == nil {
+					// The deadline was already gone before the first attempt:
+					// no dispatch happened, the call is timed out (§5).
+					err = context.DeadlineExceeded
+				}
+				return raw, attempts, err
+			}
+		}
+		slice := limits.MaxDuration
+		if bound > 1 {
+			// A retryable call divides its one deadline across the attempts it
+			// may make: nobody gets a fresh deadline (§5).
+			slice = time.Until(deadline) / time.Duration(bound)
+		}
+		attempts++
+		attemptCtx, cancelAttempt := context.WithTimeout(callCtx, slice)
+		attemptStart := p.now()
+		p.Auditor.emit(event.EventTypeToolAttemptStarted, req, map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "call_id": callID,
+			"attempt": fmt.Sprint(attempts), "max_attempts": fmt.Sprint(bound),
+		})
+		inv.AttemptIndex = attempts - 1
+		raw, err = adapter.Invoke(attemptCtx, inv)
+		// The attempt context's own error must be read before it is released:
+		// cancel() would otherwise make every attempt look cancelled.
+		attemptCtxErr := attemptCtx.Err()
+		cancelAttempt()
+		attemptOutcome := classifyOutcome(err, attemptCtxErr)
+		fields := map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "call_id": callID,
+			"attempt": fmt.Sprint(attempts), "outcome": attemptOutcome,
+			"duration_ms": fmt.Sprint(p.now().Sub(attemptStart).Milliseconds()),
+		}
+		if err != nil {
+			fields["error_class"] = errorClass(adapterErrorKind(callCtx, err))
+		}
+		p.Auditor.emit(event.EventTypeToolAttemptCompleted, req, fields)
+		if err == nil {
+			return raw, attempts, nil
+		}
+		if !DecideRetry(err, manifest, attempts) {
+			return raw, attempts, err
+		}
+		// §5: a retry may only be scheduled when a whole attempt still fits in
+		// the remaining call deadline; otherwise the first error stands.
+		if hasDeadline && time.Until(deadline) < slice {
+			return raw, attempts, err
+		}
+		p.Auditor.emit(event.EventTypeToolRetryScheduled, req, map[string]string{
+			"tool_id": req.ToolID, "operation": req.Operation, "call_id": callID,
+			"attempt":     fmt.Sprint(attempts),
+			"error_class": errorClass(adapterErrorKind(callCtx, err)),
+		})
+	}
+	return raw, attempts, err
 }
 
 // CanInvoke evaluates permission for one invocation (contract §28/§5 step 6).
@@ -419,6 +563,8 @@ func adapterErrorKind(ctx context.Context, err error) error {
 		return ErrExternal
 	case errors.Is(err, ErrValidation):
 		return ErrValidation
+	case errors.Is(err, ErrUnknownOutcome):
+		return ErrUnknownOutcome
 	default:
 		return ErrInternal
 	}

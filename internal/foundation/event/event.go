@@ -57,6 +57,18 @@ const (
 	EventTypeToolPermissionDenied    EventType = "tool.permission.denied"
 	EventTypeToolCredentialDenied    EventType = "tool.credential.denied"
 	EventTypeToolResultTruncated     EventType = "tool.result.truncated"
+	// Operational Reliability & Tool Semantics v1
+	// (contracts/OPERATIONAL_RELIABILITY_CONTRACTS.md §10).
+	EventTypeToolAttemptStarted           EventType = "tool.attempt.started"
+	EventTypeToolAttemptCompleted         EventType = "tool.attempt.completed"
+	EventTypeToolRetryScheduled           EventType = "tool.retry.scheduled"
+	EventTypeToolInvocationCancelled      EventType = "tool.invocation.cancelled"
+	EventTypeToolInvocationTimedOut       EventType = "tool.invocation.timed_out"
+	EventTypeToolInvocationUnknownOutcome EventType = "tool.invocation.unknown"
+	EventTypeToolCapabilityDisabled       EventType = "tool.capability.disabled"
+	EventTypeToolCapabilityDeprecated     EventType = "tool.capability.deprecated"
+	EventTypeToolReconciliationAvailable  EventType = "tool.reconciliation.available"
+	EventTypeToolReconciliationCompleted  EventType = "tool.reconciliation.completed"
 	// Agent intelligence layer v1 (control loop) events. agent.thinking is
 	// TELEMETRY ONLY — phase/step/action-type/reason-category/attempt; never
 	// raw reasoning, never model prompts (AGENT_INTELLIGENCE_CONTRACTS §13).

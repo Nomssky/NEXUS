@@ -57,6 +57,19 @@ type Invocation struct {
 	AgentID    string
 	Credential CredentialHandle
 	Limits     ResourceLimits
+	// CallID identifies the logical invocation. It stays identical across
+	// safe-retry attempts of the same logical call, enabling audit-trail
+	// correlation and idempotency-key derivation
+	// (OPERATIONAL_RELIABILITY_CONTRACTS §4/§5/§7).
+	CallID string
+	// AttemptIndex is the 0-based index of this physical attempt within the
+	// logical call (§4). Adapters report it in telemetry but do not interpret
+	// it for permission decisions.
+	AttemptIndex int
+	// IdempotencyKey is a stable key per logical invocation for mutation-safe
+	// de-duplication (§7). It MUST NOT be regenerated across attempts of the
+	// same call.
+	IdempotencyKey string
 }
 
 // Adapter is a registered capability implementation.
@@ -88,6 +101,22 @@ type Result struct {
 	Truncated bool              `json:"truncated,omitempty"`
 	// Bytes is the measured size of the result payload after bounds.
 	Bytes int `json:"bytes"`
+	// Outcome is the explicit terminal semantics of this logical invocation:
+	// completed, failed, cancelled, timed_out, or unknown (§5).
+	Outcome string `json:"outcome,omitempty"`
+	// Attempts is the number of physical attempts made against the adapter
+	// before this result was reached (§4).
+	Attempts int `json:"attempts,omitempty"`
+	// CapabilityState is the capability's lifecycle state at dispatch time
+	// (§10): registered, enabled, disabled, or deprecated.
+	CapabilityState string `json:"capability_state,omitempty"`
+	// RetryRecommended is the centralized class verdict: would a fresh attempt
+	// plausibly succeed? Always false for an unknown outcome (§3).
+	RetryRecommended bool `json:"retry_recommended,omitempty"`
+	// ReconciliationAvailable reports that an unknown outcome on this call can
+	// be resolved by reading the capability back (§9). It never implies a
+	// background worker; reconciliation stays operator/on-demand.
+	ReconciliationAvailable bool `json:"reconciliation_available,omitempty"`
 }
 
 // Result status values.
