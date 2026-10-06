@@ -15,6 +15,12 @@ import (
 // first-class *outcome*, not a tool failure.
 var ErrUnknownOutcome = errors.New("unknown outcome")
 
+// ErrNotSent marks a transport failure that provably happened BEFORE the
+// request left this process (dial or name resolution). Nothing was committed
+// remotely, which is the only condition under which a mutation may be
+// re-dispatched (§2).
+var ErrNotSent = errors.New("request never sent")
+
 // ErrCapabilityDisabled is the lifecycle refusal of contract §10: a disabled
 // capability is rejected before any adapter dispatch, so no effect of any kind
 // can be observed from it.
@@ -25,11 +31,50 @@ var ErrCapabilityDisabled = errors.New("capability_disabled")
 // deterministic transport transients for read-class tools may retry once;
 // mutations, cancellations, timeouts, unknown outcomes and every classified
 // rejection fail closed.
-func DecideRetry(err error, manifest tool.ToolManifest, attemptsMade int) bool {
-	if attemptsMade >= attemptBound(manifest) {
+func DecideRetry(err error, class tool.SideEffectClass, attemptsMade int) bool {
+	if attemptsMade >= maxAttemptsPerCall {
 		return false // the attempt budget is spent; §2 bounds it per call
 	}
-	return RetryRecommended(err, manifest)
+	return RetryRecommended(err, class)
+}
+
+// OperationSideEffects is implemented by a capability whose operations differ in
+// what they do to the world even though the manifest declares one conservative
+// tool-level class (http.request: a GET reads, a POST mutates). The adapter
+// states the true class per operation; nothing is inferred from a tool's name.
+type OperationSideEffects interface {
+	OperationSideEffect(operation string) (tool.SideEffectClass, bool)
+}
+
+// EffectiveClass resolves the side-effect class that governs one invocation.
+// The manifest's tool-level class is always the conservative default; a
+// capability may only narrow it for an operation it declares itself, and never
+// widen it.
+func EffectiveClass(manifest tool.ToolManifest, adapter tool.Adapter, operation string) tool.SideEffectClass {
+	if a, ok := adapter.(OperationSideEffects); ok {
+		// The only legal narrowing is to `read`: an adapter may state that one
+		// operation of its capability does not mutate. It may never widen the
+		// manifest class, so a declared mutation class is ignored.
+		if class, ok := a.OperationSideEffect(operation); ok &&
+			class == tool.SideEffectRead && manifest.SideEffectClass != tool.SideEffectRead {
+			return tool.SideEffectRead
+		}
+	}
+	return manifest.SideEffectClass
+}
+
+// RetryAdmitted is DecideRetry plus the capability gate of §2: a mutation may
+// only be re-dispatched when the platform knows nothing was committed
+// (ErrNotSent) and the adapter can de-duplicate a replay by its idempotency
+// key. A capability that advertises neither never retries a mutation.
+func RetryAdmitted(err error, class tool.SideEffectClass, adapter tool.Adapter, attemptsMade int) bool {
+	if !DecideRetry(err, class, attemptsMade) {
+		return false
+	}
+	if class == tool.SideEffectRead {
+		return true
+	}
+	return errors.Is(err, ErrNotSent) && adapterSupportsIdempotency(adapter)
 }
 
 // RetryRecommended is the class-only half of DecideRetry: it answers "would a
@@ -37,37 +82,38 @@ func DecideRetry(err error, manifest tool.ToolManifest, attemptsMade int) bool {
 // bound. It is the value surfaced in the observation (contract §8) and it is
 // the reason an `unknown` outcome can never carry a retry recommendation
 // (§3): an unknown outcome is not an error class that a retry may re-drive.
-func RetryRecommended(err error, manifest tool.ToolManifest) bool {
+func RetryRecommended(err error, class tool.SideEffectClass) bool {
 	if err == nil {
 		return false
 	}
 	// §6: only read-class operations retry automatically, and only for
 	// deterministic transport transients. Mutations, cancellations, unknown
 	// outcomes and every classified rejection fail closed.
-	if manifest.SideEffectClass != tool.SideEffectRead {
-		return false
-	}
 	switch {
+	case errors.Is(err, ErrNotSent):
+		// §2: nothing was committed, so a re-issue cannot duplicate anything.
+		// For a mutation the capability gate in RetryAdmitted still applies.
+		return true
 	case errors.Is(err, ErrExternal), errors.Is(err, ErrTimeout),
 		errors.Is(err, ErrNetworkBlocked), errors.Is(err, context.DeadlineExceeded):
 		// A read that timed out on transport is a deterministic transient; the
 		// deadline-fit check in runAttempts is what stops the retry loop.
-		return true
+		// An indeterminate mutation failure never reaches this case.
+		return class == tool.SideEffectRead
 	default:
 		return false
 	}
 }
 
-// attemptBound is the maximum number of physical attempts for one logical
-// invocation: 2 for read-class (one retry), 1 for mutations.
-func attemptBound(manifest tool.ToolManifest) int {
-	switch manifest.SideEffectClass {
-	case tool.SideEffectRead:
-		return 2
-	default:
-		return 1
-	}
-}
+// maxAttemptsPerCall is the attempt bound for one logical invocation: exactly
+// one retry, for every side-effect class. The retry itself is only ever
+// admitted under the rules of §2 (a transient read failure, or a mutation proven
+// never to have been sent).
+const maxAttemptsPerCall = 2
+
+// attemptBound is the attempt bound for one logical invocation, expressed on the
+// effective class of the operation being invoked.
+func attemptBound(_ tool.SideEffectClass) int { return maxAttemptsPerCall }
 
 // classifyOutcome maps the final error + caller context into the contract
 // token: completed / failed / cancelled / timed_out / unknown (contract §5).
@@ -105,6 +151,8 @@ func errorClass(err error) string {
 		return "scope denied"
 	case errors.Is(err, ErrCredential):
 		return "credential unavailable"
+	case errors.Is(err, ErrNotSent):
+		return "not sent"
 	case errors.Is(err, ErrNetworkBlocked):
 		return "network blocked"
 	case errors.Is(err, ErrTimeout):
@@ -190,8 +238,14 @@ type ReconciliationCapable interface {
 
 // RetryPolicy is the discovery-visible retry posture of one capability.
 const (
-	RetryPolicyNone        = "none"
+	// RetryPolicyNone: no automatic retry is ever admitted.
+	RetryPolicyNone = "none"
+	// RetryPolicyBoundedRead: one retry on a deterministic transport transient
+	// for read-class operations.
 	RetryPolicyBoundedRead = "bounded_read_retry"
+	// RetryPolicyNotSent: a mutation is re-dispatched only when the platform
+	// knows it was never sent and the adapter de-duplicates by idempotency key.
+	RetryPolicyNotSent = "not_sent_retry"
 )
 
 // Reliability is the bounded, non-secret reliability metadata for one
@@ -218,14 +272,19 @@ func ReliabilityFor(manifest tool.ToolManifest, state CapabilityState, adapter t
 		ToolID:          manifest.ID,
 		State:           state,
 		SideEffectClass: string(manifest.SideEffectClass),
-		MaxAttempts:     attemptBound(manifest),
+		MaxAttempts:     attemptBound(manifest.SideEffectClass),
 		RetryPolicy:     RetryPolicyNone,
-	}
-	if r.MaxAttempts > 1 {
-		r.RetryPolicy = RetryPolicyBoundedRead
 	}
 	if a, ok := adapter.(IdempotencyCapable); ok && a.SupportsIdempotency() {
 		r.SupportsIdempotency = true
+	}
+	switch manifest.SideEffectClass {
+	case tool.SideEffectRead:
+		r.RetryPolicy = RetryPolicyBoundedRead
+	default:
+		if r.SupportsIdempotency {
+			r.RetryPolicy = RetryPolicyNotSent
+		}
 	}
 	if a, ok := adapter.(ReconciliationCapable); ok && a.SupportsReconciliation() {
 		r.SupportsReconciliation = true
@@ -236,6 +295,13 @@ func ReliabilityFor(manifest tool.ToolManifest, state CapabilityState, adapter t
 	}
 	r.MaxOutputBytes = manifest.ResourceLimits.MaxOutputByte
 	return r
+}
+
+// adapterSupportsIdempotency reports whether an adapter accepts a stable
+// idempotency key for its mutations (§7).
+func adapterSupportsIdempotency(adapter tool.Adapter) bool {
+	a, ok := adapter.(IdempotencyCapable)
+	return ok && a.SupportsIdempotency()
 }
 
 // adapterSupportsReconciliation reports whether an adapter can resolve an

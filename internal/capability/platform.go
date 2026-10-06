@@ -297,6 +297,9 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	if strings.TrimSpace(callID) == "" {
 		callID = fmt.Sprintf("%s-%d", req.ToolID, p.now().UnixNano())
 	}
+	// The retry class is the effective class of THIS operation (§2): a
+	// capability may narrow its conservative tool-level class, never widen it.
+	class := EffectiveClass(manifest, adapter, req.Operation)
 	callCtx, cancel := context.WithTimeout(ctx, limits.MaxDuration)
 	defer cancel()
 	p.Auditor.emit(event.EventTypeToolInvocationStarted, req, map[string]string{
@@ -304,7 +307,7 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 		"side_effect_class": string(manifest.SideEffectClass), "call_id": callID,
 		"capability_state": string(state),
 	})
-	raw, attempts, err := p.runAttempts(callCtx, adapter, manifest, limits, tool.Invocation{
+	raw, attempts, err := p.runAttempts(callCtx, adapter, manifest, class, limits, tool.Invocation{
 		ToolID: req.ToolID, Operation: req.Operation, Input: input,
 		BusinessID: req.BusinessID, DivisionID: req.DivisionID, ActorID: req.ActorID,
 		AgentID: req.AgentID, Credential: handle, Limits: limits,
@@ -316,7 +319,7 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	// The surfaced verdict combines the class decision with the remaining
 	// budget: a spent attempt budget never recommends another attempt, and an
 	// unknown outcome never does either (§3).
-	res.RetryRecommended = RetryRecommended(err, manifest) && attempts < attemptBound(manifest)
+	res.RetryRecommended = RetryAdmitted(err, class, adapter, attempts)
 	if res.Outcome == "unknown" {
 		// An unknown outcome is never re-driven automatically (§9). It only
 		// surfaces a reconciliation requirement when the capability advertises
@@ -383,33 +386,32 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 
 // runAttempts dispatches one logical call as bounded physical attempts that all
 // share the single call deadline (contract §1, §2, §5). It is the only place
-// that may retry anything: the verdict comes from DecideRetry, the bound from
-// the side-effect class, and a retry is only started when a whole attempt
-// still fits inside the remaining deadline.
+// that may retry anything: the verdict comes from RetryAdmitted, the bound from
+// the effective side-effect class, and the per-attempt budget is a share of the
+// one call deadline — nobody ever gets a fresh deadline.
 func (p *Platform) runAttempts(callCtx context.Context, adapter tool.Adapter, manifest tool.ToolManifest,
-	limits tool.ResourceLimits, inv tool.Invocation, req Request, callID string) (tool.RawResult, int, error) {
+	class tool.SideEffectClass, limits tool.ResourceLimits, inv tool.Invocation, req Request, callID string) (tool.RawResult, int, error) {
 	deadline, hasDeadline := callCtx.Deadline()
-	bound := attemptBound(manifest)
+	bound := attemptBound(class)
+	// §5: the call's single deadline is divided across the attempts it may
+	// make. Because every attempt context is a child of the call context, a
+	// retry can never outlive the call deadline even when less than a full
+	// share remains — the attempt is cut short instead.
+	slice := limits.MaxDuration
+	if hasDeadline && bound > 1 {
+		slice = time.Until(deadline) / time.Duration(bound)
+	}
 	var raw tool.RawResult
 	var err error
 	attempts := 0
 	for attempts < bound {
-		if hasDeadline {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				if err == nil {
-					// The deadline was already gone before the first attempt:
-					// no dispatch happened, the call is timed out (§5).
-					err = context.DeadlineExceeded
-				}
-				return raw, attempts, err
+		if hasDeadline && time.Until(deadline) <= 0 {
+			// No time left for another attempt: the call is over, whether or not
+			// a retry was admissible.
+			if err == nil {
+				err = context.DeadlineExceeded
 			}
-		}
-		slice := limits.MaxDuration
-		if bound > 1 {
-			// A retryable call divides its one deadline across the attempts it
-			// may make: nobody gets a fresh deadline (§5).
-			slice = time.Until(deadline) / time.Duration(bound)
+			return raw, attempts, err
 		}
 		attempts++
 		attemptCtx, cancelAttempt := context.WithTimeout(callCtx, slice)
@@ -437,12 +439,7 @@ func (p *Platform) runAttempts(callCtx context.Context, adapter tool.Adapter, ma
 		if err == nil {
 			return raw, attempts, nil
 		}
-		if !DecideRetry(err, manifest, attempts) {
-			return raw, attempts, err
-		}
-		// §5: a retry may only be scheduled when a whole attempt still fits in
-		// the remaining call deadline; otherwise the first error stands.
-		if hasDeadline && time.Until(deadline) < slice {
+		if !RetryAdmitted(err, class, adapter, attempts) {
 			return raw, attempts, err
 		}
 		p.Auditor.emit(event.EventTypeToolRetryScheduled, req, map[string]string{

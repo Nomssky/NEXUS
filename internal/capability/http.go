@@ -147,6 +147,18 @@ func (t *HTTPTool) Operations() []string {
 	return []string{"delete", "get", "patch", "post", "put"}
 }
 
+// OperationSideEffect narrows the manifest's conservative `write` class for the
+// read-only methods: a GET or HEAD reads and may take the read retry policy,
+// while POST/PUT/PATCH/DELETE keep the declared mutation class and therefore
+// never retry unless the request was provably never sent
+// (OPERATIONAL_RELIABILITY_CONTRACTS §2).
+func (t *HTTPTool) OperationSideEffect(operation string) (tool.SideEffectClass, bool) {
+	if isReadMethod(operation) {
+		return tool.SideEffectRead, true
+	}
+	return tool.SideEffectWrite, true
+}
+
 // SupportsIdempotency reports that mutating operations carry the stable
 // Idempotency-Key header derived from the logical call id
 // (OPERATIONAL_RELIABILITY_CONTRACTS §7): a re-issued identical mutation is
@@ -387,6 +399,12 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 		if errors.Is(err, ErrNetworkBlocked) {
 			return tool.RawResult{}, err
 		}
+		// A failure that provably happened before the request left this
+		// process committed nothing remotely (§2): a re-issue cannot duplicate
+		// anything, whatever the method was.
+		if neverSent(err) {
+			return tool.RawResult{}, fmt.Errorf("%w: %v", ErrNotSent, err)
+		}
 		// For a non-idempotent mutation class operation, a transport failure
 		// after the request was dispatched means we cannot prove whether the
 		// remote side received and committed the mutation — this is the
@@ -440,6 +458,21 @@ func (t *HTTPTool) request(ctx context.Context, rq request) (tool.RawResult, err
 		Headers:  headers,
 		Metadata: map[string]string{"duration_ms": "0"},
 	}, nil
+}
+
+// neverSent reports whether a transport error proves the request never left
+// this process: a DNS failure or a connect-phase error. Any error after that
+// point (write, TLS-established read, partial response) is indeterminate.
+func neverSent(err error) bool {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial"
+	}
+	return false
 }
 
 // isReadMethod reports whether the HTTP operation is an idempotent read.

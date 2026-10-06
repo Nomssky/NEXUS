@@ -86,6 +86,12 @@ func (s *scriptedAdapter) invocations() []tool.Invocation {
 	return append([]tool.Invocation(nil), s.seen...)
 }
 
+// idempotentStub advertises the §7 mutation de-duplication capability, which is
+// what makes a re-issue admissible for a mutation.
+type idempotentStub struct{ *scriptedAdapter }
+
+func (i idempotentStub) SupportsIdempotency() bool { return true }
+
 func okStep() step {
 	return step{result: tool.RawResult{Result: map[string]string{"output": "ok"}}}
 }
@@ -296,21 +302,72 @@ func TestNonRetryableClassesNeverRetry(t *testing.T) {
 	}
 }
 
-func TestMutationIsNeverRetriedAutomatically(t *testing.T) {
+func TestIndeterminateMutationIsNeverRetried(t *testing.T) {
 	ad := &scriptedAdapter{ops: []string{"execute"}, plan: []step{{err: fmt.Errorf("%w: connection reset", ErrExternal)}}}
 	p, _, bus := newPlatform(t, func(reg *tool.ToolRegistry) {
 		_ = reg.Register(mutationManifest("retry.mutation"), ad)
 	})
 	res := p.Invoke(context.Background(), allowedRequest("retry.mutation"))
 	if ad.attempts() != 1 || res.Attempts != 1 {
-		t.Fatalf("mutations must never auto-retry, attempts=%d adapter=%d", res.Attempts, ad.attempts())
+		t.Fatalf("an indeterminate mutation must never be re-dispatched, attempts=%d adapter=%d", res.Attempts, ad.attempts())
 	}
 	if res.RetryRecommended {
-		t.Fatalf("a mutation failure must never recommend an automatic retry")
+		t.Fatalf("an indeterminate mutation must never recommend an automatic retry")
 	}
 	if hasEvent(bus, event.EventTypeToolRetryScheduled) {
 		t.Fatalf("mutation retry must be suppressed, events=%v", eventTypes(bus))
 	}
+}
+
+func TestMutationRetriesOnlyWhenProvenNotSentAndIdempotent(t *testing.T) {
+	t.Run("not sent and idempotent re-issues once", func(t *testing.T) {
+		base := &scriptedAdapter{ops: []string{"execute"}, plan: []step{
+			{err: fmt.Errorf("%w: dial refused", ErrNotSent)},
+			okStep(),
+		}}
+		ad := idempotentStub{base}
+		p, _, bus := newPlatform(t, func(reg *tool.ToolRegistry) {
+			_ = reg.Register(mutationManifest("retry.notsent.idem"), ad)
+		})
+		res := p.Invoke(context.Background(), allowedRequest("retry.notsent.idem"))
+		if res.Status != tool.StatusSuccess || res.Attempts != 2 {
+			t.Fatalf("a provably unsent mutation may be re-issued once, got %+v", res)
+		}
+		if countEvents(bus, event.EventTypeToolRetryScheduled) != 1 {
+			t.Fatalf("the re-issue must be framed, events=%v", eventTypes(bus))
+		}
+		invs := ad.invocations()
+		if invs[0].IdempotencyKey != invs[1].IdempotencyKey {
+			t.Fatalf("the re-issue must carry the same idempotency key")
+		}
+	})
+	t.Run("not sent but not idempotent stays single-shot", func(t *testing.T) {
+		ad := &scriptedAdapter{ops: []string{"execute"}, plan: []step{
+			{err: fmt.Errorf("%w: dial refused", ErrNotSent)},
+			okStep(),
+		}}
+		p, _, _ := newPlatform(t, func(reg *tool.ToolRegistry) {
+			_ = reg.Register(mutationManifest("retry.notsent.plain"), ad)
+		})
+		res := p.Invoke(context.Background(), allowedRequest("retry.notsent.plain"))
+		if res.Attempts != 1 || ad.attempts() != 1 {
+			t.Fatalf("a capability without idempotency support must not re-issue, attempts=%d", res.Attempts)
+		}
+	})
+	t.Run("idempotent but unknown stays single-shot", func(t *testing.T) {
+		base := &scriptedAdapter{ops: []string{"execute"}, plan: []step{
+			{err: fmt.Errorf("%w: response lost", ErrUnknownOutcome)},
+			okStep(),
+		}}
+		ad := idempotentStub{base}
+		p, _, _ := newPlatform(t, func(reg *tool.ToolRegistry) {
+			_ = reg.Register(mutationManifest("retry.unknown.idem"), ad)
+		})
+		res := p.Invoke(context.Background(), allowedRequest("retry.unknown.idem"))
+		if res.Attempts != 1 || res.Outcome != "unknown" {
+			t.Fatalf("an unknown outcome must never be re-dispatched, got %+v", res)
+		}
+	})
 }
 
 // ---------- §5 deadline hierarchy ----------
@@ -356,27 +413,58 @@ func TestParentDeadlineBoundsChildCall(t *testing.T) {
 	}
 }
 
-func TestRetryIsSkippedWhenItCannotFit(t *testing.T) {
+func TestRetryCannotExtendTheCallDeadline(t *testing.T) {
 	m := readManifest("deadline.nofit")
-	m.ResourceLimits = tool.ResourceLimits{MaxDuration: 200 * time.Millisecond}
-	// The first attempt burns most of the deadline before failing: the retry
-	// no longer fits inside the remaining call deadline and is never started.
+	m.ResourceLimits = tool.ResourceLimits{MaxDuration: 300 * time.Millisecond}
+	// The first attempt burns most of the shared deadline before failing. The
+	// retry is admissible by class, but it only has the time that is left: it
+	// is cut short and cannot succeed, because a retry never receives a fresh
+	// deadline (§5).
 	ad := &scriptedAdapter{ops: []string{"execute"}, plan: []step{
-		{delay: 170 * time.Millisecond, err: fmt.Errorf("%w: late transient", ErrExternal)},
-		okStep(),
+		{delay: 260 * time.Millisecond, err: fmt.Errorf("%w: late transient", ErrExternal)},
+		{delay: 2 * time.Second},
 	}}
 	p, _, bus := newPlatform(t, func(reg *tool.ToolRegistry) {
 		_ = reg.Register(m, ad)
 	})
+	start := time.Now()
 	res := p.Invoke(context.Background(), allowedRequest("deadline.nofit"))
-	if res.Attempts != 1 || ad.attempts() != 1 {
-		t.Fatalf("a retry that cannot fit must not be dispatched, result=%d adapter=%d", res.Attempts, ad.attempts())
+	elapsed := time.Since(start)
+	if elapsed > 700*time.Millisecond {
+		t.Fatalf("a retry must not extend the call deadline: whole call took %s", elapsed)
 	}
-	if hasEvent(bus, event.EventTypeToolRetryScheduled) {
-		t.Fatalf("a retry that cannot fit must not be announced, events=%v", eventTypes(bus))
+	if res.Status == tool.StatusSuccess || res.Outcome != "timed_out" {
+		t.Fatalf("the cut-short retry must end the call as timed_out, got %+v", res)
 	}
-	if res.Status == tool.StatusSuccess {
-		t.Fatalf("the second scripted step must never have run")
+	if res.Attempts != 2 {
+		t.Fatalf("both attempts must be counted, got %d", res.Attempts)
+	}
+	if !hasEvent(bus, event.EventTypeToolRetryScheduled) {
+		t.Fatalf("the admitted retry must be announced, events=%v", eventTypes(bus))
+	}
+}
+
+func TestDeadlineExhaustedBeforeAnyAttempt(t *testing.T) {
+	m := readManifest("deadline.exhausted")
+	m.ResourceLimits = tool.ResourceLimits{MaxDuration: 300 * time.Millisecond}
+	ad := &scriptedAdapter{ops: []string{"execute"}, plan: []step{{delay: 2 * time.Second}}}
+	p, _, _ := newPlatform(t, func(reg *tool.ToolRegistry) {
+		_ = reg.Register(m, ad)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := p.Invoke(ctx, allowedRequest("deadline.exhausted"))
+	if res.Outcome != "timed_out" {
+		t.Fatalf("an exhausted parent deadline must classify as timed_out, got %+v", res)
+	}
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("attempts must not outlive the parent deadline, took %s", elapsed)
+	}
+	// Both attempts were cut short by the same deadline, and the attempt count
+	// is reported honestly.
+	if res.Attempts != 2 || ad.attempts() != 2 {
+		t.Fatalf("both physical attempts must be counted, result=%d adapter=%d", res.Attempts, ad.attempts())
 	}
 }
 
@@ -589,8 +677,8 @@ func TestReliabilityDiscoveryIsDerivedFromManifestAndAdapter(t *testing.T) {
 		t.Fatalf("a read must advertise the bounded read retry policy, got %+v", readRel)
 	}
 	mutRel := ReliabilityFor(mutation, p.CapabilityState(mutation.ID), p.Adapter(mutation.ID))
-	if mutRel.RetryPolicy != RetryPolicyNone || mutRel.MaxAttempts != 1 {
-		t.Fatalf("a mutation must advertise no automatic retry, got %+v", mutRel)
+	if mutRel.RetryPolicy != RetryPolicyNone || mutRel.MaxAttempts != 2 {
+		t.Fatalf("a mutation without idempotency support must advertise no retry at all, got %+v", mutRel)
 	}
 	if mutRel.SupportsIdempotency {
 		t.Fatalf("an adapter that does not advertise idempotency must not claim it")
@@ -713,37 +801,36 @@ func TestReliabilityPathsCannotWidenAuthority(t *testing.T) {
 }
 
 func TestClassifyAndRecommendAreConsistent(t *testing.T) {
-	read := readManifest("unit.read")
-	mutation := mutationManifest("unit.write")
 	cases := []struct {
-		err      error
-		ctxErr   error
-		outcome  string
-		retryOK  bool
-		manifest tool.ToolManifest
+		err     error
+		ctxErr  error
+		outcome string
+		retryOK bool
+		class   tool.SideEffectClass
 	}{
-		{nil, nil, "completed", false, read},
-		{fmt.Errorf("%w: x", ErrExternal), nil, "failed", true, read},
-		{fmt.Errorf("%w: x", ErrExternal), nil, "failed", false, mutation},
-		{context.Canceled, nil, "cancelled", false, read},
-		{context.DeadlineExceeded, nil, "timed_out", true, read},
-		{fmt.Errorf("%w: x", ErrUnknownOutcome), nil, "unknown", false, read},
-		{nil, context.Canceled, "cancelled", false, read},
-		{nil, context.DeadlineExceeded, "timed_out", false, read},
+		{nil, nil, "completed", false, tool.SideEffectRead},
+		{fmt.Errorf("%w: x", ErrExternal), nil, "failed", true, tool.SideEffectRead},
+		{fmt.Errorf("%w: x", ErrExternal), nil, "failed", false, tool.SideEffectExternalMutation},
+		{context.Canceled, nil, "cancelled", false, tool.SideEffectRead},
+		{context.DeadlineExceeded, nil, "timed_out", true, tool.SideEffectRead},
+		{fmt.Errorf("%w: x", ErrUnknownOutcome), nil, "unknown", false, tool.SideEffectRead},
+		{fmt.Errorf("%w: x", ErrNotSent), nil, "failed", true, tool.SideEffectExternalMutation},
+		{nil, context.Canceled, "cancelled", false, tool.SideEffectRead},
+		{nil, context.DeadlineExceeded, "timed_out", false, tool.SideEffectRead},
 	}
 	for _, c := range cases {
 		if got := classifyOutcome(c.err, c.ctxErr); got != c.outcome {
 			t.Fatalf("classifyOutcome(%v,%v) = %q, want %q", c.err, c.ctxErr, got, c.outcome)
 		}
-		if got := RetryRecommended(c.err, c.manifest); got != c.retryOK {
-			t.Fatalf("RetryRecommended(%v) = %v, want %v", c.err, got, c.retryOK)
+		if got := RetryRecommended(c.err, c.class); got != c.retryOK {
+			t.Fatalf("RetryRecommended(%v, %v) = %v, want %v", c.err, c.class, got, c.retryOK)
 		}
 	}
-	if got := attemptBound(read); got != 2 {
+	if got := attemptBound(tool.SideEffectRead); got != 2 {
 		t.Fatalf("read attempt bound = %d, want 2", got)
 	}
-	if got := attemptBound(mutation); got != 1 {
-		t.Fatalf("mutation attempt bound = %d, want 1", got)
+	if got := attemptBound(tool.SideEffectExternalMutation); got != 2 {
+		t.Fatalf("attempt bound is one retry for every class, got %d", got)
 	}
 }
 
@@ -766,5 +853,69 @@ func TestErrorClassTaxonomyIsStable(t *testing.T) {
 		if got := errorClass(err); got != want {
 			t.Fatalf("errorClass(%v) = %q, want %q", err, got, want)
 		}
+	}
+}
+
+// operationClassAdapter narrows its tool-level class for one operation, the way
+// http.request narrows `write` to `read` for GET/HEAD.
+type operationClassAdapter struct {
+	*scriptedAdapter
+	narrowed tool.SideEffectClass
+	op       string
+}
+
+func (o operationClassAdapter) OperationSideEffect(op string) (tool.SideEffectClass, bool) {
+	if op == o.op {
+		return o.narrowed, true
+	}
+	return "", false
+}
+
+func TestEffectiveClassNarrowsNeverWidens(t *testing.T) {
+	m := mutationManifest("class.narrow")
+	ad := operationClassAdapter{narrowed: tool.SideEffectRead, op: "read"}
+	if got := EffectiveClass(m, ad, "read"); got != tool.SideEffectRead {
+		t.Fatalf("a declared operation class must narrow, got %q", got)
+	}
+	if got := EffectiveClass(m, ad, "write"); got != m.SideEffectClass {
+		t.Fatalf("an undeclared operation must keep the manifest class, got %q", got)
+	}
+	// An adapter may not widen the manifest class.
+	widen := operationClassAdapter{narrowed: tool.SideEffectExternalMutation, op: "read"}
+	readManifest := readManifest("class.widen")
+	if got := EffectiveClass(readManifest, widen, "read"); got != tool.SideEffectRead {
+		t.Fatalf("an adapter must never widen the manifest class, got %q", got)
+	}
+	// A capability that declares nothing keeps the manifest class.
+	plain := &scriptedAdapter{ops: []string{"execute"}}
+	if got := EffectiveClass(m, plain, "write"); got != m.SideEffectClass {
+		t.Fatalf("the manifest class must remain the default, got %q", got)
+	}
+}
+
+func TestReadOperationOfAWriteCapabilityRetries(t *testing.T) {
+	m := mutationManifest("class.retry")
+	m.Operations = []string{"read", "write"}
+	base := &scriptedAdapter{ops: []string{"read", "write"}, plan: []step{
+		{err: fmt.Errorf("%w: connection reset", ErrExternal)},
+		okStep(),
+	}}
+	ad := operationClassAdapter{scriptedAdapter: base, narrowed: tool.SideEffectRead, op: "read"}
+	p, _, bus := newPlatform(t, func(reg *tool.ToolRegistry) { _ = reg.Register(m, ad) })
+	req := allowedRequest("class.retry")
+	req.Operation = "read"
+	res := p.Invoke(context.Background(), req)
+	if res.Status != tool.StatusSuccess || res.Attempts != 2 {
+		t.Fatalf("a declared read operation must take the read retry policy, got %+v", res)
+	}
+	if !hasEvent(bus, event.EventTypeToolRetryScheduled) {
+		t.Fatalf("the retry must be framed, events=%v", eventTypes(bus))
+	}
+	// The same capability's mutating operation stays single-shot.
+	mutating := allowedRequest("class.retry")
+	mutating.Operation = "write"
+	res = p.Invoke(context.Background(), mutating)
+	if res.Attempts != 1 {
+		t.Fatalf("a mutating operation must stay single-shot, got %+v", res)
 	}
 }
