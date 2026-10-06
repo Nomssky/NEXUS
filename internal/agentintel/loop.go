@@ -2,6 +2,7 @@ package agentintel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -434,10 +435,19 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
+			var oe *agentexec.OutcomeError
+			if errors.As(err, &oe) {
+				obs.Outcome, obs.Attempts = oe.Outcome, oe.Attempts
+				obs.RetryRecommended = oe.RetryRecommended
+				// An unknown outcome is never re-driven: it only carries a
+				// reconciliation requirement (OPERATIONAL_RELIABILITY §3, §9).
+				obs.ReconciliationRequired = oe.Outcome == "unknown"
+			}
 			return obs, usage, StateFailed, "tool failed: " + err.Error()
 		}
 		obs.Result = out
 		obs.Text = kvString(out)
+		obs.Outcome, obs.Attempts = "completed", 1
 		rn.emit(event.EventTypeToolCompleted, map[string]string{"tool_id": a.Tool, "agent_id": agentID, "status": "ok"})
 		return obs, usage, "", ""
 	case ActionDelegate:

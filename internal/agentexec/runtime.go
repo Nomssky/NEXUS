@@ -482,6 +482,21 @@ type ToolScope struct {
 	CorrelationID string
 }
 
+// OutcomeError reports a failed logical invocation with its terminal
+// outcome/class (OPERATIONAL_RELIABILITY_CONTRACTS §17). It unwraps to the
+// underlying cause text; callers may read Outcome/Attempts directly for
+// observation normalization instead of parsing error text.
+type OutcomeError struct {
+	Outcome                 string
+	Attempts                int
+	RetryRecommended        bool
+	ReconciliationAvailable bool
+	Cause                   error
+}
+
+func (e *OutcomeError) Error() string { return e.Cause.Error() }
+func (e *OutcomeError) Unwrap() error { return e.Cause }
+
 // InvokeToolScoped is the mediated invocation with the full runtime scope
 // (identity, business, division, allowlist, correlation). It is the same
 // boundary as InvokeTool; only the scope is richer.
@@ -501,7 +516,13 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 			DivisionID: scope.DivisionID, AgentTools: allowedTools, CorrelationID: corr,
 		})
 		if res.Status != tool.StatusSuccess {
-			return nil, fmt.Errorf("%s", res.Error)
+			return nil, &OutcomeError{
+				Outcome:                 res.Outcome,
+				Attempts:                res.Attempts,
+				RetryRecommended:        res.RetryRecommended,
+				ReconciliationAvailable: res.ReconciliationAvailable,
+				Cause:                   errors.New(res.Error),
+			}
 		}
 		return res.Result, nil
 	}

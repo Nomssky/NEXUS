@@ -264,6 +264,17 @@ type Observation struct {
 	Result        map[string]string `json:"result,omitempty"`
 	Text          string            `json:"text,omitempty"`
 	Timestamp     time.Time         `json:"timestamp"`
+	// Outcome mirrors the platform terminal classification: completed |
+	// failed | cancelled | timed_out | unknown (OPERATIONAL_RELIABILITY §5).
+	// Empty for memory/delegate/observation paths that are not tool calls.
+	Outcome  string `json:"outcome,omitempty"`
+	Attempts int    `json:"attempts,omitempty"`
+	// RetryRecommended is the platform's class verdict, surfaced rather than
+	// re-derived here: `unknown` always reports false (§3).
+	RetryRecommended bool `json:"retry_recommended,omitempty"`
+	// ReconciliationRequired marks an unknown outcome that an operator must
+	// resolve out of band. It never triggers a background retry (§9).
+	ReconciliationRequired bool `json:"reconciliation_required,omitempty"`
 }
 
 // WorkingMemory is per-execution, process-local scratch state (§11). It dies
