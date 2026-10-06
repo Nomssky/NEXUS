@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
@@ -70,6 +71,10 @@ type Options struct {
 	// the agent definitions in-memory (Level 0 durability) and the agent
 	// surface cap its guarantees on that — matching registry's Posture).
 	Store store.Store
+
+	// Capability configures the shipped capability catalogue (optional; the
+	// zero value registers only the deterministic self-contained tools).
+	Capability CapabilityOptions
 
 	// GatewayOptions are passed through to the gateway server (L-002 test
 	// seam for deterministic listen behavior). Nil/empty in production.
@@ -182,6 +187,29 @@ func New(opts Options) *Launcher {
 	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
 	gwOpts = append(gwOpts, gateway.WithAgentExecution(agentReg, agentRt))
 
+	// Capability & Tool Platform v1 (contracts/CAPABILITY_TOOL_CONTRACTS.md):
+	// the SAME tool registry gains validated manifests and mediated adapters,
+	// and the agent execution runtime's tool boundary runs through the
+	// platform. There is one registry, one invocation path, one credential
+	// boundary and one result/redaction pipeline. Governance stays upstream
+	// and unchanged — the platform performs no policy evaluation of its own.
+	platform, capErr := capabilityPlatform(os.Getenv, opts.Config.Storage.DataDir,
+		agentTools, opts.Memberships, engine.EventBus(), opts.Capability)
+	if capErr != nil {
+		if opts.Logger != nil {
+			opts.Logger.Error("capability platform not registered", logging.Fields{
+				Context: map[string]any{"err": capErr.Error()},
+			})
+		}
+	} else {
+		agentRt.Platform = platform
+		// Registered secret values are handed to the platform for redaction.
+		if v := os.Getenv("NEXUS_TOOL_CREDENTIAL_VALUE"); v != "" {
+			platform.RegisterSecret(v)
+		}
+		gwOpts = append(gwOpts, gateway.WithCapabilityPlatform(platform))
+	}
+
 	// Agent intelligence layer v1: the bounded control loop. It runs inside
 	// the same admitted request pipeline and reuses the agent execution
 	// primitives (tool boundary + delegation) rather than a second framework.
@@ -191,6 +219,11 @@ func New(opts Options) *Launcher {
 	}
 	intelRt := agentintel.New(agentReg, agentRt,
 		&agentintel.Decision{Router: engine.ModelRouter()}, engine.EventBus(), intelMem)
+	if platform != nil {
+		// The bounded capability catalog reaches the decision prompt as
+		// informational discovery; it grants nothing (contract §4/§31).
+		intelRt.Catalog = capabilityCatalog{platform: platform}
+	}
 	gwOpts = append(gwOpts, gateway.WithIntelligence(intelRt))
 	gwOpts = append(gwOpts, opts.GatewayOptions...)
 	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)

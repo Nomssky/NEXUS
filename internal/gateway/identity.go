@@ -113,6 +113,10 @@ func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/intelligence" || strings.HasPrefix(path, "/api/v1/intelligence/") {
 		return true
 	}
+	// Capability & Tool Platform v1 discovery (business-scoped catalog).
+	if path == "/api/v1/tools" || strings.HasPrefix(path, "/api/v1/tools/") {
+		return true
+	}
 	return false
 }
 

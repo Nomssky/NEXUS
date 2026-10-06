@@ -256,6 +256,12 @@ type Secret struct {
 	value []byte
 }
 
+// Value returns the raw secret for the point of use. It is deliberately not a
+// JSON-visible field: callers that need the value (for example a capability
+// tool adapter at the credential boundary) read it here, and it must never be
+// logged, serialized into a result, or returned to a model.
+func (s Secret) Value() []byte { return s.value }
+
 // NewSecret constructs a Secret from a raw value. The value is copied and the
 // caller's slice is not retained.
 func NewSecret(store, name string, value []byte) Secret {

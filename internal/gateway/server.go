@@ -37,6 +37,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/agentintel"
+	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -106,6 +107,9 @@ type Server struct {
 	// intel is the agent intelligence control loop (v1). Nil makes the
 	// objective endpoints fail closed (503).
 	intel *agentintel.Runtime
+	// capability is the Capability & Tool Platform seam (nil ⇒ the discovery
+	// surface fails closed with 503).
+	capability *capability.Platform
 
 	// nexusID stamps the installation identity onto external event
 	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
@@ -276,6 +280,9 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("POST /api/v1/executions", s.handleSubmitExecution)
 	s.mux.HandleFunc("GET /api/v1/executions/{id}", s.handleGetExecution)
 	s.mux.HandleFunc("POST /api/v1/executions/{id}/cancel", s.handleCancelExecution)
+
+	// Capability & Tool Platform v1: informational capability discovery.
+	s.mux.HandleFunc("GET /api/v1/tools", s.handleListTools)
 
 	// Agent intelligence layer v1.
 	s.mux.HandleFunc("POST /api/v1/intelligence/execute", s.handleSubmitIntelligence)

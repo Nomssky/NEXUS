@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -28,8 +29,12 @@ const (
 // ToolCallSpec is one deterministic tool invocation the agent is allowed
 // to make inside this execution.
 type ToolCallSpec struct {
-	ToolID string            `json:"tool_id"`
-	Input  map[string]string `json:"input,omitempty"`
+	ToolID string `json:"tool_id"`
+	// Operation selects an explicit manifest operation when the tool has
+	// more than one (e.g. filesystem: read/write/list). Empty means the
+	// tool's default operation. It never widens what the manifest declares.
+	Operation string            `json:"operation,omitempty"`
+	Input     map[string]string `json:"input,omitempty"`
 }
 
 // Node is one workflow node: an agent task + its bounded inputs.
@@ -82,6 +87,13 @@ const (
 // events, cancellation, and scope checks stay upstream.
 type Runtime struct {
 	Registry *Registry
+	// Platform is the Capability & Tool Platform seam
+	// (contracts/CAPABILITY_TOOL_CONTRACTS.md §5). When set, InvokeTool runs
+	// the full mediated path (manifest, schema, allowlist, scope, permission,
+	// budget, credential, adapter, normalization, redaction). When nil the
+	// pre-platform allowlist+registry path is used, which keeps unit-level
+	// construction of the runtime valid without a platform.
+	Platform *capability.Platform
 	Tools    *tool.ToolRegistry
 	ToolExec map[string]func(ctx context.Context, input map[string]string) (map[string]string, error)
 	Router   *modelrouter.ModelRouter
@@ -418,6 +430,24 @@ func stringIn(list []string, id string) bool {
 	return false
 }
 
+// correlationOf extracts the correlation id carried by the executor context so
+// capability audit events can join the execution trace.
+func correlationOf(ctx context.Context) string {
+	if v, ok := ctx.Value(correlationKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// correlationKey carries the request correlation id into adapter contexts.
+type correlationKey struct{}
+
+// WithCorrelation attaches the execution correlation id to a context so the
+// capability platform can stamp its audit events with it.
+func WithCorrelation(ctx context.Context, correlationID string) context.Context {
+	return context.WithValue(ctx, correlationKey{}, correlationID)
+}
+
 func mustMarshalSpec(s *Spec) string {
 	b, _ := json.Marshal(s)
 	return string(b)
@@ -431,14 +461,49 @@ func (r *Runtime) toolKnown(id string) bool {
 	return ok
 }
 
-// InvokeTool performs one mediated tool call under the *existing* tool
-// boundary: allowlist (agent-owned) → registry existence → deterministic
-// executor. Exported so the intelligence layer reuses this exact boundary
-// instead of introducing a second one. Errors are descriptive; every failure
-// is terminal for the caller (tool failure never becomes success).
+// InvokeTool performs one mediated tool call. With a Platform wired it is the
+// capability platform's single invocation path; without one it is the
+// pre-platform allowlist+registry check over the deterministic executors. Both
+// paths are the *same* boundary from the caller's point of view — there is no
+// second invocation mechanism.
 func (r *Runtime) InvokeTool(ctx context.Context, agentID string, allowedTools []string, businessID string, call ToolCallSpec) (map[string]string, error) {
+	return r.InvokeToolScoped(ctx, ToolScope{BusinessID: businessID, AgentTools: allowedTools}, agentID, call)
+}
+
+// ToolScope carries the runtime-established facts of one tool invocation.
+// Every field is established by the runtime from the admitted request and the
+// agent definition — never from model output
+// (contracts/CAPABILITY_TOOL_CONTRACTS.md §28).
+type ToolScope struct {
+	ActorID       string
+	BusinessID    string
+	DivisionID    string
+	AgentTools    []string
+	CorrelationID string
+}
+
+// InvokeToolScoped is the mediated invocation with the full runtime scope
+// (identity, business, division, allowlist, correlation). It is the same
+// boundary as InvokeTool; only the scope is richer.
+func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID string, call ToolCallSpec) (map[string]string, error) {
+	allowedTools, businessID := scope.AgentTools, scope.BusinessID
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if r.Platform != nil {
+		corr := scope.CorrelationID
+		if corr == "" {
+			corr = correlationOf(ctx)
+		}
+		res := r.Platform.Invoke(ctx, capability.Request{
+			ToolID: call.ToolID, Operation: call.Operation, Input: call.Input,
+			AgentID: agentID, ActorID: scope.ActorID, BusinessID: businessID,
+			DivisionID: scope.DivisionID, AgentTools: allowedTools, CorrelationID: corr,
+		})
+		if res.Status != tool.StatusSuccess {
+			return nil, fmt.Errorf("%s", res.Error)
+		}
+		return res.Result, nil
 	}
 	if strings.TrimSpace(call.ToolID) == "" {
 		return nil, fmt.Errorf("tool id is required")

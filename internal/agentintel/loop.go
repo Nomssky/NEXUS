@@ -89,6 +89,10 @@ type Runtime struct {
 	Caps     Caps
 	Now      func() time.Time
 	Memory   *MemoryStore
+	// Catalog provides the bounded capability catalog for the prompt
+	// (CAPABILITY_TOOL_CONTRACTS §4). Optional: without it the prompt carries
+	// no catalog and tool calls are still validated by the platform.
+	Catalog CatalogProvider
 
 	mu     sync.Mutex
 	states map[string]State
@@ -250,6 +254,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		raw, derr := r.Decider.Decide(loopCtx, DecisionPrompt{
 			Objective: obj.Description, StepID: step.StepID, StepIntent: step.Intent,
 			Observations: observations, BudgetUsage: usage, Budget: budget,
+			Tools: r.toolHints(req, agentID),
 		})
 		if derr != nil {
 			if ctx.Err() != nil {
@@ -363,6 +368,31 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	}
 }
 
+// CatalogProvider yields the bounded capability catalog for one scope.
+type CatalogProvider interface {
+	Catalog(businessID, divisionID string) []ToolHint
+}
+
+// toolHints returns the catalog narrowed to the acting agent's allowlist.
+func (r *Runtime) toolHints(req *executor.WorkRequest, agentID string) []ToolHint {
+	if r.Catalog == nil {
+		return nil
+	}
+	allowed := map[string]struct{}{}
+	for _, t := range r.agentTools(agentID) {
+		allowed[t] = struct{}{}
+	}
+	all := r.Catalog.Catalog(req.BusinessID, req.DivisionID)
+	out := make([]ToolHint, 0, len(all))
+	for _, h := range all {
+		if _, ok := allowed[h.ID]; !ok {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // planner returns the configured planner (advisory model by default).
 func (r *Runtime) planner() Planner {
 	if r.Planner != nil {
@@ -397,8 +427,10 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		usage.ToolCalls++
 		obs := &Observation{ObservationID: newID("obs"), Source: "tool:" + a.Tool, ActionType: ActionToolCall,
 			Status: "ok", Timestamp: r.now()}
-		out, err := r.Exec.InvokeTool(ctx, agentID, r.agentTools(agentID), rn.businessID,
-			agentexec.ToolCallSpec{ToolID: a.Tool, Input: a.Input})
+		out, err := r.Exec.InvokeToolScoped(ctx, agentexec.ToolScope{
+			ActorID: rn.req.ActorID, BusinessID: rn.businessID, DivisionID: rn.divisionID,
+			AgentTools: r.agentTools(agentID), CorrelationID: rn.req.CorrelationID,
+		}, agentID, agentexec.ToolCallSpec{ToolID: a.Tool, Operation: a.Operation, Input: a.Input})
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
@@ -484,6 +516,16 @@ func (s *execScope) AgentVisible(agentID, businessID, divisionID string) bool {
 func (s *execScope) ToolRegistered(toolID string) bool {
 	_, ok := s.tools.Tools.GetTool(toolID)
 	return ok
+}
+
+// ToolSupportsOperation reports whether the tool's manifest declares the
+// operation. The manifest is the only authority: a model cannot invent one.
+func (s *execScope) ToolSupportsOperation(toolID, operation string) bool {
+	m, ok := s.tools.Tools.Manifest(toolID)
+	if !ok {
+		return false
+	}
+	return m.Supports(operation)
 }
 
 func (s *execScope) AgentAllowsTool(agentID, toolID string) bool {

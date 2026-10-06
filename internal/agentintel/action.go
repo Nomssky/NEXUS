@@ -38,8 +38,13 @@ type Action struct {
 	// model_call
 	Prompt string `json:"prompt,omitempty"`
 	// tool_call
-	Tool  string            `json:"tool,omitempty"`
-	Input map[string]string `json:"input,omitempty"`
+	Tool string `json:"tool,omitempty"`
+	// Operation selects an explicit manifest operation for tools that declare
+	// more than one (e.g. filesystem read/write/list, http methods). It is a
+	// closed vocabulary enforced against the manifest — it can never widen
+	// what the tool declares (CAPABILITY_TOOL_CONTRACTS §5).
+	Operation string            `json:"operation,omitempty"`
+	Input     map[string]string `json:"input,omitempty"`
 	// delegate
 	AgentID   string `json:"agent_id,omitempty"`
 	Objective string `json:"objective,omitempty"`
@@ -125,6 +130,13 @@ func extractJSONObject(s string) string {
 	return ""
 }
 
+// OperationResolver is an OPTIONAL ScopeResolver capability: it reports whether
+// a tool manifest declares an operation. When a resolver does not implement it,
+// any explicit operation on a tool_call is rejected (fail closed).
+type OperationResolver interface {
+	ToolSupportsOperation(toolID, operation string) bool
+}
+
 // ActionContext is everything the validator needs to decide an action. It is
 // runtime state, never model-provided.
 type ActionContext struct {
@@ -184,6 +196,11 @@ func ValidateAction(a Action, c *ActionContext, r ScopeResolver, caps Caps) erro
 		}
 		if c.AgentID != "" && !contains(c.AgentTools, a.Tool) {
 			return fmt.Errorf("rejected: tool %q is not in the acting agent's allowlist", a.Tool)
+		}
+		if a.Operation != "" {
+			if ops, ok := r.(OperationResolver); !ok || !ops.ToolSupportsOperation(a.Tool, a.Operation) {
+				return fmt.Errorf("rejected: tool %q does not support operation %q", a.Tool, a.Operation)
+			}
 		}
 		if c.Used.ToolCalls >= c.Budget.MaxToolCalls {
 			return fmt.Errorf("rejected: tool-call budget exhausted (%d)", c.Budget.MaxToolCalls)
@@ -283,6 +300,20 @@ type DecisionPrompt struct {
 	Observations []Observation
 	BudgetUsage  BudgetUsage
 	Budget       Budget
+	// Tools is the bounded capability catalog the acting agent may use
+	// (CAPABILITY_TOOL_CONTRACTS §4/§31): ids, operations, side-effect
+	// classes. It never contains credentials, secret values, internal paths
+	// or authorization internals, and it grants nothing — every invocation is
+	// validated again by the capability platform.
+	Tools []ToolHint
+}
+
+// ToolHint is one entry of the bounded capability catalog.
+type ToolHint struct {
+	ID         string
+	Summary    string
+	Operations []string
+	SideEffect string
 }
 
 // PlanPrompt is the advisory planning request.

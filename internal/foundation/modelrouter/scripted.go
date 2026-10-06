@@ -12,9 +12,31 @@ package modelrouter
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 )
+
+// subjectURL extracts the first URL token from the caller's own text (the
+// objective or step description) — never from the runtime envelope.
+func subjectURL(lower string, i int) string {
+	rest := lower[i:]
+	end := strings.IndexAny(rest, " \t\n\"},")
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
+// fixtureURL lets the deterministic simulation provider point at the
+// black-box suite's local fixture server (loopback must be explicitly
+// enabled via NEXUS_TOOL_HTTP_ALLOW_LOOPBACK=true for this to succeed).
+func fixtureURL() string {
+	if v := os.Getenv("NEXUS_SEEDED_HTTP_FIXTURE"); v != "" {
+		return v
+	}
+	return "http://127.0.0.1:18089/fixture"
+}
 
 // NewScriptedProvider builds the deterministic simulation provider.
 func NewScriptedProvider(cfg ProviderConfig) *ScriptedProvider {
@@ -71,6 +93,7 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 //  3. "delegate", not yet observed -> delegate action
 //  4. "memory"                     -> memory_write, then memory_read
 //  5. named tool, not yet observed -> tool_call for that tool
+//     (calculator, echo, http.request, web.search, filesystem.*, git, data)
 //  6. "replan" with replans == 0    -> replan action
 //  7. otherwise                    -> complete
 //
@@ -91,7 +114,7 @@ func scriptedAnswer(prompt string) string {
 	if strings.HasPrefix(strings.TrimSpace(lower), "system: you are the planner") {
 		return scriptedPlan(objective)
 	}
-	observedTool := func(name string) bool { return strings.Contains(obsBlock, "source=tool:"+name+" ") }
+	observedTool := func(name string) bool { return strings.Contains(obsBlock, "source=tool:"+name) }
 	observed := func(kind string) bool { return strings.Contains(obsBlock, " "+kind+" ok]") }
 
 	switch {
@@ -114,6 +137,33 @@ func scriptedAnswer(prompt string) string {
 		return `{"type":"tool_call","tool":"calculator","input":{"a":"6","b":"7","op":"mul"}}`
 	case strings.Contains(subject, "echo") && !observedTool("echo"):
 		return fmt.Sprintf(`{"type":"tool_call","tool":"echo","input":{"text":%q}}`, objective)
+	case (strings.Contains(subject, "http request") || strings.Contains(subject, "http.request") || strings.Contains(subject, "fetch")) && !observedTool("http.request"):
+		url := fixtureURL()
+		// An explicit URL inside the objective is caller data and wins; the
+		// fixture env URL is the fallback.
+		if i := strings.Index(lower, "http://"); i >= 0 {
+			url = subjectURL(lower, i)
+		} else if i := strings.Index(lower, "https://"); i >= 0 {
+			url = subjectURL(lower, i)
+		}
+		return fmt.Sprintf(`{"type":"tool_call","tool":"http.request","operation":"get","input":{"url":%q}}`, url)
+	case (strings.Contains(subject, "search the web") || strings.Contains(subject, "web research") || strings.Contains(subject, "web.search")) && !observedTool("web.search"):
+		return `{"type":"tool_call","tool":"web.search","input":{"query":"nexus"}}`
+	case strings.Contains(subject, "filesystem") && strings.Contains(subject, "..") && !observedTool("filesystem"):
+		// Traversal attempt: the sandbox must reject it (black-box probe).
+		return `{"type":"tool_call","tool":"filesystem.read","operation":"read","input":{"path":"../../../etc/passwd"}}`
+	case strings.Contains(subject, "filesystem read") && !observedTool("filesystem.read"):
+		return `{"type":"tool_call","tool":"filesystem.read","operation":"read","input":{"path":"notes/intel.txt"}}`
+	case strings.Contains(subject, "filesystem") && !observedTool("filesystem.write"):
+		return `{"type":"tool_call","tool":"filesystem.write","operation":"write","input":{"path":"notes/intel.txt","content":"written during objective"}}`
+	case strings.Contains(subject, "git") && strings.Contains(subject, "escape") && !observedTool("git"):
+		return `{"type":"tool_call","tool":"git","operation":"status","input":{"repo":"../../"}}`
+	case strings.Contains(subject, "git status") && !observedTool("git"):
+		return `{"type":"tool_call","tool":"git","operation":"status","input":{"repo":"."}}`
+	case strings.Contains(subject, "github") && !observedTool("github"):
+		return `{"type":"tool_call","tool":"github.issue.list","operation":"execute","input":{"repo":"owner/repo"}}`
+	case (strings.Contains(subject, "json") || strings.Contains(subject, "structured data") || strings.Contains(subject, "data.json")) && !observedTool("data"):
+		return `{"type":"tool_call","tool":"data","operation":"json.parse","input":{"payload":"{\"a\":1}"}}`
 	case strings.Contains(subject, "replan") && budgetUsed(budgetLine, "replans") == 0:
 		return `{"type":"replan","reason":"the first approach was not sufficient"}`
 	default:

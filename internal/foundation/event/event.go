@@ -47,6 +47,16 @@ const (
 	EventTypeModelStarted   EventType = "model.started"
 	EventTypeToolRequested  EventType = "tool.requested"
 	EventTypeToolStarted    EventType = "tool.started"
+	// Capability & Tool Platform v1 (CAPABILITY_TOOL_CONTRACTS §15): the same
+	// envelope and bus; none of these carry secrets or raw payloads.
+	EventTypeToolRegistered          EventType = "tool.registered"
+	EventTypeToolInvocationStarted   EventType = "tool.invocation.started"
+	EventTypeToolInvocationCompleted EventType = "tool.invocation.completed"
+	EventTypeToolInvocationFailed    EventType = "tool.invocation.failed"
+	EventTypeToolInvocationRejected  EventType = "tool.invocation.rejected"
+	EventTypeToolPermissionDenied    EventType = "tool.permission.denied"
+	EventTypeToolCredentialDenied    EventType = "tool.credential.denied"
+	EventTypeToolResultTruncated     EventType = "tool.result.truncated"
 	// Agent intelligence layer v1 (control loop) events. agent.thinking is
 	// TELEMETRY ONLY — phase/step/action-type/reason-category/attempt; never
 	// raw reasoning, never model prompts (AGENT_INTELLIGENCE_CONTRACTS §13).
