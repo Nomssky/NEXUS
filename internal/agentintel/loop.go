@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -567,7 +568,7 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		// passes through the same admission point as a tool call, with the child
 		// agent as the resource (contract §2).
 		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionDelegate,
-			control.ResourceTypeAgent, a.AgentID, a.Objective); done {
+			control.ResourceTypeAgent, control.DelegateTarget(a.AgentID)); done {
 			return obs, usage, st, msg
 		}
 		rn.emit(event.EventTypeAgentDelegated, map[string]string{"agent_id": a.AgentID, "depth": "1"})
@@ -589,11 +590,22 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	case ActionMemoryWrite:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryWrite,
 			Status: "ok", Timestamp: r.now()}
-		// A durable write is a consequential action. Memory is DATA, never
-		// authority — so the record is admitted on its own merits rather than
-		// being trusted, and the runtime establishes the scope (contract §2, §14).
+		// A durable write is a consequential action, and memory is DATA — never
+		// authority. The target is resolved by the memory platform FIRST, using
+		// the same authorization and clamping Write performs, and that resolved
+		// record id is what governance decides about (contract §6). A model
+		// asking for a broader scope than it may write gets the clamped target
+		// evaluated, not the request.
+		target, terr := r.memoryWriteTarget(rn, agentID, a, observationsFor(working))
+		if terr != nil {
+			// The memory platform refused the candidate outright, so governance
+			// never decided anything. That is an action failure (nothing ran), not
+			// a governance denial — the two axes stay separate.
+			obs.Status, obs.Text = "failed", terr.Error()
+			return obs, usage, StateFailed, "memory_write failed: " + terr.Error()
+		}
 		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionMemoryWrite,
-			control.ResourceTypeMemory, control.MemoryResource(string(a.MemoryScope), a.Key), a.Value); done {
+			control.ResourceTypeMemory, control.MemoryResource(target.RecordID)); done {
 			return obs, usage, st, msg
 		}
 		rec, err := r.memoryWrite(rn, agentID, a, observationsFor(working))
@@ -630,9 +642,36 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	case ActionMemoryDelete:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryDelete,
 			Status: "ok", Timestamp: r.now()}
-		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionMemoryDelete,
-			control.ResourceTypeMemory, control.MemoryResource(string(a.MemoryScope), a.Key), ""); done {
-			return obs, usage, st, msg
+		// A delete removes EVERY record the caller can see under that key, across
+		// scopes. The runtime therefore resolves the actual affected set first
+		// (through the authorized query path, which is the same query the delete
+		// performs) and governance decides about that set — not about a
+		// model-supplied scope (contract §6).
+		targets, terr := r.memoryDeleteTargets(rn, agentID, a.Key)
+		if terr != nil {
+			obs.Status, obs.Text = "failed", terr.Error()
+			return obs, usage, StateFailed, "memory_delete failed: " + terr.Error()
+		}
+		if len(targets) == 0 {
+			// Nothing is visible under that key: the delete removes nothing, so
+			// there is no effect to admit. Report it honestly instead of asking
+			// governance about an effect that cannot happen.
+			obs.Status, obs.Text = "notfound", "no memory for key "+a.Key
+			return obs, usage, "", ""
+		}
+		adm, aerr := r.admitMemoryDelete(rn, agentID, targets)
+		if aerr != nil {
+			// No controller is a governance availability failure, which is a
+			// denial by design (fail closed), not a generic failure.
+			obs.Status, obs.Text = "denied", aerr.Error()
+			obs.Result = map[string]string{
+				"governance_outcome": governance.DENY.String(),
+				"action":             control.ActionMemoryDelete,
+			}
+			return obs, usage, StateDenied, "memory_delete denied: " + aerr.Error()
+		}
+		if obs2, st, msg, done := finishMemoryDeleteAdmission(obs, adm); done {
+			return obs2, usage, st, msg
 		}
 		n, err := r.memoryDelete(rn, agentID, a.Key)
 		if err != nil {
@@ -782,16 +821,25 @@ func rejectionSummary(res ValidationResult) string {
 	return strings.Join(parts, "; ")
 }
 
-// admitNonTool runs governance admission for a consequential action that is not
-// a mediated tool call: delegation (it starts another execution) and durable
-// memory writes/deletes (they change persistent state). The same controller, the
-// same five outcomes and the same fail-closed rule apply, so no consequential
-// agent action reaches its side effect un-admitted.
+// admitNonTool runs governance admission AND constraint enforcement for a
+// consequential action that is not a mediated tool call: delegation (it starts
+// another execution) and durable memory writes/deletes (they change persistent
+// state).
+//
+// target is the RUNTIME-ESTABLISHED thing the effect will actually touch — the
+// child agent id, or the record id the memory platform derived — never a value
+// the model chose. That is what makes the decision meaningful and what makes
+// constraint enforcement possible: an allowlist is compared against the real
+// effect, not the request.
+//
+// An ALLOW_WITH_CONSTRAINTS is not enough to proceed. Every returned constraint
+// is checked against target through the single shared enforcement point, and a
+// constraint the runtime cannot enforce fails closed (contract §4).
 //
 // It returns done=false when the action may proceed. The caller keeps its own
 // observation so the status, source and action type stay correct; a refused
 // action returns the observation with the governance state instead.
-func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource, detail string) (
+func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource string) (
 	*Observation, State, string, bool) {
 	obs := &Observation{ObservationID: newID("obs"), Timestamp: r.now(),
 		Source: "governance", ActionType: ActionType(action)}
@@ -828,6 +876,30 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource,
 		return obs, StateDenied, obs.Text, true
 	}
 	if adm.Allowed() {
+		// ALLOW or ALLOW_WITH_CONSTRAINTS. The constraints are enforced here, not
+		// merely recorded: an unchecked ALLOW_WITH_CONSTRAINTS must never reach
+		// the effect.
+		effect, cerr := control.ConstrainEffect(action, resource, adm)
+		if cerr != nil {
+			obs.Status = "denied"
+			obs.Text = cerr.Error()
+			obs.Result = map[string]string{
+				"governance_outcome": governance.DENY.String(),
+				"action":             action,
+				"constraint_failure": "unenforceable",
+			}
+			rn.emit(event.EventTypeActionRejected, map[string]string{
+				"action": action, "reason": "constraint cannot be enforced (fail closed)"})
+			return obs, StateDenied, cerr.Error(), true
+		}
+		// Constraints were satisfied by this very effect; that is an admission
+		// fact, so it rides the existing proposal fact rather than a new event.
+		for _, applied := range effect.Applied {
+			rn.emit(event.EventTypeActionProposed, map[string]string{
+				"action": action, "status": "constrained",
+				"constraint_id": applied.ID, "constraint_type": applied.Kind,
+			})
+		}
 		return nil, "", "", false
 	}
 	obs.Text = admissionMessage(adm)
@@ -853,6 +925,84 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource,
 		obs.Status = "denied"
 		return obs, StateDenied, obs.Text, true
 	}
+}
+
+// admitMemoryDelete admits a delete whose effect spans a SET of records. The
+// proposal names the resolved set (each record the caller can actually see under
+// the key), so a policy that pins specific records is checked against the real
+// target set instead of a model-supplied scope.
+func (r *Runtime) admitMemoryDelete(rn *run, agentID string, recordIDs []string) (control.Admission, error) {
+	if r.Exec == nil || r.Exec.Controller == nil {
+		return control.Admission{}, fmt.Errorf("no governance controller configured (fail closed)")
+	}
+	return r.Exec.Controller.Admit(control.Proposal{
+		ProposalID:    newID("prop"),
+		CorrelationID: rn.execID, ExecutionID: rn.execID, ObjectiveID: rn.execID,
+		StepID:     rn.req.TaskID,
+		ActorID:    rn.req.ActorID,
+		AgentID:    agentID,
+		BusinessID: rn.businessID, DivisionID: rn.divisionID,
+		Action:       control.ActionMemoryDelete,
+		Resource:     memoryDeleteResource(recordIDs),
+		ResourceType: control.ResourceTypeMemory,
+		// The resolved records travel as bounded evaluation context so a policy
+		// can be written against them, never as authority.
+		Context: map[string]string{"record_count": fmt.Sprint(len(recordIDs))},
+	})
+}
+
+// memoryDeleteResource renders the resolved target set as ONE stable resource id,
+// so a policy's resource_ids can name an exact multi-record delete.
+func memoryDeleteResource(recordIDs []string) string {
+	sorted := append([]string(nil), recordIDs...)
+	sort.Strings(sorted)
+	return "memory-delete:" + strings.Join(sorted, ",")
+}
+
+// finishMemoryDeleteAdmission applies the shared non-tool enforcement rules to a
+// delete admission: constraints are enforced against every record in the resolved
+// set, and a blocked decision stops the delete.
+func finishMemoryDeleteAdmission(obs *Observation, adm control.Admission) (*Observation, State, string, bool) {
+	if adm.Allowed() {
+		effect, cerr := control.ConstrainEffect(control.ActionMemoryDelete, adm.Proposal.Resource, adm)
+		if cerr != nil {
+			obs.Status, obs.Text = "denied", cerr.Error()
+			return obs, StateDenied, cerr.Error(), true
+		}
+		for _, applied := range effect.Applied {
+			obs.Result = appendConstraintEvidence(obs.Result, applied)
+		}
+		return obs, "", "", false
+	}
+	obs.Text = admissionMessage(adm)
+	obs.Status = "denied"
+	obs.Result = map[string]string{"governance_outcome": adm.Decision.Outcome.String(),
+		"action": control.ActionMemoryDelete}
+	if adm.ApprovalID != "" {
+		obs.Result["approval_id"] = adm.ApprovalID
+	}
+	if adm.EscalationID != "" {
+		obs.Result["escalation_id"] = adm.EscalationID
+	}
+	switch adm.Decision.Outcome {
+	case governance.REQUIRE_APPROVAL:
+		obs.Status = "pending_approval"
+		return obs, StatePendingApproval, obs.Text, true
+	case governance.ESCALATE:
+		obs.Status = "escalated"
+		return obs, StateEscalated, obs.Text, true
+	default:
+		return obs, StateDenied, obs.Text, true
+	}
+}
+
+func appendConstraintEvidence(dst map[string]string, c control.EffectiveConstraint) map[string]string {
+	if dst == nil {
+		dst = map[string]string{}
+	}
+	dst["constraint_id"] = c.ID
+	dst["constraint_type"] = c.Kind
+	return dst
 }
 
 func admissionMessage(adm control.Admission) string {

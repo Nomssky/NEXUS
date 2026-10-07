@@ -150,6 +150,64 @@ func Constrain(toolID, operation string, limits Limits, adm Admission) (Constrai
 	return cr, nil
 }
 
+// ConstrainEffect is the single reusable enforcement point for a consequential
+// effect that is NOT a capability invocation: delegation, a durable memory write
+// and a durable memory delete all pass through it (contract §4).
+//
+// It exists so a constraint can never be merely recorded. The caller supplies the
+// RUNTIME-ESTABLISHED target — the thing the effect will actually touch, never a
+// value the model chose — and this function decides, before the effect, whether
+// every returned constraint holds for it:
+//
+//   - a mandatory constraint the runtime cannot check for this action type fails
+//     closed (ErrConstraintUnenforceable), which is the honest answer when the
+//     runtime cannot prove compliance;
+//   - an allowlist constraint admits exactly the values it names and rejects
+//     everything else, including an empty value that cannot be identified;
+//   - advisory constraints are recorded, never enforced, by construction: they
+//     are not present in Admission.Effective.
+//
+// targetKind selects which comparison applies: a delegation is constrained by the
+// delegate target id, a memory mutation by the resolved record id.
+func ConstrainEffect(targetKind string, target string, adm Admission) (EffectConstraint, error) {
+	ec := EffectConstraint{Kind: targetKind, Target: target}
+	for _, c := range adm.Effective {
+		if target == "" {
+			// A restriction cannot be checked against an unidentified target, and
+			// failing open here would let a constraint be skipped by omitting the
+			// target.
+			return ec, fmt.Errorf("%w: %s constraint %q cannot be checked against an unidentified target",
+				ErrConstraintUnenforceable, targetKind, c.ID)
+		}
+		switch c.Kind {
+		case ConstraintToolAllowlist, ConstraintOperationAllowlist, ConstraintResourceRestrict:
+			if !c.Allows(target) {
+				return ec, fmt.Errorf("%w: %s %q is outside the allowed set of %s",
+					ErrConstraintUnenforceable, targetKind, target, c.ID)
+			}
+			ec.Applied = append(ec.Applied, c)
+		case ConstraintMaxDuration:
+			// A duration bound is meaningful only for an effect that has a
+			// deadline. A non-tool effect has none, so enforcing it is impossible
+			// rather than satisfied — fail closed instead of ignoring it.
+			return ec, fmt.Errorf("%w: %s constraint %q has no duration to bound",
+				ErrConstraintUnenforceable, targetKind, c.ID)
+		default:
+			return ec, fmt.Errorf("%w: %s constraint type %q is not enforceable for %s",
+				ErrConstraintUnenforceable, targetKind, c.Kind, targetKind)
+		}
+	}
+	return ec, nil
+}
+
+// EffectConstraint is the proven-compliant view of a non-tool effect: the target
+// the runtime established, and the constraints that were checked against it.
+type EffectConstraint struct {
+	Kind    string
+	Target  string
+	Applied []EffectiveConstraint
+}
+
 // Limits is the minimal shape of the capability limits a constraint tightens.
 type Limits struct {
 	MaxDuration time.Duration

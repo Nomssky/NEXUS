@@ -27,21 +27,21 @@ func observationsFor(w *WorkingMemory) []Observation {
 // request — an observation id. It may never choose provenance or trust, may not
 // widen its scope, and a promoted observation takes its CONTENT from the
 // runtime's observation rather than from the model.
-func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []Observation) (memory.Record, error) {
-	if r.Memory == nil {
-		return memory.Record{}, fmt.Errorf("memory: no memory platform configured")
-	}
-	id := r.memoryIdentity(rn, agentID)
+// memoryCandidate builds the candidate a write WOULD use, including the
+// promotion rules. It is the single place that candidate is constructed, so the
+// target resolution and the mutation can never drift apart (contract §6).
+func (r *Runtime) memoryCandidate(id memory.Identity, a Action, observations []Observation) (memory.Candidate, memory.WriterKind, error) {
 	cand := memory.Candidate{
 		Key:   a.Key,
 		Value: a.Value,
 		Type:  memory.Type(a.MemoryType),
 		Scope: memory.Scope(a.MemoryScope),
 	}
+	kind := memory.WriterAgent
 	if obsID := strings.TrimSpace(a.ObservationID); obsID != "" {
 		obs, ok := findObservation(observations, obsID)
 		if !ok {
-			return memory.Record{}, fmt.Errorf("memory: observation %q is not part of this execution", obsID)
+			return memory.Candidate{}, "", fmt.Errorf("memory: observation %q is not part of this execution", obsID)
 		}
 		// Promotion: content and provenance come from the runtime's own
 		// observation. The reliability outcome travels with it and is never
@@ -55,11 +55,57 @@ func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []
 		cand.RetryRecommended = obs.RetryRecommended
 		cand.ReconciliationRequired = obs.ReconciliationRequired
 		if cand.Value == "" {
-			return memory.Record{}, fmt.Errorf("memory: observation %q carries no content to promote", obsID)
+			return memory.Candidate{}, "", fmt.Errorf("memory: observation %q carries no content to promote", obsID)
 		}
-		return r.Memory.Write(id, memory.WriterObservation, cand)
+		kind = memory.WriterObservation
 	}
-	return r.Memory.Write(id, memory.WriterAgent, cand)
+	return cand, kind, nil
+}
+
+// memoryWriteTarget resolves the RUNTIME-ESTABLISHED destination of a write
+// through the memory platform's own authorization and scope clamping, without
+// mutating anything. Governance then decides about that target (contract §6).
+func (r *Runtime) memoryWriteTarget(rn *run, agentID string, a Action, observations []Observation) (memory.WriteTarget, error) {
+	if r.Memory == nil {
+		return memory.WriteTarget{}, fmt.Errorf("memory: no memory platform configured")
+	}
+	id := r.memoryIdentity(rn, agentID)
+	cand, kind, err := r.memoryCandidate(id, a, observations)
+	if err != nil {
+		return memory.WriteTarget{}, err
+	}
+	return r.Memory.ResolveWriteTarget(id, kind, cand)
+}
+
+// memoryDeleteTargets resolves the set of records a delete would ACTUALLY remove:
+// every record the caller is authorized to see under that key, across scopes.
+// It uses the same authorized query the delete then performs.
+func (r *Runtime) memoryDeleteTargets(rn *run, agentID, key string) ([]string, error) {
+	if r.Memory == nil || strings.TrimSpace(key) == "" {
+		return nil, nil
+	}
+	id := r.memoryIdentity(rn, agentID)
+	res, err := r.Memory.Query(id, memory.Query{BusinessID: id.BusinessID, Key: key})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(res.Records))
+	for _, rec := range res.Records {
+		ids = append(ids, rec.ID)
+	}
+	return ids, nil
+}
+
+func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []Observation) (memory.Record, error) {
+	if r.Memory == nil {
+		return memory.Record{}, fmt.Errorf("memory: no memory platform configured")
+	}
+	id := r.memoryIdentity(rn, agentID)
+	cand, kind, err := r.memoryCandidate(id, a, observations)
+	if err != nil {
+		return memory.Record{}, err
+	}
+	return r.Memory.Write(id, kind, cand)
 }
 
 // memoryRead resolves one key through the authorized query path.
