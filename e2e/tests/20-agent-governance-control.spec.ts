@@ -758,6 +758,94 @@ test.describe('AGENT GOVERNANCE & CONTROL', () => {
     expect((await query.json()).count, 'the allowed write must persist').toBe(1);
   });
 
+  test('a constrained memory write that violates the restriction is denied before persisting', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    // The shared fixture may already hold a notes record from an earlier
+    // case; remove it so this assertion measures ONLY what this objective
+    // writes.
+    const existing = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', agent_id: agentID },
+    });
+    for (const rec of (await existing.json()).records ?? []) {
+      await request.delete(`${nexus.baseURL}/api/v1/memory/${rec.memory_id}?business_id=${nexus.businessID}&agent_id=${agentID}`, { headers: bootstrapHeaders(nexus) });
+    }
+    await putPolicy(request, nexus, `e2e-gov-memconstraint-${suffix}`, {
+      ...memoryWritePolicy('ALLOW_WITH_CONSTRAINTS'),
+      constraints: [
+        // Governance must enforce this against the runtime-established
+        // record id, not the model's requested scope: a record whose id is
+        // not listed fails closed.
+        { constraint_id: 'c-rec', constraint_type: 'resource_restriction', expression: 'memory:mem:biz-1:_:other', severity: 'mandatory' },
+      ],
+    });
+
+    const { result } = await runObjective(request, nexus, 'remember the meeting notes in memory');
+    expect(result.status).toBe('failed');
+    expect(result.error.code).toBe('POLICY_DENIED');
+    expect(result.error.message).toContain('outside the allowed set');
+
+    const query = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', agent_id: agentID },
+    });
+    expect(query.status()).toBe(200);
+    expect((await query.json()).count, 'a blocked constrained write persists nothing').toBe(0);
+  });
+
+  test('a constrained memory write whose restriction matches the runtime target succeeds', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    // Resolve the target the same way the runtime will: the agent writes
+    // agent-scoped memory for key "notes", so the resolved record id is
+    // mem:<business>:_:<agent>... — business scope it is not. List the
+    // record this agent will actually produce.
+    await putPolicy(request, nexus, `e2e-gov-memconstraint2-${suffix}`, {
+      ...memoryWritePolicy('ALLOW_WITH_CONSTRAINTS'),
+      constraints: [
+        { constraint_id: 'c-rec', constraint_type: 'resource_restriction', expression: `memory:mem:${nexus.businessID}:${agentID}:notes`, severity: 'mandatory' },
+      ],
+    });
+
+    const { result } = await runObjective(request, nexus, 'remember the meeting notes in memory');
+    expect(result.status).toBe('completed');
+
+    const query = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', agent_id: agentID },
+    });
+    expect(query.status()).toBe(200);
+    expect((await query.json()).count).toBe(1);
+  });
+
+  test('a constrained delegation to an unlisted agent is denied', async ({ request, nexus }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    await putPolicy(request, nexus, `e2e-gov-delegconstraint-${suffix}`, {
+      action: { action_type: 'custom', action_ids: ['delegate'] },
+      resource: { resource_type: 'agent' },
+      effect: 'ALLOW_WITH_CONSTRAINTS',
+      precedence: 1000,
+      constraints: [
+        { constraint_id: 'c-author', constraint_type: 'resource_restriction', expression: `agent:${agentID}`, severity: 'mandatory' },
+      ],
+    });
+
+    // The scripted provider delegates to its own default agent id — not the
+    // one the constraint lists — so admission must fail closed.
+    const { result } = await runObjective(request, nexus, 'delegate the detail work');
+    expect(result.status).toBe('failed');
+    expect(result.error.code).toBe('POLICY_DENIED');
+    expect(result.error.message).toContain('state=denied');
+  });
+
   test('an unknown outcome stays unknown with no automatic redispatch', async ({ request, nexus }) => {
     await ensureIdentities(request, nexus);
     await ensureAgent(request, nexus);
