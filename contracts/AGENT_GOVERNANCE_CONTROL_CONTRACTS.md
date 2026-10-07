@@ -125,11 +125,16 @@ resolve target → governance admission → constraint enforcement → execute E
 ```
 
 There is no independently re-resolved target between admission and mutation. A
-delete deletes exactly the admitted record ids (`Platform.DeleteExact`, all or
-nothing: if one admitted id is no longer available or authorized the whole
-delete fails closed rather than mutating a smaller set), and a write re-derives
-its target immediately before `Write` and refuses to write if that derivation
-differs from the admitted one (contract §6). Model-supplied scope, key or record
+delete deletes exactly the admitted record ids and does so as ONE atomic batch:
+every id is verified first, the storage mutation is a single `store.DeleteBatch`
+(never a per-record loop), and any failure leaves the store untouched and
+publishes no deletion event — a governed delete is never partially applied and
+never reported as applied when it was not (`Platform.DeleteExact`, contract
+memory §10). A write is executed with `Platform.WriteBound`: the platform
+re-derives the target inside the same critical section that guards the mutation,
+compares it to the admitted target, and persists the record built from that
+compared target, so a mismatch — or an authorization that no longer holds —
+refuses the write before anything is stored. Model-supplied scope, key or record
 selection carries no authority after admission.
 
 ### Which actions are admitted

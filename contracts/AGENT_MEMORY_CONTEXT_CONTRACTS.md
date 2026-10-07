@@ -154,6 +154,14 @@ writer = system | agent | observation
 The model cannot widen scope, write into another business, impersonate another
 agent, forge provenance/trust, or alter governance.
 
+A write whose target was resolved **before** governance saw it is executed with
+`write_bound`: the platform re-derives the target inside the same critical
+section that guards the mutation, compares it to the resolved one, and persists
+the record built from that compared target. A mismatch, or an authorization that
+no longer holds, refuses the write **before** anything is stored — the effect can
+never be a different record than the one that was resolved. There is no window
+between the target check and the mutation.
+
 ## 8. Conflicts
 
 The conflict namespace is the record's `subject` (defaulting to its key). If two
@@ -177,6 +185,11 @@ refresh `updated_at` while preserving `created_at` and the original `source`.
 
 * `delete` — soft delete via the store; the record disappears from every normal
   read immediately (`status=deleted`).
+* `delete_exact` — removes a caller-named set of records as ONE atomic step:
+  every id is verified first, the storage mutation is a single batch, and a
+  failure anywhere leaves the store exactly as it was. A governed memory delete
+  (§ governance contract §2) uses this and never a per-record loop, so a
+  partially applied deletion is not representable.
 * `expire` — `expires_at` in the past; excluded from normal retrieval, still
   auditable by id.
 * no undeclared retention: nothing is deleted in the background, and there are no
