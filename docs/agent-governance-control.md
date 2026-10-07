@@ -108,7 +108,23 @@ not commentary. The enforced set is closed:
 | `tool_allowlist` | comma-separated tool ids | another tool fails closed |
 | `operation_allowlist` | comma-separated operations | another operation fails closed |
 | `max_duration_ms` | positive integer ms | tightens the call budget (never widens) |
-| `resource_restriction` | comma-separated resource ids | another resource fails closed |
+| `resource_restriction` | comma-separated resource ids | a resource that is not listed fails closed |
+
+The effect a constraint guards is the one the effect will actually perform:
+for a tool call it is the constrained capability; for a delegation it is the
+child agent id (`agent:`); for a memory write it is the resolved record id
+(`memory:mem:...`); for a memory delete it is the resolved set of record ids
+(`memory-delete:...`). For a memory effect the resource is the id the memory
+platform derives by replaying its own authorization and scope clamping — never
+the scope the model requested — so this is what the operator should list:
+
+```jsonc
+{ "constraint_id": "c-rec", "constraint_type": "resource_restriction",
+  "expression": "memory:mem:<business>:<agent>:<key>", "severity": "mandatory" }
+```
+
+A `max_duration_ms` constraint does not apply to a non-tool effect, which has no
+external deadline; it fails closed there rather than passing as unenforced.
 
 Rules worth knowing:
 
@@ -120,6 +136,10 @@ Rules worth knowing:
 - A model cannot remove, weaken or "ignore" a constraint: constraints travel from
   the decision into the request, and the capability platform still applies its
   own allowlist, scope and manifest gates afterwards.
+- Enforcement is not tool-only. The same admission controller runs for a
+  delegation and for a durable memory write/delete, comparing the returned
+  constraints against the runtime-established target (`control.ConstrainEffect`);
+  a target that fails the constraint denies the action before the effect.
 
 ## Approvals
 
