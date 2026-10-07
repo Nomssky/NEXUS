@@ -14,6 +14,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
+	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
@@ -256,7 +257,10 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 	}, nil
 }
 
-// runAgentUnit executes tools→model for one agent inside one execution.
+// runAgentUnit executes tools→model for one agent inside one execution. The
+// gather phase runs through InvokeToolScoped — the single mediated tool path —
+// so a tool an agent executes here is admitted by governance and executed by the
+// capability platform exactly as it is inside an intelligence loop.
 func runAgentUnit(req *executor.WorkRequest, ctx context.Context, start time.Time, tools []ToolCallSpec, a *Definition, rt *Runtime) (*executor.Outcome, *executor.Outcome) {
 	r := rt
 	// Gather-phase: bounded, deterministic tools.
@@ -273,26 +277,56 @@ func runAgentUnit(req *executor.WorkRequest, ctx context.Context, start time.Tim
 				Duration: r.now().Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
 				CreatedAt: start, CompletedAt: r.now()}
 		}
-		execFn, hasExec := r.ToolExec[t.ToolID]
-		if !hasExec || execFn == nil {
-			return nil, &executor.Outcome{TaskID: req.TaskID, AgentID: a.ID, Status: "failed",
-				Error:    fmt.Sprintf("tool %q has no executor", t.ToolID),
-				Duration: r.now().Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
-				CreatedAt: start, CompletedAt: r.now()}
+		// The gather phase executes through the ONE mediated tool path, so it
+		// inherits governance admission, the agent allowlist, the capability
+		// platform's manifest/credential/redaction gates and operational
+		// reliability. Calling execFn directly here was a bypass of all of them
+		// (AGENT_GOVERNANCE_CONTROL_CONTRACTS §6).
+		scope := ToolScope{
+			ActorID: req.ActorID, BusinessID: req.BusinessID, DivisionID: req.DivisionID,
+			AgentTools: a.AllowedTools, CorrelationID: req.CorrelationID,
 		}
-		// Allowlist: the caller's tool set must be a subset of the agent's.
-		if !stringIn(a.AllowedTools, t.ToolID) {
-			return nil, &executor.Outcome{TaskID: req.TaskID, AgentID: a.ID, Status: "failed",
-				Error:    fmt.Sprintf("tool %q is not in the agent allowlist", t.ToolID),
-				Duration: r.now().Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,
-				CreatedAt: start, CompletedAt: r.now()}
-		}
-		r.emit(event.EventTypeToolRequested, req, req.ActorID, "requested",
-			map[string]string{"tool_id": t.ToolID, "agent_id": a.ID})
-		r.emit(event.EventTypeToolStarted, req, req.ActorID, "started",
-			map[string]string{"tool_id": t.ToolID, "agent_id": a.ID})
-		out, err := execFn(ctx, t.Input)
+		out, err := r.InvokeToolScoped(ctx, scope, a.ID, ToolCallSpec{
+			ToolID: t.ToolID, Operation: t.Operation, Input: t.Input,
+		})
 		if err != nil {
+			// A governance refusal is reported with its own state rather than as
+			// a plain tool failure, exactly as the intelligence loop does it.
+			var ae *AdmissionError
+			if errors.As(err, &ae) {
+				status, detail := "denied", ae.Error()
+				switch ae.Outcome {
+				case governance.REQUIRE_APPROVAL:
+					status, detail = "pending_approval", ae.Error()
+				case governance.ESCALATE:
+					status, detail = "escalated", ae.Error()
+				}
+				return nil, &executor.Outcome{
+					TaskID: req.TaskID, AgentID: a.ID, Status: status,
+					Error:    fmt.Sprintf("state=%s: %s", status, detail),
+					Output:   "state=" + status,
+					Duration: r.now().Sub(start), CorrelationID: req.CorrelationID,
+					BusinessID: req.BusinessID, CreatedAt: start, CompletedAt: r.now(),
+					ApprovalID: ae.ApprovalID, EscalationRef: ae.EscalationID,
+				}
+			}
+			// Operational Reliability: an outcome the platform could not determine
+			// stays `unknown` and is never re-dispatched by the caller.
+			var oe *OutcomeError
+			if errors.As(err, &oe) {
+				status := "failed"
+				if oe.Outcome == "unknown" {
+					status = "unknown"
+				}
+				return nil, &executor.Outcome{
+					TaskID: req.TaskID, AgentID: a.ID, Status: status,
+					Error:    fmt.Sprintf("tool %q %s: %v", t.ToolID, oe.Outcome, err),
+					Output:   fmt.Sprintf("outcome=%s attempts=%d", oe.Outcome, oe.Attempts),
+					Evidence: []string{fmt.Sprintf("outcome=%s retry_recommended=%t", oe.Outcome, oe.RetryRecommended)},
+					Duration: r.now().Sub(start), CorrelationID: req.CorrelationID,
+					BusinessID: req.BusinessID, CreatedAt: start, CompletedAt: r.now(),
+				}
+			}
 			return nil, &executor.Outcome{TaskID: req.TaskID, AgentID: a.ID, Status: "failed",
 				Error:    fmt.Sprintf("tool %q failed: %v", t.ToolID, err),
 				Duration: r.now().Sub(start), CorrelationID: req.CorrelationID, BusinessID: req.BusinessID,

@@ -63,6 +63,9 @@ func execFixtureNew(t *testing.T, providerStatus modelrouter.ProviderStatus) *ex
 	toolReg := tool.NewToolRegistry()
 	agents := agentexec.NewRegistry("nx:nexus:test", reg, toolReg)
 	rt := agentexec.NewRuntime(agents, toolReg, engine.ModelRouter(), engine.EventBus())
+	// The gather phase runs through the mediated tool path, so admission is
+	// mandatory here exactly as it is in the launcher.
+	rt.Controller = engine.Controller()
 
 	// bootstrap membership for the fixture owner
 	members.Add(identity.Membership{IdentityID: "owner", BusinessID: "default", Role: identity.RoleAdmin, Status: identity.StatusActive})
