@@ -524,3 +524,44 @@ func TestActionApprovalEventsAreMetadataOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestApprovalDoesNotOverrideAChangedPolicy(t *testing.T) {
+	h := &actionGateHandler{tool: "http.request"}
+	e := newActionControlEngine(t, h, actionPolicy("p-gate", governance.REQUIRE_APPROVAL, "http.request", nil))
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-polchanged", Context: NewRequestContext("exec-polchanged", "biz-1", "user-1"),
+		Intent: "gate", Handler: h.handle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approvalID := approvalIDFrom(awaitResult(t, e, "exec-polchanged"))
+	if approvalID == "" {
+		t.Fatal("expected an approval id")
+	}
+	if err := e.ApproveRequest(approvalID, "biz-1", "approver-1", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if res := awaitResult(t, e, "exec-polchanged"); res.Status != "completed" {
+		t.Fatalf("the resumed run must complete: %+v", res.Error)
+	}
+
+	// The policy then changes: the same action is now unconditionally denied.
+	e.Governance().SetPolicies([]*governance.Policy{
+		e.Governance().Policies()[0],
+		actionPolicy("p-nowdeny", governance.DENY, "http.request", nil),
+	})
+	// A FRESH approval for the same gated action is opened.
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-polchanged-2", Context: NewRequestContext("exec-polchanged-2", "biz-1", "user-1"),
+		Intent: "gate again", Handler: h.handle,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res := awaitResult(t, e, "exec-polchanged-2")
+	if res.Status != "failed" || res.Error == nil || res.Error.Code != "POLICY_DENIED" {
+		t.Fatalf("the changed policy must decide now: %+v", res.Error)
+	}
+	if h.effectCount() != 1 {
+		t.Fatalf("only the first, approved run may have executed: %d", h.effectCount())
+	}
+}

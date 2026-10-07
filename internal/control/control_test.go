@@ -469,10 +469,63 @@ func TestRiskForSideEffectClasses(t *testing.T) {
 }
 
 func TestMemoryResourceRendering(t *testing.T) {
-	if got := MemoryResource("agent", "notes"); got != "memory:agent/notes" {
+	// The resource is the runtime-established RECORD id, never a
+	// model-requested scope: the memory platform may clamp a request to a
+	// narrower scope, and governance must decide about the effect.
+	recordID := "mem:biz-1:governed-agent:notes"
+	if got := MemoryResource(recordID); got != "memory:"+recordID {
 		t.Fatalf("memory resource id = %q", got)
 	}
-	if !strings.HasPrefix(MemoryResource("business", "k"), "memory:") {
+	if !strings.HasPrefix(MemoryResource("mem:x"), "memory:mem:") {
 		t.Fatalf("a memory resource must be namespaced")
+	}
+	if got := DelegateTarget("agent-7"); got != "agent:agent-7" {
+		t.Fatalf("delegate resource id = %q", got)
+	}
+}
+
+// --- non-tool constraint enforcement (contract §4) ---------------------------
+
+func TestConstrainEffectEnforcesAgainstTheRealTarget(t *testing.T) {
+	adm := Admission{Effective: []EffectiveConstraint{
+		{Kind: ConstraintResourceRestrict, ID: "c1", Allowed: []string{"memory:mem:biz:a:notes"}},
+	}}
+	effect, err := ConstrainEffect(ActionMemoryWrite, "memory:mem:biz:a:notes", adm)
+	if err != nil {
+		t.Fatalf("a satisfied constraint must admit the effect: %v", err)
+	}
+	if len(effect.Applied) != 1 {
+		t.Fatalf("the satisfied constraint must be recorded: %+v", effect)
+	}
+
+	if _, err := ConstrainEffect(ActionMemoryWrite, "memory:mem:biz:a:other", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("a target outside the constraint must fail closed, got %v", err)
+	}
+}
+
+func TestConstrainEffectNeverTrustsAnUnidentifiedTarget(t *testing.T) {
+	adm := Admission{Effective: []EffectiveConstraint{
+		{Kind: ConstraintResourceRestrict, ID: "c1", Allowed: []string{"a"}},
+	}}
+	if _, err := ConstrainEffect(ActionDelegate, "", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("an empty target must fail closed, got %v", err)
+	}
+}
+
+func TestConstrainEffectRejectsADurationConstraintOnANonToolEffect(t *testing.T) {
+	adm := Admission{Effective: []EffectiveConstraint{
+		{Kind: ConstraintMaxDuration, ID: "c-time", MaxDuration: time.Second},
+	}}
+	if _, err := ConstrainEffect(ActionMemoryDelete, "memory:mem:x", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("a duration bound cannot be verified for a non-tool effect: %v", err)
+	}
+}
+
+func TestConstrainEffectRejectsAnUnknownType(t *testing.T) {
+	adm := Admission{Effective: []EffectiveConstraint{
+		{Kind: "temperature_limit", ID: "c-x"},
+	}}
+	if _, err := ConstrainEffect(ActionDelegate, "agent:helper", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("an unknown constraint type must fail closed, got %v", err)
 	}
 }

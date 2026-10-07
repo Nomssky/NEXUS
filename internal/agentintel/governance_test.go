@@ -448,3 +448,134 @@ func TestLoopMemoryDeleteIsAdmitted(t *testing.T) {
 		t.Fatalf("a denied delete must leave exactly the record it was asked to remove: %+v", res.Records)
 	}
 }
+
+// --- Blocker A: constraints are enforced for delegation and memory ----------
+
+func TestConstraintOnDelegationMatchingTargetProceeds(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionDelegate,
+		governanceConstraint(control.ConstraintResourceRestrict, "agent:governed-agent", "mandatory")))
+	g.rt.Exec.Router = seededRouter(t)
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"delegate","agent_id":"governed-agent","objective":"gather supporting detail"}`,
+			`{"type":"complete","result":"delegated"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "delegate the detail work"}, ""), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("a constraint satisfied by the actual delegate target must allow it: %+v", out)
+	}
+}
+
+func TestConstraintOnDelegationMismatchedTargetBlocksBeforeDelegation(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionDelegate,
+		governanceConstraint(control.ConstraintResourceRestrict, "agent:someone-else", "mandatory")))
+	g.rt.Exec.Router = seededRouter(t)
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"delegate","agent_id":"governed-agent","objective":"gather detail"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "delegate the detail work"}, ""), nil)
+	if out == nil || out.Status != "denied" {
+		t.Fatalf("a constraint mismatch must block before delegation: %+v", out)
+	}
+	if !strings.Contains(out.Error, "outside the allowed set") {
+		t.Fatalf("the denial must name the constraint failure: %s", out.Error)
+	}
+}
+
+func TestConstraintOnMemoryWriteEnforcedAgainstResolvedTarget(t *testing.T) {
+	// The policy constrains writes to agent-scoped records only. When the model
+	// asks for business scope, the memory platform's writableScope CLAMPS the
+	// write for a mode-limited agent — and governance must evaluate the clamped
+	// target, not the request.
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionMemoryWrite,
+		governanceConstraint(control.ConstraintResourceRestrict, "memory:mem:biz-1::governed-agent:notes", "mandatory")))
+	if _, err := g.rt.Registry.Update("governed-agent", func(d *agentexec.Definition) error {
+		d.Memory = agentexec.MemoryConfig{Mode: "division"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_write","key":"notes","value":"v","memory_scope":"business"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "remember a note"}, ""), nil)
+	// The division-mode agent asking for business writes was already denied by
+	// the memory platform; this test keeps that authority ordering.
+	if out == nil || out.Status != "failed" {
+		t.Fatalf("the memory platform must still veto a scope the agent may not use: %+v", out)
+	}
+}
+
+func TestConstraintOnMemoryWriteSatisfiedByResolvedTarget(t *testing.T) {
+	// Same shape, but the constraint names exactly what the runtime resolves:
+	// the write is permitted by governance, and the effect happens.
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionMemoryWrite,
+		governanceConstraint(control.ConstraintResourceRestrict,
+			"memory:mem:biz-1:governed-agent:notes", "mandatory")))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"memory_write","key":"notes","value":"stored","memory_type":"fact","memory_scope":"agent"}`,
+		`{"type":"complete","result":"remembered"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "remember a note"}, ""), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("a constraint satisfied by the resolved target must allow the write: %+v", out)
+	}
+	res, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1", Key: "notes"})
+	if len(res.Records) != 1 {
+		t.Fatalf("the constrained write must have persisted: %+v", res.Records)
+	}
+}
+
+func TestConstraintOnMemoryDeleteMismatchBlocksBeforeMutation(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionMemoryDelete,
+		governanceConstraint(control.ConstraintResourceRestrict, "memory:mem:biz-1:someone:else", "mandatory")))
+	owner := memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"}
+	written, err := g.rt.Memory.Write(owner, memory.WriterUser, memory.Candidate{
+		Key: "doomed", Value: "still here", Type: memory.TypeFact,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_delete","key":"doomed"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "forget the note"}, ""), nil)
+	if out == nil || out.Status != "denied" {
+		t.Fatalf("a delete whose resolved target violates the constraint must be denied: %+v", out)
+	}
+	res, _ := g.rt.Memory.Query(owner, memory.Query{BusinessID: "biz-1", Key: "doomed"})
+	if len(res.Records) != 1 || res.Records[0].ID != written.ID {
+		t.Fatalf("a blocked delete must remove nothing: %+v", res.Records)
+	}
+}
+
+func TestGovernanceDecidesAboutTheResolvedTargetNotTheRequestedOne(t *testing.T) {
+	// The model asks for a business-scoped write; the agent is allowed it, the
+	// resolver says scope=business, and governance evaluates THAT resolved
+	// record id. The failure mode being tested is governance approving scope
+	// "whatever the model said" rather than the real effect.
+	g := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionMemoryWrite,
+		governanceConstraint(control.ConstraintResourceRestrict,
+			"memory:mem:biz-1:_:notes", "mandatory")))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"memory_write","key":"notes","value":"v","memory_type":"fact","memory_scope":"business"}`,
+		`{"type":"complete","result":"ok"}`}}
+	out, _ := g.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "store a business note"}, ""), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("the resolved business-scoped target must satisfy the constraint: %+v", out)
+	}
+	// And a requested-scope constraint that does NOT match the resolved record
+	// must fail: the resolver produced mem:biz-1:_:notes, not the literal the
+	// model supplied.
+	g2 := newGovernedFixture(t, seededAllowPolicy(), constraintsPolicy(control.ActionMemoryWrite,
+		governanceConstraint(control.ConstraintResourceRestrict,
+			"memory:business/notes", "mandatory")))
+	g2.rt.Decider = &scriptedDecider{plan: goodPlan,
+		answers: []string{`{"type":"memory_write","key":"notes","value":"v","memory_scope":"business"}`}}
+	out2, _ := g2.rt.Run(context.Background(),
+		workRequest(t, Objective{Description: "store a business note"}, ""), nil)
+	if out2 == nil || out2.Status == "completed" {
+		t.Fatalf("a constraint written against the MODEL's scope string must not match the resolved record: %+v", out2)
+	}
+}
