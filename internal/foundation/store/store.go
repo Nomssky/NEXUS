@@ -106,6 +106,17 @@ type Store interface {
 	// Delete removes a record by ID (soft delete sets status to deleted).
 	Delete(id string) error
 
+	// DeleteBatch soft-deletes every id as ONE atomic step: either every
+	// record ends up deleted, or none of them does and the call returns an
+	// error. It fails when any id is unknown, so a caller that holds a set of
+	// records it must remove together never ends up with a partially applied
+	// removal — a governed deletion is exactly this shape.
+	//
+	// An implementation must validate every id BEFORE mutating anything, and
+	// must never fall back to per-record deletes: a fallback reintroduces the
+	// partial mutation this method exists to prevent.
+	DeleteBatch(ids []string) error
+
 	// List returns records matching the given filter.
 	List(filter Filter) ([]*Record, error)
 

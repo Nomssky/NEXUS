@@ -138,6 +138,98 @@ func (fs *FileStore) Delete(id string) error {
 	return nil
 }
 
+// DeleteBatch soft-deletes every id as one atomic step.
+//
+// The index is what every read observes, so the batch is published in two
+// phases under the store lock: every updated record is first staged as a
+// synced temp file next to its target (nothing is published yet, so a failure
+// there leaves the store exactly as it was), and only then is each staged file
+// renamed over its target. If a rename fails after some have been published,
+// the already-published records are restored from their pre-batch bytes within
+// this same call, so the batch still lands all-or-nothing from the store's
+// point of view. There is no per-record fallback and no deferred repair work.
+func (fs *FileStore) DeleteBatch(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Validate the whole batch before mutating anything.
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return &StoreError{Code: "INVALID_RECORD", Message: "record ID required"}
+		}
+		if _, ok := fs.index[id]; !ok {
+			return &StoreError{Code: "NOT_FOUND", Message: fmt.Sprintf("record %s not found", id)}
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+
+	now := fs.now()
+	originals := make([]*Record, 0, len(unique))
+	updates := make([]*Record, 0, len(unique))
+	staged := make([]string, 0, len(unique))
+	paths := make([]string, 0, len(unique))
+	cleanup := func() {
+		for _, tmp := range staged {
+			_ = os.Remove(tmp)
+		}
+	}
+
+	// Phase 1 — stage. Nothing is visible to any reader yet.
+	for _, id := range unique {
+		original := *fs.index[id]
+		updated := original
+		updated.Status = RecordStatusDeleted
+		updated.UpdatedAt = now
+		updated.Version = original.Version + 1
+
+		tmp, path, err := fs.stageRecord(&updated)
+		if err != nil {
+			cleanup()
+			return err
+		}
+		originals = append(originals, &original)
+		updates = append(updates, &updated)
+		staged = append(staged, tmp)
+		paths = append(paths, path)
+	}
+
+	// Phase 2 — publish. The index still describes the pre-batch state, so a
+	// failure here is invisible to every reader unless the rollback fails.
+	for i, tmp := range staged {
+		if err := os.Rename(tmp, paths[i]); err != nil {
+			cleanup()
+			for j := 0; j < i; j++ {
+				if rerr := fs.writeRecord(originals[j]); rerr != nil {
+					return &StoreError{
+						Code:    "IO_ERROR",
+						Message: fmt.Sprintf("delete batch rollback of %s failed: %v", originals[j].ID, rerr),
+					}
+				}
+			}
+			return &StoreError{
+				Code:    "IO_ERROR",
+				Message: fmt.Sprintf("delete batch publish %s: %v", updates[i].ID, err),
+			}
+		}
+	}
+
+	for _, updated := range updates {
+		cp := *updated
+		fs.index[updated.ID] = &cp
+	}
+	return nil
+}
+
 // List returns records matching the given filter.
 //
 // NOTE: FileStore uses the shared matchesFilter function (from memstore.go),
@@ -205,46 +297,59 @@ func (fs *FileStore) CountAll() int {
 // A crash mid-write can therefore never leave a truncated or partial record
 // behind — readers see either the old bytes or the new ones.
 func (fs *FileStore) writeRecord(record *Record) error {
+	tmp, path, err := fs.stageRecord(record)
+	if err != nil {
+		return err
+	}
+	// Remove the temp file on any failure path; after a successful rename the
+	// name no longer exists (remove of a missing path is a no-op).
+	defer func() { _ = os.Remove(tmp) }()
+
+	if err := os.Rename(tmp, path); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("rename: %v", err)}
+	}
+	return nil
+}
+
+// stageRecord writes the record's JSON into a synced temp file next to its
+// target and returns that temp path together with the target path. The caller
+// publishes it with os.Rename, which is what makes the publish atomic; a
+// batch stages every record before publishing any of them.
+func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, err error) {
 	typeDir := filepath.Join(fs.dir, string(record.Type))
 	if err := os.MkdirAll(typeDir, 0o755); err != nil {
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
 	}
 
-	path := filepath.Join(typeDir, record.ID+".json")
+	path = filepath.Join(typeDir, record.ID+".json")
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
-		return &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("marshal: %v", err)}
+		return "", "", &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("marshal: %v", err)}
 	}
 
 	tmp, err := os.CreateTemp(typeDir, "."+record.ID+"-*.tmp")
 	if err != nil {
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create temp: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create temp: %v", err)}
 	}
-	tmpName := tmp.Name()
-	// Remove the temp file on any failure path; after a successful rename the
-	// name no longer exists (remove of a missing path is a no-op).
-	defer func() { _ = os.Remove(tmpName) }()
+	tmpName = tmp.Name()
 
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("write: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("write: %v", err)}
 	}
 	// Durability: flush file contents before the rename publishes them.
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync: %v", err)}
 	}
 	if err := tmp.Close(); err != nil {
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("close: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("close: %v", err)}
 	}
 	// Match the historical permissions of direct writes (os.WriteFile 0644).
 	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("chmod: %v", err)}
+		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("chmod: %v", err)}
 	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("rename: %v", err)}
-	}
-	return nil
+	return tmpName, path, nil
 }
 
 // loadAll loads all records from disk into the index.

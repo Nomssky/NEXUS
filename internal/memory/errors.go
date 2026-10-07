@@ -22,6 +22,10 @@ var (
 	ErrConflict = errors.New("conflict")
 	// ErrExpired is a write against a record that has expired.
 	ErrExpired = errors.New("expired")
+	// ErrTargetDrift is a bound write whose effective target no longer equals
+	// the target that was admitted for it. Nothing was written: the platform
+	// refuses before the mutation (contract §7).
+	ErrTargetDrift = errors.New("memory target drift")
 )
 
 // ScopeOf is the canonical scope authority used by the platform. It is the

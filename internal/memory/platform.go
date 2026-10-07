@@ -208,24 +208,86 @@ func (p *Platform) writableScope(id Identity, kind WriterKind, requested Scope, 
 
 // Write creates or updates one record from a validated candidate (contract §7).
 // The writer kind — not the payload — decides provenance and trust.
+// Write resolves the effective target under the platform lock and persists a
+// record carrying exactly that target.
 func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, error) {
-	source, trust, ok := ProvenanceOf(kind)
-	if !ok {
-		return Record{}, fmt.Errorf("%w: unknown writer %q", ErrValidation, kind)
-	}
-	if err := p.authorize(id, divisionFor(id, c)); err != nil {
-		return Record{}, err
-	}
-	scope, divisionID, err := p.writableScope(id, kind, c.Scope, strings.TrimSpace(c.DivisionID))
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	target, err := p.resolveWriteTargetLocked(id, kind, c)
 	if err != nil {
 		return Record{}, err
 	}
+	return p.writeTargetLocked(id, kind, c, target)
+}
+
+// WriteBound executes a previously resolved target, but only after re-deriving
+// it HERE, under the same platform lock that guards the mutation, and comparing
+// it to what was admitted. The record it persists is built from that compared
+// target — it is never re-derived a second time — so "the target governance
+// admitted" and "the record that exists afterwards" are the same value by
+// construction, not by a diagnostic performed after the fact.
+//
+// A caller that has no admitted target uses Write; a caller whose effect was
+// governed uses WriteBound. This is not a second authorization layer: the same
+// authorize/writableScope pair decides both, in the same order, with the same
+// inputs (contract §7).
+func (p *Platform) WriteBound(id Identity, kind WriterKind, c Candidate, admitted WriteTarget) (Record, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	target, err := p.resolveWriteTargetLocked(id, kind, c)
+	if err != nil {
+		return Record{}, fmt.Errorf("%w: %w", ErrTargetDrift, err)
+	}
+	if target != admitted {
+		return Record{}, fmt.Errorf(
+			"%w: governed target %q differs from the target this write would use (%q scope=%q division=%q): not executed",
+			ErrTargetDrift, admitted.RecordID, target.RecordID, target.Scope, target.DivisionID)
+	}
+	return p.writeTargetLocked(id, kind, c, target)
+}
+
+// resolveWriteTargetLocked derives the record a write WOULD touch, running the
+// platform's own authorization and scope clamping. The caller must hold p.mu,
+// so the derivation cannot drift away from the mutation that follows it.
+func (p *Platform) resolveWriteTargetLocked(id Identity, kind WriterKind, c Candidate) (WriteTarget, error) {
+	if _, _, ok := ProvenanceOf(kind); !ok {
+		return WriteTarget{}, fmt.Errorf("%w: unknown writer %q", ErrValidation, kind)
+	}
+	if err := p.authorize(id, divisionFor(id, c)); err != nil {
+		return WriteTarget{}, err
+	}
+	scope, divisionID, err := p.writableScope(id, kind, c.Scope, strings.TrimSpace(c.DivisionID))
+	if err != nil {
+		return WriteTarget{}, err
+	}
 	if err := p.authorize(id, divisionForScope(scope, divisionID)); err != nil {
-		return Record{}, err
+		return WriteTarget{}, err
 	}
 	key := normalizeKey(c.Key)
 	if key == "" {
-		return Record{}, fmt.Errorf("%w: key is required", ErrValidation)
+		return WriteTarget{}, fmt.Errorf("%w: key is required", ErrValidation)
+	}
+	// The identity is derived through the SAME helper the mutation uses, so the
+	// target reported here is byte-for-byte the record id the effect carries.
+	recordID := p.idFor(&Record{
+		BusinessID: id.BusinessID, DivisionID: divisionID, AgentID: id.AgentID,
+		Scope: scope, Key: key,
+	})
+	return WriteTarget{
+		Scope:      scope,
+		DivisionID: divisionID,
+		RecordID:   recordID,
+		WriterKind: kind,
+	}, nil
+}
+
+// writeTargetLocked persists the candidate AS the given target. It never
+// re-derives scope, division or record id, so the persisted record cannot
+// differ from the target the caller validated. The caller must hold p.mu.
+func (p *Platform) writeTargetLocked(id Identity, kind WriterKind, c Candidate, target WriteTarget) (Record, error) {
+	source, trust, ok := ProvenanceOf(kind)
+	if !ok {
+		return Record{}, fmt.Errorf("%w: unknown writer %q", ErrValidation, kind)
 	}
 	mtype := c.Type
 	if mtype == "" {
@@ -253,13 +315,11 @@ func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, err
 		return Record{}, fmt.Errorf("%w: expires_at must be in the future", ErrValidation)
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	now := p.nowTime()
 	rec := Record{
-		BusinessID: id.BusinessID, DivisionID: divisionID, AgentID: id.AgentID,
-		Scope: scope, Type: mtype, Key: key, Value: value,
-		Subject: normalizeSubject(c.Subject, key), Source: source, Trust: trust, Writer: kind,
+		BusinessID: id.BusinessID, DivisionID: target.DivisionID, AgentID: id.AgentID,
+		Scope: target.Scope, Type: mtype, Key: normalizeKey(c.Key), Value: value,
+		Subject: normalizeSubject(c.Subject, normalizeKey(c.Key)), Source: source, Trust: trust, Writer: kind,
 		Metadata: meta, CreatedAt: now, UpdatedAt: now, ExpiresAt: c.ExpiresAt,
 		Status:  StatusActive,
 		Outcome: c.Outcome, Attempts: c.Attempts,
@@ -268,7 +328,7 @@ func (p *Platform) Write(id Identity, kind WriterKind, c Candidate) (Record, err
 	if c.ObservationID != "" {
 		rec.Metadata = withMeta(rec.Metadata, "observation_id", c.ObservationID)
 	}
-	rec.ID = p.idFor(&rec)
+	rec.ID = target.RecordID
 
 	// Existing record: preserve identity fields and created_at, bump version.
 	var prev *store.Record
@@ -432,20 +492,30 @@ func (p *Platform) Delete(id Identity, memID string) error {
 	return nil
 }
 
-// DeleteExact removes EXACTLY the admitted set, atomically from the caller's
-// viewpoint: every target is verified first, and if any one cannot be loaded or
-// delete-authorized, NONE are removed. This makes a delete that was admitted for
-// [A,B] unable to drift into [A,B,C] (a later broad re-query cannot enter the
-// set) and unable to silently degrade into [A] when B became unavailable.
+// DeleteExact removes EXACTLY the admitted set, all of it or none of it:
 //
-// The platform lock is held across both phases, and every platform mutation
-// (Write, Delete, Expire) takes the same lock, so a concurrent platform write
-// cannot interpose between verification and mutation; store-level errors from
-// Delete abort the whole batch, which the caller must treat as fail-closed.
+//   - every id is verified (loadable and delete-authorized) BEFORE anything is
+//     mutated, so an unavailable member fails the whole call closed instead of
+//     quietly deleting a smaller set than the one that was admitted;
+//   - the storage mutation is ONE atomic batch (store.DeleteBatch), never a
+//     sequence of per-record deletes, so a storage error after the first member
+//     cannot leave a partially applied governed delete;
+//   - statuses and delete events are published only after the batch succeeded,
+//     so a failed batch is externally indistinguishable from one that never ran.
+//
+// The platform lock is held across verification and mutation, and every
+// platform mutation takes the same lock, so a concurrent platform write cannot
+// interpose. Nothing outside the admitted id set is read or written: no query is
+// issued here (contract §10, governance contract §2).
 func (p *Platform) DeleteExact(id Identity, memIDs []string) error {
+	if len(memIDs) == 0 {
+		return nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	// Verify first: nothing has been mutated at this point.
+	targets := make([]*Record, 0, len(memIDs))
 	for _, memID := range memIDs {
 		rec, _, err := p.load(memID)
 		if err != nil {
@@ -454,18 +524,19 @@ func (p *Platform) DeleteExact(id Identity, memIDs []string) error {
 		if err := p.canRead(id, rec); err != nil {
 			return fmt.Errorf("memory: delete not authorized for admitted record %q: %w", memID, err)
 		}
+		targets = append(targets, rec)
 	}
-	// Apply exactly the admitted set; no record outside it is touched.
-	for _, memID := range memIDs {
-		rec, _, err := p.load(memID)
-		if err != nil {
-			return fmt.Errorf("memory: delete %q: %w", memID, err)
+
+	// One atomic storage step over the admitted set. A failure here leaves the
+	// records untouched, so nothing below runs and no event is published.
+	if p.st != nil {
+		if err := p.st.DeleteBatch(memIDs); err != nil {
+			return fmt.Errorf("memory: delete %d admitted record(s): %w", len(memIDs), err)
 		}
-		if p.st != nil {
-			if err := p.st.Delete(memID); err != nil && !errors.Is(err, store.ErrNotFound) {
-				return fmt.Errorf("memory: delete %q: %w", memID, err)
-			}
-		}
+	}
+
+	// The mutation happened; now it becomes visible.
+	for _, rec := range targets {
 		rec.Status = StatusDeleted
 		rec.UpdatedAt = p.nowTime()
 		p.emit(EventDeleted, *rec, map[string]string{"scope": string(rec.Scope), "type": string(rec.Type)})
@@ -527,35 +598,9 @@ type WriteTarget struct {
 // This is a read-only seam, not a second authorization layer: it calls the same
 // authorize/writableScope pair, in the same order, with the same inputs.
 func (p *Platform) ResolveWriteTarget(identity Identity, kind WriterKind, c Candidate) (WriteTarget, error) {
-	if _, _, ok := ProvenanceOf(kind); !ok {
-		return WriteTarget{}, fmt.Errorf("%w: unknown writer %q", ErrValidation, kind)
-	}
-	if err := p.authorize(identity, divisionFor(identity, c)); err != nil {
-		return WriteTarget{}, err
-	}
-	scope, divisionID, err := p.writableScope(identity, kind, c.Scope, strings.TrimSpace(c.DivisionID))
-	if err != nil {
-		return WriteTarget{}, err
-	}
-	if err := p.authorize(identity, divisionForScope(scope, divisionID)); err != nil {
-		return WriteTarget{}, err
-	}
-	key := normalizeKey(c.Key)
-	if key == "" {
-		return WriteTarget{}, fmt.Errorf("%w: key is required", ErrValidation)
-	}
-	// The identity is derived through the SAME helper Write uses, so the target
-	// reported here is byte-for-byte the record id the effect would carry.
-	recordID := p.idFor(&Record{
-		BusinessID: identity.BusinessID, DivisionID: divisionID, AgentID: identity.AgentID,
-		Scope: scope, Key: key,
-	})
-	return WriteTarget{
-		Scope:      scope,
-		DivisionID: divisionID,
-		RecordID:   recordID,
-		WriterKind: kind,
-	}, nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.resolveWriteTargetLocked(identity, kind, c)
 }
 
 // ---------- reads ----------

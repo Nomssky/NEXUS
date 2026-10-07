@@ -105,29 +105,15 @@ func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []
 	if err != nil {
 		return memory.Record{}, err
 	}
-	// The admitted target was derived by an earlier ResolveWriteTarget run. If
-	// anything in the decision-relevant inputs changed between admission and
-	// mutation — agent definition, membership, memory mode, scope clamp — that
-	// re-derivation now differs, and we MUST NOT write a different target than
-	// the one governance admitted (contract §6). Staleness always fails closed.
-	resolved, rerr := r.Memory.ResolveWriteTarget(id, kind, cand)
-	if rerr != nil {
-		return memory.Record{}, fmt.Errorf("target re-resolution failed: %w", rerr)
-	}
-	if resolved != admitted {
-		return memory.Record{}, fmt.Errorf("governance target %q differs from actual target %q: not executing", admitted.RecordID, resolved.RecordID)
-	}
-	rec, err := r.Memory.Write(id, kind, cand)
+	// The effect is executed against the admitted target and nothing else. The
+	// platform re-derives the target under the SAME lock that guards the
+	// mutation and refuses if it differs, so there is no window in which a
+	// changed agent definition, membership or memory mode could redirect the
+	// write to a record governance never saw (contract §6/§7). This is a
+	// platform capability, not a second authorization pass here.
+	rec, err := r.Memory.WriteBound(id, kind, cand, admitted)
 	if err != nil {
 		return memory.Record{}, err
-	}
-	// Final guard: the record Write persisted must be the exact record
-	// governance admitted. Any other record id/scope/division means the effect
-	// that ran is not the effect that was governed, so we report drift even
-	// though the write already happened — callers that observe drift stop
-	// treating the result as admitted.
-	if rec.ID != admitted.RecordID || rec.Scope != admitted.Scope || rec.DivisionID != admitted.DivisionID {
-		return rec, fmt.Errorf("write drift: admitted %q but platform persisted %q", admitted.RecordID, rec.ID)
 	}
 	return rec, nil
 }

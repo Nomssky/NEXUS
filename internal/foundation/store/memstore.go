@@ -97,6 +97,41 @@ func (s *MemStore) Delete(id string) error {
 	return nil
 }
 
+// DeleteBatch removes every record by id as one atomic step: an unknown id
+// leaves the whole set untouched.
+func (s *MemStore) DeleteBatch(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Validate the whole batch first: nothing has been mutated yet, so a
+	// refusal cannot leave a partially deleted set behind.
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return ErrInvalidRecord
+		}
+		if _, ok := s.records[id]; !ok {
+			return ErrNotFound
+		}
+		seen[id] = struct{}{}
+	}
+
+	now := s.now()
+	for id := range seen {
+		record := s.records[id]
+		if record == nil {
+			continue
+		}
+		record.Status = RecordStatusDeleted
+		record.UpdatedAt = now
+	}
+	return nil
+}
+
 // List returns records matching the given filter.
 func (s *MemStore) List(filter Filter) ([]*Record, error) {
 	s.mu.RLock()
