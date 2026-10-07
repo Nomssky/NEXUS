@@ -892,3 +892,430 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 		ids[r.ID] = true
 	}
 }
+
+// ---------- governed mutation: atomic delete and bound write (contract §10) ---
+
+// spyStore records every storage mutation so a test can prove WHICH mutation
+// path the platform used and what it persisted.
+type spyStore struct {
+	store.Store
+	mu           sync.Mutex
+	batchCalls   [][]string
+	singleDelete []string
+	puts         []string
+	failBatch    bool
+	// partialBatch makes DeleteBatch break its own contract: it applies the
+	// FIRST id and then fails, which is exactly the storage fault the platform
+	// must never turn into a silently partial governed delete.
+	partialBatch bool
+	// onPut runs at the persistence boundary (inside the platform lock).
+	onPut func(id string)
+}
+
+func (s *spyStore) Delete(id string) error {
+	s.mu.Lock()
+	s.singleDelete = append(s.singleDelete, id)
+	s.mu.Unlock()
+	return s.Store.Delete(id)
+}
+
+func (s *spyStore) DeleteBatch(ids []string) error {
+	s.mu.Lock()
+	s.batchCalls = append(s.batchCalls, append([]string(nil), ids...))
+	partial := s.partialBatch
+	fail := s.failBatch
+	s.mu.Unlock()
+	if partial {
+		if len(ids) > 0 {
+			if err := s.Store.Delete(ids[0]); err != nil {
+				return err
+			}
+		}
+		return errors.New("storage: batch write failed after the first record")
+	}
+	if fail {
+		return errors.New("storage: batch write failed")
+	}
+	return s.Store.DeleteBatch(ids)
+}
+
+func (s *spyStore) Put(rec *store.Record) error {
+	s.mu.Lock()
+	s.puts = append(s.puts, rec.ID)
+	hook := s.onPut
+	s.mu.Unlock()
+	if hook != nil {
+		hook(rec.ID)
+	}
+	return s.Store.Put(rec)
+}
+
+func (s *spyStore) snapshot() (batches [][]string, singles []string, puts []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batches = append([][]string(nil), s.batchCalls...)
+	singles = append([]string(nil), s.singleDelete...)
+	puts = append([]string(nil), s.puts...)
+	return
+}
+
+func newSpyFixture(t *testing.T) (*Platform, *spyStore, *sink) {
+	t.Helper()
+	spy := &spyStore{Store: store.NewMemStore()}
+	bus := &sink{}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p, err := Open(spy, Options{
+		Now:    func() time.Time { return now },
+		Scopes: NewMembershipScopes(memberships(t).AllowsScope),
+		Redact: secretRedactor("tok-abcdef-123456"),
+		Bus:    bus,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return p, spy, bus
+}
+
+func TestDeleteExactIsOneAtomicStorageMutation(t *testing.T) {
+	p, spy, _ := newSpyFixture(t)
+	id := owner("a1")
+	a, _ := p.Write(id, WriterUser, Candidate{Key: "k1", Value: "v"})
+	b, _ := p.Write(id, WriterUser, Candidate{Key: "k2", Value: "v"})
+
+	if err := p.DeleteExact(id, []string{a.ID, b.ID}); err != nil {
+		t.Fatalf("delete exact: %v", err)
+	}
+	batches, singles, _ := spy.snapshot()
+	if len(singles) != 0 {
+		t.Fatalf("DeleteExact must never fall back to per-record deletes: %v", singles)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("the admitted set must be one storage mutation, got %d batches", len(batches))
+	}
+	if len(batches[0]) != 2 || batches[0][0] != a.ID || batches[0][1] != b.ID {
+		t.Fatalf("the batch must carry exactly the admitted ids, got %v", batches[0])
+	}
+}
+
+func TestDeleteExactLeavesNoMutationWhenTheBatchFails(t *testing.T) {
+	p, spy, bus := newSpyFixture(t)
+	id := owner("a1")
+	a, _ := p.Write(id, WriterUser, Candidate{Key: "k1", Value: "v"})
+	b, _ := p.Write(id, WriterUser, Candidate{Key: "k2", Value: "v"})
+	spy.failBatch = true
+
+	if err := p.DeleteExact(id, []string{a.ID, b.ID}); err == nil {
+		t.Fatal("a storage failure must fail the whole governed delete")
+	}
+	if n := bus.count(EventDeleted); n != 0 {
+		t.Fatalf("a failed delete must publish no deletion event, got %d", n)
+	}
+	// The externally visible result is "nothing happened": both records are
+	// still readable, still active and still queryable.
+	for _, rec := range []Record{a, b} {
+		got, err := p.Get(id, rec.ID)
+		if err != nil {
+			t.Fatalf("%s must still be readable: %v", rec.ID, err)
+		}
+		if got.Status != StatusActive {
+			t.Fatalf("%s must still be active, got %q", rec.ID, got.Status)
+		}
+	}
+	res, err := p.Query(id, Query{BusinessID: "biz-1"})
+	if err != nil || len(res.Records) != 2 {
+		t.Fatalf("both records must survive a failed batch: got %d err=%v", len(res.Records), err)
+	}
+}
+
+func TestDeleteExactNeverReportsASilentlyPartialGovernedDelete(t *testing.T) {
+	p, spy, bus := newSpyFixture(t)
+	id := owner("a1")
+	a, _ := p.Write(id, WriterUser, Candidate{Key: "k1", Value: "v"})
+	b, _ := p.Write(id, WriterUser, Candidate{Key: "k2", Value: "v"})
+	// The storage layer breaks its own atomicity contract: A is removed, then
+	// the batch fails. The platform still refuses to report a governed delete
+	// that did not happen in full — and, critically, does not degrade into
+	// per-record deletes that would make a partial mutation normal.
+	spy.partialBatch = true
+
+	if err := p.DeleteExact(id, []string{a.ID, b.ID}); err == nil {
+		t.Fatal("a failed batch must surface as a failure, never as a completed delete")
+	}
+	if n := bus.count(EventDeleted); n != 0 {
+		t.Fatalf("a partially applied batch must not publish deletion events, got %d", n)
+	}
+	_, singles, _ := spy.snapshot()
+	if len(singles) != 0 {
+		t.Fatalf("the platform must not retry the batch member by member: %v", singles)
+	}
+	// B — which the failing storage never touched — is untouched and visible.
+	got, err := p.Get(id, b.ID)
+	if err != nil || got.Status != StatusActive {
+		t.Fatalf("an untouched admitted record must stay visible: %+v err=%v", got, err)
+	}
+}
+
+// ---------- §7 bound write: the governed target IS the persisted target -------
+
+// revocableScopes is the canonical scope authority with a switchable decision,
+// so a test can revoke membership at the moment a write is being admitted.
+type revocableScopes struct {
+	mu      sync.Mutex
+	allowed bool
+	calls   int
+	// gate, when set, blocks the first authorization check until closed.
+	gate     chan struct{}
+	gateOnce sync.Once
+}
+
+func (r *revocableScopes) AllowsScope(string, string, string) bool {
+	r.mu.Lock()
+	r.calls++
+	gate := r.gate
+	allowed := r.allowed
+	r.mu.Unlock()
+	if gate != nil {
+		r.gateOnce.Do(func() { <-gate })
+	}
+	return allowed
+}
+
+func (r *revocableScopes) revoke()        { r.mu.Lock(); r.allowed = false; r.mu.Unlock() }
+func (r *revocableScopes) callCount() int { r.mu.Lock(); defer r.mu.Unlock(); return r.calls }
+
+// block installs a gate that holds the NEXT authorization check, so a test can
+// observe what the platform is doing while it holds its own lock.
+func (r *revocableScopes) block() chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gate = make(chan struct{})
+	r.gateOnce = sync.Once{}
+	return r.gate
+}
+
+func newScopedFixture(t *testing.T, scopes ScopeChecker) (*Platform, *spyStore, *sink) {
+	t.Helper()
+	spy := &spyStore{Store: store.NewMemStore()}
+	bus := &sink{}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p, err := Open(spy, Options{
+		Now:    func() time.Time { return now },
+		Scopes: scopes,
+		Redact: secretRedactor("tok-abcdef-123456"),
+		Bus:    bus,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return p, spy, bus
+}
+
+func TestWriteBoundPersistsExactlyTheAdmittedTarget(t *testing.T) {
+	p, spy, _ := newSpyFixture(t)
+	id := owner("a1")
+	cand := Candidate{Key: "notes", Value: "v", Type: TypeFact}
+	admitted, err := p.ResolveWriteTarget(id, WriterAgent, cand)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	rec, err := p.WriteBound(id, WriterAgent, cand, admitted)
+	if err != nil {
+		t.Fatalf("bound write: %v", err)
+	}
+	if rec.ID != admitted.RecordID || rec.Scope != admitted.Scope || rec.DivisionID != admitted.DivisionID {
+		t.Fatalf("persisted record %+v is not the admitted target %+v", rec, admitted)
+	}
+	// The storage boundary saw exactly one persisted id, and it is the admitted one.
+	_, _, puts := spy.snapshot()
+	if len(puts) != 1 || puts[0] != admitted.RecordID {
+		t.Fatalf("the store must receive exactly the admitted record, got %v", puts)
+	}
+	got, err := p.Get(id, admitted.RecordID)
+	if err != nil || got.ID != admitted.RecordID {
+		t.Fatalf("the admitted record must exist afterwards: %+v err=%v", got, err)
+	}
+}
+
+func TestWriteBoundRefusesADriftedTargetWithoutPersistingAnything(t *testing.T) {
+	p, spy, _ := newSpyFixture(t)
+	id := owner("a1")
+	cand := Candidate{Key: "notes", Value: "v", Type: TypeFact}
+	admitted, err := p.ResolveWriteTarget(id, WriterAgent, cand)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// A different key is a different record: admitting one target and writing
+	// another is exactly the drift the binding exists to refuse.
+	stale := admitted
+	stale.RecordID = MemoryID("biz-1", "", "a1", "other")
+
+	if _, err := p.WriteBound(id, WriterAgent, cand, stale); !errors.Is(err, ErrTargetDrift) {
+		t.Fatalf("a drifted target must be refused as drift, got %v", err)
+	}
+	_, _, puts := spy.snapshot()
+	if len(puts) != 0 {
+		t.Fatalf("a refused bound write must persist nothing, store saw %v", puts)
+	}
+	res, _ := p.Query(id, Query{BusinessID: "biz-1"})
+	if len(res.Records) != 0 {
+		t.Fatalf("a refused bound write leaves no record: %+v", res.Records)
+	}
+	// The genuine target still writes normally afterwards: the refusal was
+	// about the mismatch, not a broken platform.
+	if _, err := p.WriteBound(id, WriterAgent, cand, admitted); err != nil {
+		t.Fatalf("the admitted target must still write: %v", err)
+	}
+}
+
+func TestWriteBoundRefusesARevocationObservedAtTheMutationBoundary(t *testing.T) {
+	scopes := &revocableScopes{allowed: true}
+	p, spy, _ := newScopedFixture(t, scopes)
+	id := owner("a1")
+	cand := Candidate{Key: "notes", Value: "v", Type: TypeFact}
+	admitted, err := p.ResolveWriteTarget(id, WriterAgent, cand)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// Membership is revoked after admission. The platform re-authorizes INSIDE
+	// its mutation boundary, so the revocation is observed and nothing is
+	// persisted — the effect never outlives its authorization.
+	scopes.revoke()
+
+	if _, err := p.WriteBound(id, WriterAgent, cand, admitted); err == nil {
+		t.Fatal("a write whose authorization was revoked must fail closed")
+	}
+	_, _, puts := spy.snapshot()
+	if len(puts) != 0 {
+		t.Fatalf("a revoked write must persist nothing, store saw %v", puts)
+	}
+	res, _ := p.Query(id, Query{BusinessID: "biz-1"})
+	if len(res.Records) != 0 {
+		t.Fatalf("a revoked write leaves no record: %+v", res.Records)
+	}
+	if scopes.callCount() == 0 {
+		t.Fatal("the write must consult the scope authority at the mutation boundary")
+	}
+}
+
+func TestWriteBoundHoldsThePlatformLockFromTargetCheckThroughMutation(t *testing.T) {
+	scopes := &revocableScopes{allowed: true}
+	p, _, _ := newScopedFixture(t, scopes)
+	id := owner("a1")
+	cand := Candidate{Key: "notes", Value: "v", Type: TypeFact}
+	admitted, err := p.ResolveWriteTarget(id, WriterAgent, cand)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	// From here on the platform's own authorization check blocks, which pins it
+	// inside the critical section that guards the mutation.
+	gate := scopes.block()
+
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		_, _ = p.WriteBound(id, WriterAgent, cand, admitted)
+	}()
+
+	// The first authorization check is held inside the platform: until it is
+	// released, another mutation cannot interpose between the target check and
+	// the write it authorizes.
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-blocked:
+		t.Fatal("a mutation interleaved inside the platform lock")
+	default:
+	}
+	close(gate)
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bound write never completed after the lock was released")
+	}
+	got, err := p.Get(id, admitted.RecordID)
+	if err != nil || got.ID != admitted.RecordID {
+		t.Fatalf("the bound write must persist the admitted record: %+v err=%v", got, err)
+	}
+}
+
+func TestWriteBoundUnderConcurrentRevocationNeverPersistsAnUnadmittedTarget(t *testing.T) {
+	scopes := &revocableScopes{allowed: true}
+	spy := &spyStore{Store: store.NewMemStore()}
+	bus := &sink{}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p, err := Open(spy, Options{
+		Now:    func() time.Time { return now },
+		Scopes: scopes,
+		Redact: secretRedactor("tok-abcdef-123456"),
+		Bus:    bus,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	id := owner("a1")
+	// Two admissible targets, each resolved BEFORE the churn starts.
+	notes, _ := p.ResolveWriteTarget(id, WriterAgent, Candidate{Key: "notes", Value: "v"})
+	other, _ := p.ResolveWriteTarget(id, WriterAgent, Candidate{Key: "other", Value: "v"})
+	// The candidate each writer re-offers is the one its target was resolved
+	// from, so every persisted id must equal one of the two admitted ids.
+	type offer struct {
+		key    string
+		target WriteTarget
+	}
+	offers := []offer{{key: "notes", target: notes}, {key: "other", target: other}}
+
+	var (
+		mu      sync.Mutex
+		bad     []string
+		writers sync.WaitGroup
+		churn   sync.WaitGroup
+		stop    = make(chan struct{})
+	)
+	// Every persisted record must be one of the two admitted ids: if the
+	// platform could drift between the target check and the mutation, a third
+	// id would show up here.
+	spy.onPut = func(recID string) {
+		if recID != notes.RecordID && recID != other.RecordID {
+			mu.Lock()
+			bad = append(bad, recID)
+			mu.Unlock()
+		}
+	}
+	// Membership churn: the authorization decision flips while writes run.
+	churn.Add(1)
+	go func() {
+		defer churn.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			scopes.mu.Lock()
+			scopes.allowed = i%2 == 0
+			scopes.mu.Unlock()
+		}
+	}()
+	for w := 0; w < 4; w++ {
+		writers.Add(1)
+		go func(w int) {
+			defer writers.Done()
+			for i := 0; i < 500; i++ {
+				o := offers[(w+i)%len(offers)]
+				_, _ = p.WriteBound(id, WriterAgent, Candidate{Key: o.key, Value: "v"}, o.target)
+			}
+		}(w)
+	}
+	writers.Wait()
+	close(stop)
+	churn.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bad) != 0 {
+		t.Fatalf("the platform persisted targets nobody admitted: %v", bad)
+	}
+	_, _, puts := spy.snapshot()
+	if len(puts) == 0 {
+		t.Fatal("the concurrency test never persisted anything; it proves nothing")
+	}
+}

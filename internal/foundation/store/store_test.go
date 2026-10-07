@@ -273,3 +273,45 @@ func TestMemStoreBusinessIsolation(t *testing.T) {
 		t.Errorf("expected r1, got %v", records[0].ID)
 	}
 }
+
+// TEST-STO-BATCH-1: DeleteBatch removes every id or none of them. A set the
+// caller must remove as a unit (a governed memory delete) can never end up
+// partially applied.
+func TestMemStoreDeleteBatchIsAllOrNothing(t *testing.T) {
+	s := NewMemStore()
+	for _, id := range []string{"r1", "r2", "r3"} {
+		if err := s.Put(&Record{ID: id, Type: RecordTypeMemory}); err != nil {
+			t.Fatalf("put %s: %v", id, err)
+		}
+	}
+	if err := s.DeleteBatch([]string{"r1", "r2"}); err != nil {
+		t.Fatalf("delete batch: %v", err)
+	}
+	for _, id := range []string{"r1", "r2"} {
+		if rec, err := s.Get(id); err == nil && rec != nil {
+			t.Errorf("%s must be deleted", id)
+		}
+	}
+	if rec, err := s.Get("r3"); err != nil || rec == nil {
+		t.Errorf("a record outside the batch must survive: %v", err)
+	}
+
+	// An unknown id refuses the WHOLE batch: r3 stays.
+	if err := s.DeleteBatch([]string{"r3", "nope"}); err == nil {
+		t.Error("a batch with an unknown id must fail")
+	}
+	if rec, err := s.Get("r3"); err != nil || rec == nil {
+		t.Errorf("a refused batch must not mutate anything: %v", err)
+	}
+	// Duplicates name the same record and stay a single removal.
+	if err := s.DeleteBatch([]string{"r3", "r3"}); err != nil {
+		t.Errorf("duplicate ids in a batch: %v", err)
+	}
+	if rec, err := s.Get("r3"); err == nil && rec != nil {
+		t.Error("r3 must be deleted")
+	}
+	// An empty batch is a no-op, not an error.
+	if err := s.DeleteBatch(nil); err != nil {
+		t.Errorf("empty batch: %v", err)
+	}
+}

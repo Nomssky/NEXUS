@@ -354,3 +354,71 @@ func TestFileStoreAtomicWrite(t *testing.T) {
 		t.Errorf("update not durable: %s", got.Data)
 	}
 }
+
+// TEST-STO-BATCH-2: the file store publishes a batch in one step. A refused
+// batch leaves both the index and the on-disk mirror untouched, and a successful
+// batch removes every id.
+func TestFileStoreDeleteBatchIsAllOrNothing(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	fs, err := NewFileStoreWithClock(dir, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"rec-1", "rec-2"} {
+		if err := fs.Put(&Record{ID: id, Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":1}`)}); err != nil {
+			t.Fatalf("put %s: %v", id, err)
+		}
+	}
+
+	// An unknown id refuses the whole batch: nothing on disk changed.
+	if err := fs.DeleteBatch([]string{"rec-1", "nope"}); err == nil {
+		t.Fatal("a batch with an unknown id must fail")
+	}
+	for _, id := range []string{"rec-1", "rec-2"} {
+		got, err := fs.Get(id)
+		if err != nil || got == nil {
+			t.Fatalf("%s must survive a refused batch: %v", id, err)
+		}
+		if got.Status != RecordStatusActive {
+			t.Fatalf("%s must still be active, got %q", id, got.Status)
+		}
+		path := filepath.Join(dir, string(RecordTypeMemory), id+".json")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(data), `"status": "active"`) {
+			t.Fatalf("%s on disk changed during a refused batch: %s", id, data)
+		}
+	}
+
+	// A complete batch removes every id, in the index and on disk.
+	if err := fs.DeleteBatch([]string{"rec-1", "rec-2"}); err != nil {
+		t.Fatalf("delete batch: %v", err)
+	}
+	for _, id := range []string{"rec-1", "rec-2"} {
+		got, err := fs.Get(id)
+		if err != nil || got == nil {
+			t.Fatalf("%s must still be readable by id after a soft delete: %v", id, err)
+		}
+		if got.Status != RecordStatusDeleted {
+			t.Fatalf("%s must be soft deleted, got %q", id, got.Status)
+		}
+		if _, err := fs.List(Filter{Type: RecordTypeMemory}); err != nil {
+			t.Fatalf("list: %v", err)
+		}
+	}
+	// The batch survives a reopen: the mirror really was published.
+	reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	deleted, err := reopened.List(Filter{Type: RecordTypeMemory, Status: RecordStatusDeleted})
+	if err != nil {
+		t.Fatalf("list deleted: %v", err)
+	}
+	if len(deleted) != 2 {
+		t.Fatalf("both records must be deleted after a reopen, got %d", len(deleted))
+	}
+}

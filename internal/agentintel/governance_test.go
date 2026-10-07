@@ -712,11 +712,92 @@ func TestWriteDoesNotPersistWhenTargetDriftsBetweenAdmissionAndExecution(t *test
 		Action{Type: ActionMemoryWrite, Key: "k", Value: "v", MemoryType: "fact"}, nil, target); err == nil {
 		t.Fatal("target drift must fail closed")
 	}
-	// Zero unauthorized mutation: no record was written.
+	// Zero unauthorized mutation: the platform refused BEFORE persisting, so
+	// nothing reached storage and no record exists.
 	res, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
 		memory.Query{BusinessID: "biz-1", Key: "k"})
 	if len(res.Records) != 0 {
 		t.Fatalf("drift must produce zero mutation, got %+v", res.Records)
+	}
+}
+
+// A model that supplies a scope has no authority: the runtime establishes the
+// target, governance decides about THAT target, and the platform persists
+// exactly it. This traces the whole agent consequential path: the constraint
+// names the runtime-established record id, so a write that persisted anything
+// else would fail closed instead of succeeding.
+func TestGovernedWritePersistsExactlyTheAdmittedTarget(t *testing.T) {
+	// The runtime establishes this record: this agent's declared memory mode
+	// permits business scope, so key "notes" resolves to the business record.
+	admittedID := memory.MemoryID("biz-1", "", "", "notes")
+	g := newGovernedFixture(t, constraintsPolicy(control.ActionMemoryWrite,
+		governanceConstraint(control.ConstraintResourceRestrict, control.MemoryResource(admittedID), "mandatory")))
+
+	// The model asks for the widest scope it can name; the runtime decides.
+	answer := `{"type":"memory_write","key":"notes","value":"v","memory_type":"fact","memory_scope":"business"}`
+	out := g.run(t, "remember the notes", answer, `{"type":"complete","result":"done"}`)
+	if out.Status != "completed" {
+		t.Fatalf("the governed write must complete: %+v", out)
+	}
+	// The persisted record IS the target governance was asked about.
+	stored, err := g.rt.Memory.Get(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"}, admittedID)
+	if err != nil {
+		t.Fatalf("the admitted record must exist: %v", err)
+	}
+	if stored.ID != admittedID || stored.Scope != memory.ScopeBusiness {
+		t.Fatalf("persisted %+v, admitted %q", stored, admittedID)
+	}
+	res, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1"})
+	if len(res.Records) != 1 {
+		t.Fatalf("the write must touch exactly the admitted record, got %d", len(res.Records))
+	}
+}
+
+// Observation promotion writes through the SAME governed path: the content and
+// provenance come from the runtime, and the target is still the one governance
+// admitted.
+func TestObservationPromotionGoesThroughTheGovernedWritePath(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	// Drive the promotion explicitly: an observation this execution produced is
+	// written by a memory_write action whose content is the runtime's.
+	req := workRequest(t, Objective{Description: "promote"}, "")
+	rn := &run{rt: g.rt, req: req, execID: "exec-1", businessID: req.BusinessID, ag: nil}
+	obs := Observation{ObservationID: "obs-1", Source: "tool", ActionType: ActionToolCall,
+		Status: "ok", Text: "the ledger says X", Result: map[string]string{"path": "/tmp/report.txt"}}
+	action := Action{Type: ActionMemoryWrite, Key: "promoted-observation", ObservationID: "obs-1", MemoryType: "observation"}
+
+	// The runtime establishes the target; the model contributed no key, value,
+	// scope or selection.
+	target, err := g.rt.memoryWriteTarget(rn, "governed-agent", action, []Observation{obs})
+	if err != nil {
+		t.Fatalf("promotion must resolve a target: %v", err)
+	}
+	adm, aerr := g.rt.Exec.Controller.Admit(control.Proposal{
+		ProposalID: "p-promote", CorrelationID: "exec-1", ExecutionID: "exec-1", ObjectiveID: "exec-1",
+		ActorID: req.ActorID, AgentID: "governed-agent", BusinessID: "biz-1",
+		Action: control.ActionMemoryWrite, Resource: control.MemoryResource(target.RecordID),
+		ResourceType: control.ResourceTypeMemory,
+	})
+	if aerr != nil || !adm.Allowed() {
+		t.Fatalf("admission must allow: %v", aerr)
+	}
+	rec, err := g.rt.memoryWrite(rn, "governed-agent", action, []Observation{obs}, target)
+	if err != nil {
+		t.Fatalf("promotion write: %v", err)
+	}
+	if rec.ID != target.RecordID {
+		t.Fatalf("promotion persisted %q, admitted %q", rec.ID, target.RecordID)
+	}
+	if rec.Type != memory.TypeObservation {
+		t.Fatalf("a promoted observation keeps its type, got %q", rec.Type)
+	}
+	// The content came from the runtime's observation, not from the model.
+	if rec.Value == "" || rec.Metadata["observation_id"] != "obs-1" {
+		t.Fatalf("promotion must carry the runtime's observation, got %+v", rec)
+	}
+	if rec.Source != memory.SourceToolObservation {
+		t.Fatalf("provenance must be platform-owned, got %q", rec.Source)
 	}
 }
 
