@@ -608,7 +608,7 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 			control.ResourceTypeMemory, control.MemoryResource(target.RecordID)); done {
 			return obs, usage, st, msg
 		}
-		rec, err := r.memoryWrite(rn, agentID, a, observationsFor(working))
+		rec, err := r.memoryWrite(rn, agentID, a, observationsFor(working), target)
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
 			return obs, usage, StateFailed, "memory_write failed: " + err.Error()
@@ -673,7 +673,7 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		if obs2, st, msg, done := finishMemoryDeleteAdmission(obs, adm); done {
 			return obs2, usage, st, msg
 		}
-		n, err := r.memoryDelete(rn, agentID, a.Key)
+		n, err := r.memoryDeleteExactly(rn, agentID, targets)
 		if err != nil {
 			obs.Status, obs.Text = "failed", err.Error()
 			return obs, usage, StateFailed, "memory_delete failed: " + err.Error()

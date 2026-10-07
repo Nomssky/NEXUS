@@ -96,7 +96,7 @@ func (r *Runtime) memoryDeleteTargets(rn *run, agentID, key string) ([]string, e
 	return ids, nil
 }
 
-func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []Observation) (memory.Record, error) {
+func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []Observation, admitted memory.WriteTarget) (memory.Record, error) {
 	if r.Memory == nil {
 		return memory.Record{}, fmt.Errorf("memory: no memory platform configured")
 	}
@@ -105,7 +105,31 @@ func (r *Runtime) memoryWrite(rn *run, agentID string, a Action, observations []
 	if err != nil {
 		return memory.Record{}, err
 	}
-	return r.Memory.Write(id, kind, cand)
+	// The admitted target was derived by an earlier ResolveWriteTarget run. If
+	// anything in the decision-relevant inputs changed between admission and
+	// mutation — agent definition, membership, memory mode, scope clamp — that
+	// re-derivation now differs, and we MUST NOT write a different target than
+	// the one governance admitted (contract §6). Staleness always fails closed.
+	resolved, rerr := r.Memory.ResolveWriteTarget(id, kind, cand)
+	if rerr != nil {
+		return memory.Record{}, fmt.Errorf("target re-resolution failed: %w", rerr)
+	}
+	if resolved != admitted {
+		return memory.Record{}, fmt.Errorf("governance target %q differs from actual target %q: not executing", admitted.RecordID, resolved.RecordID)
+	}
+	rec, err := r.Memory.Write(id, kind, cand)
+	if err != nil {
+		return memory.Record{}, err
+	}
+	// Final guard: the record Write persisted must be the exact record
+	// governance admitted. Any other record id/scope/division means the effect
+	// that ran is not the effect that was governed, so we report drift even
+	// though the write already happened — callers that observe drift stop
+	// treating the result as admitted.
+	if rec.ID != admitted.RecordID || rec.Scope != admitted.Scope || rec.DivisionID != admitted.DivisionID {
+		return rec, fmt.Errorf("write drift: admitted %q but platform persisted %q", admitted.RecordID, rec.ID)
+	}
+	return rec, nil
 }
 
 // memoryRead resolves one key through the authorized query path.
@@ -121,24 +145,26 @@ func (r *Runtime) memoryRead(rn *run, agentID, key string) (memory.Record, bool)
 	return res.Records[0], true
 }
 
-// memoryDelete removes every visible record stored under a key. Deletion is
-// scoped: an agent can only delete what it could have written.
-func (r *Runtime) memoryDelete(rn *run, agentID, key string) (int, error) {
-	if r.Memory == nil || strings.TrimSpace(key) == "" {
+// memoryDeleteExactly removes EXACTLY the records already admitted by
+// governance: the set resolved by memoryDeleteTargets and enforced by
+// ConstrainEffect. It never re-queries: a broad authorization-scope re-read
+// between admission and mutation could include a record that governance never
+// saw (contract §6). The whole batch is atomic from the caller's point of view:
+// if ANY record cannot be loaded or delete-authorized, none are removed and the
+// caller fails closed rather than mutating a target different from the admitted
+// set.
+func (r *Runtime) memoryDeleteExactly(rn *run, agentID string, targets []string) (int, error) {
+	if r.Memory == nil {
+		return 0, nil
+	}
+	if len(targets) == 0 {
 		return 0, nil
 	}
 	id := r.memoryIdentity(rn, agentID)
-	res, err := r.Memory.Query(id, memory.Query{BusinessID: id.BusinessID, Key: key})
-	if err != nil {
+	if err := r.Memory.DeleteExact(id, targets); err != nil {
 		return 0, err
 	}
-	deleted := 0
-	for _, rec := range res.Records {
-		if err := r.Memory.Delete(id, rec.ID); err == nil {
-			deleted++
-		}
-	}
-	return deleted, nil
+	return len(targets), nil
 }
 
 // findObservation looks up an observation produced by THIS execution.

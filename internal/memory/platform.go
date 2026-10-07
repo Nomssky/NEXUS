@@ -410,10 +410,11 @@ func (p *Platform) Update(id Identity, memID string, expectedVersion int, c Cand
 
 // Delete removes one record the caller may see. The record stops being visible
 // to every normal read immediately (contract §10).
+// Delete deletes one record by id.
 func (p *Platform) Delete(id Identity, memID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	rec, prev, err := p.load(memID)
+	rec, _, err := p.load(memID)
 	if err != nil {
 		return err
 	}
@@ -427,8 +428,48 @@ func (p *Platform) Delete(id Identity, memID string) error {
 	}
 	rec.Status = StatusDeleted
 	rec.UpdatedAt = p.nowTime()
-	_ = prev
 	p.emit(EventDeleted, *rec, map[string]string{"scope": string(rec.Scope), "type": string(rec.Type)})
+	return nil
+}
+
+// DeleteExact removes EXACTLY the admitted set, atomically from the caller's
+// viewpoint: every target is verified first, and if any one cannot be loaded or
+// delete-authorized, NONE are removed. This makes a delete that was admitted for
+// [A,B] unable to drift into [A,B,C] (a later broad re-query cannot enter the
+// set) and unable to silently degrade into [A] when B became unavailable.
+//
+// The platform lock is held across both phases, and every platform mutation
+// (Write, Delete, Expire) takes the same lock, so a concurrent platform write
+// cannot interpose between verification and mutation; store-level errors from
+// Delete abort the whole batch, which the caller must treat as fail-closed.
+func (p *Platform) DeleteExact(id Identity, memIDs []string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Verify first: nothing has been mutated at this point.
+	for _, memID := range memIDs {
+		rec, _, err := p.load(memID)
+		if err != nil {
+			return fmt.Errorf("memory: cannot delete admitted record %q: %w", memID, err)
+		}
+		if err := p.canRead(id, rec); err != nil {
+			return fmt.Errorf("memory: delete not authorized for admitted record %q: %w", memID, err)
+		}
+	}
+	// Apply exactly the admitted set; no record outside it is touched.
+	for _, memID := range memIDs {
+		rec, _, err := p.load(memID)
+		if err != nil {
+			return fmt.Errorf("memory: delete %q: %w", memID, err)
+		}
+		if p.st != nil {
+			if err := p.st.Delete(memID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return fmt.Errorf("memory: delete %q: %w", memID, err)
+			}
+		}
+		rec.Status = StatusDeleted
+		rec.UpdatedAt = p.nowTime()
+		p.emit(EventDeleted, *rec, map[string]string{"scope": string(rec.Scope), "type": string(rec.Type)})
+	}
 	return nil
 }
 

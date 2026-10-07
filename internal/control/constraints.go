@@ -181,9 +181,17 @@ func ConstrainEffect(targetKind string, target string, adm Admission) (EffectCon
 		}
 		switch c.Kind {
 		case ConstraintToolAllowlist, ConstraintOperationAllowlist, ConstraintResourceRestrict:
-			if !c.Allows(target) {
-				return ec, fmt.Errorf("%w: %s %q is outside the allowed set of %s",
-					ErrConstraintUnenforceable, targetKind, target, c.ID)
+			// A forget's target is a SET of record ids; the constraint must cover
+			// every one of them (subset check), not just the joined label.
+			targets, err := runtimeTargets(targetKind, target)
+			if err != nil {
+				return ec, err
+			}
+			for _, t := range targets {
+				if !c.Allows(t) {
+					return ec, fmt.Errorf("%w: %s %q is outside the allowed set of %s",
+						ErrConstraintUnenforceable, targetKind, t, c.ID)
+				}
 			}
 			ec.Applied = append(ec.Applied, c)
 		case ConstraintMaxDuration:
@@ -198,6 +206,35 @@ func ConstrainEffect(targetKind string, target string, adm Admission) (EffectCon
 		}
 	}
 	return ec, nil
+}
+
+// runtimeTargets expands a runtime target into the concrete values a
+// restriction is checked against. A single target stays as-is; a forget's
+// comma-joined delete set ("memory-delete:id1,id2") is split into its member
+// record ids with the prefix stripped, so a resource_restriction enumerates the
+// exact records an operator wants to bound.
+func runtimeTargets(targetKind, target string) ([]string, error) {
+	switch targetKind {
+	case "memory_delete":
+		if !strings.HasPrefix(target, "memory-delete:") {
+			return nil, fmt.Errorf("%w: memory_delete constraint against unexpected target %q",
+				ErrConstraintUnenforceable, target)
+		}
+		members := strings.Split(strings.TrimPrefix(target, "memory-delete:"), ",")
+		out := make([]string, 0, len(members))
+		for _, m := range members {
+			if strings.TrimSpace(m) == "" {
+				continue
+			}
+			out = append(out, strings.TrimSpace(m))
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("%w: memory_delete constraint against an empty target set", ErrConstraintUnenforceable)
+		}
+		return out, nil
+	default:
+		return []string{target}, nil
+	}
 }
 
 // EffectConstraint is the proven-compliant view of a non-tool effect: the target
