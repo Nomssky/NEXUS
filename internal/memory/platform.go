@@ -456,6 +456,67 @@ func (p *Platform) Expire(id Identity, memID string, at time.Time) error {
 	return nil
 }
 
+// ---------- writes ----------
+
+// WriteTarget is the runtime-established destination of one memory mutation: the
+// record identity that WOULD be written, resolved by the same authorization and
+// clamping that Write performs, without performing the mutation.
+//
+// It exists so an upstream control layer can be told what the actual effect will
+// be instead of being told what the caller asked for. The requested scope is
+// input, not authority: ResolveWriteTarget applies exactly the checks Write
+// applies — provenance, scope validity, division consistency, the agent memory
+// mode and membership — so a caller cannot obtain a target it could not write,
+// and a clamped target cannot be hidden from the control layer.
+type WriteTarget struct {
+	Scope      Scope
+	DivisionID string
+	// RecordID is the identity the record would carry: mem:<business>:<agent>:<key>.
+	RecordID string
+	// WriterKind is the provenance the write would carry, decided by the runtime
+	// (never by the payload).
+	WriterKind WriterKind
+}
+
+// ResolveWriteTarget performs the authorization and scope resolution of Write and
+// reports the resulting target without mutating anything. An error here is the
+// same error Write would return for the same candidate, so a caller may treat a
+// target it could not resolve as "this write will not happen".
+//
+// This is a read-only seam, not a second authorization layer: it calls the same
+// authorize/writableScope pair, in the same order, with the same inputs.
+func (p *Platform) ResolveWriteTarget(identity Identity, kind WriterKind, c Candidate) (WriteTarget, error) {
+	if _, _, ok := ProvenanceOf(kind); !ok {
+		return WriteTarget{}, fmt.Errorf("%w: unknown writer %q", ErrValidation, kind)
+	}
+	if err := p.authorize(identity, divisionFor(identity, c)); err != nil {
+		return WriteTarget{}, err
+	}
+	scope, divisionID, err := p.writableScope(identity, kind, c.Scope, strings.TrimSpace(c.DivisionID))
+	if err != nil {
+		return WriteTarget{}, err
+	}
+	if err := p.authorize(identity, divisionForScope(scope, divisionID)); err != nil {
+		return WriteTarget{}, err
+	}
+	key := normalizeKey(c.Key)
+	if key == "" {
+		return WriteTarget{}, fmt.Errorf("%w: key is required", ErrValidation)
+	}
+	// The identity is derived through the SAME helper Write uses, so the target
+	// reported here is byte-for-byte the record id the effect would carry.
+	recordID := p.idFor(&Record{
+		BusinessID: identity.BusinessID, DivisionID: divisionID, AgentID: identity.AgentID,
+		Scope: scope, Key: key,
+	})
+	return WriteTarget{
+		Scope:      scope,
+		DivisionID: divisionID,
+		RecordID:   recordID,
+		WriterKind: kind,
+	}, nil
+}
+
 // ---------- reads ----------
 
 // Get returns one record by id, or ErrNotFound — the same answer for records

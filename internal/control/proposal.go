@@ -161,7 +161,17 @@ const (
 	ResourceTypeAgent      = "agent"
 )
 
-// MemoryResource renders the resource id of a memory action.
-func MemoryResource(scope, key string) string {
-	return "memory:" + scope + "/" + key
+// MemoryResource renders the resource id of a memory action from the RUNTIME-
+// ESTABLISHED target: the record id the memory platform itself derived. It is not
+// built from a model-requested scope, because the memory platform may clamp a
+// request to a narrower scope and governance must decide about the effect that
+// will actually happen, not the one that was asked for (contract §6).
+func MemoryResource(recordID string) string {
+	return "memory:" + recordID
+}
+
+// DelegateTarget renders the resource id of a delegation from the runtime-
+// established child agent id.
+func DelegateTarget(agentID string) string {
+	return "agent:" + agentID
 }
