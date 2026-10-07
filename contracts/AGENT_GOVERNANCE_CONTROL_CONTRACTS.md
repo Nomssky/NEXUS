@@ -109,10 +109,28 @@ by running the same authorization and scope clamping `Write` performs
 (`Platform.ResolveWriteTarget`) — not the scope the model requested. For
 `memory_delete` it is the set of records the delete would actually remove,
 rendered as one deterministic resource id over that set
-(`memory-delete:<sorted ids>`). This is what makes constraints meaningful: a
-`resource_restriction` is compared against the effect that will actually happen
-(contract §6), so a model cannot route around it by asking for a different scope
-or a different key.
+(`memory-delete:<sorted ids>`); a `resource_restriction` on a delete names the
+record ids themselves and must cover **every** member of that set. This is what
+makes constraints meaningful: a `resource_restriction` is compared against the
+effect that will actually happen (contract §6), so a model cannot route around
+it by asking for a different scope or a different key.
+
+**Effect binding (binding rule).** A memory mutation must execute only against
+the runtime-established target that was presented to governance. Re-resolution
+that can broaden, narrow, or otherwise change the effect after admission is
+forbidden:
+
+```text
+resolve target → governance admission → constraint enforcement → execute EXACTLY that target
+```
+
+There is no independently re-resolved target between admission and mutation. A
+delete deletes exactly the admitted record ids (`Platform.DeleteExact`, all or
+nothing: if one admitted id is no longer available or authorized the whole
+delete fails closed rather than mutating a smaller set), and a write re-derives
+its target immediately before `Write` and refuses to write if that derivation
+differs from the admitted one (contract §6). Model-supplied scope, key or record
+selection carries no authority after admission.
 
 ### Which actions are admitted
 
@@ -185,11 +203,12 @@ Rules:
   constraint restricts the capability invocation (`control.Constrain`). For a
   delegation the constraint restricts the delegated agent id, and for a durable
   memory write/delete it restricts the runtime-established record id
-  (`control.ConstrainEffect`). A constraint the runtime cannot check against
-  that target fails closed rather than being treated as satisfied. A
-  `max_duration_ms` constraint against a non-tool effect fails closed, because
-  such an effect has no deadline to bound: enforcing it would require inventing
-  one.
+  (`control.ConstrainEffect`); for a delete, which targets a set, compliance
+  requires the restriction to cover **every** member id. A constraint the
+  runtime cannot check against that target fails closed rather than being treated
+  as satisfied. A `max_duration_ms` constraint against a non-tool effect fails
+  closed, because such an effect has no deadline to bound: enforcing it would
+  require inventing one.
 
 ## 5. Approval is not permission forever
 
