@@ -123,6 +123,22 @@ the scope the model requested — so this is what the operator should list:
   "expression": "memory:mem:<business>:<agent>:<key>", "severity": "mandatory" }
 ```
 
+A `memory_delete` targets a **set** of records, so its restriction lists the
+record ids themselves and must cover every one of them; an unlisted member fails
+the whole delete closed:
+
+```jsonc
+{ "constraint_id": "c-forget", "constraint_type": "resource_restriction",
+  "expression": "mem:<business>:<agent>:<key1>,mem:<business>:<agent>:<key2>",
+  "severity": "mandatory" }
+```
+
+What is governed is what is mutated. The delete deletes exactly the record ids
+governance saw — a record that appears afterwards is not silently included — and
+if an admitted record becomes unavailable the whole delete fails closed instead
+of removing a smaller set than the one that was approved. A write refuses to run
+at all if its target would differ from the one that was admitted.
+
 A `max_duration_ms` constraint does not apply to a non-tool effect, which has no
 external deadline; it fails closed there rather than passing as unenforced.
 
