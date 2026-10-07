@@ -100,9 +100,19 @@ missing or contradictory is rejected before governance is consulted.
 `delegate`, `memory_write`, `memory_delete`, `model_call`. `resource_type` reuses
 the EXISTING policy vocabulary (`SCHEMA_GOVERNANCE_ATTENTION` §2.4): `tool` for a
 capability (resource = the tool id), `memory` for memory writes (resource =
-`memory:<scope>/<key>`) and `agent` for delegation (resource = the child agent
-id). An operator therefore pins a capability with the same words the policy
-schema already accepts.
+`memory:<resolved-record-id>`) and `agent` for delegation (resource =
+`agent:<child-agent-id>`). An operator therefore pins a capability with the same
+words the policy schema already accepts.
+
+For `memory_write` the record id is the one the memory platform itself derived
+by running the same authorization and scope clamping `Write` performs
+(`Platform.ResolveWriteTarget`) — not the scope the model requested. For
+`memory_delete` it is the set of records the delete would actually remove,
+rendered as one deterministic resource id over that set
+(`memory-delete:<sorted ids>`). This is what makes constraints meaningful: a
+`resource_restriction` is compared against the effect that will actually happen
+(contract §6), so a model cannot route around it by asking for a different scope
+or a different key.
 
 ### Which actions are admitted
 
@@ -170,7 +180,16 @@ Rules:
 * an unknown `constraint_type` fails closed;
 * a model cannot remove, weaken or "ignore" a constraint: constraints travel from
   the decision into the invocation, and the capability platform still applies its
-  own allowlist, scope and manifest gates afterwards.
+  own allowlist, scope and manifest gates afterwards;
+* enforcement is NOT optional and is NOT per-action-type. For a tool call the
+  constraint restricts the capability invocation (`control.Constrain`). For a
+  delegation the constraint restricts the delegated agent id, and for a durable
+  memory write/delete it restricts the runtime-established record id
+  (`control.ConstrainEffect`). A constraint the runtime cannot check against
+  that target fails closed rather than being treated as satisfied. A
+  `max_duration_ms` constraint against a non-tool effect fails closed, because
+  such an effect has no deadline to bound: enforcing it would require inventing
+  one.
 
 ## 5. Approval is not permission forever
 
@@ -219,6 +238,12 @@ event with the proposal's correlation/objective context, and lets the existing
 intake queue an escalation plus an attention item. Attention prioritizes and
 interrupts; it never authorizes. An attention resolution that would result in
 execution must re-enter governance like any other proposal.
+
+`ESCALATE` blocks the action absolutely until a human decides: an ack moves the
+record to `acknowledged`, a resolve or expiry closes it, and none of those
+grants admission. Continuation requires the human to re-submit the work, which
+produces a NEW proposal that governance evaluates from scratch — it never
+inherits the escalated proposal's state.
 
 ## 7. Observability
 
