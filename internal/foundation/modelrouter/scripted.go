@@ -92,6 +92,7 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 //  2. "malformed"                  -> prose without JSON (protocol error)
 //  3. "delegate", not yet observed -> delegate action
 //  4. "memory"                     -> memory_write, then memory_read
+//  5. "forget"/"purge" + "memory"   -> memory_delete of key "notes", then complete
 //  6. named tool, not yet observed -> tool_call for that tool
 //     (calculator, echo, http.request, web.search, filesystem.*, git, data);
 //     "post via http" / "delete via http" select a mutating HTTP method
@@ -134,6 +135,10 @@ func scriptedAnswer(prompt string) string {
 			return `{"type":"complete","result":"memory consulted"}`
 		case observed("memory_write"):
 			return `{"type":"memory_read","key":"notes"}`
+		case observed("memory_delete"):
+			return `{"type":"complete","result":"memory forgotten"}`
+		case forgetMemory(subject):
+			return `{"type":"memory_delete","key":"notes"}`
 		default:
 			return `{"type":"memory_write","key":"notes","value":"noted during the objective"}`
 		}
@@ -194,6 +199,13 @@ func scriptedAnswer(prompt string) string {
 	default:
 		return `{"type":"complete","result":"objective pursued deterministically"}`
 	}
+}
+
+// forgetMemory selects the destructive memory branch: only an objective that
+// explicitly asks to forget/purge memory ever emits memory_delete, so a
+// deterministic objective can never mutate memory it did not name.
+func forgetMemory(subject string) bool {
+	return strings.Contains(subject, "forget") || strings.Contains(subject, "purge")
 }
 
 // observationID returns the id of the newest observation in the block, so a

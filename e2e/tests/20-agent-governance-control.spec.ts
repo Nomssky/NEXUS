@@ -194,6 +194,39 @@ function memoryWritePolicy(effect: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Seeds the two same-key records a forget resolves to: one agent-scoped for the
+ * governed agent, one business-scoped. Both are visible to that agent, so a
+ * memory_delete for key "notes" must resolve to the set of both ids.
+ */
+async function forgetSeed(request: APIRequestContext, nexus: NexusHandle): Promise<void> {
+  for (const rec of (await listNotes(request, nexus)).records ?? []) {
+    await request.delete(
+      `${nexus.baseURL}/api/v1/memory/${rec.memory_id}` +
+        `?business_id=${nexus.businessID}&agent_id=${agentID}`,
+      { headers: bootstrapHeaders(nexus) },
+    );
+  }
+  for (const scope of ['agent', 'business']) {
+    const res = await request.post(`${nexus.baseURL}/api/v1/memory?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', value: `seeded ${scope} note`, scope, agent_id: agentID },
+    });
+    expect(res.status(), `seed ${scope}: ${await res.text()}`).toBe(201);
+  }
+}
+
+async function listNotes(request: APIRequestContext, nexus: NexusHandle): Promise<any> {
+  const res = await request.post(`${nexus.baseURL}/api/v1/memory/query?business_id=${nexus.businessID}`, {
+    headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+    // agent_id makes the agent-scoped member visible; the business-scoped one
+    // is visible to any member of the business either way.
+    data: { key: 'notes', agent_id: agentID },
+  });
+  expect(res.status(), `memory query: ${await res.text()}`).toBe(200);
+  return res.json();
+}
+
 async function runObjective(
   request: APIRequestContext,
   nexus: NexusHandle,
@@ -823,6 +856,89 @@ test.describe('AGENT GOVERNANCE & CONTROL', () => {
     });
     expect(query.status()).toBe(200);
     expect((await query.json()).count).toBe(1);
+  });
+
+  test('a memory delete restricted to part of the resolved set removes nothing', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    // Two records under the SAME key that this agent can see: one agent-scoped,
+    // one business-scoped. A forget resolves to the set of BOTH, so the delete
+    // target is a set, not a single id.
+    await forgetSeed(request, nexus);
+    await putPolicy(request, nexus, `e2e-gov-memdel-partial-${suffix}`, {
+      action: { action_type: 'custom', action_ids: ['memory_delete'] },
+      resource: { resource_type: 'memory' },
+      effect: 'ALLOW_WITH_CONSTRAINTS',
+      precedence: 1000,
+      constraints: [
+        // Only the agent-scoped member is licensed. Compliance is a subset
+        // check over the whole resolved set, so this must fail closed.
+        {
+          constraint_id: 'c-rec',
+          constraint_type: 'resource_restriction',
+          expression: `mem:${nexus.businessID}:${agentID}:notes`,
+          severity: 'mandatory',
+        },
+      ],
+    });
+
+    const { result } = await runObjective(request, nexus, 'forget the meeting notes in memory');
+    expect(result.status).toBe('failed');
+    expect(result.error.message).toContain('outside the allowed set');
+
+    // An uncovered member fails the WHOLE delete: neither record is removed.
+    expect((await listNotes(request, nexus)).count, 'a refused delete set removes nothing').toBe(2);
+  });
+
+  test('a memory delete covering the resolved set removes exactly that set', async ({
+    request,
+    nexus,
+  }) => {
+    await ensureIdentities(request, nexus);
+    await ensureAgent(request, nexus);
+    await forgetSeed(request, nexus);
+    // Both members of the resolved set are licensed.
+    await putPolicy(request, nexus, `e2e-gov-memdel-full-${suffix}`, {
+      action: { action_type: 'custom', action_ids: ['memory_delete'] },
+      resource: { resource_type: 'memory' },
+      effect: 'ALLOW_WITH_CONSTRAINTS',
+      precedence: 1000,
+      constraints: [
+        {
+          constraint_id: 'c-rec',
+          constraint_type: 'resource_restriction',
+          expression:
+            `mem:${nexus.businessID}:${agentID}:notes,` +
+            `mem:${nexus.businessID}:_:notes`,
+          severity: 'mandatory',
+        },
+      ],
+    });
+
+    const { result } = await runObjective(request, nexus, 'forget the meeting notes in memory');
+    expect(result.status).toBe('completed');
+
+    const query = await listNotes(request, nexus);
+    expect(query.count, 'the admitted set is gone and nothing else').toBe(0);
+
+    // The delete removed the admitted ids; it was not a broad key sweep that
+    // keeps running afterwards: a record written after the fact survives.
+    await putPolicy(request, nexus, `e2e-gov-memdel-none-${suffix}`, {
+      action: { action_type: 'custom', action_ids: ['memory_delete'] },
+      resource: { resource_type: 'memory' },
+      effect: 'DENY',
+      precedence: 1000,
+    });
+    const created = await request.post(`${nexus.baseURL}/api/v1/memory?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      data: { key: 'notes', value: 'written after the governed delete', agent_id: agentID },
+    });
+    expect(created.status(), `seed: ${await created.text()}`).toBe(201);
+    const after = await listNotes(request, nexus);
+    expect(after.count, 'a later record was never part of the governed set').toBe(1);
   });
 
   test('a constrained delegation to an unlisted agent is denied', async ({ request, nexus }) => {

@@ -769,6 +769,45 @@ gov_run "remember the meeting notes in memory"
 check "an allowed memory write still persists" "completed" "$GOV_STATUS"
 check "the allowed write stored exactly one record" 1 "$(gov_memory_hits)"
 
+echo "== governance: a memory delete is bound to the set it was admitted for =="
+gov_policy_constrained() { # gov_policy_constrained <id> <action-id> <resource-type> <expression>
+  curl -s -o /dev/null "${CTL[@]}" -X PUT "$BASE/api/v1/control/policies/$1" \
+    -d "{\"policy_type\":\"access_control\",\"name\":\"$1\",\"description\":\"probe governance\",\"status\":\"active\",\"subject\":{\"subject_type\":\"all\"},\"action\":{\"action_type\":\"custom\",\"action_ids\":[\"$2\"]},\"resource\":{\"resource_type\":\"$3\"},\"effect\":\"ALLOW_WITH_CONSTRAINTS\",\"precedence\":1000,\"constraints\":[{\"constraint_id\":\"c-rec\",\"constraint_type\":\"resource_restriction\",\"expression\":\"$4\",\"severity\":\"mandatory\"}]}"
+}
+gov_memory_seed() { # seed one same-key record the governed agent can see
+  curl -s -o /dev/null "${AUTH[@]}" -X POST "$BASE/api/v1/memory?business_id=$BIZ" \
+    -d "{\"key\":\"notes\",\"value\":\"probe note\",\"scope\":\"$1\",\"agent_id\":\"$GOVAGENT\"}"
+}
+gov_memory_clear() {
+  for id in $(curl -s "${AUTH[@]}" -X POST "$BASE/api/v1/memory/query?business_id=$BIZ" \
+    -d "{\"key\":\"notes\",\"agent_id\":\"$GOVAGENT\"}" | jq -r '.records[].memory_id'); do
+    curl -s -o /dev/null "${AUTH[@]}" -X DELETE \
+      "$BASE/api/v1/memory/$id?business_id=$BIZ&agent_id=$GOVAGENT"
+  done
+}
+# Two records share the key "notes": one agent-scoped, one business-scoped. The
+# delete resolves to BOTH, so a restriction naming only one cannot admit it.
+gov_memory_clear
+gov_memory_seed agent
+gov_memory_seed business
+check "the seeded set has both members" 2 "$(gov_memory_hits)"
+gov_policy_constrained "probe-gov-memdel-partial-$$" memory_delete memory "mem:$BIZ:$GOVAGENT:notes"
+gov_run "forget the meeting notes in memory"
+check "a partially covered delete set fails closed" "failed" "$GOV_STATUS"
+contains "the uncovered member is reported" "outside the allowed set" "$(gov_msg)"
+check "a refused delete set removes nothing" 2 "$(gov_memory_hits)"
+gov_unpolicy "probe-gov-memdel-partial-$$"
+
+gov_policy_constrained "probe-gov-memdel-full-$$" memory_delete memory \
+  "mem:$BIZ:$GOVAGENT:notes,mem:$BIZ:_:notes"
+gov_run "forget the meeting notes in memory"
+check "a fully covered delete set is allowed" "completed" "$GOV_STATUS"
+check "the admitted set is gone" 0 "$(gov_memory_hits)"
+gov_unpolicy "probe-gov-memdel-full-$$"
+gov_memory_seed agent
+check "a record written after the delete survives" 1 "$(gov_memory_hits)"
+gov_memory_clear
+
 echo "== governance: UNKNOWN_OUTCOME =="
 gov_run "post via http request to http://127.0.0.1:$GOVPORT/gov-lost"
 check "an indeterminate mutation fails the objective" "failed" "$GOV_STATUS"
