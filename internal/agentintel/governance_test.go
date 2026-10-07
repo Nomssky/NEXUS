@@ -7,6 +7,7 @@ package agentintel
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -577,5 +578,216 @@ func TestGovernanceDecidesAboutTheResolvedTargetNotTheRequestedOne(t *testing.T)
 		workRequest(t, Objective{Description: "store a business note"}, ""), nil)
 	if out2 == nil || out2.Status == "completed" {
 		t.Fatalf("a constraint written against the MODEL's scope string must not match the resolved record: %+v", out2)
+	}
+}
+
+// ---- memory effect binding (TOCTOU hardening) --------------------------------
+
+// driveDeleteAdmission drives the exact helper sequence the loop performs for a
+// memory_delete action: resolve the targets once, admit them through governance,
+// enforce constraints, then mutate exactly that set.
+func driveDeleteAdmission(t *testing.T, g *governedFixture, rn *run, key string) ([]string, error) {
+	t.Helper()
+	targets, err := g.rt.memoryDeleteTargets(rn, "governed-agent", key)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
+		return targets, nil
+	}
+	adm, aerr := g.rt.admitMemoryDelete(rn, "governed-agent", targets)
+	if aerr != nil {
+		return nil, aerr
+	}
+	obs := &Observation{ActionType: ActionMemoryDelete}
+	if _, st, msg, done := finishMemoryDeleteAdmission(obs, adm); done {
+		return nil, fmt.Errorf("%s: %s", st, msg)
+	}
+	return targets, nil
+}
+
+func TestDeleteExecutesExactlyTheAdmittedSetWhenTargetExpands(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	dir := "div-1"
+	// Two visible, same-key records: one agent-scoped, one business-scoped.
+	// The admission set resolves to both.
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "governed-agent", "notes", memory.ScopeAgent)
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "", "notes", memory.ScopeBusiness)
+	ridA := memory.MemoryID("biz-1", "", "governed-agent", "notes")
+	ridB := memory.MemoryID("biz-1", "", "", "notes")
+	req := workRequest(t, Objective{Description: "forget the notes"}, dir)
+	rn := &run{rt: g.rt, req: req, execID: "exec-1", businessID: req.BusinessID, divisionID: dir, ag: nil}
+
+	targets, err := driveDeleteAdmission(t, g, rn, "notes")
+	if err != nil {
+		t.Fatalf("admission: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("expected admission for [A,B], got %v", targets)
+	}
+
+	// TOCTOU window: a same-key, same-division record C becomes visible AFTER
+	// admission but BEFORE mutation. Policy cannot see it and must not delete it.
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", dir, "governed-agent", "notes", memory.ScopeDivision)
+	ridC := memory.MemoryID("biz-1", dir, "", "notes")
+
+	n, err := g.rt.memoryDeleteExactly(rn, "governed-agent", targets)
+	if err != nil {
+		t.Fatalf("exact delete: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("exactly two records may be deleted, got %d", n)
+	}
+	// A and B are gone.
+	recs, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", DivisionID: dir, AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1", Key: "notes"})
+	var ids []string
+	for _, r := range recs.Records {
+		ids = append(ids, r.ID)
+	}
+	if len(ids) != 1 || ids[0] != ridC {
+		t.Fatalf("only C must remain, got %v", ids)
+	}
+	_ = ridA
+	_ = ridB
+}
+
+func TestDeleteRefuseWhenTargetShrinksRatherThanMutatingDifferentSet(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	dir := "div-1"
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "governed-agent", "notes", memory.ScopeAgent)
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "", "notes", memory.ScopeBusiness)
+	req := workRequest(t, Objective{Description: "forget the notes"}, dir)
+	rn := &run{rt: g.rt, req: req, execID: "exec-1", businessID: req.BusinessID, divisionID: dir, ag: nil}
+
+	targets, err := driveDeleteAdmission(t, g, rn, "notes")
+	if err != nil || len(targets) != 2 {
+		t.Fatalf("admission: %v %v", targets, err)
+	}
+	// TOCTOU: B disappears (an admin removed it) before the admitted delete runs.
+	businessRecID := memory.MemoryID("biz-1", "", "", "notes")
+	if err := g.rt.Memory.Delete(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1"}, businessRecID); err != nil {
+		t.Fatalf("prep delete: %v", err)
+	}
+	// Fail closed: A must remain, because A-alone is NOT the admitted set.
+	if _, err := g.rt.memoryDeleteExactly(rn, "governed-agent", targets); err == nil {
+		t.Fatal("a partially unavailable admitted set must fail the whole delete")
+	}
+	if _, err := g.rt.Memory.Get(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", DivisionID: dir, AgentID: "governed-agent"},
+		memory.MemoryID("biz-1", "", "governed-agent", "notes")); err != nil {
+		t.Fatalf("A must not have been deleted on a failed batch: %v", err)
+	}
+}
+
+func TestWriteDoesNotPersistWhenTargetDriftsBetweenAdmissionAndExecution(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+	req := workRequest(t, Objective{Description: "remember"}, "")
+	rn := &run{rt: g.rt, req: req, execID: "exec-1", businessID: req.BusinessID, ag: nil}
+
+	// Resolve and admit one target.
+	target, err := g.rt.memoryWriteTarget(rn, "governed-agent",
+		Action{Type: ActionMemoryWrite, Key: "k", Value: "v", MemoryType: "fact"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm, aerr := g.rt.Exec.Controller.Admit(control.Proposal{
+		ProposalID: "p1", CorrelationID: "exec-1", ExecutionID: "exec-1", ObjectiveID: "exec-1",
+		ActorID: req.ActorID, AgentID: "governed-agent", BusinessID: "biz-1",
+		Action: control.ActionMemoryWrite, Resource: control.MemoryResource(target.RecordID),
+		ResourceType: control.ResourceTypeMemory,
+	})
+	if aerr != nil || !adm.Allowed() {
+		t.Fatalf("admission must allow: %v", aerr)
+	}
+
+	// TOCTOU: the agent's memory mode changes between admission and execution.
+	if _, err := g.rt.Registry.Update("governed-agent", func(d *agentexec.Definition) error {
+		d.Memory = agentexec.MemoryConfig{Mode: "none"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := g.rt.memoryWrite(rn, "governed-agent",
+		Action{Type: ActionMemoryWrite, Key: "k", Value: "v", MemoryType: "fact"}, nil, target); err == nil {
+		t.Fatal("target drift must fail closed")
+	}
+	// Zero unauthorized mutation: no record was written.
+	res, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1", Key: "k"})
+	if len(res.Records) != 0 {
+		t.Fatalf("drift must produce zero mutation, got %+v", res.Records)
+	}
+}
+
+func TestStaleApprovalCannotAuthorizeAChangedExecutionTarget(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionMemoryWrite, ""))
+	first := g.run(t, "remember the notes", `{"type":"memory_write","key":"notes","value":"v","memory_type":"fact"}`)
+	if first.Status != "pending_approval" {
+		t.Fatalf("expected pending: %+v", first)
+	}
+	g.approver.approveAll()
+	// The policy that granted the approval is now irrelevant: by the time the
+	// approval is re-presented, the runtime's target no longer resolves to the
+	// same admitted effect (the agent has had its memory disabled).
+	if _, err := g.rt.Registry.Update("governed-agent", func(d *agentexec.Definition) error {
+		d.Memory = agentexec.MemoryConfig{Mode: "none"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := g.run(t, "remember the notes", `{"type":"memory_write","key":"notes","value":"v","memory_type":"fact"}`)
+	if second.Status == "completed" {
+		t.Fatalf("a bound-but-drifted approval must never authorize execution: %+v", second)
+	}
+	res, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1"})
+	if len(res.Records) != 0 {
+		t.Fatalf("the stale approval must not have produced a record: %+v", res.Records)
+	}
+}
+
+// memoryInsertRecord seeds a record precisely the way the memory platform would
+// derive its id, so tests can prove what the admitted set equaled.
+func (r *Runtime) memoryInsertRecord(t *testing.T, actor, biz, division, agentID, key string, scope memory.Scope) {
+	t.Helper()
+	identity := memory.Identity{ActorID: actor, BusinessID: biz, DivisionID: division, AgentID: agentID}
+	_, err := r.Memory.Write(identity, memory.WriterUser, memory.Candidate{Key: key, Value: "x", Type: memory.TypeFact, Scope: scope, DivisionID: division})
+	if err != nil {
+		t.Fatalf("seed %q/%q/%q: %v", key, division, agentID, err)
+	}
+}
+
+func TestCrossLayerTraceConsequentialMemoryDelete(t *testing.T) {
+	// authenticated request → business/division authorization → agent action →
+	// runtime target resolution → governance decision → constraint enforcement
+	// → exact target mutation → observation/result
+	g := newGovernedFixture(t, seededAllowPolicy())
+	dir := "div-1"
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "governed-agent", "notes", memory.ScopeAgent)
+	g.rt.memoryInsertRecord(t, "owner-1", "biz-1", "", "", "notes", memory.ScopeBusiness)
+
+	// The policy admits the action but constrains it to exactly the resolved
+	// record set, which this identity sees as two records.
+	resolvedA := memory.MemoryID("biz-1", "", "governed-agent", "notes")
+	resolvedB := memory.MemoryID("biz-1", "", "", "notes")
+	g.rt.Exec.Controller = control.New(control.Options{
+		Engine: governance.NewEngine([]*governance.Policy{constraintsPolicy(control.ActionMemoryDelete,
+			governanceConstraint(control.ConstraintResourceRestrict, resolvedB+","+resolvedA, "mandatory"))}),
+		Approver:  g.approver,
+		Escalator: g.escalator,
+	})
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"memory_delete","key":"notes"}`,
+		`{"type":"complete","result":"cleaned"}`}}
+
+	out, _ := g.rt.Run(context.Background(), workRequest(t, Objective{Description: "forget the notes"}, dir), nil)
+	if out == nil || out.Status != "completed" {
+		t.Fatalf("a constrained delete of the exact resolved set must succeed: %+v", out)
+	}
+	recs, _ := g.rt.Memory.Query(memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", DivisionID: dir, AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1", Key: "notes"})
+	if len(recs.Records) != 0 {
+		t.Fatalf("the governed set [A,B] must be gone, residue %+v", recs.Records)
 	}
 }

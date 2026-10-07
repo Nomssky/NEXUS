@@ -386,6 +386,114 @@ func TestDeleteIsScoped(t *testing.T) {
 	}
 }
 
+func TestDeleteExactRemovesOnlyTheNamedSet(t *testing.T) {
+	f := newFixture(t)
+	a, err := f.p.Write(owner("a1"), WriterUser, Candidate{Key: "k1", Value: "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := f.p.Write(owner("a1"), WriterUser, Candidate{Key: "k2", Value: "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := f.p.Write(owner("a1"), WriterUser, Candidate{Key: "k3", Value: "v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An exact delete removes the named records and nothing else: a record that
+	// was never admitted to governance stays, even if it matches the query the
+	// caller used to resolve its set.
+	if err := f.p.DeleteExact(owner("a1"), []string{a.ID, b.ID}); err != nil {
+		t.Fatalf("exact delete: %v", err)
+	}
+	if _, err := f.p.Get(owner("a1"), a.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a must be deleted: %v", err)
+	}
+	if _, err := f.p.Get(owner("a1"), b.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("b must be deleted: %v", err)
+	}
+	if _, err := f.p.Get(owner("a1"), c.ID); err != nil {
+		t.Fatalf("an unadmitted record must survive: %v", err)
+	}
+}
+
+func TestDeleteExactRefusesAWhollyUnavailableSet(t *testing.T) {
+	f := newFixture(t)
+	a, _ := f.p.Write(owner("a1"), WriterUser, Candidate{Key: "k1", Value: "v"})
+	b, _ := f.p.Write(owner("a1"), WriterUser, Candidate{Key: "k2", Value: "v"})
+	// One admitted target vanishes before the mutation runs.
+	if err := f.p.Delete(owner("a1"), b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.p.DeleteExact(owner("a1"), []string{a.ID, b.ID}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a shrunk admitted set must fail closed, got %v", err)
+	}
+	if _, err := f.p.Get(owner("a1"), a.ID); err != nil {
+		t.Fatalf("the whole set must be refused, not partially deleted: %v", err)
+	}
+	// An unauthorized member is refused the same way.
+	if err := f.p.DeleteExact(owner("a2"), []string{a.ID}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another agent must not delete an admitted id: %v", err)
+	}
+}
+
+func TestDeleteExactUnderConcurrentWritesRemovesOnlyItsOwnSet(t *testing.T) {
+	f := newFixture(t)
+	id := owner("a1")
+	stop := make(chan struct{})
+	var (
+		mu    sync.Mutex
+		live  []string
+		wg    sync.WaitGroup
+		turns = make(chan struct{}, 1)
+	)
+	// Writers keep adding records to the same business while deletions run. None
+	// of them is ever named in an admitted set, so none may ever disappear.
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rec, err := f.p.Write(id, WriterUser, Candidate{Key: fmt.Sprintf("live-%d-%d", w, i), Value: "v"})
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				live = append(live, rec.ID)
+				mu.Unlock()
+			}
+		}(w)
+	}
+	for round := 0; round < 100; round++ {
+		admitted, err := f.p.Write(id, WriterUser, Candidate{Key: "doomed", Value: "v"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.p.DeleteExact(id, []string{admitted.ID}); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		select {
+		case turns <- struct{}{}:
+		default:
+		}
+	}
+	close(stop)
+	wg.Wait()
+	mu.Lock()
+	survivors := append([]string(nil), live...)
+	mu.Unlock()
+	for _, rid := range survivors {
+		if _, err := f.p.Get(id, rid); err != nil {
+			t.Fatalf("a record outside the admitted set was removed (%s): %v", rid, err)
+		}
+	}
+}
+
 // ---------- §9 versioning ----------
 
 func TestVersioningRejectsStaleUpdates(t *testing.T) {

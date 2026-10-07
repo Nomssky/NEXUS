@@ -521,6 +521,28 @@ func TestConstrainEffectRejectsADurationConstraintOnANonToolEffect(t *testing.T)
 	}
 }
 
+func TestConstrainEffectCoversEveryMemberOfADeleteSet(t *testing.T) {
+	// A forget's target is a SET of record ids. A restriction enumerates the
+	// records it licenses, so compliance means every admitted id is covered —
+	// naming only one member must not silently admit the whole set.
+	adm := Admission{Effective: []EffectiveConstraint{
+		{Kind: ConstraintResourceRestrict, ID: "c1", Allowed: []string{"mem:biz:a:notes", "mem:biz:b:notes"}},
+	}}
+	if _, err := ConstrainEffect(ActionMemoryDelete, "memory-delete:mem:biz:a:notes,mem:biz:b:notes", adm); err != nil {
+		t.Fatalf("a fully covered delete set must admit: %v", err)
+	}
+	if _, err := ConstrainEffect(ActionMemoryDelete, "memory-delete:mem:biz:a:notes,mem:biz:c:notes", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("an uncovered member must fail the whole delete, got %v", err)
+	}
+	// An unlabelled target cannot be proven to be a delete set.
+	if _, err := ConstrainEffect(ActionMemoryDelete, "mem:biz:a:notes", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("a delete target without its set label must fail closed, got %v", err)
+	}
+	if _, err := ConstrainEffect(ActionMemoryDelete, "memory-delete: , ", adm); !errors.Is(err, ErrConstraintUnenforceable) {
+		t.Fatalf("an empty delete set must fail closed, got %v", err)
+	}
+}
+
 func TestConstrainEffectRejectsAnUnknownType(t *testing.T) {
 	adm := Admission{Effective: []EffectiveConstraint{
 		{Kind: "temperature_limit", ID: "c-x"},
