@@ -121,6 +121,14 @@ winner and never overwrites by insertion order.
   immutable after creation.
 * `Delete` is an immediate soft delete: the record is invisible to every normal
   read, in both the in-memory and file stores.
+* `DeleteExact` removes a caller-named set as one atomic batch — all ids verified
+  first, one storage mutation, no per-record loop — so a failure leaves the store
+  exactly as it was. It backs the governed `memory_delete`, where the set is the
+  one governance admitted.
+* `WriteBound` executes an already-resolved target: the platform re-derives the
+  target under the same lock that guards the mutation and refuses to persist
+  anything that does not match it, so the stored record is always the record that
+  was resolved.
 * `Expire` sets `expires_at`; expired records are excluded from retrieval and stay
   auditable by id. There are no cleanup workers and no undeclared retention.
 
@@ -178,7 +186,8 @@ memory_delete  { "type": "memory_delete", "key": "notes" }
   a `value` is rejected.
 * `memory_read` goes through the authorized query and returns the record with its
   provenance and outcome.
-* `memory_delete` deletes exactly what the caller could have written.
+* `memory_delete` deletes exactly what the caller could have written, and exactly
+  the record ids governance admitted — atomically, or not at all.
 
 ```json
 {"type":"memory_write","key":"ledger","observation_id":"obs-7"}

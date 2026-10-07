@@ -136,8 +136,15 @@ the whole delete closed:
 What is governed is what is mutated. The delete deletes exactly the record ids
 governance saw — a record that appears afterwards is not silently included — and
 if an admitted record becomes unavailable the whole delete fails closed instead
-of removing a smaller set than the one that was approved. A write refuses to run
-at all if its target would differ from the one that was admitted.
+of removing a smaller set than the one that was approved. The removal itself is
+a single atomic storage batch: if it fails, nothing is removed and no deletion
+event is published, so a storage fault can never turn an approved delete into a
+silently partial one.
+
+A write is executed against the admitted target and nothing else: the memory
+platform re-derives the target under the same lock that guards the mutation and
+refuses to store anything if it differs from the one governance admitted (this
+also catches a membership or agent-mode change that lands after approval).
 
 A `max_duration_ms` constraint does not apply to a non-tool effect, which has no
 external deadline; it fails closed there rather than passing as unenforced.
