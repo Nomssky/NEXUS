@@ -138,10 +138,16 @@ evidence fails the execution instead of falsely completing it.
 
 ## 10. Duplicate effects
 
-The runtime records a fingerprint of every completed consequential effect in
-this execution (action type + target + payload hash, bounded). A proposal
-identical to an already-completed effect is rejected — never silently
-re-executed. Cross-execution duplication is out of scope: each execution owns
+The runtime records a fingerprint of every completed mutating effect in this
+execution (delegations, durable memory writes/deletes, and tool calls whose
+manifest side-effect class is anything but `read`). A proposal identical to an
+already-recorded one is rejected — never silently re-executed. Reads may
+repeat: the reliability layer itself retries reads, and repeating a read
+cannot duplicate a side effect. This proposal-level guard is distinct from the
+adapters' transport-level idempotency keys (capability contract §7), which
+de-duplicate replays of a single logical call: the guard stops the second
+logical call from being proposed, the keys reconcile a call whose outcome was
+uncertain. Cross-execution duplication is out of scope: each execution owns
 its own scratch state, and approval resume is a new execution.
 
 ## 11. Cancellation and deadline
