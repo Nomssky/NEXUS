@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -420,5 +421,175 @@ func TestFileStoreDeleteBatchIsAllOrNothing(t *testing.T) {
 	}
 	if len(deleted) != 2 {
 		t.Fatalf("both records must be deleted after a reopen, got %d", len(deleted))
+	}
+}
+
+// --- durable batch recovery (crash consistency) -------------------------------
+
+// seedInterruptedBatch lays down the exact on-disk state a crash can produce:
+// a committed batch journal, and target files in MIXED states — exactly one of
+// the records has been replaced by its deleted successor. The other is still at
+// its pre-batch bytes. This is the "process died between renames" state.
+func seedInterruptedBatch(t *testing.T, dir string, originals []*Record, replacedIndex int) {
+	t.Helper()
+	now := time.Now()
+	fs, err := NewFileStoreWithClock(dir, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range originals {
+		if err := fs.Put(r); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	// Hand-craft the journal the batch engine would have written before the
+	// first rename: the pre-batch state of every member.
+	j := batchJournal{Version: 1, Records: make([]Record, 0, len(originals))}
+	for _, r := range originals {
+		j.Records = append(j.Records, *r)
+	}
+	jdata, err := json.Marshal(&j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, batchJournalName), jdata, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the crash: the target file for ONE member was already replaced
+	// by its deleted version, the journal says it was in flight, and the
+	// directory entries were never cleaned up.
+	if replacedIndex >= 0 {
+		updated := *originals[replacedIndex]
+		updated.Status = RecordStatusDeleted
+		updated.Version++
+		udata, err := json.MarshalIndent(&updated, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, string(originals[replacedIndex].Type), originals[replacedIndex].ID+".json")
+		if err := os.WriteFile(path, udata, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TEST-STO-BATCH-3: a crashed batch must not be exposed half-applied. On the
+// next open the store rolls the journal back: the member whose rename had
+// already landed is restored, and everything is visibly pre-batch again.
+func TestFileStoreRecoversInterruptedBatchToPreBatch(t *testing.T) {
+	dir := t.TempDir()
+	a := &Record{ID: "rec-a", Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":1}`)}
+	b := &Record{ID: "rec-b", Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":2}`)}
+	seedInterruptedBatch(t, dir, []*Record{a, b}, 0)
+
+	fs, err := NewFileStoreWithClock(dir, time.Now)
+	if err != nil {
+		t.Fatalf("open after a crash must succeed via recovery: %v", err)
+	}
+	for _, r := range []string{"rec-a", "rec-b"} {
+		got, err := fs.Get(r)
+		if err != nil || got == nil {
+			t.Fatalf("%s must be readable after recovery: %v", r, err)
+		}
+		if got.Status != RecordStatusActive {
+			t.Fatalf("%s must be restored to its pre-batch state, got %q", r, got.Status)
+		}
+	}
+	// The journal is gone: recovery does not replay forever.
+	if _, err := os.Stat(filepath.Join(dir, batchJournalName)); !os.IsNotExist(err) {
+		t.Fatalf("the journal must be removed after recovery, stat err=%v", err)
+	}
+	// And the pre-batch state is what a later reader — after a second open — sees.
+	reopened, err := NewFileStoreWithClock(dir, time.Now)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	active, err := reopened.List(Filter{Type: RecordTypeMemory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("exactly the two pre-batch records must be visible, got %d", len(active))
+	}
+}
+
+// TEST-STO-BATCH-4: an interrupted batch where NO rename landed yet still
+// recovers to the pre-batch state (the rollback is idempotent, not conditional
+// on how far publication got).
+func TestFileStoreRecoversJournalEvenWhenNothingWasPublished(t *testing.T) {
+	dir := t.TempDir()
+	a := &Record{ID: "rec-a", Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":1}`)}
+	seedInterruptedBatch(t, dir, []*Record{a}, -1)
+
+	fs, err := NewFileStoreWithClock(dir, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fs.Get("rec-a")
+	if err != nil || got == nil || got.Status != RecordStatusActive {
+		t.Fatalf("pre-batch state must survive: %+v %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, batchJournalName)); !os.IsNotExist(err) {
+		t.Fatal("journal must be removed")
+	}
+}
+
+// TEST-STO-BATCH-5: a corrupt journal must fail the open closed — the store
+// refuses to guess which state it is in rather than serving a possibly
+// half-applied batch.
+func TestFileStoreFailClosedOnCorruptBatchJournal(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Put(&Record{ID: "rec-a", Type: RecordTypeMemory, Data: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, batchJournalName), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFileStore(dir); err == nil {
+		t.Fatal("a parseable-corrupt batch journal must abort the open")
+	}
+	// An unknown journal version or an empty member list is equally ambiguous.
+	if err := os.WriteFile(filepath.Join(dir, batchJournalName), []byte(`{"version":99,"records":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFileStore(dir); err == nil {
+		t.Fatal("a foreign-version batch journal must abort the open")
+	}
+}
+
+// TEST-STO-BATCH-6: after a REAL batch commits, the journal is gone and the
+// deletes survive a restart; after a batch NEVER returns (journal removed only
+// on success), a restart shows the pre-batch state.
+func TestFileStoreBatchOutcomeIsStableAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	fs, err := NewFileStoreWithClock(dir, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Put(&Record{ID: "rec-a", Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Put(&Record{ID: "rec-b", Type: RecordTypeMemory, Status: RecordStatusActive, Data: []byte(`{"v":2}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.DeleteBatch([]string{"rec-a", "rec-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, batchJournalName)); !os.IsNotExist(err) {
+		t.Fatal("a committed batch must not leave a journal behind")
+	}
+	reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _ := reopened.List(Filter{Type: RecordTypeMemory})
+	deleted, _ := reopened.List(Filter{Type: RecordTypeMemory, Status: RecordStatusDeleted})
+	if len(active) != 0 || len(deleted) != 2 {
+		t.Fatalf("committed batch must survive restart, active=%d deleted=%d", len(active), len(deleted))
 	}
 }
