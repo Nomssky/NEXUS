@@ -146,6 +146,10 @@ type run struct {
 	businessID string
 	divisionID string
 	ag         *agent.Agent
+	// depth is the intelligence delegation depth of this execution: gateway
+	// roots run at 0, and every delegation validates depth+1 against the
+	// budget before creating a child (delegation contract §8).
+	depth int
 }
 
 func (rn *run) emit(ev event.EventType, extra map[string]string) {
@@ -367,7 +371,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		actx := &ActionContext{
 			Objective: obj, BusinessID: req.BusinessID, DivisionID: req.DivisionID, ActorID: req.ActorID,
 			AgentID: agentID, AgentTools: r.agentTools(agentID), Iterations: usage.Iterations,
-			Used: usage, Budget: budget, Depth: 1,
+			Used: usage, Budget: budget, Depth: rn.depth + 1,
 			StepHasWork: current != nil || len(observations) > 0,
 		}
 		if verr := ValidateAction(action, actx, r.scope(), r.Caps); verr != nil {
@@ -696,26 +700,40 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 			Status: "ok", Timestamp: r.now()}
 		// Delegation is a consequential action: it starts another execution. It
 		// passes through the same admission point as a tool call, with the child
-		// agent as the resource (contract §2).
-		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionDelegate,
-			control.ResourceTypeAgent, control.DelegateTarget(a.AgentID)); done {
-			return obs, usage, st, msg
+		// agent as the resource (contract §2). The child runs one level deeper;
+		// validation already enforced the depth bound.
+		childDepth := rn.depth + 1
+		// Proposed child tools are intersected here, at effect time, against
+		// the registry and both allowlists — validation checked the same
+		// shape, but authority is re-established now, not trusted from the
+		// proposal (contract §4).
+		childTools, terr := r.resolveDelegateTools(rn, agentID, a)
+		if terr != nil {
+			obs.Status, obs.Text = "failed", terr.Error()
+			return obs, usage, StateFailed, "delegation failed: " + terr.Error()
 		}
-		rn.emit(event.EventTypeAgentDelegated, map[string]string{"agent_id": a.AgentID, "depth": "1"})
+		admObs, st, msg, done, proposalID := r.admitNonTool(rn, agentID, control.ActionDelegate,
+			control.ResourceTypeAgent, control.DelegateTarget(a.AgentID))
+		if done {
+			return admObs, usage, st, msg
+		}
+		rn.emit(event.EventTypeAgentDelegated, map[string]string{
+			"agent_id": a.AgentID, "depth": fmt.Sprint(childDepth),
+			"parent_agent_id": agentID, "child_tools": fmt.Sprint(len(childTools))})
 		out, err := r.Exec.DelegateChild(ctx, rn.req, rn.ag, agentexec.DelegateSpec{
-			ID: newID("child"), Intent: a.Objective, AgentID: a.AgentID,
-		}, 0)
+			ID: newID("child"), Intent: a.Objective, AgentID: a.AgentID, Tools: childTools,
+			ParentAgentID: agentID, DelegationActionID: proposalID,
+		}, rn.depth)
 		if err != nil || out == nil || out.Status != "completed" {
-			msg := "delegation failed"
-			if err != nil {
-				msg = err.Error()
-			} else if out != nil {
-				msg = fmt.Sprintf("child execution ended %s: %s", out.Status, out.Error)
-			}
-			obs.Status, obs.Text = "failed", msg
-			return obs, usage, StateFailed, msg
+			return r.delegateChildOutcome(obs, usage, out, err)
 		}
+		// Child output is DATA for the parent: it becomes observation text,
+		// never an instruction and never a state rewrite (contract §7).
 		obs.Text = out.Output
+		obs.Result = map[string]string{
+			"child_status": out.Status, "child_agent_id": out.AgentID,
+			"child_task_id": out.TaskID,
+		}
 		return obs, usage, "", ""
 	case ActionMemoryWrite:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryWrite,
@@ -734,7 +752,7 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 			obs.Status, obs.Text = "failed", terr.Error()
 			return obs, usage, StateFailed, "memory_write failed: " + terr.Error()
 		}
-		if obs, st, msg, done := r.admitNonTool(rn, agentID, control.ActionMemoryWrite,
+		if obs, st, msg, done, _ := r.admitNonTool(rn, agentID, control.ActionMemoryWrite,
 			control.ResourceTypeMemory, control.MemoryResource(target.RecordID)); done {
 			return obs, usage, st, msg
 		}
@@ -829,6 +847,90 @@ func obsAttempts(obs *Observation) int {
 		return 0
 	}
 	return obs.Attempts
+}
+
+// resolveDelegateTools intersects model-proposed child tools with the tool
+// registry, the child agent's allowlist and the parent agent's allowlist,
+// and converts the survivors to execution specs. Validation already checked
+// this shape; this re-establishes it at effect time because the registry may
+// have changed between proposal and effect. Empty proposal means a model-only
+// child (no child tools) and needs no agent resolution.
+func (r *Runtime) resolveDelegateTools(rn *run, agentID string, a Action) ([]agentexec.ToolCallSpec, error) {
+	if len(a.DelegateTools) == 0 {
+		return nil, nil
+	}
+	if strings.TrimSpace(a.AgentID) == "" {
+		return nil, fmt.Errorf("delegation failed: delegate_tools requires an explicit agent_id")
+	}
+	childDef, ok := r.Registry.Get(a.AgentID)
+	if !ok {
+		return nil, fmt.Errorf("delegation failed: child agent %q is not registered", a.AgentID)
+	}
+	_ = childDef
+	parentTools := r.agentTools(agentID)
+	if strings.TrimSpace(agentID) == "" {
+		return nil, fmt.Errorf("delegation failed: cannot bound child tools without a resolved parent agent")
+	}
+	out := make([]agentexec.ToolCallSpec, 0, len(a.DelegateTools))
+	for i, t := range a.DelegateTools {
+		where := fmt.Sprintf("delegate_tools[%d]", i)
+		if strings.TrimSpace(t.Tool) == "" {
+			return nil, fmt.Errorf("delegation failed: %s needs a tool id", where)
+		}
+		if !r.scope().ToolRegistered(t.Tool) {
+			return nil, fmt.Errorf("delegation failed: %s tool %q is not registered", where, t.Tool)
+		}
+		if t.Operation != "" {
+			ops, ok := r.scope().(OperationResolver)
+			if !ok || !ops.ToolSupportsOperation(t.Tool, t.Operation) {
+				return nil, fmt.Errorf("delegation failed: %s tool %q does not support operation %q", where, t.Tool, t.Operation)
+			}
+		}
+		if !contains(childDef.AllowedTools, t.Tool) {
+			return nil, fmt.Errorf("delegation failed: %s tool %q is not in child agent %q's allowlist", where, t.Tool, a.AgentID)
+		}
+		if !contains(parentTools, t.Tool) {
+			return nil, fmt.Errorf("delegation failed: %s tool %q is not in parent agent %q's allowlist", where, t.Tool, agentID)
+		}
+		out = append(out, agentexec.ToolCallSpec{ToolID: t.Tool, Operation: t.Operation, Input: t.Input})
+	}
+	return out, nil
+}
+
+// delegateChildOutcome normalizes a non-completed child execution into the
+// parent's observation without collapsing distinct outcomes (contract §7): an
+// unknown child stays unknown (with reconciliation markers, never
+// re-dispatched here), a denied/pending/escalated child is reported as what
+// it is with its references, and anything else fails honestly. The parent run
+// always ends failed — a child that did not complete is never mistaken for
+// success, and a foreign approval is never adopted as the parent's own.
+func (r *Runtime) delegateChildOutcome(obs *Observation, usage BudgetUsage, out *executor.Outcome, err error) (*Observation, BudgetUsage, State, string) {
+	msg := "delegation failed"
+	if err != nil {
+		msg = err.Error()
+	} else if out != nil {
+		msg = fmt.Sprintf("child execution ended %s: %s", out.Status, out.Error)
+	}
+	obs.Status, obs.Text = "failed", msg
+	if out != nil {
+		obs.Result = map[string]string{"child_status": out.Status, "child_agent_id": out.AgentID, "child_task_id": out.TaskID}
+		switch out.Status {
+		case "unknown":
+			obs.Outcome = "unknown"
+			obs.ReconciliationRequired = true
+		case "timed_out":
+			obs.Outcome = "timed_out"
+		case "cancelled":
+			obs.Outcome = "cancelled"
+		case "pending_approval":
+			obs.Result["approval_id"] = out.ApprovalID
+		case "escalated":
+			obs.Result["escalation_id"] = out.EscalationRef
+		case "denied":
+			obs.Result["governance_outcome"] = "DENY"
+		}
+	}
+	return obs, usage, StateFailed, msg
 }
 
 // scope exposes the Agent Execution visibility rules to the validators.
@@ -995,19 +1097,21 @@ func rejectionSummary(res ValidationResult) string {
 // observation so the status, source and action type stay correct; a refused
 // action returns the observation with the governance state instead.
 func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource string) (
-	*Observation, State, string, bool) {
+	*Observation, State, string, bool, string) {
 	obs := &Observation{ObservationID: newID("obs"), Timestamp: r.now(),
 		Source: "governance", ActionType: ActionType(action)}
+	proposalID := ""
 
 	if r.Exec == nil || r.Exec.Controller == nil {
 		// Fail closed: governance unavailable is a denial, never a silent allow.
 		obs.Status = "denied"
 		obs.Text = "no governance controller configured (fail closed)"
 		obs.Result = map[string]string{"governance_outcome": governance.DENY.String(), "action": action}
-		return obs, StateDenied, obs.Text, true
+		return obs, StateDenied, obs.Text, true, proposalID
 	}
+	proposalID = newID("prop")
 	adm, err := r.Exec.Controller.Admit(control.Proposal{
-		ProposalID: newID("prop"),
+		ProposalID: proposalID,
 		// execID is the identity the loop itself runs under (correlation id,
 		// falling back to the task id) — the same value the objective, the plan
 		// and the events use, so an approval binds to THIS execution and to
@@ -1028,7 +1132,7 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource 
 		obs.Status = "denied"
 		obs.Text = err.Error()
 		obs.Result = map[string]string{"governance_outcome": governance.DENY.String(), "action": action}
-		return obs, StateDenied, obs.Text, true
+		return obs, StateDenied, obs.Text, true, proposalID
 	}
 	if adm.Allowed() {
 		// ALLOW or ALLOW_WITH_CONSTRAINTS. The constraints are enforced here, not
@@ -1045,7 +1149,7 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource 
 			}
 			rn.emit(event.EventTypeActionRejected, map[string]string{
 				"action": action, "reason": "constraint cannot be enforced (fail closed)"})
-			return obs, StateDenied, cerr.Error(), true
+			return obs, StateDenied, cerr.Error(), true, proposalID
 		}
 		// Constraints were satisfied by this very effect; that is an admission
 		// fact, so it rides the existing proposal fact rather than a new event.
@@ -1055,7 +1159,7 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource 
 				"constraint_id": applied.ID, "constraint_type": applied.Kind,
 			})
 		}
-		return nil, "", "", false
+		return nil, "", "", false, proposalID
 	}
 	obs.Text = admissionMessage(adm)
 	obs.Status = "denied"
@@ -1072,13 +1176,13 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource 
 	switch adm.Decision.Outcome {
 	case governance.REQUIRE_APPROVAL:
 		obs.Status = "pending_approval"
-		return obs, StatePendingApproval, obs.Text, true
+		return obs, StatePendingApproval, obs.Text, true, proposalID
 	case governance.ESCALATE:
 		obs.Status = "escalated"
-		return obs, StateEscalated, obs.Text, true
+		return obs, StateEscalated, obs.Text, true, proposalID
 	default:
 		obs.Status = "denied"
-		return obs, StateDenied, obs.Text, true
+		return obs, StateDenied, obs.Text, true, proposalID
 	}
 }
 

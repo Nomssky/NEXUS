@@ -49,6 +49,13 @@ type Action struct {
 	// delegate
 	AgentID   string `json:"agent_id,omitempty"`
 	Objective string `json:"objective,omitempty"`
+	// DelegateTools proposes explicit tool calls for the child to perform
+	// (AGENT_DELEGATION_CONTRACTS §4). A proposal is never a grant: the
+	// runtime intersects every entry with the tool registry, the child
+	// agent's allowlist and the parent agent's allowlist, and each surviving
+	// call still passes the child's own governance admission and capability
+	// gates. Empty means a model-only child (no child tools).
+	DelegateTools []DelegateToolCall `json:"delegate_tools,omitempty"`
 	// memory_*
 	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
@@ -68,6 +75,15 @@ type Action struct {
 	// complete / fail / replan
 	Result string `json:"result,omitempty"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// DelegateToolCall is one model-proposed tool call for a delegated child.
+// It mirrors ToolCallSpec without importing the execution layer into the
+// protocol: the loop converts validated entries when building the child.
+type DelegateToolCall struct {
+	Tool      string            `json:"tool,omitempty"`
+	Operation string            `json:"operation,omitempty"`
+	Input     map[string]string `json:"input,omitempty"`
 }
 
 // ParseAction decodes exactly one strict decision object from the whole model
@@ -195,6 +211,18 @@ func ValidateAction(a Action, c *ActionContext, r ScopeResolver, caps Caps) erro
 				return fmt.Errorf("rejected: agent %q is not visible in this scope", a.AgentID)
 			}
 		}
+		// Proposed child tools are validated structurally here; the
+		// intersection with both allowlists happens here too, because both
+		// agents are known. Admission and capability gates still run later,
+		// per effect, at child runtime.
+		if len(a.DelegateTools) > 0 {
+			if strings.TrimSpace(a.AgentID) == "" {
+				return fmt.Errorf("rejected: delegate_tools requires an explicit agent_id")
+			}
+			if err := validateDelegateTools(a.DelegateTools, a.AgentID, c.AgentID, r); err != nil {
+				return err
+			}
+		}
 		if c.Used.Delegations >= c.Budget.MaxDelegations {
 			return fmt.Errorf("rejected: delegation budget exhausted (%d)", c.Budget.MaxDelegations)
 		}
@@ -220,6 +248,35 @@ func ValidateAction(a Action, c *ActionContext, r ScopeResolver, caps Caps) erro
 	default:
 		return fmt.Errorf("protocol: unknown action type %q", a.Type)
 	}
+}
+
+// validateDelegateTools applies the structural half of the child-capability
+// intersection (contract §4): every proposed child tool must name a tool, a
+// registered tool, a declared operation, and an entry on BOTH the child
+// agent's allowlist and the parent agent's allowlist. The delegator cannot
+// give what it lacks, and the child cannot gain what its definition forbids.
+func validateDelegateTools(tools []DelegateToolCall, childID, parentID string, r ScopeResolver) error {
+	for i, t := range tools {
+		where := fmt.Sprintf("delegate_tools[%d]", i)
+		if strings.TrimSpace(t.Tool) == "" {
+			return fmt.Errorf("rejected: %s needs a tool id", where)
+		}
+		if r == nil || !r.ToolRegistered(t.Tool) {
+			return fmt.Errorf("rejected: %s tool %q is not registered", where, t.Tool)
+		}
+		if t.Operation != "" {
+			if ops, ok := r.(OperationResolver); !ok || !ops.ToolSupportsOperation(t.Tool, t.Operation) {
+				return fmt.Errorf("rejected: %s tool %q does not support operation %q", where, t.Tool, t.Operation)
+			}
+		}
+		if !r.AgentAllowsTool(childID, t.Tool) {
+			return fmt.Errorf("rejected: %s tool %q is not in child agent %q's allowlist", where, t.Tool, childID)
+		}
+		if parentID == "" || !r.AgentAllowsTool(parentID, t.Tool) {
+			return fmt.Errorf("rejected: %s tool %q is not in parent agent %q's allowlist", where, t.Tool, parentID)
+		}
+	}
+	return nil
 }
 
 // BudgetUsage is the consumed counter set (§9). Counters are incremented by
