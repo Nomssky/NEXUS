@@ -220,6 +220,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			rn.transition(StateCancelled, nil)
 			return cancelledOutcome(req, start, r.now()), nil
 		}
+		if loopCtx.Err() != nil {
+			rn.transition(StateDeadlineExceeded, nil)
+			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
+		}
 		rn.transition(StateFailed, map[string]string{"reason": "planner failed"})
 		return failedOutcome(req, start, r.now(), StateFailed, "planner failed: "+planErr.Error()), nil
 	}
@@ -339,6 +343,12 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			if ctx.Err() != nil {
 				rn.transition(StateCancelled, nil)
 				return cancelledOutcome(req, start, r.now()), nil
+			}
+			// The caller's deadline expired mid-decision: that is the
+			// existing deadline_exceeded outcome, not a provider failure.
+			if loopCtx.Err() != nil {
+				rn.transition(StateDeadlineExceeded, nil)
+				return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 			}
 			rn.transition(StateFailed, map[string]string{"reason": "decision failed"})
 			return failedOutcome(req, start, r.now(), StateFailed, "decision failed: "+derr.Error()), nil
@@ -526,6 +536,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				if ctx.Err() != nil {
 					rn.transition(StateCancelled, nil)
 					return cancelledOutcome(req, start, r.now()), nil
+				}
+				if loopCtx.Err() != nil {
+					rn.transition(StateDeadlineExceeded, nil)
+					return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 				}
 				rn.transition(StateFailed, map[string]string{"reason": "replan failed"})
 				return failedOutcome(req, start, r.now(), StateFailed, "replan failed: "+perr.Error()), nil
