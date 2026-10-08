@@ -74,13 +74,18 @@ type Action struct {
 // ParseAction extracts the single structured action from a model response.
 // The response must contain a JSON object with a known "type"; anything else
 // is a protocol error — the runtime never guesses an intent from prose.
+//
+// Unknown JSON fields are a protocol error: a model may never silently smuggle
+// a privileged field (owner ids, scope, approvals, provider selection,
+// membership) through an action that structurally decodes. This is how the
+// loop enforces "model output is data, never authority".
 func ParseAction(content string) (Action, error) {
 	obj := extractJSONObject(content)
 	if obj == "" {
 		return Action{}, fmt.Errorf("protocol: model response contained no JSON action")
 	}
 	var a Action
-	if err := json.Unmarshal([]byte(obj), &a); err != nil {
+	if err := strictDecodeJSON(obj, &a); err != nil {
 		return Action{}, fmt.Errorf("protocol: malformed action JSON: %w", err)
 	}
 	if _, ok := validActions[a.Type]; !ok {
@@ -98,13 +103,25 @@ func ParsePlan(content string) ([]Step, error) {
 	var envelope struct {
 		Steps []Step `json:"steps"`
 	}
-	if err := json.Unmarshal([]byte(obj), &envelope); err != nil {
+	if err := strictDecodeJSON(obj, &envelope); err != nil {
 		return nil, fmt.Errorf("planner: malformed plan JSON: %w", err)
 	}
 	if len(envelope.Steps) == 0 {
 		return nil, fmt.Errorf("planner: plan has no steps")
 	}
 	return envelope.Steps, nil
+}
+
+// strictDecodeJSON unmarshals v from s, rejecting ANY field that is not part
+// of the declared boundary struct — the model cannot smuggle a new "field"
+// past the parser to claim authority it did not earn.
+func strictDecodeJSON(s string, v interface{}) error {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	return nil
 }
 
 // extractJSONObject returns the first balanced {...} block, tolerating prose
