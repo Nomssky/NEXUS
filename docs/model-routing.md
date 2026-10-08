@@ -66,3 +66,47 @@ Offline determinism for tests and demos: `NEXUS_SEEDED_PROVIDER_STATUS=offline`
 (PROVIDER_CONTRACTS §12) makes the seeded provider start offline; the gateway
 and control plane stay healthy, and every execution fails honestly
 (`e2e/tests/15-agent-execution.spec.ts`, `internal/agentexec/retry_test.go`).
+## Production provider: `models.providers`
+
+The shipped binary keeps booting its deterministic simulation by default. A
+production inference adapter is registered only when `models.providers` is set
+in the JSON config passed with `--config` — never as a silent default:
+
+```json
+{
+  "models": {
+    "providers": [{
+      "id": "openai-prod",
+      "endpoint": "https://api.openai.com/v1",
+      "model_id": "gpt-4o-mini",
+      "api_key_env": "NEXUS_OPENAI_API_KEY",
+      "timeout_ms": 30000,
+      "allow_insecure_http": false
+    }]
+  }
+}
+```
+
+Registration behavior:
+
+- one OpenAI-compatible Chat Completions adapter per entry, behind the same
+  `modelrouter.Provider` interface as every other provider;
+- the API key comes from `api_key_env`, read at invoke time — it is never
+  serialized into config snapshots, logs, accounting records or errors;
+- `endpoint` must be `https`, or `http` **only** with
+  `allow_insecure_http: true` and a loopback host (a dev/fixture posture, not
+  a production default);
+- model invocation honors the request context (deadline + cancellation) and
+  the configured `timeout_ms`; hang/length responses are bounded;
+- token usage is taken from the provider's `usage` block as-is; nothing is
+  fabricated when the provider omits it;
+- routing, failover, health demotion, local-first preference and accounting
+  stay inside `ModelRouter` — the model itself can never say *"use provider X"*;
+- with `models.providers` set, the seeded simulator is NOT registered, so
+  production config is an explicit, auditable boundary rather than a
+  default-off switch.
+
+When no providers are configured the launcher seeds exactly the deterministic
+simulation provider (`simulated:default` or the scripted decision-table
+provider behind `NEXUS_SEEDED_PROVIDER_MODE=scripted`), which is what the
+shipped E2E suite and offline CI exercise — **never an external API key**.
