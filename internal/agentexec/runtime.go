@@ -64,6 +64,14 @@ type DelegateSpec struct {
 	AgentID      string         `json:"agent_id,omitempty"`
 	Capabilities []string       `json:"capabilities,omitempty"`
 	Tools        []ToolCallSpec `json:"tools,omitempty"`
+	// ParentAgentID is the delegating agent as resolved by the runtime that
+	// created this request. It is stamped into the child's Delegation link;
+	// model output never sets it (AGENT_DELEGATION_CONTRACTS §2).
+	ParentAgentID string `json:"-"`
+	// DelegationActionID is the governance proposal id that admitted this
+	// delegation. Empty when the delegation predates linkage (never for new
+	// intelligence-loop delegations).
+	DelegationActionID string `json:"-"`
 }
 
 // Spec is the execution-layer request (deserialized from
@@ -204,6 +212,12 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 
 	// Child delegates execute inside the same scope; each emits its own
 	// events and counts toward child bookkeeping on the parent result.
+	// Fan-out is bounded by the existing parallelism bound: one request can
+	// never fan into an unbounded swarm (AGENT_DELEGATION_CONTRACTS §8).
+	if len(spec.Delegates) > r.maxFan {
+		return failedOutcome(req, ag, start, fmt.Sprintf("delegation fan-out exceeded (%d > %d)",
+			len(spec.Delegates), r.maxFan)), nil
+	}
 	childResults := []string{}
 	childFailures := []string{}
 	for _, d := range spec.Delegates {
@@ -613,6 +627,11 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 // business/division/actor/correlation/cancellation context, so it can never
 // widen authority. The intelligence layer uses this; it does not have a second
 // delegation mechanism.
+//
+// The child request carries an explicit runtime-stamped Delegation link
+// (parent task/agent/correlation, admission proposal id, depth), so lineage
+// is a runtime fact rather than a naming convention. Scope fields are copied,
+// never widened; the deadline travels with ctx.
 func (r *Runtime) DelegateChild(ctx context.Context, parent *executor.WorkRequest, ag *agent.Agent, child DelegateSpec, depth int) (*executor.Outcome, error) {
 	childReq := &executor.WorkRequest{
 		TaskID:        parent.TaskID + "/delegate/" + child.ID,
@@ -626,6 +645,13 @@ func (r *Runtime) DelegateChild(ctx context.Context, parent *executor.WorkReques
 		})},
 		Constraints: parent.Constraints,
 		Priority:    parent.Priority,
+		Delegation: &executor.DelegationLink{
+			ParentTaskID:        parent.TaskID,
+			ParentAgentID:       child.ParentAgentID,
+			ParentCorrelationID: parent.CorrelationID,
+			ActionID:            child.DelegationActionID,
+			Depth:               depth + 1,
+		},
 	}
 	return r.execute(ctx, childReq, ag, depth+1)
 }

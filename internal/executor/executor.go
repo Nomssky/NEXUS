@@ -173,8 +173,30 @@ type WorkRequest struct {
 	// Evaluate then satisfies a REQUIRE_APPROVAL policy with it (approval
 	// resume path). nil = no approval on file (normal execution).
 	ApprovalState *governance.ApprovalState `json:"-"`
+	// Delegation links a child execution to the exact delegation that created
+	// it. It is stamped by the runtime that creates the child — never by
+	// model output — so a child is never attachable to an unrelated parent,
+	// business, execution or actor (AGENT_DELEGATION_CONTRACTS §2). nil = the
+	// work is not a delegated child.
+	Delegation *DelegationLink `json:"delegation,omitempty"`
 	// Handler performs the actual work. If nil, a default handler is used.
 	Handler TaskHandler
+}
+
+// DelegationLink is the runtime-owned parentage of one child execution: ids
+// only, no authority. Authority is never inherited through this link — the
+// child is admitted, scoped and budgeted on its own (contract §4).
+type DelegationLink struct {
+	// ParentTaskID is the delegating execution's task id.
+	ParentTaskID string `json:"parent_task_id"`
+	// ParentAgentID is the delegating agent as resolved by the runtime.
+	ParentAgentID string `json:"parent_agent_id"`
+	// ParentCorrelationID is the end-to-end trace the child extends.
+	ParentCorrelationID string `json:"parent_correlation_id,omitempty"`
+	// ActionID is the governance proposal id that admitted the delegation.
+	ActionID string `json:"action_id,omitempty"`
+	// Depth is the agentexec nesting depth the child runs at.
+	Depth int `json:"depth,omitempty"`
 }
 
 // TaskHandler is a function that executes a task's actual work.
