@@ -18,15 +18,34 @@ execution context.
 
 ```
 User ─▶ Research Agent ─▶ Coding Agent
-        └ authority: business, division, actor, governance decision ─┘ (unchanged)
+        └ scope: business, division, actor, correlation, deadline-context ─┘ (unchanged)
 ```
 
 A child inherits, verbatim:
 
 * `business_id`, `division_id`, actor identity,
-* the parent's **governance authorization** (no second gate is invented, and no
-  second approval mechanism),
-* `correlation_id`/`root_request_id`, so the whole tree is one trace.
+* `correlation_id`/`root_request_id`, so the whole tree is one trace,
+* the parent's remaining deadline (context-carried; the child cannot extend it).
+
+What is NOT inherited (v4, `contracts/AGENT_DELEGATION_CONTRACTS.md`):
+
+* **governance decisions and approvals** — the same engine admits every
+  effect, but each admission is its own: the parent delegation is admitted on
+  `agent:<child>`, and every child effect is admitted on its own target with
+  its own fingerprint. Approving the delegation never approves a child
+  effect; a pending/escalated/denied child is reported as what it is, never
+  adopted, never auto-resumed;
+* **capabilities** — the child's effective tools are the intersection of the
+  model proposal with the tool registry, the child agent's allowlist, the
+  parent agent's allowlist, governance, and platform gates. The delegator
+  cannot give what it lacks; the child cannot gain what its definition
+  forbids;
+* **memory** — children have no durable memory path (no platform, no
+  memory-reaching tool), so isolation holds by construction. What the parent
+  learns arrives only as child output text inside the parent observation;
+* **budget** — delegation count is bounded by the parent's delegation budget,
+  nesting depth by `maxDepth`, spec fan-out by `maxFan`. No layer multiplies
+  budgets.
 
 A child cannot: switch business, switch division, widen a division scope,
 bypass governance/approval, or see a foreign resource. There is no API to
@@ -37,10 +56,15 @@ identically to children.
 
 * `agent.delegated` event per child (delegate id, target agent id) on the same
   event bus with the root correlation id;
+* every child request carries a runtime-stamped `Delegation` link (parent
+  task/agent/correlation, admission proposal id, depth), surfaced on the
+  child's `agent.started` event as metadata;
 * child outcomes are summarized in the parent's output;
 * the parent's terminal result reports `child_executions`;
 * a child failure fails the parent (with the child's failure named) — a failed
-  child is never silently ignored into a "successful" parent.
+  child is never silently ignored into a "successful" parent;
+* an unknown child outcome stays unknown on the parent observation (with
+  reconciliation markers) and is never re-dispatched.
 
 ## Limits (v1)
 
