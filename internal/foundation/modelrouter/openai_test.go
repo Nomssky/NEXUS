@@ -2,6 +2,7 @@ package modelrouter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -154,3 +155,74 @@ func TestOpenAIProviderCredentialMissing(t *testing.T) {
 		t.Fatal("a missing credential must fail honestly")
 	}
 }
+
+func TestOpenAIProviderSendsStrictStructuredSchema(t *testing.T) {
+	var sawBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"{\"type\":\"complete\"}"},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+	p := okProvider(t, srv)
+	schema := []byte(`{"type":"object","properties":{"type":{"type":"string"}}}`)
+	_, err := p.Invoke(context.Background(), &GenerateRequest{
+		RequestID: "r", ModelID: "m", Messages: []Message{{Role: "system", Content: "s"}, {Role: "user", Content: "u"}},
+		Structured: &StructuredOutputSchema{Name: "agent_decision_v1", Schema: schema, Strict: true},
+	})
+	if err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	var wire map[string]interface{}
+	if err := jsonUnmarshalTest(sawBody, &wire); err != nil {
+		t.Fatalf("wire request is not JSON: %v", err)
+	}
+	rf, ok := wire["response_format"].(map[string]interface{})
+	if !ok || rf["type"] != "json_schema" {
+		t.Fatalf("structured request must render as json_schema, got %v", wire["response_format"])
+	}
+	js, ok := rf["json_schema"].(map[string]interface{})
+	if !ok || js["name"] != "agent_decision_v1" || js["strict"] != true {
+		t.Fatalf("schema name/strict must travel: %v", rf)
+	}
+	msgs, ok := wire["messages"].([]interface{})
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("both typed messages must travel, got %v", wire["messages"])
+	}
+	if msgs[0].(map[string]interface{})["role"] != "system" || msgs[1].(map[string]interface{})["role"] != "user" {
+		t.Fatalf("roles must be runtime-assigned system/user: %v", msgs)
+	}
+}
+
+func TestOpenAIProviderRejectsInvalidStructuredSchema(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no HTTP request may leave when the schema itself is invalid")
+	}))
+	defer srv.Close()
+	p := okProvider(t, srv)
+	_, err := p.Invoke(context.Background(), &GenerateRequest{
+		RequestID: "r", ModelID: "m",
+		Structured: &StructuredOutputSchema{Name: "agent_decision_v1", Schema: []byte(`{oops`), Strict: true},
+	})
+	if err == nil {
+		t.Fatal("an invalid schema must fail before any HTTP call")
+	}
+}
+
+func TestRouterRejectsStructuredRequestWithoutCapableModel(t *testing.T) {
+	mr := NewModelRegistry()
+	if err := mr.RegisterModel(&ModelDefinition{ID: "plain", ProviderID: "p1",
+		Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeLocal, Status: ModelStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	router := NewModelRouter(mr, RoutingPolicyLocalFirst)
+	router.RegisterProvider(NewLocalProvider(ProviderConfig{ID: "p1"}))
+	_, _, err := router.Invoke(context.Background(),
+		&RoutingRequest{RequestID: "r", RequiredCaps: []ModelCapability{CapabilityReasoning}, FallbackEnabled: true},
+		&GenerateRequest{RequestID: "r", Structured: &StructuredOutputSchema{Name: "agent_decision_v1", Schema: []byte(`{"type":"object"}`), Strict: true}})
+	if err == nil || !strings.Contains(err.Error(), "structured output") {
+		t.Fatalf("a structured request with no capable model must fail honestly, got %v", err)
+	}
+}
+
+func jsonUnmarshalTest(b []byte, v interface{}) error { return json.Unmarshal(b, v) }
