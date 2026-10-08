@@ -2,7 +2,6 @@ package agentintel
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -71,22 +70,14 @@ type Action struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// ParseAction extracts the single structured action from a model response.
-// The response must contain a JSON object with a known "type"; anything else
-// is a protocol error — the runtime never guesses an intent from prose.
-//
-// Unknown JSON fields are a protocol error: a model may never silently smuggle
-// a privileged field (owner ids, scope, approvals, provider selection,
-// membership) through an action that structurally decodes. This is how the
-// loop enforces "model output is data, never authority".
+// ParseAction decodes exactly one strict decision object from the whole model
+// response (protocol v2). Anything that is not exactly one schema-shaped
+// object — prose, a second object, an array, null, oversized or truncated
+// text, duplicate keys — is a protocol error, never a guess.
 func ParseAction(content string) (Action, error) {
-	obj := extractJSONObject(content)
-	if obj == "" {
-		return Action{}, fmt.Errorf("protocol: model response contained no JSON action")
-	}
 	var a Action
-	if err := strictDecodeJSON(obj, &a); err != nil {
-		return Action{}, fmt.Errorf("protocol: malformed action JSON: %w", err)
+	if err := parseStrictDecisionObject(content, &a); err != nil {
+		return Action{}, fmt.Errorf("protocol: %w", err)
 	}
 	if _, ok := validActions[a.Type]; !ok {
 		return Action{}, fmt.Errorf("protocol: unknown action type %q", a.Type)
@@ -94,72 +85,20 @@ func ParseAction(content string) (Action, error) {
 	return a, nil
 }
 
-// ParsePlan extracts a plan from a model response (advisory; validated after).
+// ParsePlan decodes exactly one strict plan object from the whole model
+// response (advisory; validated after). The same whole-response rule applies:
+// no prose extraction, no second object, no silent repair.
 func ParsePlan(content string) ([]Step, error) {
-	obj := extractJSONObject(content)
-	if obj == "" {
-		return nil, fmt.Errorf("planner: model response contained no JSON plan")
-	}
 	var envelope struct {
 		Steps []Step `json:"steps"`
 	}
-	if err := strictDecodeJSON(obj, &envelope); err != nil {
-		return nil, fmt.Errorf("planner: malformed plan JSON: %w", err)
+	if err := parseStrictDecisionObject(content, &envelope); err != nil {
+		return nil, fmt.Errorf("planner: %w", err)
 	}
 	if len(envelope.Steps) == 0 {
 		return nil, fmt.Errorf("planner: plan has no steps")
 	}
 	return envelope.Steps, nil
-}
-
-// strictDecodeJSON unmarshals v from s, rejecting ANY field that is not part
-// of the declared boundary struct — the model cannot smuggle a new "field"
-// past the parser to claim authority it did not earn.
-func strictDecodeJSON(s string, v interface{}) error {
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	return nil
-}
-
-// extractJSONObject returns the first balanced {...} block, tolerating prose
-// and fenced code around it.
-func extractJSONObject(s string) string {
-	start := strings.Index(s, "{")
-	if start < 0 {
-		return ""
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			switch {
-			case esc:
-				esc = false
-			case c == '\\':
-				esc = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return ""
 }
 
 // OperationResolver is an OPTIONAL ScopeResolver capability: it reports whether
@@ -375,12 +314,21 @@ type DecisionPrompt struct {
 	Context string
 }
 
-// ToolHint is one entry of the bounded capability catalog.
+// ToolHint is one entry of the bounded capability catalog. It is advisory
+// context only: ids, operations, a short description, the input shape the
+// model needs to build a valid proposal, and the side-effect class. It never
+// carries credentials, secret values, internal paths, authorization internals,
+// governance internals or raw membership data — the capability platform
+// authorizes every invocation separately.
 type ToolHint struct {
 	ID         string
 	Summary    string
 	Operations []string
 	SideEffect string
+	// InputShape names the accepted input fields ("a:string*,b:string"):
+	// a trailing "*" marks a required field. Derived from the tool manifest's
+	// input schema, never from model input.
+	InputShape string
 }
 
 // PlanPrompt is the advisory planning request.

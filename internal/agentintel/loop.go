@@ -35,23 +35,23 @@ func (d *Decision) now() time.Time {
 	return time.Now()
 }
 
-// Decide asks the model for the next structured action (§6).
+// Decide asks the model for the next structured action (§6, protocol v2).
 func (d *Decision) Decide(ctx context.Context, p DecisionPrompt) (string, error) {
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	return d.invoke(ctx, p.StepID, buildDecisionMessages(p))
+	return d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest())
 }
 
-// Plan asks the model for an advisory plan (§3).
+// Plan asks the model for an advisory plan (§3, protocol v2).
 func (d *Decision) Plan(ctx context.Context, p PlanPrompt) (string, error) {
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	return d.invoke(ctx, "plan", buildPlanMessages(p))
+	return d.invoke(ctx, "plan", buildPlanEnvelope(p), PlanStructuredRequest())
 }
 
-func (d *Decision) invoke(ctx context.Context, id string, lines []string) (string, error) {
+func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, structured *modelrouter.StructuredOutputSchema) (string, error) {
 	routeReq := &modelrouter.RoutingRequest{
 		RequestID:       id,
 		AgentID:         d.AgentID,
@@ -60,8 +60,9 @@ func (d *Decision) invoke(ctx context.Context, id string, lines []string) (strin
 	}
 	gen := &modelrouter.GenerateRequest{
 		RequestID:      id,
-		Messages:       toMessages(lines),
+		Messages:       toProviderMessages(msgs),
 		ResponseFormat: "json",
+		Structured:     structured,
 		MaxTokens:      512,
 	}
 	resp, _, err := d.Router.Invoke(ctx, routeReq, gen)
@@ -69,17 +70,6 @@ func (d *Decision) invoke(ctx context.Context, id string, lines []string) (strin
 		return "", fmt.Errorf("provider invocation failed: %w", err)
 	}
 	return resp.Content, nil
-}
-
-// toMessages maps prompts onto provider messages. Every prompt is sent as
-// untrusted user content: the runtime composes the instruction envelope, so
-// no provider-visible string carries runtime authority (§8).
-func toMessages(lines []string) []modelrouter.Message {
-	msgs := make([]modelrouter.Message, 0, len(lines))
-	for _, l := range lines {
-		msgs = append(msgs, modelrouter.Message{Role: "user", Content: l})
-	}
-	return msgs
 }
 
 // Runtime is the bounded control loop (§4). It runs as an executor handler

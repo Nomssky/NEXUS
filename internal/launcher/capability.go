@@ -143,7 +143,9 @@ func workspaceRoot(env func(string) string, dataDir, businessID string) string {
 // knows nothing about the intelligence layer.
 type capabilityCatalog struct{ platform *capability.Platform }
 
-// Catalog returns the scope-visible catalog as bounded prompt hints.
+// Catalog returns the scope-visible catalog as bounded prompt hints. The
+// input shape is derived from each manifest's declared input schema (field
+// names, types, required markers) — descriptive context only, never a grant.
 func (c capabilityCatalog) Catalog(businessID, divisionID string) []agentintel.ToolHint {
 	if c.platform == nil {
 		return nil
@@ -156,7 +158,27 @@ func (c capabilityCatalog) Catalog(businessID, divisionID string) []agentintel.T
 			Summary:    m.Description,
 			Operations: m.SortedOperations(),
 			SideEffect: string(m.SideEffectClass),
+			InputShape: inputShapeOf(m),
 		})
 	}
 	return out
+}
+
+// inputShapeOf renders "name:type" per declared input field, "*" = required.
+// It exposes the shape the model needs for a valid proposal and nothing
+// about credentials, paths, membership or governance.
+func inputShapeOf(m tool.ToolManifest) string {
+	parts := make([]string, 0, len(m.InputSchema.Fields))
+	for _, f := range m.InputSchema.Fields {
+		name := strings.TrimSpace(string(f.Name))
+		if name == "" {
+			continue
+		}
+		part := name + ":" + strings.TrimSpace(string(f.Type))
+		if f.Required {
+			part += "*"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ",")
 }
