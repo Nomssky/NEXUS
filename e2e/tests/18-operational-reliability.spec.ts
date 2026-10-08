@@ -414,7 +414,7 @@ test.describe('OPERATIONAL RELIABILITY & TOOL SEMANTICS', () => {
   test('replanning does not reset the budget counters', async ({ request, nexus }) => {
     await registerReliabilityAnalyst(request, nexus);
     const { result } = await runObjective(
-      request, nexus, 'replan the approach and then report the outcome',
+      request, nexus, 'replan the delegate approach and then report the outcome',
     );
     expect(result.status).toBe('completed');
     const summary = result.outcome.summary as string;

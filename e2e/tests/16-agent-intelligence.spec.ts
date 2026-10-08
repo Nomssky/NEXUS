@@ -127,7 +127,7 @@ test.describe('AGENT INTELLIGENCE LAYER', () => {
 
   test('replanning produces a new plan version and still completes', async ({ request, nexus }) => {
     await ensureAnalyst(request, nexus);
-    const result = await runObjective(request, nexus, 'replan the approach once and then finish');
+    const result = await runObjective(request, nexus, 'replan the calculator approach once and then finish');
     expect(result.status).toBe('completed');
     expect(result.outcome.summary).toContain('replans=1');
   });

@@ -288,7 +288,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
       ...bootstrapHeaders(nexus),
     });
     try {
-      const submit = await submitObjective(request, nexus, 'use what you remember', {
+      const submit = await submitObjective(request, nexus, 'use what you remember in memory', {
         context: { agent_id: agentId },
       });
       expect(submit.status()).toBe(202);
@@ -320,7 +320,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
       ...bootstrapHeaders(nexus),
     });
     try {
-      const submit = await submitObjective(request, nexus, 'use what you remember', {
+      const submit = await submitObjective(request, nexus, 'use what you remember in memory', {
         context: { agent_id: agentId },
       });
       expect(submit.status()).toBe(202);
@@ -559,7 +559,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
     });
     expect(policy.status()).toBe(200);
     try {
-      const { result } = await runObjective(request, nexus, 'use what you remember', {
+      const { result } = await runObjective(request, nexus, 'use what you remember in memory', {
         context: { agent_id: agentId },
       });
       expect(result.status).toBe('failed');
@@ -591,7 +591,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
       );
       expect(await read.text()).not.toContain(secret);
       const agentId = await registerMemoryAgent(request, nexus, 't11', ['echo', 'calculator']);
-      const { result } = await runObjective(request, nexus, 'use what you remember', {
+      const { result } = await runObjective(request, nexus, 'use what you remember in memory', {
         context: { agent_id: agentId },
       });
       expect(result.status).toBe('completed');
@@ -616,7 +616,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
       ...bootstrapHeaders(nexus),
     });
     try {
-      const submit = await submitObjective(request, nexus, 'use what you remember about the filler records', {
+      const submit = await submitObjective(request, nexus, 'use what you remember in memory with the filler records', {
         context: { agent_id: agentId },
       });
       expect(submit.status()).toBe(202);
@@ -629,7 +629,7 @@ test.describe('AGENT MEMORY & CONTEXT PLATFORM', () => {
       const result = await pollObjective(request, nexus, execution_id);
       // Old memory never displaces the current task: the objective still ran.
       expect(result.status).toBe('completed');
-      expect(result.outcome.summary).toContain('objective=use what you remember about the filler records');
+      expect(result.outcome.summary).toContain('objective=use what you remember in memory with the filler records');
       const truncated = framesOf(conn, 'context.truncated').filter(
         (f: any) => f.json?.correlation_id === execution_id,
       );
