@@ -220,6 +220,34 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 		return nil, nil, err
 	}
 
+	// A structured-output request must only reach a model that explicitly
+	// advertises CapabilityStructuredOutput — never silently downgraded to
+	// free text. The primary candidate was already capability-filtered, but
+	// the check is repeated here so a caller that sets Structured without the
+	// matching RequiredCaps still fails honestly instead of prose-parsing.
+	if genReq.Structured != nil && !mr.modelAdvertises(decision.ModelID, CapabilityStructuredOutput) {
+		reselected := ""
+		for _, modelID := range decision.FallbackChain {
+			if mr.modelAdvertises(modelID, CapabilityStructuredOutput) {
+				reselected = modelID
+				break
+			}
+		}
+		if reselected == "" {
+			return nil, decision, fmt.Errorf("no routed model advertises %q for structured output %q",
+				CapabilityStructuredOutput, genReq.Structured.Name)
+		}
+		mdl, ok := mr.registry.GetModel(reselected)
+		if !ok {
+			return nil, decision, fmt.Errorf("no routed model advertises %q for structured output %q",
+				CapabilityStructuredOutput, genReq.Structured.Name)
+		}
+		decision.ModelID = mdl.ID
+		decision.ProviderID = mdl.ProviderID
+		decision.Reason = fmt.Sprintf("reselected %s (provider=%s) for structured output %q",
+			mdl.ID, mdl.ProviderID, genReq.Structured.Name)
+	}
+
 	// D2: the primary attempt must invoke the model routing actually chose
 	// — callers pass an empty/placeholder ModelID and the router owns
 	// selection (routing ≠ authorization; selection here, governance at
@@ -256,6 +284,11 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 		for _, modelID := range decision.FallbackChain[1:] {
 			mdl, ok := mr.registry.GetModel(modelID)
 			if !ok {
+				continue
+			}
+			// A structured request never falls back to a model that cannot
+			// honor it — skipping is honest, downgrading would not be.
+			if genReq.Structured != nil && !hasModelCapability(mdl, CapabilityStructuredOutput) {
 				continue
 			}
 			genReq.ModelID = modelID
@@ -434,4 +467,26 @@ func (mr *ModelRouter) GetAccounting() *InvocationAccounting {
 // GetHealth returns the health registry.
 func (mr *ModelRouter) GetHealth() *HealthRegistry {
 	return mr.health
+}
+
+// modelAdvertises reports whether the named model explicitly carries the
+// capability. Unknown models never count as capable — fail closed.
+func (mr *ModelRouter) modelAdvertises(modelID string, cap ModelCapability) bool {
+	mdl, ok := mr.registry.GetModel(modelID)
+	if !ok {
+		return false
+	}
+	return hasModelCapability(mdl, cap)
+}
+
+func hasModelCapability(mdl *ModelDefinition, cap ModelCapability) bool {
+	if mdl == nil {
+		return false
+	}
+	for _, c := range mdl.Capabilities {
+		if c == cap {
+			return true
+		}
+	}
+	return false
 }

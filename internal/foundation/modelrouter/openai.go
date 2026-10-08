@@ -111,7 +111,14 @@ type chatRequest struct {
 }
 
 type chatRespFmt struct {
-	Type string `json:"type"`
+	Type       string          `json:"type"`
+	JSONSchema *chatJSONSchema `json:"json_schema,omitempty"`
+}
+
+type chatJSONSchema struct {
+	Name   string          `json:"name"`
+	Schema json.RawMessage `json:"schema,omitempty"`
+	Strict bool            `json:"strict,omitempty"`
 }
 
 type chatResponse struct {
@@ -153,7 +160,22 @@ func (p *OpenAIProvider) Invoke(ctx context.Context, req *GenerateRequest) (*Gen
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 	}
-	if req.ResponseFormat == "json" {
+	// The canonical structured-output request renders as the provider's
+	// strict JSON-schema response format. A malformed schema declaration is
+	// a configuration error, never a silent downgrade to free text.
+	if req.Structured != nil {
+		if strings.TrimSpace(req.Structured.Name) == "" || len(req.Structured.Schema) == 0 {
+			return nil, &ProviderError{Kind: "invalid_request", Provider: p.config.ID,
+				Cause: fmt.Errorf("structured output schema is incomplete")}
+		}
+		var schemaDoc json.RawMessage
+		if err := json.Unmarshal(req.Structured.Schema, &schemaDoc); err != nil {
+			return nil, &ProviderError{Kind: "invalid_request", Provider: p.config.ID,
+				Cause: fmt.Errorf("structured output schema is not valid JSON: %w", err)}
+		}
+		chatReq.ResponseFmt = &chatRespFmt{Type: "json_schema",
+			JSONSchema: &chatJSONSchema{Name: req.Structured.Name, Schema: schemaDoc, Strict: req.Structured.Strict}}
+	} else if req.ResponseFormat == "json" {
 		chatReq.ResponseFmt = &chatRespFmt{Type: "json_object"}
 	}
 	body, err := json.Marshal(chatReq)

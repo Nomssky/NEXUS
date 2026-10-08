@@ -78,6 +78,16 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 		prompt.WriteString(m.Content)
 		prompt.WriteString("\n")
 	}
+	// Protocol v2 carries the structured request name alongside the prompt:
+	// a plan request is answered with a plan even though the v2 instruction
+	// envelope no longer starts with the legacy planner prefix. The decision
+	// table itself is unchanged — only the framing moved.
+	if req.Structured != nil && req.Structured.Name == "agent_plan_v1" {
+		content := scriptedPlan(extractAfter(strings.ToLower(prompt.String()), "objective: "))
+		return &GenerateResponse{
+			RequestID: req.RequestID, ModelID: req.ModelID, Content: content, FinishReason: "stop",
+		}, nil
+	}
 	content := scriptedAnswer(prompt.String())
 	return &GenerateResponse{
 		RequestID: req.RequestID, ModelID: req.ModelID, Content: content, FinishReason: "stop",

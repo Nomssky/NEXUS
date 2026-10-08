@@ -67,7 +67,6 @@ type Provider interface {
 	Invoke(ctx context.Context, req *GenerateRequest) (*GenerateResponse, error)
 }
 
-// GenerateRequest is a normalized request to a model provider.
 type GenerateRequest struct {
 	RequestID      string           `json:"request_id"`
 	ModelID        string           `json:"model_id"`
@@ -77,6 +76,20 @@ type GenerateRequest struct {
 	Tools          []ToolDefinition `json:"tools,omitempty"`
 	Stream         bool             `json:"stream,omitempty"`
 	ResponseFormat string           `json:"response_format,omitempty"`
+	// Structured requests the strict decision protocol from
+	// AGENT_MODEL_PROTOCOL_CONTRACTS §3: the provider must honor the declared
+	// JSON schema exactly, or fail honestly — never silently return free text.
+	Structured *StructuredOutputSchema `json:"structured,omitempty"`
+}
+
+// StructuredOutputSchema is the provider-neutral form of "the model must
+// return exactly this JSON object shape". The agent intelligence layer fills
+// it; the router chooses the provider; the provider adapter renders its own
+// wire representation — agentintel never names a vendor API (§3).
+type StructuredOutputSchema struct {
+	Name   string `json:"name"`
+	Schema []byte `json:"schema"`
+	Strict bool   `json:"strict"`
 }
 
 // Message represents a conversation message.
