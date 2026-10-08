@@ -100,6 +100,29 @@ RUNTIME AUTHORITY > MODEL PROPOSAL > TOOL / MEMORY / CHILD DATA > EXTERNAL DATA
   loop, so no observation can change them — the guarantee is structural, not a
   claim of perfect prompt-injection prevention.
 
+## 5b. Typed model protocol (v2)
+
+`contracts/AGENT_MODEL_PROTOCOL_CONTRACTS.md` is authoritative. In short:
+
+* the runtime sends exactly two messages — `system` (the versioned
+  authoritative instruction envelope, `agent_decision_v1`) and `user` (the
+  typed untrusted context: objective, step, budget, bounded tool catalog with
+  input shapes, bounded memory, bounded observations). The model never chooses
+  roles and cannot modify instructions;
+* the model must return exactly one JSON object matching the declared decision
+  schema. Prose around JSON, a second object, arrays, `null`, oversized or
+  truncated text, duplicate keys and unknown fields are deterministic protocol
+  failures — the old "extract the first `{...}` out of prose" fallback is
+  removed from the consequential path;
+* `agentintel` requests structure provider-neutrally
+  (`modelrouter.StructuredOutputSchema`); the OpenAI-compatible adapter renders
+  `response_format: {type: "json_schema", ...}`. A provider that cannot honor
+  the schema fails honestly — routing reselects a capable model or errors, and
+  the flow never silently downgrades to free text;
+* `CapabilityStructuredOutput` (emit one strict decision) and
+  `CapabilityToolCalling` (native provider tool calls) are distinct: the loop
+  needs only the former, and NEXUS actions stay runtime-owned regardless.
+
 ## 6. Test providers (simulation, not production)
 
 The shipped binary seeds a *simulated* provider that answers with empty
