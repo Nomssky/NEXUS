@@ -10,11 +10,15 @@ package agentintel
 // validated write.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
 // Default working-memory bounds. Working memory is scratch state: if it needs to
@@ -23,6 +27,10 @@ const (
 	defaultWorkingEntries   = 64
 	defaultWorkingValueSize = 4 * 1024
 	defaultWorkingObs       = 16
+	// defaultWorkingEffects bounds the completed-effect fingerprints below.
+	// One iteration performs at most one consequential action, so this is
+	// far above any reachable count inside the iteration budget.
+	defaultWorkingEffects = 64
 )
 
 // WorkingMemory is per-execution, process-local scratch state (§2). It is
@@ -40,6 +48,10 @@ type WorkingMemory struct {
 	pending      string
 	deadline     time.Time
 	discarded    bool
+	// effects fingerprints every COMPLETED consequential effect of this
+	// execution (contract §10). A proposal identical to a recorded one is a
+	// duplicate the runtime must not blindly re-execute.
+	effects map[string]struct{}
 }
 
 // NewWorkingMemory returns empty, bounded working memory.
@@ -49,6 +61,7 @@ func NewWorkingMemory() *WorkingMemory {
 		maxValue:   defaultWorkingValueSize,
 		maxObs:     defaultWorkingObs,
 		entries:    map[string]string{},
+		effects:    map[string]struct{}{},
 	}
 }
 
@@ -149,6 +162,105 @@ func (m *WorkingMemory) Snapshot() WorkingSnapshot {
 		Objective: m.objective, StepID: m.stepID, StepIntent: m.stepIntent,
 		Pending: m.pending, Deadline: m.deadline, Entries: entries, Observations: obs,
 	}
+}
+
+// NoteEffect records a completed consequential effect. It reports false when
+// the identical effect already completed in this execution — the caller must
+// refuse to duplicate it. Only effects the runtime itself performed are ever
+// recorded; model claims are never fingerprints.
+func (m *WorkingMemory) NoteEffect(fp string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if fp == "" {
+		return false, fmt.Errorf("working memory: empty effect fingerprint")
+	}
+	if _, dup := m.effects[fp]; dup {
+		return false, nil
+	}
+	if len(m.effects) >= defaultWorkingEffects {
+		return false, fmt.Errorf("working memory holds its %d effect bound", defaultWorkingEffects)
+	}
+	m.effects[fp] = struct{}{}
+	return true, nil
+}
+
+// HasEffect reports whether the identical effect already completed.
+func (m *WorkingMemory) HasEffect(fp string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, dup := m.effects[fp]
+	return dup
+}
+
+// EffectCount reports how many completed effects are recorded.
+func (m *WorkingMemory) EffectCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.effects)
+}
+
+// repeatGuardFingerprint returns the duplicate-suppression fingerprint for an
+// action proposal, or "" when repetition is harmless. Reads may repeat — the
+// reliability layer itself retries reads — but anything that mutates,
+// delegates, or persists must never run twice blindly in one execution
+// (contract §10). An unresolvable side-effect class fails closed toward
+// fingerprinting.
+func repeatGuardFingerprint(r ScopeResolver, a Action) string {
+	switch a.Type {
+	case ActionDelegate, ActionMemoryWrite, ActionMemoryDelete:
+		return effectFingerprint(a)
+	case ActionToolCall:
+		if se, ok := r.(SideEffectResolver); ok {
+			if class, known := se.ToolSideEffect(a.Tool); known && class == string(tool.SideEffectRead) {
+				return ""
+			}
+		}
+		return effectFingerprint(a)
+	default:
+		return ""
+	}
+}
+
+// effectFingerprint renders the identity of one consequential action proposal:
+// type, effective target and payload, deterministically ordered. Two proposals
+// with the same fingerprint would cause the same side effect, so the second
+// one must not run blindly. Control and read-only actions have no fingerprint.
+func effectFingerprint(a Action) string {
+	h := sha256.New()
+	write := func(s string) { _, _ = h.Write([]byte(s + "\x00")) }
+	switch a.Type {
+	case ActionToolCall:
+		write("tool_call")
+		write(a.Tool)
+		write(a.Operation)
+		keys := make([]string, 0, len(a.Input))
+		for k := range a.Input {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			write(k)
+			write(a.Input[k])
+		}
+	case ActionDelegate:
+		write("delegate")
+		write(a.AgentID)
+		write(a.Objective)
+	case ActionMemoryWrite:
+		write("memory_write")
+		write(a.Key)
+		write(a.Value)
+		write(a.MemoryType)
+		write(a.MemoryScope)
+		write(a.ObservationID)
+	case ActionMemoryDelete:
+		write("memory_delete")
+		write(a.Key)
+	default:
+		return ""
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:])
 }
 
 // Discard drops every entry when the execution ends. Durable memory is never

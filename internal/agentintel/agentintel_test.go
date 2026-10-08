@@ -332,6 +332,7 @@ func TestReplanningIsBoundedAndVersioned(t *testing.T) {
 		plan: goodPlan,
 		answers: []string{
 			`{"type":"replan","reason":"the first approach was blocked"}`,
+			`{"type":"tool_call","tool":"calculator","input":{"a":"6","b":"7","op":"mul"}}`,
 			`{"type":"complete","result":"second plan finished"}`,
 		},
 	})

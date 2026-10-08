@@ -108,6 +108,15 @@ type OperationResolver interface {
 	ToolSupportsOperation(toolID, operation string) bool
 }
 
+// SideEffectResolver is an OPTIONAL ScopeResolver capability: it reports the
+// manifest's side-effect class for a tool. The duplicate-effect guard uses it
+// to fingerprint only effects that must not repeat (anything but read): when
+// a resolver does not implement it, every tool call is treated as repeating
+// -unsafe (fail closed).
+type SideEffectResolver interface {
+	ToolSideEffect(toolID string) (string, bool)
+}
+
 // ActionContext is everything the validator needs to decide an action. It is
 // runtime state, never model-provided.
 type ActionContext struct {
@@ -312,6 +321,12 @@ type DecisionPrompt struct {
 	// objective and the current step are always reserved and memory can never
 	// crowd them out (contract §12).
 	Context string
+	// PlanVersion is the active runtime plan version, and StepStates is the
+	// authoritative per-step ledger rendered for the decision (depth contract
+	// §12). Both are runtime facts: the model reads them as data and cannot
+	// write them — there is no decision field that maps back onto them.
+	PlanVersion int
+	StepStates  string
 }
 
 // ToolHint is one entry of the bounded capability catalog. It is advisory

@@ -71,6 +71,12 @@ func buildDecisionEnvelope(p DecisionPrompt) []ModelMessage {
 	var b strings.Builder
 	b.WriteString("OBJECTIVE: " + p.Objective + "\n")
 	b.WriteString("STEP: " + p.StepID + " intent=" + p.StepIntent + "\n")
+	if p.PlanVersion > 0 {
+		b.WriteString(fmt.Sprintf("PLAN: version=%d\n", p.PlanVersion))
+	}
+	if strings.TrimSpace(p.StepStates) != "" {
+		b.WriteString("STEP_STATES (runtime facts, read-only): " + strings.TrimSpace(p.StepStates) + "\n")
+	}
 	b.WriteString("BUDGET: " + fmt.Sprintf("iterations=%d/%d tool_calls=%d/%d delegations=%d/%d replans=%d/%d model_calls=%d/%d",
 		p.BudgetUsage.Iterations, p.Budget.MaxIterations, p.BudgetUsage.ToolCalls, p.Budget.MaxToolCalls,
 		p.BudgetUsage.Delegations, p.Budget.MaxDelegations, p.BudgetUsage.Replans, p.Budget.MaxReplans,

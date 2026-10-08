@@ -210,8 +210,16 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 
 	// ---- planning (advisory) --------------------------------------------
 	rn.transition(StatePlanning, nil)
+	if ctx.Err() != nil {
+		rn.transition(StateCancelled, nil)
+		return cancelledOutcome(req, start, r.now()), nil
+	}
 	steps, planErr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
 	if planErr != nil {
+		if ctx.Err() != nil {
+			rn.transition(StateCancelled, nil)
+			return cancelledOutcome(req, start, r.now()), nil
+		}
 		rn.transition(StateFailed, map[string]string{"reason": "planner failed"})
 		return failedOutcome(req, start, r.now(), StateFailed, "planner failed: "+planErr.Error()), nil
 	}
@@ -226,6 +234,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
 		return failedOutcome(req, start, r.now(), StateFailed, "plan rejected: "+rejectionSummary(res)), nil
 	}
+	// The step ledger is runtime-owned scratch for this plan version: the
+	// model proposed the steps, but readiness, execution order and terminal
+	// facts are decided here (contract §3, §4).
+	ledger := newPlanLedger(plan)
 
 	agentID := r.resolveAgent(obj, req)
 	usage := BudgetUsage{}
@@ -236,7 +248,6 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	working.SetDeadline(deadline)
 	memIdentity := r.memoryIdentity(rn, agentID)
 	observations := []Observation{}
-	stepIdx := 0
 	contextAnnounced := false
 	contextTruncatedAnnounced := false
 
@@ -258,9 +269,29 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		}
 		usage.Iterations++
 
+		// ---- step readiness (runtime decides) -------------------------
+		// Dependencies resolve here, never in the model: the current step is
+		// the first ready step in plan order, so a step can never execute
+		// before the steps it depends on, whatever array position the model
+		// gave it. Newly ready or newly blocked steps emit one event each.
+		for _, id := range ledger.refresh() {
+			switch ledger.get(id).Status {
+			case StepReady:
+				rn.emit(event.EventTypeStepReady, map[string]string{
+					"step": id, "plan_version": fmt.Sprint(ledger.version)})
+			case StepBlocked:
+				rn.emit(event.EventTypeStepBlocked, map[string]string{
+					"step": id, "plan_version": fmt.Sprint(ledger.version)})
+			}
+		}
 		step := Step{StepID: "finalize", Intent: "produce the final result"}
-		if stepIdx < len(plan.Steps) {
-			step = plan.Steps[stepIdx]
+		current := ledger.nextReady()
+		if current != nil {
+			step = *current
+			if err := ledger.begin(step.StepID); err != nil {
+				rn.transition(StateFailed, map[string]string{"reason": "ledger refused the step"})
+				return failedOutcome(req, start, r.now(), StateFailed, "step refused: "+err.Error()), nil
+			}
 		}
 		rn.transition(StateExecuting, map[string]string{"step": step.StepID, "iteration": fmt.Sprint(usage.Iterations)})
 		rn.emit(event.EventTypeStepStarted, map[string]string{"step": step.StepID, "intent": step.Intent})
@@ -299,6 +330,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			Tools:   r.toolHints(req, agentID),
 			Memory:  assembledMemoryRecords(assembled),
 			Context: assembled.Text,
+			// Authoritative runtime state travels with every decision: the
+			// active plan version and the ledger's step facts (contract §12).
+			PlanVersion: plan.Version,
+			StepStates:  ledger.describe(),
 		})
 		if derr != nil {
 			if ctx.Err() != nil {
@@ -323,7 +358,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			Objective: obj, BusinessID: req.BusinessID, DivisionID: req.DivisionID, ActorID: req.ActorID,
 			AgentID: agentID, AgentTools: r.agentTools(agentID), Iterations: usage.Iterations,
 			Used: usage, Budget: budget, Depth: 1,
-			StepHasWork: stepIdx < len(plan.Steps) || len(observations) > 0,
+			StepHasWork: current != nil || len(observations) > 0,
 		}
 		if verr := ValidateAction(action, actx, r.scope(), r.Caps); verr != nil {
 			rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": verr.Error()})
@@ -334,9 +369,32 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			rn.transition(StateFailed, map[string]string{"reason": "action rejected"})
 			return failedOutcome(req, start, r.now(), StateFailed, "action rejected: "+verr.Error()), nil
 		}
+		// A completed mutating effect is never silently repeated: the
+		// fingerprint of every consequential mutation this execution performed
+		// is recorded, and an identical proposal is rejected before anything
+		// can run again (contract §10). Reads may repeat — the reliability
+		// layer itself retries reads — and resume is a new execution with
+		// fresh scratch state, so legitimate re-execution is unaffected.
+		if fp := repeatGuardFingerprint(r.scope(), action); fp != "" && working.HasEffect(fp) {
+			msg := "action rejected: duplicate of an already-completed effect (not re-executed)"
+			rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": msg})
+			rn.transition(StateFailed, map[string]string{"reason": "duplicate effect"})
+			return failedOutcome(req, start, r.now(), StateFailed, msg), nil
+		}
 		rn.emit(event.EventTypeActionProposed, map[string]string{"action": string(action.Type), "step": step.StepID})
 
 		// ---- act --------------------------------------------------------
+		// Cancellation and deadline are re-checked after the model call and
+		// before any effect: a decision that arrived too late never runs
+		// (contract §11).
+		if ctx.Err() != nil {
+			rn.transition(StateCancelled, nil)
+			return cancelledOutcome(req, start, r.now()), nil
+		}
+		if loopCtx.Err() != nil {
+			rn.transition(StateDeadlineExceeded, nil)
+			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
+		}
 		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
 		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, agentID, working, usage, budget)
 		usage = next
@@ -344,12 +402,67 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			observations = append(observations, *obs)
 			working.AddObservation(*obs)
 			_ = working.Put(obs.ObservationID, obs.Source+": "+obs.Status)
+			if current != nil {
+				if oerr := ledger.observe(step.StepID); oerr == nil {
+					rn.emit(event.EventTypeStepObserving, map[string]string{
+						"step": step.StepID, "observation": obs.ObservationID,
+						"plan_version": fmt.Sprint(ledger.version)})
+				}
+			}
 			rn.transition(StateObserving, map[string]string{"observation": obs.ObservationID, "status": obs.Status})
 			rn.emit(event.EventTypeObservationCreated, map[string]string{"observation_id": obs.ObservationID,
 				"source": obs.Source, "action_type": string(obs.ActionType), "status": obs.Status})
 			rn.emit(event.EventTypeStepCompleted, map[string]string{"step": step.StepID, "observation": obs.ObservationID})
 		} else {
 			rn.emit(event.EventTypeStepCompleted, map[string]string{"step": step.StepID, "observation": ""})
+		}
+		// The ledger settles the current step from the authoritative result:
+		// success completes it on the observation's evidence, failure fails
+		// it and blocks everything downstream. Governance terminals leave
+		// the step unmarked — a denial, a pending approval and an escalation
+		// are not execution outcomes (contract §8).
+		if current != nil && termState != "" {
+			switch termState {
+			case StateCompleted, StateFailed:
+				failed := termState == StateFailed
+				obsID := ""
+				if obs != nil {
+					obsID = obs.ObservationID
+				}
+				if ferr := ledger.finish(step.StepID, obsID,
+					firstNonEmpty(termMsg, string(termState)),
+					obsOutcome(obs), obsAttempts(obs), failed); ferr == nil {
+					if failed {
+						rn.emit(event.EventTypeStepFailed, map[string]string{
+							"step": step.StepID, "plan_version": fmt.Sprint(ledger.version)})
+						for _, id := range ledger.refresh() {
+							if ledger.get(id).Status == StepBlocked {
+								rn.emit(event.EventTypeStepBlocked, map[string]string{
+									"step": id, "plan_version": fmt.Sprint(ledger.version)})
+							}
+						}
+					}
+				}
+			}
+		}
+		// A consequential mutation that ran to success is fingerprinted so the
+		// model cannot make the runtime repeat it blindly (contract §10).
+		if termState == "" && obs != nil {
+			if fp := repeatGuardFingerprint(r.scope(), action); fp != "" {
+				if _, ferr := working.NoteEffect(fp); ferr != nil {
+					rn.transition(StateFailed, map[string]string{"reason": "effect ledger refused"})
+					return failedOutcome(req, start, r.now(), StateFailed, "effect ledger refused: "+ferr.Error()), nil
+				}
+			}
+			if current != nil {
+				if ferr := ledger.finish(step.StepID, obs.ObservationID,
+					firstNonEmpty(obs.Text, string(obs.Status)),
+					obsOutcome(obs), obsAttempts(obs), false); ferr == nil {
+					rn.emit(event.EventTypeStepCompleted, map[string]string{
+						"step": step.StepID, "observation": obs.ObservationID,
+						"plan_version": fmt.Sprint(ledger.version)})
+				}
+			}
 		}
 		if termState != "" {
 			if termState == StateCompleted {
@@ -403,9 +516,17 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				return failedOutcome(req, start, r.now(), StateBudgetExhausted,
 					fmt.Sprintf("replan budget exhausted (%d)", budget.MaxReplans)), nil
 			}
+			if ctx.Err() != nil {
+				rn.transition(StateCancelled, nil)
+				return cancelledOutcome(req, start, r.now()), nil
+			}
 			rn.transition(StateReplanning, map[string]string{"reason": action.Reason, "version": fmt.Sprint(plan.Version + 1)})
 			newSteps, perr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
 			if perr != nil {
+				if ctx.Err() != nil {
+					rn.transition(StateCancelled, nil)
+					return cancelledOutcome(req, start, r.now()), nil
+				}
 				rn.transition(StateFailed, map[string]string{"reason": "replan failed"})
 				return failedOutcome(req, start, r.now(), StateFailed, "replan failed: "+perr.Error()), nil
 			}
@@ -419,15 +540,12 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			}
 			rn.emit(event.EventTypePlanReplanned, map[string]string{"version": fmt.Sprint(newPlan.Version),
 				"parent_version": fmt.Sprint(newPlan.ParentVersion), "reason": newPlan.Reason})
+			// The new version is a fresh ledger that carries completed steps
+			// forward as immutable fact: what already ran is never re-run,
+			// and a later model response cannot rewrite it (contract §7, §9).
 			plan = newPlan
-			stepIdx = 0
+			ledger = ledger.carryCompleted(newPlan)
 		case ActionToolCall, ActionDelegate, ActionModelCall, ActionMemoryRead, ActionMemoryWrite, ActionMemoryDelete:
-			if stepIdx < len(plan.Steps) {
-				stepIdx++
-			}
-		}
-		if stepIdx >= len(plan.Steps) && action.Type != ActionComplete {
-			stepIdx = len(plan.Steps) // next iteration is the finalize decision
 		}
 	}
 }
@@ -471,6 +589,14 @@ func (r *Runtime) planner() Planner {
 func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action, agentID string, working *WorkingMemory, usage BudgetUsage, budget Budget) (*Observation, BudgetUsage, State, string) {
 	switch a.Type {
 	case ActionComplete:
+		// Completion needs runtime evidence, not model assertion: at least
+		// one observation from this execution must exist (contract §9). A
+		// completion claim with no evidence — a fabricated "done", a success
+		// story for an effect that never ran — fails the execution instead
+		// of falsely completing it.
+		if len(observationsFor(working)) == 0 {
+			return nil, usage, StateFailed, "complete rejected: no runtime evidence of progress"
+		}
 		return nil, usage, StateCompleted, a.Result
 	case ActionFail:
 		return nil, usage, StateFailed, "model requested failure: " + a.Reason
@@ -675,6 +801,22 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 	}
 }
 
+// obsOutcome normalizes a possibly-nil observation to its reliability outcome.
+func obsOutcome(obs *Observation) string {
+	if obs == nil {
+		return ""
+	}
+	return obs.Outcome
+}
+
+// obsAttempts normalizes a possibly-nil observation to its attempt count.
+func obsAttempts(obs *Observation) int {
+	if obs == nil {
+		return 0
+	}
+	return obs.Attempts
+}
+
 // scope exposes the Agent Execution visibility rules to the validators.
 func (r *Runtime) scope() ScopeResolver {
 	return &execScope{registry: r.Registry, tools: r.Exec}
@@ -709,6 +851,15 @@ func (s *execScope) ToolSupportsOperation(toolID, operation string) bool {
 		return false
 	}
 	return m.Supports(operation)
+}
+
+// ToolSideEffect reports the manifest's side-effect class for a tool.
+func (s *execScope) ToolSideEffect(toolID string) (string, bool) {
+	m, ok := s.tools.Tools.Manifest(toolID)
+	if !ok {
+		return "", false
+	}
+	return string(m.SideEffectClass), true
 }
 
 func (s *execScope) AgentAllowsTool(agentID, toolID string) bool {

@@ -79,6 +79,12 @@ const (
 	EventTypePlanReplanned      EventType = "plan.replanned"
 	EventTypeStepStarted        EventType = "step.started"
 	EventTypeStepCompleted      EventType = "step.completed"
+	// Execution-depth step lifecycle (AGENT_EXECUTION_DEPTH_CONTRACTS §3):
+	// metadata only (step id, plan version, status, observation ref).
+	EventTypeStepReady          EventType = "step.ready"
+	EventTypeStepObserving      EventType = "step.observing"
+	EventTypeStepFailed         EventType = "step.failed"
+	EventTypeStepBlocked        EventType = "step.blocked"
 	EventTypeActionProposed     EventType = "action.proposed"
 	EventTypeActionRejected     EventType = "action.rejected"
 	EventTypeObservationCreated EventType = "observation.created"

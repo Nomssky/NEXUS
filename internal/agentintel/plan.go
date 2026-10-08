@@ -106,6 +106,7 @@ func ValidatePlan(p *Plan, r ScopeResolver, caps Caps) ValidationResult {
 		}
 	}
 	for _, s := range p.Steps {
+		seen := map[string]struct{}{}
 		for _, d := range s.Dependencies {
 			if _, ok := ids[d]; !ok {
 				reject(s.StepID, fmt.Sprintf("depends on unknown step %q", d))
@@ -113,6 +114,10 @@ func ValidatePlan(p *Plan, r ScopeResolver, caps Caps) ValidationResult {
 			if d == s.StepID {
 				reject(s.StepID, "step depends on itself")
 			}
+			if _, dup := seen[d]; dup {
+				reject(s.StepID, fmt.Sprintf("duplicate dependency %q", d))
+			}
+			seen[d] = struct{}{}
 		}
 	}
 	if hasCycle(p) {

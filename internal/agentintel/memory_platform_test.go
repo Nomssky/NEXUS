@@ -112,9 +112,12 @@ func (c *capturingDecider) Decide(_ context.Context, p DecisionPrompt) (string, 
 		clone := p
 		c.prompt = &clone
 	}
+	// A read first (an observation either way), then complete: the tests using
+	// this decider assert on the captured context, and completion requires
+	// runtime evidence of progress.
 	if c.idx == 0 {
 		c.idx++
-		return `{"type":"complete","result":"ok"}`, nil
+		return `{"type":"memory_read","key":"notes"}`, nil
 	}
 	return `{"type":"complete","result":"ok"}`, nil
 }
