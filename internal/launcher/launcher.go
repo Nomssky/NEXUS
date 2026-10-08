@@ -115,6 +115,56 @@ func New(opts Options) *Launcher {
 	// the shipped behaviour, "offline" makes the seed fail at the provider so
 	// a deterministic failed-provider run is reachable without registering a
 	// real provider. Only an existing ProviderStatus is selected here.
+	// Production inference is exclusively opt-in: the launcher registers real
+	// providers ONLY from explicit models.providers configuration. Without it,
+	// the deterministic seeded simulation remains the default (offline/CI).
+	for _, prov := range opts.Config.Models.Providers {
+		p, err := modelrouter.NewOpenAIProvider(modelrouter.ProviderConfig{
+			ID: prov.ID, Name: prov.Name, Endpoint: prov.Endpoint,
+			APIKeyEnv: prov.APIKeyEnv, Timeout: prov.Timeout,
+			AllowInsecureHTTP: prov.AllowInsecureHTTP,
+			MaxRequestBytes:   prov.MaxRequestBytes, MaxResponseBytes: prov.MaxResponseBytes,
+		})
+		if err != nil {
+			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				initErr: fmt.Errorf("model provider %q: %w", prov.ID, err)}
+		}
+		engine.ModelRouter().RegisterProvider(p)
+		caps := make([]modelrouter.ModelCapability, 0, len(prov.Capabilities))
+		if len(prov.Capabilities) == 0 {
+			caps = []modelrouter.ModelCapability{
+				modelrouter.CapabilityReasoning,
+				modelrouter.CapabilityToolCalling,
+				modelrouter.CapabilityStructuredOutput,
+			}
+		} else {
+			for _, c := range prov.Capabilities {
+				caps = append(caps, modelrouter.ModelCapability(c))
+			}
+		}
+		// Model ID matches the real inference endpoint's model name, so the
+		// provider wire request carries the exact identifier the remote
+		// server expects; the provider link lives in ModelDefinition's
+		// ProviderID field, not mashed into the model name.
+		if regErr := engine.ModelRegistry().RegisterModel(&modelrouter.ModelDefinition{
+			ID:               prov.ModelID,
+			ProviderID:       p.Identify(),
+			Capabilities:     caps,
+			Runtime:          modelrouter.RuntimeRemote,
+			Status:           modelrouter.ModelStatusActive,
+			ExternalTransfer: true,
+			DataRetention:    "standard",
+		}); regErr != nil {
+			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				initErr: fmt.Errorf("register model %q: %w", prov.ModelID, regErr)}
+		}
+		if opts.Logger != nil {
+			opts.Logger.Info("production model provider registered", logging.Fields{
+				Context: map[string]any{"provider_id": prov.ID, "model_id": prov.ModelID, "endpoint": prov.Endpoint},
+			})
+		}
+	}
+
 	if engine.ModelRegistry().ModelCount() == 0 {
 		seedStatus := modelrouter.ProviderStatus(opts.Config.Models.SeededProviderStatus)
 		if seedStatus == "" {

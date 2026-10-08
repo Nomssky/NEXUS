@@ -118,6 +118,12 @@ interface StartOptions {
    * (PROVIDER_CONTRACTS §12): the harness still owns the credentials.
    */
   extraEnv?: Record<string, string>;
+  /**
+   * Extra CLI arguments for the binary (e.g. --config <path>), so a spec can
+   * boot the gateway with an explicit file-backed provider configuration
+   * without needing another hidden API surface.
+   */
+  args?: string[];
 }
 
 /**
@@ -190,7 +196,7 @@ export async function startNexus(opts: StartOptions = {}): Promise<NexusHandle> 
   }
 
   async function spawnAndWait(): Promise<void> {
-    child = spawn(bin, [], { env, cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    child = spawn(bin, opts.args ?? [], { env, cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout!.on('data', (c) => capture(c, 'out'));
     child.stderr!.on('data', (c) => capture(c, 'err'));
     child.on('error', (err) => {

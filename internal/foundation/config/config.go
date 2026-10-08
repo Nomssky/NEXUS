@@ -29,6 +29,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 )
@@ -65,6 +66,28 @@ type ModelsConfig struct {
 	// (AGENT_INTELLIGENCE_CONTRACTS §16/§17). It adds no health state, no
 	// error category and no event; rejected values abort boot.
 	SeededProviderMode string `json:"seeded_provider_mode"`
+
+	// Providers lists real production inference adapters. When any entry is
+	// configured the launcher registers them instead of the seeded simulator,
+	// so real inference is always an explicit configuration choice.
+	Providers []ModelProviderConfig `json:"providers"`
+}
+
+// ModelProviderConfig is one production provider registration. It never holds
+// the API key: APIKeyEnv names the environment variable that carries it.
+type ModelProviderConfig struct {
+	ID                string        `json:"id"`
+	Name              string        `json:"name,omitempty"`
+	Endpoint          string        `json:"endpoint"`
+	ModelID           string        `json:"model_id"`
+	APIKeyEnv         string        `json:"api_key_env"`
+	Timeout           time.Duration `json:"timeout,omitempty"`
+	AllowInsecureHTTP bool          `json:"allow_insecure_http,omitempty"`
+	MaxRequestBytes   int64         `json:"max_request_bytes,omitempty"`
+	MaxResponseBytes  int64         `json:"max_response_bytes,omitempty"`
+	// Capabilities defaults to reasoning/tool_calling/structured_output —
+	// the exact set the agent intelligence loop requires.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // StorageConfig configures durable storage (C05). The default is empty:
@@ -261,6 +284,18 @@ type fileConfig struct {
 	Models *struct {
 		SeededProviderStatus *string `json:"seeded_provider_status"`
 		SeededProviderMode   *string `json:"seeded_provider_mode"`
+		Providers            []struct {
+			ID                string   `json:"id"`
+			Name              string   `json:"name"`
+			Endpoint          string   `json:"endpoint"`
+			ModelID           string   `json:"model_id"`
+			APIKeyEnv         string   `json:"api_key_env"`
+			TimeoutMS         *int     `json:"timeout_ms"`
+			AllowInsecureHTTP *bool    `json:"allow_insecure_http"`
+			MaxRequestBytes   *int64   `json:"max_request_bytes"`
+			MaxResponseBytes  *int64   `json:"max_response_bytes"`
+			Capabilities      []string `json:"capabilities"`
+		} `json:"providers"`
 	} `json:"models"`
 }
 
@@ -325,6 +360,27 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	}
 	if fc.Models != nil && fc.Models.SeededProviderMode != nil {
 		cfg.Models.SeededProviderMode = *fc.Models.SeededProviderMode
+	}
+	if fc.Models != nil && len(fc.Models.Providers) > 0 {
+		for _, p := range fc.Models.Providers {
+			entry := ModelProviderConfig{
+				ID: p.ID, Name: p.Name, Endpoint: p.Endpoint, ModelID: p.ModelID,
+				APIKeyEnv: p.APIKeyEnv, Capabilities: append([]string(nil), p.Capabilities...),
+			}
+			if p.TimeoutMS != nil {
+				entry.Timeout = time.Duration(*p.TimeoutMS) * time.Millisecond
+			}
+			if p.AllowInsecureHTTP != nil {
+				entry.AllowInsecureHTTP = *p.AllowInsecureHTTP
+			}
+			if p.MaxRequestBytes != nil {
+				entry.MaxRequestBytes = *p.MaxRequestBytes
+			}
+			if p.MaxResponseBytes != nil {
+				entry.MaxResponseBytes = *p.MaxResponseBytes
+			}
+			cfg.Models.Providers = append(cfg.Models.Providers, entry)
+		}
 	}
 	if fc.Security != nil {
 		s := fc.Security
