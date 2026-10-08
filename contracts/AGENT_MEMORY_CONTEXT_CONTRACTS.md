@@ -189,7 +189,9 @@ refresh `updated_at` while preserving `created_at` and the original `source`.
   every id is verified first, the storage mutation is a single batch, and a
   failure anywhere leaves the store exactly as it was. A governed memory delete
   (§ governance contract §2) uses this and never a per-record loop, so a
-  partially applied deletion is not representable.
+  partially applied deletion is not representable. Across a process crash the
+  durable store rolls an interrupted batch back to its pre-batch state on the
+  next open, so restart can never expose a half-applied governed delete.
 * `expire` — `expires_at` in the past; excluded from normal retrieval, still
   auditable by id.
 * no undeclared retention: nothing is deleted in the background, and there are no

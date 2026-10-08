@@ -112,9 +112,23 @@ type Store interface {
 	// records it must remove together never ends up with a partially applied
 	// removal — a governed deletion is exactly this shape.
 	//
-	// An implementation must validate every id BEFORE mutating anything, and
-	// must never fall back to per-record deletes: a fallback reintroduces the
-	// partial mutation this method exists to prevent.
+	// A correct implementation gives this durable contract:
+	//   - normal call failure: the store still reads as pre-batch, synchronously;
+	//   - concurrent access: the store lock serializes batches; readers observe
+	//     the whole batch or none of it;
+	//   - process crash: a batch journal records the pre-batch state durably
+	//     before any record file is published, so startup recovery rolls the
+	//     interrupted batch back, and an interrupted batch is NEVER exposed
+	//     half-applied — the store fails closed on a corrupt or ambiguous
+	//     journal rather than guessing;
+	//   - after a successful return: the batch survives restart, journal
+	//     already removed;
+	//   - filesystem I/O failure: the call fails and, after the batch's own
+	//     rollback, no record is half-changed.
+	//
+	// The implementation must never degrade the batch into per-record deletes:
+	// a fallback reintroduces the partial mutation this method exists to
+	// prevent.
 	DeleteBatch(ids []string) error
 
 	// List returns records matching the given filter.

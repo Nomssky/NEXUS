@@ -130,7 +130,10 @@ every id is verified first, the storage mutation is a single `store.DeleteBatch`
 (never a per-record loop), and any failure leaves the store untouched and
 publishes no deletion event — a governed delete is never partially applied and
 never reported as applied when it was not (`Platform.DeleteExact`, contract
-memory §10). A write is executed with `Platform.WriteBound`: the platform
+memory §10). If the process dies mid-batch, the store's batch journal lets the
+next open roll the interrupted batch back to its pre-batch state, so restart
+cannot expose a half-applied delete; single-record replacement durability is
+kept by per-file and per-directory fsyncs. A write is executed with `Platform.WriteBound`: the platform
 re-derives the target inside the same critical section that guards the mutation,
 compares it to the admitted target, and persists the record built from that
 compared target, so a mismatch — or an authorization that no longer holds —
