@@ -472,3 +472,75 @@ The governance paths are untouched: `POLICY_DENIED`, `APPROVAL_REQUIRED` and
 ---
 
 *This document defines provider abstraction contracts. Failure, reconciliation, and security contracts are in EXTERNAL_FAILURE_RECONCILIATION.md.*
+
+---
+
+## 13. Production Model Inference Provider (ADDENDUM)
+
+**Status:** ADDENDUM — additive to the LOCKED sections above. Sections 1–12 are
+unchanged. This section defines the production OpenAI-compatible inference
+provider behind the existing `modelrouter.Provider` boundary, and pins the
+security properties it must honour.
+
+### 13.1 Authority
+
+A provider is an untrusted inference backend. It may receive an authorized
+model request and return model output, provider metadata, or an error. It may
+NOT:
+
+- authorize actions
+- mutate NEXUS state
+- grant capabilities
+- change identity, business, division or execution ownership
+- approve governance or issue approval/escalation decisions
+- bypass capability invocation or admission
+- write memory directly
+- directly execute tools
+
+Model output is always untrusted data. No model response becomes an
+executable effect until it has passed the existing runtime validation,
+governance admission, capability, memory and reliability layers (§7 and the
+agent-intelligence pipeline). The model is a proposer, never an authority.
+
+### 13.2 Real Provider Adapter
+
+| Property | Requirement |
+|---|---|
+| Protocol | OpenAI-compatible Chat Completions (`POST {base}/chat/completions`) |
+| Provider ID / base URL / model ID / timeout | configure from launcher config; never from model or agent payloads |
+| Credential | `api_key_env` names the environment variable holding the key; the key is read at invoke time and is never stored in source, model definitions, agent definitions or telemetry |
+| Plain HTTP | requires an explicit `allow_insecure_http` flag; the default is HTTPS only |
+| Concurrency | a provider instance serializes nothing it does not have to; the provider may be called concurrently |
+| URL | fixed per provider configuration; model output cannot change it |
+
+### 13.3 HTTP Safety
+
+- Request/response sizes are bounded (defaults 1 MiB; configurable).
+- Per-request timeout honours the router/provider timeout and the caller's
+  context cancellation.
+- No arbitrary URL may be taken from the request, the model, or a tool.
+- Authorization headers and credentials are never written into logs, events,
+  error messages, accounting records or telemetry; error strings are
+  redacted.
+- Raw prompts and raw responses are not emitted as telemetry.
+- The adapter must not become an SSRF primitive: the provider base URL is
+  fixed at launch.
+
+### 13.4 Normalized Result & Accounting
+
+`GenerateResponse` is the existing normalized shape; the provider adds its
+own latency and may add `usage` token counts. When the provider omits token
+usage, the empty fields are preserved as-is — they are never fabricated. The
+router's existing `InvocationRecord` accounting is the only accounting path;
+no second accounting subsystem may be introduced.
+
+### 13.5 Failure Semantics
+
+- A provider error is a typed failure classified into the contract's existing
+  model-failure categories (§7.3).
+- Cancellation and deadline propagate: a cancelled request is not submitted, a
+  cancelled context aborts an in-flight HTTP call.
+- Calling a provider explicitly ("use provider X") is never read from model
+  output: routing stays runtime-controlled inside `ModelRouter`.
+- Only a malformed structured decision from a model is a protocol failure;
+  provider transport failures remain ordinary intelligence failures.
