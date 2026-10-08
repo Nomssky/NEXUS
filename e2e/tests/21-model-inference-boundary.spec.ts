@@ -36,17 +36,21 @@ beforeAll(async () => {
         res.writeHead(404).end(JSON.stringify({ error: 'unknown path' }));
         return;
       }
-      // Match the runtime envelope: planner prompt -> one-step plan;
-      // decision prompt -> immediate complete (StepHasWork is true for a
-      // one-step plan), so the loop reaches a deterministic terminal state.
+      // Match the runtime envelope: planner prompt -> one-step plan; first
+      // decision -> a model_call (runtime evidence, no tools needed); second
+      // decision -> complete. Completion requires runtime evidence, so the
+      // fixture must produce an observation before completing.
       // Protocol v2 marks the request with the structured schema name, which
       // is how the fixture tells a plan apart from a decision.
       const schemaName = (lastBody as any)?.response_format?.json_schema?.name ?? '';
+      const promptText = JSON.stringify(lastBody);
       let content: string;
-      if (schemaName === 'agent_plan_v1' || /planner of a nexus agent execution/i.test(JSON.stringify(lastBody))) {
+      if (schemaName === 'agent_plan_v1' || /planner of a nexus agent execution/i.test(promptText)) {
         content = '{"steps":[{"step_id":"s1","intent":"gather"}]}';
-      } else {
+      } else if (/model_call ok\]/.test(promptText)) {
         content = '{"type":"complete","result":"finished through the production provider path"}';
+      } else {
+        content = '{"type":"model_call","prompt":"consider the objective"}';
       }
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
