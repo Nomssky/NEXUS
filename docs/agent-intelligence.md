@@ -155,3 +155,29 @@ production providers plug into the same interface.
 * Working memory is process-local scratch state, never persisted.
 * No vector/embedding memory, no learned capability acquisition, no multi-agent
   debate, no cross-business delegation, no durable execution recovery.
+## 9. Bounded multi-step execution (v3)
+
+`contracts/AGENT_EXECUTION_DEPTH_CONTRACTS.md` is authoritative. In short:
+
+* plans are typed, bounded and validated before anything executes (unique
+  step ids, same-plan dependencies, no self/duplicate dependencies, acyclic,
+  known tools and operations, no authority-shaped fields);
+* a runtime-owned step ledger (`pending → ready → executing → observing →
+  completed`, with `failed`/`blocked`/`cancelled` terminals) decides
+  readiness and order — the model cannot assign step state, and a step never
+  executes before its dependencies whatever array position it was given;
+* a failed step fails the run and transitively blocks its dependents; events
+  (`step.ready/started/observing/completed/failed/blocked`) carry ids and
+  versions only;
+* replans activate a new immutable plan version carrying completed steps
+  forward by id with their original evidence — history is never rewritten and
+  completed effects never re-run automatically;
+* `complete` requires runtime evidence (at least one observation), otherwise
+  the run fails instead of falsely completing; fabricated success claims for
+  effects that never ran are rejected the same way;
+* an identical repeat of a completed *mutating* effect (delegation, durable
+  memory write/delete, non-read tool call) is rejected, never re-executed;
+  reads may repeat, and adapter idempotency keys still reconcile uncertain
+  single calls;
+* cancellation is checked before planning, every step, governance, every
+  effect and replanning; the caller deadline is fixed and never extended.
