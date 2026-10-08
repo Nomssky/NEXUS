@@ -32,6 +32,15 @@ type ProviderConfig struct {
 	// introduces no new state — and is the only way the launcher-seeded
 	// simulator can be started as a deterministic provider failure.
 	Status ProviderStatus `json:"status,omitempty"`
+
+	// Production provider fields (PROVIDER_CONTRACTS §13). The API key itself
+	// is NEVER stored here: APIKeyEnv names the process environment variable
+	// that carries it. AllowInsecureHTTP is the explicit opt-in for plain
+	// loopback HTTP; MaxRequestBytes and MaxResponseBytes bound the payloads.
+	APIKeyEnv         string `json:"api_key_env,omitempty"`
+	AllowInsecureHTTP bool   `json:"allow_insecure_http,omitempty"`
+	MaxRequestBytes   int64  `json:"max_request_bytes,omitempty"`
+	MaxResponseBytes  int64  `json:"max_response_bytes,omitempty"`
 }
 
 // initialProviderStatus normalizes the configured starting health: an unset
