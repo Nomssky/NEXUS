@@ -162,6 +162,24 @@ func (r *Runtime) emit(ev event.EventType, req *executor.WorkRequest, actor, out
 	})
 }
 
+// delegationFields renders the runtime-stamped parent linkage of a child
+// execution as event metadata (ids only, no authority). A root execution
+// emits no linkage fields.
+func delegationFields(req *executor.WorkRequest) map[string]string {
+	if req == nil || req.Delegation == nil {
+		return nil
+	}
+	out := map[string]string{
+		"parent_task_id":   req.Delegation.ParentTaskID,
+		"parent_agent_id":  req.Delegation.ParentAgentID,
+		"delegation_depth": fmt.Sprint(req.Delegation.Depth),
+	}
+	if req.Delegation.ActionID != "" {
+		out["delegation_action_id"] = req.Delegation.ActionID
+	}
+	return out
+}
+
 func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent, depth int) (*executor.Outcome, error) {
 	start := r.now()
 	var spec Spec
@@ -170,7 +188,15 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 			return failedOutcome(req, ag, start, "invalid agent_execution spec: "+err.Error()), nil
 		}
 	}
-	r.emit(event.EventTypeAgentStarted, req, req.ActorID, "started", nil)
+	r.emit(event.EventTypeAgentStarted, req, req.ActorID, "started", delegationFields(req))
+
+	// Fan-out is bounded by the existing parallelism bound: one request can
+	// never fan into an unbounded swarm (AGENT_DELEGATION_CONTRACTS §8). This
+	// is checked before any work so a rejected fan-out runs nothing.
+	if len(spec.Delegates) > r.maxFan {
+		return failedOutcome(req, ag, start, fmt.Sprintf("delegation fan-out exceeded (%d > %d)",
+			len(spec.Delegates), r.maxFan)), nil
+	}
 
 	// Workflow composition path.
 	if spec.Workflow != nil {
@@ -212,12 +238,6 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 
 	// Child delegates execute inside the same scope; each emits its own
 	// events and counts toward child bookkeeping on the parent result.
-	// Fan-out is bounded by the existing parallelism bound: one request can
-	// never fan into an unbounded swarm (AGENT_DELEGATION_CONTRACTS §8).
-	if len(spec.Delegates) > r.maxFan {
-		return failedOutcome(req, ag, start, fmt.Sprintf("delegation fan-out exceeded (%d > %d)",
-			len(spec.Delegates), r.maxFan)), nil
-	}
 	childResults := []string{}
 	childFailures := []string{}
 	for _, d := range spec.Delegates {
@@ -235,6 +255,14 @@ func (r *Runtime) execute(ctx context.Context, req *executor.WorkRequest, ag *ag
 				AgentID: d.AgentID, RequiredCapabilities: d.Capabilities, Tools: d.Tools,
 			})},
 			Constraints: req.Constraints, Priority: req.Priority,
+			// Every child carries the runtime-stamped linkage, whichever
+			// path created it (AGENT_DELEGATION_CONTRACTS §2).
+			Delegation: &executor.DelegationLink{
+				ParentTaskID:        req.TaskID,
+				ParentAgentID:       sel.Agent.ID,
+				ParentCorrelationID: req.CorrelationID,
+				Depth:               depth + 1,
+			},
 		}
 		child, err := r.execute(childCtx, childReq, ag, depth+1)
 		if err != nil {
