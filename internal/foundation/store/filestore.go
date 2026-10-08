@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -138,16 +139,22 @@ func (fs *FileStore) Delete(id string) error {
 	return nil
 }
 
-// DeleteBatch soft-deletes every id as one atomic step.
+// DeleteBatch soft-deletes every id as one atomic step, in both senses:
 //
-// The index is what every read observes, so the batch is published in two
-// phases under the store lock: every updated record is first staged as a
-// synced temp file next to its target (nothing is published yet, so a failure
-// there leaves the store exactly as it was), and only then is each staged file
-// renamed over its target. If a rename fails after some have been published,
-// the already-published records are restored from their pre-batch bytes within
-// this same call, so the batch still lands all-or-nothing from the store's
-// point of view. There is no per-record fallback and no deferred repair work.
+//   - ordinary result: either every id ends up deleted or none does —
+//     validation happens before any mutation, and a storage error mid-batch
+//     restores the pre-batch state synchronously, inside the call;
+//   - process crash: the store never loses track of whether a batch finished.
+//     The pre-batch state of the batch is durably recorded in a batch journal
+//     BEFORE any record file is published, and the journal is removed only
+//     after every rename is durable. On the next open the store replays that
+//     state deterministically — an interrupted batch is rolled back to its
+//     pre-batch form, never exposed half-applied.
+//
+// The store lock serializes batches and concurrent readers see the index,
+// which is only updated after durable publication, so a concurrent reader
+// observes the whole batch or none of it. There is no per-record fallback and
+// no background repair work.
 func (fs *FileStore) DeleteBatch(ids []string) error {
 	if len(ids) == 0 {
 		return nil
@@ -203,17 +210,33 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 		paths = append(paths, path)
 	}
 
-	// Phase 2 — publish. The index still describes the pre-batch state, so a
-	// failure here is invisible to every reader unless the rollback fails.
+	// Phase 2 — make the batch recoverable before touching a single target.
+	// The journal holds the pre-batch records, so a crash at ANY later point
+	// can be rolled back deterministically. Nothing is published yet.
+	if err := fs.publishBatchJournal(originals); err != nil {
+		cleanup()
+		return err
+	}
+
+	// Phase 3 — publish. The index still describes the pre-batch state, so an
+	// I/O failure here is invisible to every reader once the rollback runs.
 	for i, tmp := range staged {
 		if err := os.Rename(tmp, paths[i]); err != nil {
 			cleanup()
+			// Synchronous abort: restore the pre-batch state before returning,
+			// then drop the journal — the batch is now entirely unapplied.
 			for j := 0; j < i; j++ {
 				if rerr := fs.writeRecord(originals[j]); rerr != nil {
 					return &StoreError{
 						Code:    "IO_ERROR",
 						Message: fmt.Sprintf("delete batch rollback of %s failed: %v", originals[j].ID, rerr),
 					}
+				}
+			}
+			if jerr := fs.removeBatchJournal(); jerr != nil {
+				return &StoreError{
+					Code:    "IO_ERROR",
+					Message: fmt.Sprintf("delete batch journal cleanup: %v", jerr),
 				}
 			}
 			return &StoreError{
@@ -223,11 +246,160 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 		}
 	}
 
+	// Phase 4 — durability of the batch: the retargeted files' directories
+	// must be synced so the renames themselves survive a crash.
+	syncedDirs := map[string]struct{}{}
+	for _, p := range paths {
+		dir := filepath.Dir(p)
+		if _, ok := syncedDirs[dir]; ok {
+			continue
+		}
+		if err := syncDir(dir); err != nil {
+			return &StoreError{
+				Code:    "IO_ERROR",
+				Message: fmt.Sprintf("sync %s: %v", dir, err),
+			}
+		}
+		syncedDirs[dir] = struct{}{}
+	}
+
+	// Phase 5 — commit: the batch is fully applied, so the journal goes away.
+	// From this syscall on, the outcome no longer depends on recovery.
+	if err := fs.removeBatchJournal(); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("delete batch commit: %v", err)}
+	}
+	if err := syncDir(fs.dir); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync %s: %v", fs.dir, err)}
+	}
+
 	for _, updated := range updates {
 		cp := *updated
 		fs.index[updated.ID] = &cp
 	}
 	return nil
+}
+
+// batchJournalName is the store-wide marker that exactly one delete batch was
+// in flight. It lives at the store root so discovery does not depend on type
+// directories, and the record payload is generic store data — it carries no
+// memory or governance semantics.
+const batchJournalName = ".batch-journal.json"
+
+// batchJournal records the pre-batch records of an in-flight delete batch.
+// Version is bumped if the format ever changes; a foreign version is an
+// ambiguity the store must fail closed on, never guess at.
+type batchJournal struct {
+	Version int      `json:"version"`
+	Records []Record `json:"records"`
+}
+
+// publishBatchJournal durably records the pre-batch state BEFORE any target
+// file is replaced. It is written like every store mutation: temp file, sync,
+// rename, plus a root-directory sync so the journal entry itself is durable.
+func (fs *FileStore) publishBatchJournal(records []*Record) error {
+	j := batchJournal{Version: 1, Records: make([]Record, 0, len(records))}
+	for _, r := range records {
+		j.Records = append(j.Records, *r)
+	}
+	data, err := json.Marshal(&j)
+	if err != nil {
+		return &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("batch journal: %v", err)}
+	}
+	path := filepath.Join(fs.dir, batchJournalName)
+	tmp, err := os.CreateTemp(fs.dir, ".batch-journal-*.tmp")
+	if err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal temp: %v", err)}
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal write: %v", err)}
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal sync: %v", err)}
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal close: %v", err)}
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		_ = os.Remove(tmpName)
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal chmod: %v", err)}
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal publish: %v", err)}
+	}
+	if err := syncDir(fs.dir); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal sync dir: %v", err)}
+	}
+	return nil
+}
+
+// removeBatchJournal drops the journal file and syncs the root directory so
+// the removal itself is durable.
+func (fs *FileStore) removeBatchJournal() error {
+	path := filepath.Join(fs.dir, batchJournalName)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := syncDir(fs.dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// recoverInterruptedBatch replays the pre-batch state recorded by a journal
+// left behind by a crashed DeleteBatch, and removes the journal. It runs
+// BEFORE any record is loaded, and a corrupt or ambiguous journal aborts the
+// open — an interrupted batch is never exposed half-applied, and a doubtful one
+// is never exposed silently.
+func (fs *FileStore) recoverInterruptedBatch() error {
+	path := filepath.Join(fs.dir, batchJournalName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no interrupted batch
+		}
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("read batch journal: %v", err)}
+	}
+	var j batchJournal
+	if err := json.Unmarshal(data, &j); err != nil || j.Version != 1 || len(j.Records) == 0 {
+		return &StoreError{
+			Code:    "CORRUPT_RECORD",
+			Message: "batch journal is corrupt or from an unsupported format: " + path,
+		}
+	}
+	// Roll every recorded record back to its pre-batch state. This is safe to
+	// replay: restoring a record that was never replaced simply rewrites the
+	// same bytes.
+	for i := range j.Records {
+		if strings.TrimSpace(j.Records[i].ID) == "" || j.Records[i].Type == "" {
+			return &StoreError{Code: "CORRUPT_RECORD", Message: "batch journal carries an incomplete record"}
+		}
+		if err := fs.writeRecord(&j.Records[i]); err != nil {
+			return err
+		}
+	}
+	if err := fs.removeBatchJournal(); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal cleanup: %v", err)}
+	}
+	return nil
+}
+
+// syncDir fsyncs a directory so the renames recorded in it are durable. A
+// crash must never be able to claim a batch committed while the rename that
+// carried it is still only in the page cache.
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // List returns records matching the given filter.
@@ -308,6 +480,10 @@ func (fs *FileStore) writeRecord(record *Record) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("rename: %v", err)}
 	}
+	// The rename only becomes durable once the directory entry is synced.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync dir: %v", err)}
+	}
 	return nil
 }
 
@@ -360,6 +536,14 @@ func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, e
 // documented fail-closed hydration (OpenRegistry on corrupt records) never
 // saw the corruption and booted with silently missing data.
 func (fs *FileStore) loadAll() error {
+	// A batch that was interrupted by a crash must be resolved before the
+	// first read is served: either it committed (journal already removed) or
+	// it did not (journal present → roll back). A corrupt journal aborts the
+	// open rather than guessing.
+	if err := fs.recoverInterruptedBatch(); err != nil {
+		return err
+	}
+
 	entries, err := os.ReadDir(fs.dir)
 	if err != nil {
 		if os.IsNotExist(err) {
