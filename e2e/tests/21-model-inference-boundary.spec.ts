@@ -39,9 +39,11 @@ beforeAll(async () => {
       // Match the runtime envelope: planner prompt -> one-step plan;
       // decision prompt -> immediate complete (StepHasWork is true for a
       // one-step plan), so the loop reaches a deterministic terminal state.
-      const promptText = JSON.stringify(lastBody);
+      // Protocol v2 marks the request with the structured schema name, which
+      // is how the fixture tells a plan apart from a decision.
+      const schemaName = (lastBody as any)?.response_format?.json_schema?.name ?? '';
       let content: string;
-      if (/planner of a nexus agent execution/i.test(promptText)) {
+      if (schemaName === 'agent_plan_v1' || /planner of a nexus agent execution/i.test(JSON.stringify(lastBody))) {
         content = '{"steps":[{"step_id":"s1","intent":"gather"}]}';
       } else {
         content = '{"type":"complete","result":"finished through the production provider path"}';
@@ -117,5 +119,7 @@ test('the production provider adapter carries an objective end-to-end', async ({
   // and the model ID travelled from the config, never from model output.
   expect(lastAuthHeader).toBe('Bearer fixture-test-key');
   expect(lastModel).toBe('fixture-model');
-  expect(lastBody?.response_format, JSON.stringify(lastBody)).toEqual({ type: 'json_object' });
+  expect(lastBody?.response_format?.type, JSON.stringify(lastBody?.response_format)).toBe('json_schema');
+  expect(lastBody?.response_format?.json_schema?.name).toBe('agent_decision_v1');
+  expect(lastBody?.response_format?.json_schema?.strict).toBe(true);
 });
