@@ -139,7 +139,10 @@ if an admitted record becomes unavailable the whole delete fails closed instead
 of removing a smaller set than the one that was approved. The removal itself is
 a single atomic storage batch: if it fails, nothing is removed and no deletion
 event is published, so a storage fault can never turn an approved delete into a
-silently partial one.
+silently partial one. A process crash in the middle of a batch does not change
+this outcome: the store records the batch in a journal before publishing any
+file, and restores the pre-batch state when the store is opened again, so an
+interrupted delete can never be half-applied on disk.
 
 A write is executed against the admitted target and nothing else: the memory
 platform re-derives the target under the same lock that guards the mutation and

@@ -124,7 +124,9 @@ winner and never overwrites by insertion order.
 * `DeleteExact` removes a caller-named set as one atomic batch — all ids verified
   first, one storage mutation, no per-record loop — so a failure leaves the store
   exactly as it was. It backs the governed `memory_delete`, where the set is the
-  one governance admitted.
+  one governance admitted. A process crash mid-batch is recovered on the next
+  open: the store's batch journal rolls the in-flight batch back to its
+  pre-batch state rather than exposing a half-applied one.
 * `WriteBound` executes an already-resolved target: the platform re-derives the
   target under the same lock that guards the mutation and refuses to persist
   anything that does not match it, so the stored record is always the record that
