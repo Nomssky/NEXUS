@@ -153,7 +153,7 @@ func newGovernedRuntime(t *testing.T, policies ...*governance.Policy) *governedR
 		Registry: reg, Tools: tools, ToolExec: BuiltinExecutor(),
 		Platform:   platform,
 		Controller: control.New(control.Options{Engine: governance.NewEngine(policies), Approver: host, Escalator: host}),
-		now:        time.Now, maxDepth: 3, maxFan: 4,
+		now:        time.Now, maxDepth: 3, maxFan: 4, maxConcurrent: 4,
 	}
 	return &governedRuntime{rt: rt, adapter: adapter, host: host}
 }

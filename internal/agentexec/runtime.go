@@ -770,11 +770,11 @@ func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.Wor
 	var started atomic.Int32
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, r.semaphoreSize())
-	for i := range members {
-		m := members[i]
-		outcome.Results[i] = CoordinationChildResult{Index: m.Index, ChildID: m.Spec.ID, AgentID: m.Spec.AgentID}
+	for pos := range members {
+		m := members[pos]
+		outcome.Results[pos] = CoordinationChildResult{Index: m.Index, ChildID: m.Spec.ID, AgentID: m.Spec.AgentID}
 		wg.Add(1)
-		go func() {
+		go func(p int, mm CoordinationMember) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
@@ -783,14 +783,14 @@ func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.Wor
 			}
 			defer func() { <-sem }()
 			started.Add(1)
-			outcome.Results[m.Index].Started = true
-			out, err := r.DelegateChild(ctx, parent, ag, m.Spec, depth)
-			outcome.Results[m.Index].Outcome = out
-			outcome.Results[m.Index].Err = err
+			outcome.Results[p].Started = true
+			out, err := r.DelegateChild(ctx, parent, ag, mm.Spec, depth)
+			outcome.Results[p].Outcome = out
+			outcome.Results[p].Err = err
 			if out != nil {
-				outcome.Results[m.Index].TaskID = out.TaskID
+				outcome.Results[p].TaskID = out.TaskID
 			}
-		}()
+		}(pos, m)
 	}
 	wg.Wait()
 	outcome.Started = int(started.Load())

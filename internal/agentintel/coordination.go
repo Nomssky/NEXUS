@@ -142,12 +142,16 @@ func (r *Runtime) performCoordinate(rn *run, ctx context.Context, a Action, agen
 			},
 		})
 	}
-	outcome := r.Exec.RunCoordinationGroup(ctx, rn.req, rn.ag, members, rn.depth)
+	outcome, gerr := r.Exec.RunCoordinationGroup(ctx, rn.req, rn.ag, members, rn.depth)
+	if gerr != nil {
+		obs.Status, obs.Text = "failed", gerr.Error()
+		return obs, usage, StateFailed, "coordination failed: " + gerr.Error()
+	}
 
 	// Wave-level interruption is terminal; settlement never is.
 	if outcome.Cancelled {
 		for _, res := range outcome.Results {
-			r.recordCoordinationMember(working, a, res)
+			r.recordCoordinationMember(working, a, settledMember{orig: res.Index, agent: res.AgentID, res: res})
 		}
 		obs.Status, obs.Text = "failed", fmt.Sprintf("coordination %s cancelled after %d of %d started",
 			groupID, outcome.Started, len(members))
@@ -155,7 +159,7 @@ func (r *Runtime) performCoordinate(rn *run, ctx context.Context, a Action, agen
 	}
 	if outcome.DeadlineExceeded {
 		for _, res := range outcome.Results {
-			r.recordCoordinationMember(working, a, res)
+			r.recordCoordinationMember(working, a, settledMember{orig: res.Index, agent: res.AgentID, res: res})
 		}
 		obs.Status, obs.Text = "failed", fmt.Sprintf("coordination %s exceeded its deadline after %d of %d started",
 			groupID, outcome.Started, len(members))
@@ -165,21 +169,28 @@ func (r *Runtime) performCoordinate(rn *run, ctx context.Context, a Action, agen
 	// Settle deterministically in member declaration order — never completion
 	// race order (contract §7). Completed members are fingerprinted; anything
 	// else is recorded as what it is, never collapsed, never retried here.
-	for _, res := range outcome.Results {
-		r.recordCoordinationMember(working, a, res)
+	// Positional wave results are joined back to their declaration identity
+	// through the ready list the wave was built from.
+	settled := make([]settledMember, 0, len(ready))
+	for i, ad := range ready {
+		sm := settledMember{orig: ad.pending.index, agent: ad.pending.member.AgentID, res: outcome.Results[i]}
+		settled = append(settled, sm)
+		r.recordCoordinationMember(working, a, sm)
 	}
-	agg := aggregateCoordination(groupID, a, outcome)
+	agg := aggregateSettled(groupID, settled)
 	obs.Text = agg.text
 	obs.Result = agg.fields
 	obs.Outcome = agg.outcome
 	obs.Attempts = outcome.Started
 	obs.ReconciliationRequired = agg.reconciliation
-	rn.emit(event.EventTypeCoordinationCompleted, map[string]string{
-		"group_id": groupID, "members": fmt.Sprint(len(members)),
-		"completed": fmt.Sprint(agg.completed), "failed": fmt.Sprint(agg.failed),
-		"unknown":      fmt.Sprint(agg.unknown),
+	completedFields := map[string]string{
+		"group_id": groupID, "members": fmt.Sprint(len(settled)),
 		"plan_version": fmt.Sprint(planVersion),
-	})
+	}
+	for status, n := range agg.byStatus {
+		completedFields[status] = fmt.Sprint(n)
+	}
+	rn.emit(event.EventTypeCoordinationCompleted, completedFields)
 	return obs, usage, "", ""
 }
 
@@ -202,16 +213,27 @@ func memberRefusedStatus(st State) string {
 // completed, so regroups prune it instead of re-running it. Anything else is
 // left unrecorded: a failed member may be proposed again, a completed one
 // may not.
-func (r *Runtime) recordCoordinationMember(working *WorkingMemory, a Action, res agentexec.CoordinationChildResult) {
-	if !res.Started || res.Outcome == nil || res.Outcome.Status != "completed" {
+func (r *Runtime) recordCoordinationMember(working *WorkingMemory, a Action, sm settledMember) {
+	if !sm.res.Started || sm.res.Outcome == nil || sm.res.Outcome.Status != "completed" {
 		return
 	}
-	if res.Index < 0 || res.Index >= len(a.Children) {
+	if sm.orig < 0 || sm.orig >= len(a.Children) {
 		return
 	}
-	m := a.Children[res.Index]
+	m := a.Children[sm.orig]
 	fp := delegateEffectFingerprint(m.AgentID, m.Objective, m.DelegateTools)
 	_, _ = working.NoteEffect(fp)
+}
+
+// settledMember joins one ran member's declaration identity with its wave
+// result. Results arrive positionally from the wave; orig restores the
+// member's declaration index, so rendering never depends on completion race
+// order and pruned members simply have no entry (their original evidence
+// stands in their own observations).
+type settledMember struct {
+	orig  int
+	agent string
+	res   agentexec.CoordinationChildResult
 }
 
 // coordinationAggregate is the deterministic settlement record.
@@ -223,19 +245,35 @@ type coordinationAggregate struct {
 	failed         int
 	unknown        int
 	reconciliation bool
+	// byStatus carries every observed status class for event metadata, so
+	// denied/pending/escalated members stay visible instead of vanishing
+	// into a bucket.
+	byStatus map[string]int
 }
 
-// aggregateCoordination renders the settlement in member declaration order.
-// Counts per status class travel as fields; per-member identity, status,
-// outcome and truncated output travel namespaced by index. Completion race
-// order never appears.
-func aggregateCoordination(groupID string, a Action, outcome agentexec.CoordinationOutcome) coordinationAggregate {
-	agg := coordinationAggregate{fields: map[string]string{
-		"group_id": groupID, "group_size": fmt.Sprint(len(outcome.Results)),
-	}}
-	var lines []string
-	byStatus := map[string]int{}
+// aggregateCoordination renders a full wave settlement: results arrive with
+// declaration identity attached, so this is a thin wrapper over the settled
+// renderer kept for direct tests.
+func aggregateCoordination(groupID string, _ Action, outcome agentexec.CoordinationOutcome) coordinationAggregate {
+	settled := make([]settledMember, 0, len(outcome.Results))
 	for _, res := range outcome.Results {
+		settled = append(settled, settledMember{orig: res.Index, agent: res.AgentID, res: res})
+	}
+	return aggregateSettled(groupID, settled)
+}
+
+// aggregateSettled renders the settlement in member declaration order.
+// Counts per status class travel as fields; per-member identity, status,
+// outcome and truncated output travel namespaced by declaration index.
+// Completion race order never appears.
+func aggregateSettled(groupID string, settled []settledMember) coordinationAggregate {
+	agg := coordinationAggregate{fields: map[string]string{
+		"group_id": groupID, "group_size": fmt.Sprint(len(settled)),
+	}, byStatus: map[string]int{}}
+	var lines []string
+	byStatus := agg.byStatus
+	for _, sm := range settled {
+		res := sm.res
 		status, result, attempts := memberSettlement(res)
 		byStatus[status]++
 		switch status {
@@ -244,10 +282,13 @@ func aggregateCoordination(groupID string, a Action, outcome agentexec.Coordinat
 		case "unknown":
 			agg.unknown++
 			agg.reconciliation = true
-		default:
+		case "failed":
 			agg.failed++
 		}
-		key := fmt.Sprintf("child.%d", res.Index)
+		// Every other status (denied, pending_approval, escalated,
+		// cancelled, timed_out) travels under its own exact name in the
+		// fields below — never folded into a bucket that would hide it.
+		key := fmt.Sprintf("child.%d", sm.orig)
 		agg.fields[key+".agent"] = res.AgentID
 		agg.fields[key+".status"] = status
 		if res.TaskID != "" {
@@ -257,13 +298,13 @@ func aggregateCoordination(groupID string, a Action, outcome agentexec.Coordinat
 			agg.fields[key+".result"] = truncate(result, 512)
 		}
 		_ = attempts
-		lines = append(lines, fmt.Sprintf("[%d:%s %s]", res.Index, shortID(res.AgentID), status))
+		lines = append(lines, fmt.Sprintf("[%d:%s %s]", sm.orig, shortID(sm.agent), status))
 	}
 	for status, n := range byStatus {
 		agg.fields[status] = fmt.Sprint(n)
 	}
 	// Deterministic one-line summary first, then the per-member record.
-	summary := fmt.Sprintf("group %s settled %d (%s)", groupID, len(outcome.Results), joinStatusCounts(byStatus))
+	summary := fmt.Sprintf("group %s settled %d (%s)", groupID, len(settled), joinStatusCounts(byStatus))
 	agg.text = summary + "\n" + strings.Join(lines, "\n")
 	switch {
 	case agg.unknown > 0:
