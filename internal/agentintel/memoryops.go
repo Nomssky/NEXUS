@@ -176,7 +176,7 @@ func (r *Runtime) contextInputs(rn *run, id memory.Identity, obj Objective, step
 		o := observations[i]
 		obsIn = append(obsIn, memory.ObservationInput{
 			ID: o.ObservationID, Source: o.Source, Status: o.Status, Text: o.Text,
-			Outcome: o.Outcome, Attempts: o.Attempts,
+			Outcome: o.Outcome, Attempts: o.Attempts, ActionType: string(o.ActionType),
 			RetryRecommended: o.RetryRecommended, ReconciliationRequired: o.ReconciliationRequired,
 		})
 	}

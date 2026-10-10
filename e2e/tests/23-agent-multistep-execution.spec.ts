@@ -103,7 +103,12 @@ function planFor(objective: string): string {
 
 function decide(objective: string, body: any): { status: number; content: string } {
   const messages = JSON.stringify(body?.messages ?? []);
-  const obsCount = (messages.match(/tool_call ok\]/g) ?? []).length;
+  // Distinct observation ids: every observation renders in both the
+  // observations block and the assembled context (with its action type since
+  // the context-fidelity fix), so raw match counts double-count.
+  const obsCount = new Set(
+    [...messages.matchAll(/\[([^\s\]]+) tool_call ok\]/g)].map((m) => m[1]),
+  ).size;
   const echo = (text: string) =>
     `{"type":"tool_call","tool":"echo","input":{"text":${JSON.stringify(text)}}}`;
   const httpGet = (p: string) =>

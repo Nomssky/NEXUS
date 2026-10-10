@@ -63,6 +63,10 @@ type ObservationInput struct {
 	Attempts               int
 	RetryRecommended       bool
 	ReconciliationRequired bool
+	// ActionType carries the originating action (tool_call, delegate,
+	// coordinate, ...) so context renders what produced the observation.
+	// Empty keeps the old status-only rendering.
+	ActionType string
 }
 
 // Input is everything the assembler may draw on for one decision.
@@ -265,6 +269,9 @@ func renderObservation(o ObservationInput) string {
 // ActionTypeOrStatus keeps the observation label present even for inputs that
 // carry only a status.
 func (o ObservationInput) ActionTypeOrStatus() string {
+	if o.ActionType != "" {
+		return o.ActionType
+	}
 	if o.Status != "" {
 		return o.Status
 	}
