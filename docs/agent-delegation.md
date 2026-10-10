@@ -78,3 +78,25 @@ identically to children.
   foundation spawn-safety counters (`foundation/agent`) remain the authority
   for agent-level spawning; the v1 delegate path cannot create authority the
   parent does not hold.
+## Bounded parallel coordination (v5)
+
+`contracts/AGENT_COORDINATION_CONTRACTS.md` is authoritative. In short:
+
+* one typed `coordinate` action names an explicit member list — one concurrent
+  wave of mutually independent children. Parallelism is never inferred;
+  ordering across waves stays at the plan level (v3 dependencies);
+* members run concurrently under one semaphore (`maxConcurrent`, separate
+  from the total bound `maxFan`); every member passes its own admission
+  before any member starts, so a group is never a blanket authorization;
+* members count fully against the parent delegation budget, share the parent
+  deadline, and abort with it; cancellation stops new members and settles the
+  wave as cancelled/deadline-exceeded;
+* settlement is one deterministic parent observation in member declaration
+  order (never completion race order): per-member identity, status, outcome
+  and truncated output, plus totals per status class. Partial settlement is
+  non-terminal — the parent may replan — while unknown stays unknown,
+  approvals/escalations stay reported (never adopted, never converted), and
+  completed members are fingerprinted so regroups prune them instead of
+  re-running them;
+* children keep the full v4 boundary (own identity, scope, governance,
+  capability intersection, reliability, memory isolation); G4 is unchanged.
