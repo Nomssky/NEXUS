@@ -156,6 +156,22 @@ func (ae *ApprovalEngine) Deny(decisionID, approver, reason string) error {
 	return nil
 }
 
+// Revoke drops a pending approval without recording a decision. It exists
+// for cancellation: revoking is not a denial by anyone, so it records no
+// approver, no reason, and emits nothing — the execution's cancelled outcome
+// is the audit trail. Revoking a non-pending record is a no-op mismatch
+// (ErrApprovalNotFound), never a state change.
+func (ae *ApprovalEngine) Revoke(decisionID string) error {
+	ae.mu.Lock()
+	defer ae.mu.Unlock()
+	ar, ok := ae.pending[decisionID]
+	if !ok || ar.Status != ApprovalStatePending {
+		return fmt.Errorf("%w: %s", ErrApprovalNotFound, decisionID)
+	}
+	delete(ae.pending, decisionID)
+	return nil
+}
+
 // GetApproval returns the current state of an approval request.
 func (ae *ApprovalEngine) GetApproval(decisionID string) (*ApprovalRequest, bool) {
 	ae.mu.RLock()

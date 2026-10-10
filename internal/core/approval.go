@@ -114,6 +114,10 @@ func (e *Engine) createApproval(req *Request, decision governance.Decision, govR
 	if req == nil || req.Context == nil {
 		return nil, fmt.Errorf("core: cannot create approval without request context")
 	}
+	// A cancelled request opens no approval: cancellation wins over waiting.
+	if e.isCancelRequested(req.ID) || e.wasCancelledReq(req.ID) {
+		return nil, cancelGuardErr()
+	}
 
 	e.approvalMu.Lock()
 	if id, ok := e.approvalByReq[req.ID]; ok {
@@ -237,6 +241,18 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 	}
 	if entry.businessID != businessID {
 		return ErrScopeMismatch
+	}
+	// A cancelled request never resumes: the entry should already be gone
+	// (cancellation invalidates first), but a race can interleave lookup and
+	// invalidation — so re-check under the same outcome and refuse. The
+	// approval is dropped, never decided, and nothing revives.
+	if e.wasCancelledReq(entry.requestID) {
+		e.invalidateApprovalsForRequest(entry.requestID)
+		return ErrApprovalNotFound
+	}
+	if result, ok := e.GetResult(entry.requestID); ok && result.Status == "cancelled" {
+		e.invalidateApprovalsForRequest(entry.requestID)
+		return ErrApprovalNotFound
 	}
 
 	// Resume needs a live processing loop — check before mutating the

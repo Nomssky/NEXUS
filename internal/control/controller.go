@@ -20,6 +20,11 @@ var (
 	ErrConstraintUnenforceable = errors.New("governance: constraint cannot be enforced")
 	// ErrGovernanceUnavailable is a missing engine. Also fails closed.
 	ErrGovernanceUnavailable = errors.New("governance: engine unavailable")
+	// ErrRequestCancelled is an approval that cannot be recorded because its
+	// request was already cancelled. Callers must report cancellation, never
+	// a denial: the action was not refused, its execution is gone
+	// (APPROVAL_LIFECYCLE_CONTRACTS §8).
+	ErrRequestCancelled = errors.New("governance: request cancelled")
 )
 
 // EscalationRequest is what the controller needs from the host to raise an

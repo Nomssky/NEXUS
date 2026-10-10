@@ -84,6 +84,11 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 	// proposal carried.
 	requestID := req.ID
 
+	// A cancelled request opens no approval: cancellation wins over waiting.
+	if e.isCancelRequested(requestID) || e.wasCancelledReq(requestID) {
+		return "", cancelGuardErr()
+	}
+
 	fingerprint := p.Fingerprint()
 	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
 		if ar := e.approvalRecord(id); ar != nil && ar.Status == governance.ApprovalStatePending {

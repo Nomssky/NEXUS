@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/control"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
 	"github.com/Nomssky/NEXUS/internal/foundation/cognition"
@@ -120,6 +121,11 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// Response (N2) — proceeding on IsAllowing alone discarded them.
 	govDecision, govErr := e.chainGovernance(ctx, req)
 	if govErr != nil {
+		// Cancellation wins over waiting: a request cancelled between the
+		// queued check and the approval gate ends cancelled, never pending.
+		if errors.Is(govErr, control.ErrRequestCancelled) {
+			return e.chainCancelled(ctx, req, audit, start, "request cancelled before approval could be requested")
+		}
 		return e.chainError(req, govErr, StepGovernance, audit, start)
 	}
 	audit = append(audit, AuditEntry{
@@ -477,6 +483,21 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 				respErr.Details = map[string]string{"approval_id": execOutcome.ApprovalID}
 			} else if ar, err := e.createApproval(req, decision, govReq); err == nil {
 				respErr.Details = map[string]string{"approval_id": ar.DecisionID}
+			} else if errors.Is(err, control.ErrRequestCancelled) {
+				// Cancellation wins over waiting: report cancelled, never a
+				// denial and never a pending approval that could revive.
+				status = "cancelled"
+				message = "cancelled before approval could be requested"
+				outcomeResult = &Outcome{
+					Metrics: map[string]interface{}{
+						"duration_ms":     e.now().Sub(start).Milliseconds(),
+						"executor_status": execOutcome.Status,
+					},
+				}
+				respErr = &ChainError{
+					Code: "CANCELLED", Category: "CANCELLATION",
+					Message: message, ChainStep: string(StepAgent), Retryable: false,
+				}
 			}
 		}
 		respErr.Timestamp = e.now()
@@ -786,9 +807,14 @@ func (e *Engine) chainGovernance(_ context.Context, req *Request) (governance.De
 		code, category = "APPROVAL_REQUIRED", "APPROVAL_REQUIRED"
 		message = fmt.Sprintf("governance requires approval (outcome=%s): %s", decision.Outcome, decision.Reason)
 		// P1 wiring: open the approval loop — record + approval.requested
-		// event; the client learns approval_id via error.details.
+		// event; the client learns approval_id via error.details. A
+		// cancelled request opens nothing: the sentinel propagates to the
+		// caller, which reports cancellation (never a denial, never a
+		// pending approval that could revive).
 		if ar, err := e.createApproval(req, decision, govReq); err == nil {
 			details = map[string]string{"approval_id": ar.DecisionID}
+		} else if errors.Is(err, control.ErrRequestCancelled) {
+			return decision, err
 		}
 	} else if decision.Outcome == governance.ESCALATE {
 		// D3: code ESALATION_REQUIRED distinguishes an escalation from a

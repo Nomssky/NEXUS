@@ -77,6 +77,11 @@ type Engine struct {
 	// because one objective may need several distinct action approvals
 	// (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5).
 	actionApprovals *actionApprovalIndex
+	// cancelledReqs records terminally cancelled request IDs so a late
+	// approval can never revive them (APPROVAL_LIFECYCLE_CONTRACTS §8).
+	// Bounded FIFO like the consumed ledgers; guarded by approvalMu.
+	cancelledReqs  map[string]struct{}
+	cancelledOrder []string
 	// requestRefs is a plain reference index of admitted/in-flight requests, so
 	// an action-level approval raised inside one has something to resume. No
 	// lifecycle, no authorization, no durability (G4).
@@ -194,6 +199,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		approvals:       make(map[string]*approvalEntry),
 		approvalByReq:   make(map[string]string),
 		actionApprovals: newActionApprovalIndex(),
+		cancelledReqs:   make(map[string]struct{}),
 		requestRefs:     make(map[string]*Request),
 		shutdownCh:      make(chan struct{}),
 		loopDone:        make(chan struct{}),

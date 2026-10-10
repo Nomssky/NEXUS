@@ -210,6 +210,18 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 		if e.divisionCancelDenied(actorID, businessID, result.DivisionID) {
 			return ErrDivisionScopeMismatch
 		}
+		// A waiting execution (stored failed/APPROVAL_REQUIRED) CAN be
+		// cancelled: the wait ends, every approval bound to the request is
+		// invalidated, and the terminal cancelled result replaces the
+		// pending one — so a later approval finds nothing to decide and
+		// nothing revives (APPROVAL_LIFECYCLE_CONTRACTS §8). Every other
+		// terminal status keeps the existing 409 arbitration.
+		if isApprovalWaiting(result) {
+			e.invalidateApprovalsForRequest(requestID)
+			e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
+			e.markCancelledReq(requestID)
+			return nil
+		}
 		return terminalCancelError(result.Status)
 	}
 
@@ -224,6 +236,12 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 			}
 			if e.divisionCancelDenied(actorID, businessID, result.DivisionID) {
 				return ErrDivisionScopeMismatch
+			}
+			if isApprovalWaiting(result) {
+				e.invalidateApprovalsForRequest(requestID)
+				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
+				e.markCancelledReq(requestID)
+				return nil
 			}
 			return terminalCancelError(result.Status)
 		}
@@ -249,6 +267,12 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 		e.inflightMu.Unlock()
 		// It became terminal between the two sections.
 		if result, ok := e.GetResult(requestID); ok {
+			if isApprovalWaiting(result) {
+				e.invalidateApprovalsForRequest(requestID)
+				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
+				e.markCancelledReq(requestID)
+				return nil
+			}
 			return terminalCancelError(result.Status)
 		}
 		return ErrRequestNotFound
@@ -322,6 +346,12 @@ func (e *Engine) awaitTerminalResult(requestID, businessID string) error {
 			if result.BusinessID != businessID {
 				return ErrScopeMismatch
 			}
+			if isApprovalWaiting(result) {
+				e.invalidateApprovalsForRequest(requestID)
+				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
+				e.markCancelledReq(requestID)
+				return nil
+			}
 			return terminalCancelError(result.Status)
 		}
 		select {
@@ -330,6 +360,15 @@ func (e *Engine) awaitTerminalResult(requestID, businessID string) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// isApprovalWaiting reports whether a stored result is an execution waiting
+// on approval: failed status with the APPROVAL_REQUIRED error code (D2 —
+// there is no "pending_approval" terminal status; the wait is encoded in
+// the error, and the approval index holds the actionable record).
+func isApprovalWaiting(result *Response) bool {
+	return result != nil && result.Status == "failed" &&
+		result.Error != nil && result.Error.Code == "APPROVAL_REQUIRED"
 }
 
 // terminalCancelError maps a stored terminal status to CancelRequest's result.
