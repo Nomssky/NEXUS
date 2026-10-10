@@ -150,6 +150,9 @@ type run struct {
 	// roots run at 0, and every delegation validates depth+1 against the
 	// budget before creating a child (delegation contract §8).
 	depth int
+	// planVersion is the active plan version, maintained by the loop across
+	// replans. Event metadata reads it; the model never sets it.
+	planVersion int
 }
 
 func (rn *run) emit(ev event.EventType, extra map[string]string) {
@@ -203,7 +206,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	if execID == "" {
 		execID = req.TaskID
 	}
-	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag}
+	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag, planVersion: 1}
 
 	deadline := start.Add(budget.MaxExecutionTime)
 	loopCtx, cancel := context.WithDeadline(ctx, deadline)
@@ -389,7 +392,16 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		// can run again (contract §10). Reads may repeat — the reliability
 		// layer itself retries reads — and resume is a new execution with
 		// fresh scratch state, so legitimate re-execution is unaffected.
-		if fp := repeatGuardFingerprint(r.scope(), action); fp != "" && working.HasEffect(fp) {
+		// A coordination group whose every member already completed is the
+		// same duplicate: nothing new would run.
+		if action.Type == ActionCoordinate {
+			if fps := coordinateMemberFingerprints(action); coordinateFullyExecuted(fps, working.HasEffect) {
+				msg := "action rejected: duplicate of an already-completed effect (not re-executed)"
+				rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": msg})
+				rn.transition(StateFailed, map[string]string{"reason": "duplicate effect"})
+				return failedOutcome(req, start, r.now(), StateFailed, msg), nil
+			}
+		} else if fp := repeatGuardFingerprint(r.scope(), action); fp != "" && working.HasEffect(fp) {
 			msg := "action rejected: duplicate of an already-completed effect (not re-executed)"
 			rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": msg})
 			rn.transition(StateFailed, map[string]string{"reason": "duplicate effect"})
@@ -562,8 +574,9 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			// forward as immutable fact: what already ran is never re-run,
 			// and a later model response cannot rewrite it (contract §7, §9).
 			plan = newPlan
+			rn.planVersion = newPlan.Version
 			ledger = ledger.carryCompleted(newPlan)
-		case ActionToolCall, ActionDelegate, ActionModelCall, ActionMemoryRead, ActionMemoryWrite, ActionMemoryDelete:
+		case ActionToolCall, ActionDelegate, ActionCoordinate, ActionModelCall, ActionMemoryRead, ActionMemoryWrite, ActionMemoryDelete:
 		}
 	}
 }
@@ -735,6 +748,8 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 			"child_task_id": out.TaskID,
 		}
 		return obs, usage, "", ""
+	case ActionCoordinate:
+		return r.performCoordinate(rn, ctx, a, agentID, working, usage, budget, rn.planVersion)
 	case ActionMemoryWrite:
 		obs := &Observation{ObservationID: newID("obs"), Source: "memory", ActionType: ActionMemoryWrite,
 			Status: "ok", Timestamp: r.now()}
@@ -856,23 +871,28 @@ func obsAttempts(obs *Observation) int {
 // have changed between proposal and effect. Empty proposal means a model-only
 // child (no child tools) and needs no agent resolution.
 func (r *Runtime) resolveDelegateTools(rn *run, agentID string, a Action) ([]agentexec.ToolCallSpec, error) {
-	if len(a.DelegateTools) == 0 {
+	return r.resolveDelegateToolsFor(rn, agentID, a.AgentID, a.DelegateTools)
+}
+
+// resolveDelegateToolsFor is the shared intersection core behind single
+// delegations and coordination members.
+func (r *Runtime) resolveDelegateToolsFor(rn *run, agentID, childID string, proposed []DelegateToolCall) ([]agentexec.ToolCallSpec, error) {
+	if len(proposed) == 0 {
 		return nil, nil
 	}
-	if strings.TrimSpace(a.AgentID) == "" {
+	if strings.TrimSpace(childID) == "" {
 		return nil, fmt.Errorf("delegation failed: delegate_tools requires an explicit agent_id")
 	}
-	childDef, ok := r.Registry.Get(a.AgentID)
+	childDef, ok := r.Registry.Get(childID)
 	if !ok {
-		return nil, fmt.Errorf("delegation failed: child agent %q is not registered", a.AgentID)
+		return nil, fmt.Errorf("delegation failed: child agent %q is not registered", childID)
 	}
-	_ = childDef
-	parentTools := r.agentTools(agentID)
 	if strings.TrimSpace(agentID) == "" {
 		return nil, fmt.Errorf("delegation failed: cannot bound child tools without a resolved parent agent")
 	}
-	out := make([]agentexec.ToolCallSpec, 0, len(a.DelegateTools))
-	for i, t := range a.DelegateTools {
+	parentTools := r.agentTools(agentID)
+	out := make([]agentexec.ToolCallSpec, 0, len(proposed))
+	for i, t := range proposed {
 		where := fmt.Sprintf("delegate_tools[%d]", i)
 		if strings.TrimSpace(t.Tool) == "" {
 			return nil, fmt.Errorf("delegation failed: %s needs a tool id", where)
@@ -887,7 +907,7 @@ func (r *Runtime) resolveDelegateTools(rn *run, agentID string, a Action) ([]age
 			}
 		}
 		if !contains(childDef.AllowedTools, t.Tool) {
-			return nil, fmt.Errorf("delegation failed: %s tool %q is not in child agent %q's allowlist", where, t.Tool, a.AgentID)
+			return nil, fmt.Errorf("delegation failed: %s tool %q is not in child agent %q's allowlist", where, t.Tool, childID)
 		}
 		if !contains(parentTools, t.Tool) {
 			return nil, fmt.Errorf("delegation failed: %s tool %q is not in parent agent %q's allowlist", where, t.Tool, agentID)

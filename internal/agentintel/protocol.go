@@ -140,13 +140,48 @@ func DecisionJSONSchema() []byte {
   "additionalProperties": false,
   "required": ["type"],
   "properties": {
-    "type": {"type": "string", "enum": ["model_call","tool_call","delegate","memory_read","memory_write","memory_delete","replan","complete","fail","continue"]},
+    "type": {"type": "string", "enum": ["model_call","tool_call","delegate","coordinate","memory_read","memory_write","memory_delete","replan","complete","fail","continue"]},
     "prompt": {"type": "string"},
     "tool": {"type": "string"},
     "operation": {"type": "string"},
     "input": {"type": "object", "additionalProperties": {"type": "string"}},
     "agent_id": {"type": "string"},
     "objective": {"type": "string"},
+    "delegate_tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tool": {"type": "string"},
+          "operation": {"type": "string"},
+          "input": {"type": "object", "additionalProperties": {"type": "string"}}
+        }
+      }
+    },
+    "children": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {"type": "string"},
+          "objective": {"type": "string"},
+          "delegate_tools": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "tool": {"type": "string"},
+                "operation": {"type": "string"},
+                "input": {"type": "object", "additionalProperties": {"type": "string"}}
+              }
+            }
+          }
+        }
+      }
+    },
     "key": {"type": "string"},
     "value": {"type": "string"},
     "memory_type": {"type": "string"},

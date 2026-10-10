@@ -199,6 +199,32 @@ func (m *WorkingMemory) EffectCount() int {
 	return len(m.effects)
 }
 
+// delegateEffectFingerprint renders the identity of one delegation effect:
+// the child agent, the objective, and the exact proposed tools in order.
+// Two delegations are the same effect only when all three match, so a
+// re-delegation with different tools is a different effect, not a duplicate.
+func delegateEffectFingerprint(agentID, objective string, tools []DelegateToolCall) string {
+	h := sha256.New()
+	write := func(s string) { _, _ = h.Write([]byte(s + "\x00")) }
+	write("delegate")
+	write(agentID)
+	write(objective)
+	for _, t := range tools {
+		write(t.Tool)
+		write(t.Operation)
+		keys := make([]string, 0, len(t.Input))
+		for k := range t.Input {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			write(k)
+			write(t.Input[k])
+		}
+	}
+	return "delegate:" + hex.EncodeToString(h.Sum(nil))
+}
+
 // repeatGuardFingerprint returns the duplicate-suppression fingerprint for an
 // action proposal, or "" when repetition is harmless. Reads may repeat — the
 // reliability layer itself retries reads — but anything that mutates,
@@ -243,9 +269,7 @@ func effectFingerprint(a Action) string {
 			write(a.Input[k])
 		}
 	case ActionDelegate:
-		write("delegate")
-		write(a.AgentID)
-		write(a.Objective)
+		write(delegateEffectFingerprint(a.AgentID, a.Objective, a.DelegateTools))
 	case ActionMemoryWrite:
 		write("memory_write")
 		write(a.Key)

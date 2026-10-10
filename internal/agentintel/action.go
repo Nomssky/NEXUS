@@ -17,6 +17,7 @@ const (
 	ActionModelCall    ActionType = "model_call"
 	ActionToolCall     ActionType = "tool_call"
 	ActionDelegate     ActionType = "delegate"
+	ActionCoordinate   ActionType = "coordinate"
 	ActionMemoryRead   ActionType = "memory_read"
 	ActionMemoryWrite  ActionType = "memory_write"
 	ActionMemoryDelete ActionType = "memory_delete"
@@ -27,7 +28,7 @@ const (
 )
 
 var validActions = map[ActionType]struct{}{
-	ActionModelCall: {}, ActionToolCall: {}, ActionDelegate: {},
+	ActionModelCall: {}, ActionToolCall: {}, ActionDelegate: {}, ActionCoordinate: {},
 	ActionMemoryRead: {}, ActionMemoryWrite: {}, ActionMemoryDelete: {},
 	ActionReplan: {}, ActionComplete: {}, ActionFail: {}, ActionContinue: {},
 }
@@ -56,6 +57,11 @@ type Action struct {
 	// call still passes the child's own governance admission and capability
 	// gates. Empty means a model-only child (no child tools).
 	DelegateTools []DelegateToolCall `json:"delegate_tools,omitempty"`
+	// Children proposes an explicit coordination group: one concurrent wave
+	// of mutually independent children (AGENT_COORDINATION_CONTRACTS §2).
+	// Only valid on a coordinate action; every member needs an explicit
+	// agent id, and members carry no inter-member dependencies.
+	Children []CoordinationChild `json:"children,omitempty"`
 	// memory_*
 	Key   string `json:"key,omitempty"`
 	Value string `json:"value,omitempty"`
@@ -84,6 +90,16 @@ type DelegateToolCall struct {
 	Tool      string            `json:"tool,omitempty"`
 	Operation string            `json:"operation,omitempty"`
 	Input     map[string]string `json:"input,omitempty"`
+}
+
+// CoordinationChild is one member of a proposed coordination group: an
+// explicit child agent, its objective, and its optionally proposed tools.
+// Members are mutually independent by construction — there is no field for
+// inter-member dependencies (coordination contract §2).
+type CoordinationChild struct {
+	AgentID       string             `json:"agent_id,omitempty"`
+	Objective     string             `json:"objective,omitempty"`
+	DelegateTools []DelegateToolCall `json:"delegate_tools,omitempty"`
 }
 
 // ParseAction decodes exactly one strict decision object from the whole model
@@ -230,6 +246,8 @@ func ValidateAction(a Action, c *ActionContext, r ScopeResolver, caps Caps) erro
 			return fmt.Errorf("rejected: delegation depth limit reached (%d)", c.Budget.MaxDepth)
 		}
 		return nil
+	case ActionCoordinate:
+		return validateCoordinate(a, c, r)
 	case ActionMemoryRead:
 		if strings.TrimSpace(a.Key) == "" {
 			return fmt.Errorf("rejected: memory_read needs a key")
@@ -274,6 +292,46 @@ func validateDelegateTools(tools []DelegateToolCall, childID, parentID string, r
 		}
 		if parentID == "" || !r.AgentAllowsTool(parentID, t.Tool) {
 			return fmt.Errorf("rejected: %s tool %q is not in parent agent %q's allowlist", where, t.Tool, parentID)
+		}
+	}
+	return nil
+}
+
+// validateCoordinate applies the structural half of coordination validation
+// (coordination contract §3, §5): a non-empty member list within the remaining
+// delegation budget, every member naming an explicit scope-visible agent, and
+// every proposed child tool intersectable with both allowlists. Admission,
+// intersection at effect time, and the execution-layer fan-out net still run
+// later; this establishes structure only.
+func validateCoordinate(a Action, c *ActionContext, r ScopeResolver) error {
+	if len(a.Children) == 0 {
+		return fmt.Errorf("rejected: coordinate needs at least one child")
+	}
+	if c.Used.Delegations+len(a.Children) > c.Budget.MaxDelegations {
+		return fmt.Errorf("rejected: coordination of %d children exceeds the remaining delegation budget (%d)",
+			len(a.Children), c.Budget.MaxDelegations-c.Used.Delegations)
+	}
+	if c.Depth >= c.Budget.MaxDepth {
+		return fmt.Errorf("rejected: delegation depth limit reached (%d)", c.Budget.MaxDepth)
+	}
+	seen := map[string]struct{}{}
+	for i, m := range a.Children {
+		where := fmt.Sprintf("children[%d]", i)
+		if strings.TrimSpace(m.AgentID) == "" {
+			return fmt.Errorf("rejected: %s needs an explicit agent_id", where)
+		}
+		if r == nil || !r.AgentVisible(m.AgentID, c.BusinessID, c.DivisionID) {
+			return fmt.Errorf("rejected: %s agent %q is not visible in this scope", where, m.AgentID)
+		}
+		if strings.TrimSpace(m.Objective) == "" {
+			return fmt.Errorf("rejected: %s needs an objective", where)
+		}
+		if _, dup := seen[delegateEffectFingerprint(m.AgentID, m.Objective, m.DelegateTools)]; dup {
+			return fmt.Errorf("rejected: %s duplicates an earlier member", where)
+		}
+		seen[delegateEffectFingerprint(m.AgentID, m.Objective, m.DelegateTools)] = struct{}{}
+		if err := validateDelegateTools(m.DelegateTools, m.AgentID, c.AgentID, r); err != nil {
+			return fmt.Errorf("%s: %w", where, err)
 		}
 	}
 	return nil
