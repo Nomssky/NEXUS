@@ -81,15 +81,21 @@ const (
 	EventTypeStepCompleted      EventType = "step.completed"
 	// Execution-depth step lifecycle (AGENT_EXECUTION_DEPTH_CONTRACTS §3):
 	// metadata only (step id, plan version, status, observation ref).
-	EventTypeStepReady          EventType = "step.ready"
-	EventTypeStepObserving      EventType = "step.observing"
-	EventTypeStepFailed         EventType = "step.failed"
-	EventTypeStepBlocked        EventType = "step.blocked"
-	EventTypeActionProposed     EventType = "action.proposed"
-	EventTypeActionRejected     EventType = "action.rejected"
-	EventTypeObservationCreated EventType = "observation.created"
-	EventTypeMemoryRead         EventType = "memory.read"
-	EventTypeMemoryWritten      EventType = "memory.written"
+	EventTypeStepReady     EventType = "step.ready"
+	EventTypeStepObserving EventType = "step.observing"
+	EventTypeStepFailed    EventType = "step.failed"
+	EventTypeStepBlocked   EventType = "step.blocked"
+	// Bounded parallel coordination (AGENT_COORDINATION_CONTRACTS §10):
+	// group lifecycle only, metadata-only (group id, plan version, member
+	// counts by status). Member lifecycle reuses agent.delegated and the
+	// child agent.started/tool/governance/outcome events.
+	EventTypeCoordinationStarted   EventType = "coordination.started"
+	EventTypeCoordinationCompleted EventType = "coordination.completed"
+	EventTypeActionProposed        EventType = "action.proposed"
+	EventTypeActionRejected        EventType = "action.rejected"
+	EventTypeObservationCreated    EventType = "observation.created"
+	EventTypeMemoryRead            EventType = "memory.read"
+	EventTypeMemoryWritten         EventType = "memory.written"
 	// Agent Memory & Context Platform v1 (AGENT_MEMORY_CONTEXT_CONTRACTS §16).
 	// Metadata only: ids, scope, type, provenance, trust, counts, outcome.
 	EventTypeMemoryCreated     EventType = "memory.created"

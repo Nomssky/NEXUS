@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/capability"
@@ -682,6 +683,102 @@ func (r *Runtime) DelegateChild(ctx context.Context, parent *executor.WorkReques
 		},
 	}
 	return r.execute(ctx, childReq, ag, depth+1)
+}
+
+// CoordinationMember is one admitted member of a coordination group: the
+// DelegateSpec carries the intersected tools plus the runtime-stamped
+// parentage (ParentAgentID, DelegationActionID); Index is the declaration
+// order, which is also the deterministic aggregation order.
+type CoordinationMember struct {
+	Index int
+	Spec  DelegateSpec
+}
+
+// CoordinationChildResult is the settled record of one member: the outcome
+// as the child runtime reported it (never rewritten), or a transport error
+// when the child call itself failed. Started distinguishes members that
+// began from members skipped after cancellation/deadline.
+type CoordinationChildResult struct {
+	Index   int
+	ChildID string
+	AgentID string
+	TaskID  string
+	Started bool
+	Outcome *executor.Outcome
+	Err     error
+}
+
+// CoordinationOutcome is the settled state of one group wave: results in
+// member declaration order (never completion order), the started count for
+// budget accounting, and terminal flags when cancellation or deadline ended
+// the wave before every member settled.
+type CoordinationOutcome struct {
+	Results          []CoordinationChildResult
+	Started          int
+	Cancelled        bool
+	DeadlineExceeded bool
+}
+
+// RunCoordinationGroup executes admitted coordination members concurrently
+// under one semaphore sized by the existing parallelism bound (maxFan — the
+// same mechanism as workflow parallel nodes). Members are independent by
+// construction: no shared mutable state, no member-to-member calls, each
+// through DelegateChild with its own linkage, scope, governance and
+// reliability. A member that never starts (cancellation/deadline won the
+// semaphore race) keeps Started=false and no outcome.
+//
+// The wave always settles what it started: results are returned in member
+// declaration order whether members succeeded, failed, or were cancelled
+// mid-flight. Terminal flags report only the wave-level interruption.
+func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.WorkRequest, ag *agent.Agent, members []CoordinationMember, depth int) CoordinationOutcome {
+	outcome := CoordinationOutcome{Results: make([]CoordinationChildResult, len(members))}
+	if len(members) == 0 {
+		return outcome
+	}
+	var started atomic.Int32
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, r.maxFan)
+	for i := range members {
+		m := members[i]
+		outcome.Results[i] = CoordinationChildResult{Index: m.Index, ChildID: m.Spec.ID, AgentID: m.Spec.AgentID}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			started.Add(1)
+			outcome.Results[m.Index].Started = true
+			out, err := r.DelegateChild(ctx, parent, ag, m.Spec, depth)
+			outcome.Results[m.Index].Outcome = out
+			outcome.Results[m.Index].Err = err
+			if out != nil {
+				outcome.Results[m.Index].TaskID = out.TaskID
+			}
+		}()
+	}
+	wg.Wait()
+	outcome.Started = int(started.Load())
+	settled := true
+	for i := range outcome.Results {
+		if !outcome.Results[i].Started {
+			settled = false
+		}
+	}
+	// A fully settled wave reports its results regardless of a ctx expiry
+	// that landed after the last effect: the outcomes already happened.
+	// Anything unstarted means the wave itself was interrupted.
+	if !settled && ctx.Err() != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			outcome.DeadlineExceeded = true
+		} else {
+			outcome.Cancelled = true
+		}
+	}
+	return outcome
 }
 
 // runWorkflow executes a WorkflowSpec sequentially or with a bounded
