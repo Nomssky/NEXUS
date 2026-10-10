@@ -116,8 +116,16 @@ type Runtime struct {
 	Controller *control.Controller
 	now        func() time.Time
 	maxDepth   int
-	maxFan     int
-	mu         sync.Mutex
+	// maxFan bounds total fan-out per execution: spec Delegates and
+	// coordination members alike (contract §3).
+	maxFan int
+	// maxConcurrent bounds simultaneous child executions: the semaphore
+	// size for parallel waves. It is deliberately separate from maxFan so
+	// total and simultaneous stay independently enforceable (a wave of 20
+	// with 3 active at once is representable); both default to the same
+	// shipped value so existing behavior is unchanged.
+	maxConcurrent int
+	mu            sync.Mutex
 	// proposalSeq numbers runtime proposal identities (never model supplied).
 	proposalSeq int
 }
@@ -131,7 +139,7 @@ func NewRuntime(reg *Registry, tools *tool.ToolRegistry, router *modelrouter.Mod
 	registerBuiltins(tools)
 	return &Runtime{
 		Registry: reg, Tools: tools, ToolExec: BuiltinExecutor(),
-		Router: router, Bus: bus, now: time.Now, maxDepth: 3, maxFan: 4,
+		Router: router, Bus: bus, now: time.Now, maxDepth: 3, maxFan: 4, maxConcurrent: 4,
 	}
 }
 
@@ -161,6 +169,15 @@ func (r *Runtime) emit(ev event.EventType, req *executor.WorkRequest, actor, out
 		Priority:      event.PriorityNormal,
 		Data:          b,
 	})
+}
+
+// semaphoreSize is the concurrency bound with a deadlock-proof floor: a
+// zero-value runtime still serializes instead of wedging.
+func (r *Runtime) semaphoreSize() int {
+	if r.maxConcurrent <= 0 {
+		return 1
+	}
+	return r.maxConcurrent
 }
 
 // delegationFields renders the runtime-stamped parent linkage of a child
@@ -730,14 +747,29 @@ type CoordinationOutcome struct {
 // The wave always settles what it started: results are returned in member
 // declaration order whether members succeeded, failed, or were cancelled
 // mid-flight. Terminal flags report only the wave-level interruption.
-func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.WorkRequest, ag *agent.Agent, members []CoordinationMember, depth int) CoordinationOutcome {
+func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.WorkRequest, ag *agent.Agent, members []CoordinationMember, depth int) (CoordinationOutcome, error) {
 	outcome := CoordinationOutcome{Results: make([]CoordinationChildResult, len(members))}
 	if len(members) == 0 {
-		return outcome
+		return outcome, fmt.Errorf("coordination requires at least one member")
+	}
+	// Total fan-out is refused up front: zero children started, no
+	// semaphore, no goroutine, no effect (contract §3).
+	if len(members) > r.maxFan {
+		return outcome, fmt.Errorf("coordination fan-out exceeded (%d > %d)", len(members), r.maxFan)
+	}
+	// A wave interrupted before it begins starts nothing: no goroutine, no
+	// effect, just the honest terminal report.
+	if ctx.Err() != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			outcome.DeadlineExceeded = true
+		} else {
+			outcome.Cancelled = true
+		}
+		return outcome, nil
 	}
 	var started atomic.Int32
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, r.maxFan)
+	sem := make(chan struct{}, r.semaphoreSize())
 	for i := range members {
 		m := members[i]
 		outcome.Results[i] = CoordinationChildResult{Index: m.Index, ChildID: m.Spec.ID, AgentID: m.Spec.AgentID}
@@ -778,7 +810,7 @@ func (r *Runtime) RunCoordinationGroup(ctx context.Context, parent *executor.Wor
 			outcome.Cancelled = true
 		}
 	}
-	return outcome
+	return outcome, nil
 }
 
 // runWorkflow executes a WorkflowSpec sequentially or with a bounded
@@ -805,7 +837,7 @@ func (r *Runtime) runWorkflow(ctx context.Context, req *executor.WorkRequest, ag
 		// become ordered groups. Keep simple: resolve dependency topologically.
 		order := topoSort(wf.Nodes)
 		for _, grp := range order {
-			sem := make(chan struct{}, r.maxFan)
+			sem := make(chan struct{}, r.semaphoreSize())
 			var wg sync.WaitGroup
 			for _, n := range grp {
 				node := n

@@ -50,18 +50,18 @@ system and no agent messaging of any kind.
 
 - **Total children**: group members count fully against the parent's
   delegation budget (`Used.Delegations + len(members) ≤ MaxDelegations`), and
-  the execution layer independently refuses more than `maxFan` members.
-- **Simultaneous children**: one semaphore sized by the existing parallelism
-  bound (`maxFan`, the same mechanism as workflow parallel nodes). A group
-  larger than the remaining delegation budget is rejected before anything
-  starts; a group larger than `maxFan` is refused at the execution boundary.
+  the execution layer independently refuses more than `maxFan` members with
+  zero children started.
+- **Simultaneous children**: one semaphore sized by `maxConcurrent`, a bound
+  deliberately separate from total fan-out so the two stay independently
+  enforceable (a wave of 20 with 3 active at once is representable). Both
+  default to the same shipped value, which is strictly tighter than any split
+  configuration, never looser.
 - **Depth**: members run one level deeper; the existing max-depth terminates
   deeper nesting. Groups do not nest (a child runs units, not groups), so
   limits cannot multiply per level.
 - Together with the fixed parent deadline and cancellation context, total
-  work per execution stays bounded. The 20-total/3-simultaneous split is
-  deferred: today both axes share the existing bounds, which is strictly
-  tighter, never looser.
+  work per execution stays bounded.
 
 ## 4. Budgets, deadlines, cancellation
 
