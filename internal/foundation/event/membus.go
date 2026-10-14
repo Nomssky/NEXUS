@@ -47,6 +47,14 @@ type MemBus struct {
 	attempts  map[string]int // event ID -> delivery attempts (bounded retry)
 	nextID    int
 	now       func() time.Time
+	// tap, when set at construction, observes every accepted event
+	// synchronously at publish time, under the bus lock, after idempotency
+	// dedup and before enqueue (EXECUTION_TRACE_CONTRACTS §3). It is the
+	// trace capture seam: capture is complete when Publish returns, so a
+	// reader that observes a stored result also observes every event that
+	// result's execution published. A tap MUST be O(1), non-blocking and
+	// MUST NOT call back into the bus.
+	tap func(*Event)
 }
 
 // maxDedupSize limits the dedup map to prevent unbounded memory growth.
@@ -58,6 +66,15 @@ const maxDeliveryAttempts = 3
 
 // NewMemBus creates a new in-memory event bus.
 func NewMemBus() *MemBus {
+	return NewMemBusWithTap(nil)
+}
+
+// NewMemBusWithTap creates a bus with a synchronous publish-time tap
+// (EXECUTION_TRACE_CONTRACTS §3). The tap observes each event exactly once,
+// after dedup, on the publisher's goroutine, before Publish returns. It must
+// be provided at construction so it is immutable for the bus's lifetime —
+// never swapped under running publishers.
+func NewMemBusWithTap(tap func(*Event)) *MemBus {
 	pq := &priorityQueue{}
 	heap.Init(pq)
 
@@ -67,6 +84,7 @@ func NewMemBus() *MemBus {
 		dedup:     make(map[string]bool),
 		attempts:  make(map[string]int),
 		now:       time.Now,
+		tap:       tap,
 	}
 }
 
@@ -96,6 +114,14 @@ func (b *MemBus) Publish(event *Event) error {
 			delete(b.dedup, old)
 			b.dedupSize--
 		}
+	}
+
+	// Publish-time tap: synchronous observation of the accepted event,
+	// under the bus lock, before enqueue (EXECUTION_TRACE_CONTRACTS §3).
+	// Deduped events never reach it, so a suppressed duplicate is never
+	// presented as an additional observation.
+	if b.tap != nil {
+		b.tap(event)
 	}
 
 	// Enqueue
