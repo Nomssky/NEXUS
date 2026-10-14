@@ -41,6 +41,10 @@ type Engine struct {
 
 	// Foundation components
 	eventBus *event.MemBus
+	// traces is the bounded, redacted, process-local execution-trace
+	// registry fed synchronously by the bus tap (EXECUTION_TRACE_CONTRACTS
+	// §3, §11). A view only — never a source of authority.
+	traces *traceRegistry
 	// store is the externally exposed persistent store (C-019).
 	// It is intentionally NOT consumed by engine runtime: request results
 	// use the bounded in-memory results map, and knowledge/memory uses
@@ -201,6 +205,7 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		actionApprovals: newActionApprovalIndex(),
 		cancelledReqs:   make(map[string]struct{}),
 		requestRefs:     make(map[string]*Request),
+		traces:          newTraceRegistry(),
 		shutdownCh:      make(chan struct{}),
 		loopDone:        make(chan struct{}),
 		execConfig:      executor.DefaultConfig(),
@@ -215,8 +220,10 @@ func NewEngine(cfg *config.Config, opts ...EngineOption) (*Engine, error) {
 		return nil, e.persistErr
 	}
 
-	// Wire foundation components
-	e.eventBus = event.NewMemBus()
+	// Wire foundation components. The bus carries the synchronous
+	// publish-time tap that feeds the trace registry (contract §3), so
+	// capture is complete before any Publish call returns.
+	e.eventBus = event.NewMemBusWithTap(e.traces.record)
 	if e.store == nil {
 		e.store = store.NewMemStore()
 	}
