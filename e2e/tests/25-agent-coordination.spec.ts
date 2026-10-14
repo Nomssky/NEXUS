@@ -1,6 +1,6 @@
 import { test as base, expect, beforeAll, afterEach } from '@playwright/test';
 import type { APIRequestContext } from '@playwright/test';
-import { bootstrapHeaders, controlHeaders, randomSuffix } from '../fixtures/api';
+import { actorHeaders, bootstrapHeaders, controlHeaders, randomSuffix } from '../fixtures/api';
 import { startNexus, type NexusHandle } from '../fixtures/nexus';
 import { sweepE2ePolicies } from '../fixtures/policy';
 import { openSSE } from '../fixtures/sse';
@@ -496,6 +496,26 @@ async function runObjective(
   throw new Error('objective never reached terminal state');
 }
 
+/** Re-poll an execution that is resuming after an approval decision. */
+async function refreshObjective(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+  executionID: string,
+  timeoutMs = 25_000,
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const r = await request.get(
+      `${nexus.baseURL}/api/v1/intelligence/${executionID}?business_id=${nexus.businessID}`,
+      { headers: bootstrapHeaders(nexus) },
+    );
+    if (r.status() === 200) return await r.json();
+    expect(r.status()).toBe(202);
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error('resumed objective never reached terminal state');
+}
+
 async function pendingApprovals(request: APIRequestContext, nexus: NexusHandle): Promise<any[]> {
   const res = await request.get(`${nexus.baseURL}/api/v1/approvals?business_id=${nexus.businessID}`, {
     headers: bootstrapHeaders(nexus),
@@ -813,11 +833,25 @@ test.describe('AGENT COORDINATION', () => {
       expect(stepPayload(frame).pending_approval).toBe('1');
       expect(toolSeenPaths, 'the unapproved child mutation ran nothing').toEqual([]);
       // The child approval stays pending in the approval surface: nothing
-      // consumed or auto-resolved it behind the scenes. (It is intentionally
-      // left pending: this is the last test, and deciding it would trigger
-      // an async resume with nowhere to observe.)
+      // consumed or auto-resolved it behind the scenes.
       const pending = (await pendingApprovals(request, nexus)).map((a) => a.entity_id);
       expect(pending.length).toBeGreaterThan(0);
+      // Deciding it resumes the PARENT request the member ran under: the wave
+      // re-runs, the approved member re-admits under its own record (single
+      // use), and its mutation runs exactly once — the decision touches no
+      // other member's effects.
+      const decided = await request.post(
+        `${nexus.baseURL}/api/v1/approvals/${encodeURIComponent(pending[0])}/approve?business_id=${nexus.businessID}`,
+        {
+          headers: { ...actorHeaders(approverID, approverCredential), 'Content-Type': 'application/json' },
+          data: { reason: 'release the coordinated member' },
+        },
+      );
+      expect(decided.status(), await decided.text()).toBe(202);
+      const resumed = await refreshObjective(request, nexus, executionID);
+      expect(resumed.status).toBe('completed');
+      expect(toolSeenPaths, 'the approved member mutation runs exactly once').toEqual(['/ok']);
+      expect((await pendingApprovals(request, nexus)).map((a) => a.entity_id)).not.toContain(pending[0]);
     } finally {
       (conn as any).close();
     }

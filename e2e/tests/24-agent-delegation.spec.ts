@@ -105,7 +105,11 @@ function decide(objective: string, body: any, parent: string, child: string): { 
     };
   }
   if (objective.includes('deleg-approval') || objective.includes('deleg-escalate')) {
-    if (obsCount >= 1) return { status: 200, content: '{"type":"complete","result":"fetched"}' };
+    // A child that actually completed (delegate ok) ends the run; a child
+    // that paused on approval is unfinished work — the resumed parent
+    // re-delegates it, so the approved decision re-runs exactly the waiting
+    // mutation and nothing else (APPROVAL_LIFECYCLE §6, §9).
+    if (/delegate ok\]/.test(messages)) return { status: 200, content: '{"type":"complete","result":"fetched"}' };
     return { status: 200, content: delegateTo(child, 'fetch it', [httpTool('/ok')]) };
   }
   if (objective.includes('deleg-capability-child')) {
@@ -391,6 +395,26 @@ async function runObjective(
   throw new Error('objective never reached terminal state');
 }
 
+/** Re-poll an execution that is resuming after an approval decision. */
+async function refreshObjective(
+  request: APIRequestContext,
+  nexus: NexusHandle,
+  executionID: string,
+  timeoutMs = 25_000,
+): Promise<any> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const r = await request.get(
+      `${nexus.baseURL}/api/v1/intelligence/${executionID}?business_id=${nexus.businessID}`,
+      { headers: bootstrapHeaders(nexus) },
+    );
+    if (r.status() === 200) return await r.json();
+    expect(r.status()).toBe(202);
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error('resumed objective never reached terminal state');
+}
+
 async function pendingApprovals(request: APIRequestContext, nexus: NexusHandle): Promise<any[]> {
   const res = await request.get(`${nexus.baseURL}/api/v1/approvals?business_id=${nexus.businessID}`, {
     headers: bootstrapHeaders(nexus),
@@ -574,7 +598,7 @@ test.describe('AGENT DELEGATION', () => {
         self_approval_prohibited: true,
       },
     });
-    const { result } = await runObjective(request, nexus, 'deleg-approval fetch through a child');
+    const { executionID, result } = await runObjective(request, nexus, 'deleg-approval fetch through a child');
     expect(result.status).toBe('failed');
     expect(result.error.message).toMatch(/pending_approval/);
     expect(toolSeenPaths, 'the unapproved child mutation ran nothing').toEqual([]);
@@ -585,18 +609,22 @@ test.describe('AGENT DELEGATION', () => {
     expect(ids.length).toBeGreaterThan(0);
     const named = ids.find((id) => result.error.message.includes(id));
     expect(named, 'the child approval is named, not adopted').toBeTruthy();
-    // It is a real decidable record: the approver can still decide it, and
-    // deciding it resolves the record without resuming anything (the parent
-    // already ended failed — approval is not a time machine).
+    // It is a real decidable record, and deciding it RESUMES the waiting
+    // execution: the parent re-delegates the unfinished child, the child
+    // re-admits under its own approved record (single use), and the approved
+    // mutation runs exactly once — a decision grants nothing else.
     const decided = await request.post(
       `${nexus.baseURL}/api/v1/approvals/${encodeURIComponent(named as string)}/approve?business_id=${nexus.businessID}`,
       {
         headers: { ...actorHeaders(approverID, approverCredential), 'Content-Type': 'application/json' },
-        data: { reason: 'close out the child approval' },
+        data: { reason: 'release the child mutation' },
       },
     );
     expect(decided.status(), await decided.text()).toBe(202);
     expect((await pendingApprovals(request, nexus)).map((a) => a.entity_id)).not.toContain(named);
+    const resumed = await refreshObjective(request, nexus, executionID);
+    expect(resumed.status).toBe('completed');
+    expect(toolSeenPaths, 'the approved child mutation runs exactly once').toEqual(['/ok']);
   });
 
   test('a child escalation is reported, never mistaken for success', async ({ request, nexus }) => {
