@@ -171,6 +171,37 @@ func (r *Runtime) emit(ev event.EventType, req *executor.WorkRequest, actor, out
 	})
 }
 
+// publishInvocation emits dispatch evidence for the pre-platform builtin path
+// (CANONICAL_TOOL_DISPATCH_CONTRACTS §4.2). The invocation boundary is real,
+// so invocation-started and one terminal event are published on the shared
+// bus. No physical-attempt events are fabricated: the builtin executors are
+// pure local functions with no external dispatch — their single synchronous
+// call is the whole invocation, not an adapter attempt, and fabricating
+// attempt events would misrepresent the trace.
+func (r *Runtime) publishInvocation(ev event.EventType, corr, businessID, toolID, operation, agentID, sideEffect string, extra map[string]string) {
+	if r.Bus == nil {
+		return
+	}
+	data := map[string]string{
+		"tool_id": toolID, "operation": operation, "agent_id": agentID,
+		"side_effect_class": sideEffect, "call_id": corr,
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	b, _ := json.Marshal(data)
+	_ = r.Bus.Publish(&event.Event{
+		ID:            fmt.Sprintf("%s-%s-%d", corr, ev, r.now().UnixNano()),
+		Type:          ev,
+		Source:        "agentexec",
+		Timestamp:     r.now(),
+		BusinessID:    businessID,
+		CorrelationID: corr,
+		Priority:      event.PriorityNormal,
+		Data:          b,
+	})
+}
+
 // semaphoreSize is the concurrency bound with a deadlock-proof floor: a
 // zero-value runtime still serializes instead of wedging.
 func (r *Runtime) semaphoreSize() int {
@@ -665,7 +696,37 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 	if !ok || execFn == nil {
 		return nil, fmt.Errorf("tool %q has no executor", call.ToolID)
 	}
-	return execFn(ctx, call.Input)
+	// v8 dispatch evidence (CANONICAL_TOOL_DISPATCH_CONTRACTS §4.2): the
+	// invocation boundary is real, so invocation-started and one terminal
+	// event are published on the shared bus. No physical-attempt events are
+	// fabricated: the builtin executors are pure local functions with no
+	// external dispatch, and their single synchronous call is the whole
+	// invocation — not an adapter attempt.
+	sideEffect := "read"
+	if m, mok := r.Tools.Manifest(call.ToolID); mok {
+		sideEffect = string(m.SideEffectClass)
+	}
+	r.publishInvocation(event.EventTypeToolInvocationStarted, corr, businessID,
+		call.ToolID, call.Operation, agentID, sideEffect, nil)
+	execStart := r.now()
+	out, execErr := execFn(ctx, call.Input)
+	elapsed := r.now().Sub(execStart)
+	if execErr != nil {
+		r.publishInvocation(event.EventTypeToolInvocationFailed, corr, businessID,
+			call.ToolID, call.Operation, agentID, sideEffect, map[string]string{
+				"error_kind":  "executor failure",
+				"outcome":     "failed",
+				"duration_ms": fmt.Sprint(elapsed.Milliseconds()),
+			})
+		return nil, execErr
+	}
+	r.publishInvocation(event.EventTypeToolInvocationCompleted, corr, businessID,
+		call.ToolID, call.Operation, agentID, sideEffect, map[string]string{
+			"status":      "ok",
+			"outcome":     "completed",
+			"duration_ms": fmt.Sprint(elapsed.Milliseconds()),
+		})
+	return out, nil
 }
 
 // DelegateChild runs one child execution through the existing delegation
