@@ -668,3 +668,50 @@ func mustJSON(t *testing.T, v interface{}) []byte {
 	}
 	return b
 }
+
+// A successful builtin call on the pre-platform path now emits dispatch
+// evidence without fabricating physical attempts (v8). The invocation
+// started/terminal pair is the honest signal; source agentexec and
+// side_effect_class read distinguish it from the capability path.
+func TestTracePrePlatformBuiltinEmitsDispatchEvidenceNoAttempts(t *testing.T) {
+	f := newTraceFixture(t)
+	id := f.submitObjective(t, "multiply six by seven with the calculator")
+	if res := f.terminalPoll(id); res["status"] != "completed" {
+		t.Fatalf("expected completed, got %v (%v)", res["status"], res["error"])
+	}
+
+	tr, w := f.trace(t, id, "")
+	if tr == nil {
+		t.Fatalf("trace: %d %s", w.Code, w.Body.String())
+	}
+	proposal := entryIndex(tr, "action.proposed", "action", "tool_call")
+	decision := entryIndex(tr, "governance.decided", "action", "tool_call")
+	started := entryIndex(tr, "tool.invocation.started", "tool_id", "calculator")
+	completed := entryIndex(tr, "tool.invocation.completed", "tool_id", "calculator")
+	terminal := entryIndex(tr, "objective.completed", "state", "completed")
+	if proposal < 0 || decision < 0 || started < 0 || completed < 0 || terminal < 0 {
+		t.Fatalf("pre-platform dispatch evidence missing: %v", entryTypes(tr))
+	}
+	if !(proposal < decision && decision < started && started < completed && completed < terminal) {
+		t.Fatalf("causal order broken: proposal=%d decision=%d started=%d completed=%d terminal=%d",
+			proposal, decision, started, completed, terminal)
+	}
+	entry := tr.Entries[started]
+	if entry.Source != "agentexec" {
+		t.Fatalf("expected agentexec source for pre-platform dispatch, got %q", entry.Source)
+	}
+	if entry.Data["side_effect_class"] != "read" {
+		t.Fatalf("builtin side_effect_class should be read, got %q", entry.Data["side_effect_class"])
+	}
+	// No fabricated physical attempts: the pure local invocation is ONE
+	// call, evidenced by started + completed with zero attempt events.
+	for _, typ := range []string{"tool.attempt.started", "tool.attempt.completed", "tool.retry.scheduled"} {
+		if entryIndex(tr, typ, "", "") >= 0 {
+			t.Fatalf("pre-platform path must not fabricate %s: %v", typ, entryTypes(tr))
+		}
+	}
+	// The ok observation remains independent (post-hoc) confirmation.
+	if okToolObservation(tr, "calculator") < 0 {
+		t.Fatalf("ok observation missing: %v", entryTypes(tr))
+	}
+}
