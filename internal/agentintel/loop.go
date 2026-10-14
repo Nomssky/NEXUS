@@ -97,6 +97,11 @@ type Runtime struct {
 
 	mu     sync.Mutex
 	states map[string]State
+	// resumes holds waiting-execution snapshots for approval resume,
+	// keyed by execution id (APPROVAL_LIFECYCLE_CONTRACTS §6). Bounded
+	// FIFO, consumed on load, verified before use.
+	resumes     map[string]*runSnapshot
+	resumeOrder []string
 }
 
 // New wires a runtime with the shipped bounded defaults.
@@ -208,57 +213,101 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	}
 	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag, planVersion: 1}
 
+	// Approval resume: a waiting run left its authoritative snapshot behind
+	// under this execution id. The re-submitted request continues it —
+	// same plan, ledger, observations, budgets and deadline — instead of
+	// restarting blank (APPROVAL_LIFECYCLE_CONTRACTS §6). Anything else
+	// starts fresh.
+	snap, resumed := r.takeResume(execID, obj, req)
+
 	deadline := start.Add(budget.MaxExecutionTime)
+	if resumed {
+		// Waiting never extends the caller deadline: the original one
+		// governs, even if it already passed (then the first loop check
+		// ends the run honestly with no effects).
+		deadline = snap.deadline
+	}
 	loopCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
 	rn.transition(StateCreated, map[string]string{"objective": obj.Description})
 	rn.emit(event.EventTypeObjectiveStarted, map[string]string{"objective_id": obj.ObjectiveID, "deadline_ms": fmt.Sprint(budget.MaxExecutionTime.Milliseconds())})
 
-	// ---- planning (advisory) --------------------------------------------
-	rn.transition(StatePlanning, nil)
-	if ctx.Err() != nil {
-		rn.transition(StateCancelled, nil)
-		return cancelledOutcome(req, start, r.now()), nil
-	}
-	steps, planErr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
-	if planErr != nil {
+	var (
+		plan         *Plan
+		ledger       *planLedger
+		usage        BudgetUsage
+		working      *WorkingMemory
+		observations []Observation
+		memIdentity  memory.Identity
+		agentID      string
+	)
+	if resumed {
+		// Continue the waiting execution: re-validate the restored plan
+		// (the registry may have changed while waiting) and pick up
+		// exactly where the pause happened. No re-planning, no budget
+		// reset, no deadline extension.
+		plan = snap.plan
+		res := ValidatePlan(plan, r.scope(), r.Caps)
+		rn.emit(event.EventTypePlanValidated, map[string]string{"valid": fmt.Sprint(res.Valid), "rejections": fmt.Sprint(len(res.Rejections))})
+		if !res.Valid {
+			rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
+			return failedOutcome(req, start, r.now(), StateFailed, "plan rejected: "+rejectionSummary(res)), nil
+		}
+		ledger = snap.ledger
+		usage = snap.usage
+		working = restoreWorking(snap)
+		observations = snap.observations
+		rn.depth = snap.depth
+		rn.planVersion = snap.planVersion
+	} else {
+		// ---- planning (advisory) --------------------------------------------
+		rn.transition(StatePlanning, nil)
 		if ctx.Err() != nil {
 			rn.transition(StateCancelled, nil)
 			return cancelledOutcome(req, start, r.now()), nil
 		}
-		if loopCtx.Err() != nil {
-			rn.transition(StateDeadlineExceeded, nil)
-			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
+		steps, planErr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
+		if planErr != nil {
+			if ctx.Err() != nil {
+				rn.transition(StateCancelled, nil)
+				return cancelledOutcome(req, start, r.now()), nil
+			}
+			if loopCtx.Err() != nil {
+				rn.transition(StateDeadlineExceeded, nil)
+				return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
+			}
+			rn.transition(StateFailed, map[string]string{"reason": "planner failed"})
+			return failedOutcome(req, start, r.now(), StateFailed, "planner failed: "+planErr.Error()), nil
 		}
-		rn.transition(StateFailed, map[string]string{"reason": "planner failed"})
-		return failedOutcome(req, start, r.now(), StateFailed, "planner failed: "+planErr.Error()), nil
-	}
-	plan := &Plan{PlanID: execID, Version: 1, Steps: steps, ObjectiveID: obj.ObjectiveID,
-		CorrelationID: execID, BusinessID: req.BusinessID, DivisionID: req.DivisionID, CreatedAt: r.now()}
-	rn.emit(event.EventTypePlanCreated, map[string]string{"plan_id": execID, "version": "1", "steps": fmt.Sprint(len(plan.Steps))})
+		plan = &Plan{PlanID: execID, Version: 1, Steps: steps, ObjectiveID: obj.ObjectiveID,
+			CorrelationID: execID, BusinessID: req.BusinessID, DivisionID: req.DivisionID, CreatedAt: r.now()}
+		rn.emit(event.EventTypePlanCreated, map[string]string{"plan_id": execID, "version": "1", "steps": fmt.Sprint(len(plan.Steps))})
 
-	// ---- validation (fail-closed before any action) ----------------------
-	res := ValidatePlan(plan, r.scope(), r.Caps)
-	rn.emit(event.EventTypePlanValidated, map[string]string{"valid": fmt.Sprint(res.Valid), "rejections": fmt.Sprint(len(res.Rejections))})
-	if !res.Valid {
-		rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
-		return failedOutcome(req, start, r.now(), StateFailed, "plan rejected: "+rejectionSummary(res)), nil
+		// ---- validation (fail-closed before any action) ----------------------
+		res := ValidatePlan(plan, r.scope(), r.Caps)
+		rn.emit(event.EventTypePlanValidated, map[string]string{"valid": fmt.Sprint(res.Valid), "rejections": fmt.Sprint(len(res.Rejections))})
+		if !res.Valid {
+			rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
+			return failedOutcome(req, start, r.now(), StateFailed, "plan rejected: "+rejectionSummary(res)), nil
+		}
+		// The step ledger is runtime-owned scratch for this plan version: the
+		// model proposed the steps, but readiness, execution order and terminal
+		// facts are decided here (contract §3, §4).
+		ledger = newPlanLedger(plan)
 	}
-	// The step ledger is runtime-owned scratch for this plan version: the
-	// model proposed the steps, but readiness, execution order and terminal
-	// facts are decided here (contract §3, §4).
-	ledger := newPlanLedger(plan)
 
-	agentID := r.resolveAgent(obj, req)
-	usage := BudgetUsage{}
-	// Working memory is process-local scratch state for THIS objective: bounded,
-	// never persisted, and discarded when the execution ends (contract §2, §36).
-	working := NewWorkingMemory()
-	working.Bind(obj.Description)
-	working.SetDeadline(deadline)
-	memIdentity := r.memoryIdentity(rn, agentID)
-	observations := []Observation{}
+	agentID = r.resolveAgent(obj, req)
+	if !resumed {
+		usage = BudgetUsage{}
+		// Working memory is process-local scratch state for THIS objective: bounded,
+		// never persisted, and discarded when the execution ends (contract §2, §36).
+		working = NewWorkingMemory()
+		working.Bind(obj.Description)
+		working.SetDeadline(deadline)
+		observations = []Observation{}
+	}
+	memIdentity = r.memoryIdentity(rn, agentID)
 	contextAnnounced := false
 	contextTruncatedAnnounced := false
 
@@ -512,6 +561,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				case StateDenied:
 					return deniedOutcome(req, start, r.now(), termMsg), nil
 				case StatePendingApproval:
+					// The run pauses here: snapshot its authoritative state so
+					// the approval-driven re-submission continues instead of
+					// restarting blank (APPROVAL_LIFECYCLE_CONTRACTS §6).
+					r.snapshotRun(rn, obj, plan, ledger, observations, usage, working, deadline)
 					return pendingApprovalOutcome(req, start, r.now(), termMsg, approvalID), nil
 				default:
 					return escalatedOutcome(req, start, r.now(), termMsg, escalationRef), nil
@@ -1149,6 +1202,14 @@ func (r *Runtime) admitNonTool(rn *run, agentID, action, resourceType, resource 
 		ResourceType:  resourceType,
 	})
 	if err != nil {
+		// Cancellation is reported, never mislabeled as a policy denial:
+		// the action was not refused, its execution is gone.
+		if errors.Is(err, control.ErrRequestCancelled) {
+			obs.Status = "cancelled"
+			obs.Text = err.Error()
+			obs.Result = map[string]string{"governance_outcome": "cancelled", "action": action}
+			return obs, StateCancelled, obs.Text, true, proposalID
+		}
 		obs.Status = "denied"
 		obs.Text = err.Error()
 		obs.Result = map[string]string{"governance_outcome": governance.DENY.String(), "action": action}

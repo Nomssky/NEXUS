@@ -192,6 +192,18 @@ func (m *WorkingMemory) HasEffect(fp string) bool {
 	return dup
 }
 
+// Effects returns a copy of the completed-effect fingerprints, for run
+// snapshots that must survive the waiting period (contract §6).
+func (m *WorkingMemory) Effects() map[string]struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]struct{}, len(m.effects))
+	for fp := range m.effects {
+		out[fp] = struct{}{}
+	}
+	return out
+}
+
 // EffectCount reports how many completed effects are recorded.
 func (m *WorkingMemory) EffectCount() int {
 	m.mu.Lock()
