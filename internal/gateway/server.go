@@ -302,6 +302,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	// Agent intelligence layer v1.
 	s.mux.HandleFunc("POST /api/v1/intelligence/execute", s.handleSubmitIntelligence)
 	s.mux.HandleFunc("GET /api/v1/intelligence/{id}", s.handleGetIntelligence)
+	s.mux.HandleFunc("GET /api/v1/intelligence/{id}/trace", s.handleGetIntelligenceTrace)
 	s.mux.HandleFunc("POST /api/v1/intelligence/{id}/cancel", s.handleCancelIntelligence)
 
 	// Control surface endpoints

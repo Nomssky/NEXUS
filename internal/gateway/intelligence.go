@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/Nomssky/NEXUS/internal/agentintel"
 	"github.com/Nomssky/NEXUS/internal/core"
@@ -208,4 +209,116 @@ func (s *Server) handleCancelIntelligence(w http.ResponseWriter, r *http.Request
 	default:
 		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE", "cancellation failed", err)
 	}
+}
+
+// intelligenceTraceResponse is the read-only trace representation
+// (EXECUTION_TRACE_CONTRACTS §10): the authoritative execution status from
+// the stored record plus the bounded, redacted, process-local capture.
+// Durability is stated in every response so no consumer can mistake the
+// view for a durable journal (contract §12).
+type intelligenceTraceResponse struct {
+	ExecutionID   string             `json:"execution_id"`
+	CorrelationID string             `json:"correlation_id"`
+	BusinessID    string             `json:"business_id"`
+	DivisionID    string             `json:"division_id,omitempty"`
+	Status        string             `json:"status"`
+	Durability    string             `json:"durability"`
+	Capture       core.TraceCapture  `json:"capture"`
+	Entries       []*core.TraceEntry `json:"entries"`
+}
+
+// handleGetIntelligenceTrace returns the process-local execution trace. It
+// reuses the exact authorization sequence of the detail read (membership,
+// business match, division read — 400/401/403/404 unchanged), is strictly
+// read-only, bounds its result with limit/after_seq capture-order
+// pagination, and represents partial, evicted or redacted data honestly
+// instead of fabricating a complete trace (EXECUTION_TRACE_CONTRACTS §10).
+func (s *Server) handleGetIntelligenceTrace(w http.ResponseWriter, r *http.Request) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "execution ID required")
+		return
+	}
+	limit := core.MaxTraceEntries
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > core.MaxTraceEntries {
+			s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
+				fmt.Sprintf("limit must be an integer between 1 and %d", core.MaxTraceEntries))
+			return
+		}
+		limit = n
+	}
+	afterSeq := uint64(0)
+	if raw := r.URL.Query().Get("after_seq"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "after_seq must be a non-negative integer")
+			return
+		}
+		afterSeq = uint64(n)
+	}
+
+	// Same 404 semantics as the detail read: unknown, foreign-business and
+	// unreadable-division executions are indistinguishable (G5).
+	var divisionID, status string
+	result, ok := s.engine.GetResult(id)
+	if !ok {
+		if pending, inFlight := s.engine.Pending(id); inFlight {
+			if pending.BusinessID != businessID {
+				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+				return
+			}
+			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
+				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+				return
+			}
+			divisionID, status = pending.DivisionID, "pending"
+		} else if result, ok = s.engine.GetResult(id); !ok {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+			return
+		}
+	}
+	if result != nil {
+		if result.BusinessID != businessID {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+			return
+		}
+		if !s.authorizeDivisionRead(res.IdentityID, businessID, result.DivisionID) {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+			return
+		}
+		divisionID, status = result.DivisionID, result.Status
+	}
+
+	resp := intelligenceTraceResponse{
+		ExecutionID:   id,
+		CorrelationID: id,
+		BusinessID:    businessID,
+		DivisionID:    divisionID,
+		Status:        status,
+		Durability:    "process_local",
+		Capture: core.TraceCapture{
+			Limit: core.MaxTraceEntries,
+		},
+		Entries: []*core.TraceEntry{},
+	}
+	if view, captured := s.engine.ExecutionTrace(id, afterSeq, limit); captured {
+		resp.Capture = view.Capture
+		if view.Entries != nil {
+			resp.Entries = view.Entries
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Correlation-ID", id)
+	_ = json.NewEncoder(w).Encode(resp)
 }
