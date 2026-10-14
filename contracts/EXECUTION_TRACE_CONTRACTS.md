@@ -138,13 +138,22 @@ into another:
 2. **Runtime decision** — `action.rejected` (runtime validation refused the
    proposal), `governance.decided`, `approval.*`, state transitions.
    A rejection or denial proves the runtime did *not* proceed.
-3. **Logical tool call** — `tool.requested`/`tool.completed` from the loop
-   and the invocation identity (`call_id`) bind attempts to one logical call.
-4. **Physical attempt** — `tool.invocation.started` proves dispatch into the
-   mediated platform began; `tool.attempt.started/completed` with `attempt`
-   numbers prove physical attempts; `tool.retry.scheduled` proves a retry
-   decision. Absence of `tool.invocation.started` for a refused call is the
-   positive evidence that dispatch did not occur.
+3. **Logical tool call** — `tool.requested` records that the loop made an
+   invocation attempt through the mediated boundary; it is emitted when the
+   call returns, so on its own it does NOT prove dispatch. The attempt's
+   result is established by the events that follow it: a
+   `governance.decided` refusal, an `approval.requested`, an invocation
+   terminal event, or an `observation.created`.
+4. **Physical attempt** — in the capability-platform path,
+   `tool.invocation.started` proves dispatch into the mediated platform
+   began; `tool.attempt.started/completed` with `attempt` numbers prove
+   physical attempts; `tool.retry.scheduled` proves a retry decision. In
+   the pre-platform builtin path (hosts that run without a capability
+   platform) **no dispatch-start event exists** — that is a known evidence
+   gap of the legacy path, and the trace does not paper over it: only the
+   post-hoc `observation.created` (status `ok`, `source: tool:<id>`)
+   evidences that the builtin executor actually ran. Absence of dispatch
+   evidence after a refusal is positive evidence that nothing ran.
 5. **Confirmed outcome** — `tool.invocation.completed` proves the *adapter*
    completed within this runtime, classified by `side_effect_class`; it is
    **not** a claim about the external system beyond what
