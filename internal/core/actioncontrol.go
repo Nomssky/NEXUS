@@ -90,11 +90,15 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 	}
 
 	fingerprint := p.Fingerprint()
+	// Fast path: an identical pending approval already covers this action.
+	e.approvalMu.Lock()
 	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
-		if ar := e.approvalRecord(id); ar != nil && ar.Status == governance.ApprovalStatePending {
+		if rec, ok := e.approvalEngine.GetApproval(id); ok && rec.Status == governance.ApprovalStatePending {
+			e.approvalMu.Unlock()
 			return id, nil
 		}
 	}
+	e.approvalMu.Unlock()
 
 	config := governance.ApprovalConfig{}
 	if decision.ApprovalRequired != nil {
@@ -105,6 +109,16 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 		return "", err
 	}
 	e.approvalMu.Lock()
+	// Recheck under the same lock: a concurrent identical request may have
+	// won while this one was in the engine. The loser revokes its orphan so
+	// exactly one record per fingerprint survives — no leak, no duplicate.
+	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
+		if rec, ok := e.approvalEngine.GetApproval(id); ok && rec.Status == governance.ApprovalStatePending {
+			e.approvalMu.Unlock()
+			_ = e.approvalEngine.Revoke(ar.DecisionID)
+			return id, nil
+		}
+	}
 	e.approvals[ar.DecisionID] = &approvalEntry{
 		requestID:  requestID,
 		businessID: p.BusinessID,
