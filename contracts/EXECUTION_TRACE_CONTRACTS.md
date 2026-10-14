@@ -163,12 +163,17 @@ absence of a success event is not evidence of "no effect".
 ## 7. Delegation, coordination, approval pause/resume
 
 - Children (delegation and coordination members) **inherit the parent's
-  correlation identity**, so their events join the parent's trace under
-  their own runtime task ids (`<parent>/delegate/<id>`,
-  `<parent>/node/<id>`, group member task ids). Declaration identity
-  (member index, child task id, agent id) is carried in the events
-  themselves; the trace preserves it verbatim and never re-associates a
-  result by completion order.
+  correlation identity**, so their events join the parent's trace. A child's
+  events carry runtime-stamped linkage fields (`parent_task_id`,
+  `parent_agent_id`, `delegation_depth`, `delegation_action_id` on every
+  agentexec child event; `agent_id`/`depth`/`parent_agent_id` on the loop's
+  `agent.delegated`), and coordination members are bound to their group by
+  `group_id` plus declaration counts on `coordination.started/completed`.
+  The event envelope's optional `task_id` is carried verbatim when a
+  publisher sets it; today most publishers do not, and the trace does not
+  invent it. Declaration identity (member index, child agent id) is carried
+  in the events themselves; the trace preserves it verbatim and never
+  re-associates a result by completion order.
 - A trace query for a parent grants no new access to anything (§10): it
   returns only events the querying identity was already entitled to observe
   under its business/division scope. There is no independent child-trace
