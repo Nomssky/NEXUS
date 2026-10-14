@@ -148,11 +148,15 @@ into another:
    `tool.invocation.started` proves dispatch into the mediated platform
    began; `tool.attempt.started/completed` with `attempt` numbers prove
    physical attempts; `tool.retry.scheduled` proves a retry decision. In
-   the pre-platform builtin path (hosts that run without a capability
-   platform) **no dispatch-start event exists** — that is a known evidence
-   gap of the legacy path, and the trace does not paper over it: only the
-   post-hoc `observation.created` (status `ok`, `source: tool:<id>`)
-   evidences that the builtin executor actually ran. Absence of dispatch
+   the pre-platform builtin path (a degraded boot without a capability
+   platform), `tool.invocation.started` (source `agentexec`) and one
+   terminal event (`tool.invocation.completed`/`failed`) now prove the
+   invocation began and finished — the v7 evidence gap is closed
+   (`CANONICAL_TOOL_DISPATCH_CONTRACTS` §4.2). No `tool.attempt.*` events
+   appear on that path: the builtin executors are pure local functions
+   with no physical external attempt, and the trace does not fabricate
+   one. The post-hoc `observation.created` (status `ok`, `source:
+   tool:<id>`) remains independent confirmation. Absence of dispatch
    evidence after a refusal is positive evidence that nothing ran.
 5. **Confirmed outcome** — `tool.invocation.completed` proves the *adapter*
    completed within this runtime, classified by `side_effect_class`; it is
