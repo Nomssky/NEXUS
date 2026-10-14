@@ -489,7 +489,11 @@ test.describe('AGENT GOVERNANCE & CONTROL', () => {
 
     const resumed = await refreshObjective(request, nexus, executionID);
     expect(resumed.status).toBe('completed');
-    expect(resumed.outcome.summary).toContain('tool_calls=1');
+    // The resumed counters continue from the snapshot (APPROVAL_LIFECYCLE §6,
+    // §10): the pre-approval attempt was refused before any effect, the
+    // post-approval one executed — two dispatch attempts, and seenPaths below
+    // proves exactly one request actually left the process.
+    expect(resumed.outcome.summary).toContain('tool_calls=2');
     expect(seenPaths, 'the resumed run is the only execution').toEqual(['/ok']);
     const stillActionable = (await pendingApprovals(request, nexus)).map((a) => a.entity_id);
     expect(stillActionable, 'the spent approval leaves the actionable list').not.toContain(approvalID);

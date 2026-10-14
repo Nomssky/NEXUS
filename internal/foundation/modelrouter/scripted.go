@@ -103,7 +103,7 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 //  3. "delegate", not yet observed -> delegate action
 //  4. "memory"                     -> memory_write, then memory_read
 //  5. "forget"/"purge" + "memory"   -> memory_delete of key "notes", then complete
-//  6. named tool, not yet observed -> tool_call for that tool
+//  6. named tool, not yet successfully executed -> tool_call for that tool
 //     (calculator, echo, http.request, web.search, filesystem.*, git, data);
 //     "post via http" / "delete via http" select a mutating HTTP method
 //  7. "promote" with a tool observation in the block -> memory_write of THAT
@@ -115,6 +115,10 @@ func (p *ScriptedProvider) Invoke(ctx context.Context, req *GenerateRequest) (*G
 // "already observed" is read from the observation block the runtime echoes
 // into the prompt, and the replan counter is read from the budget line, so the
 // policy stays deterministic and progress-aware without any hidden state.
+// A tool observation counts as progress only when its status is ok: a
+// governance refusal (pending_approval, denied, escalated) is not an
+// execution, so after an approval resume the table re-proposes the waiting
+// action — exactly as a real model would.
 func scriptedAnswer(prompt string) string {
 	lower := strings.ToLower(prompt)
 	objective := extractAfter(lower, "objective: ")
@@ -129,7 +133,7 @@ func scriptedAnswer(prompt string) string {
 	if strings.HasPrefix(strings.TrimSpace(lower), "system: you are the planner") {
 		return scriptedPlan(objective)
 	}
-	observedTool := func(name string) bool { return strings.Contains(obsBlock, "source=tool:"+name) }
+	observedTool := func(name string) bool { return toolExecuted(obsBlock, name) }
 	observed := func(kind string) bool { return strings.Contains(obsBlock, " "+kind+" ok]") }
 
 	switch {
@@ -247,6 +251,30 @@ func extractObservations(lower string) string {
 		return rest[:j]
 	}
 	return rest
+}
+
+// toolExecuted reports whether an observation shows the named tool actually
+// RUNNING, i.e. a line whose status token is "ok" and whose source is that
+// tool. A governance refusal (pending_approval, denied, escalated) is
+// recorded too, but it never executed anything — after an approval resume the
+// decision table must re-propose the waiting action, exactly as a real model
+// would when it sees an action that was paused, not performed.
+func toolExecuted(obsBlock, name string) bool {
+	const src = "] source=tool:"
+	for _, line := range strings.Split(obsBlock, "\n") {
+		i := strings.Index(line, src)
+		if i < 0 {
+			continue
+		}
+		// The source token is followed by " text=..." on the same line.
+		if !strings.HasPrefix(line[i:], src+name+" ") {
+			continue
+		}
+		if strings.HasSuffix(line[:i+1], " ok]") {
+			return true
+		}
+	}
+	return false
 }
 
 // budgetUsed reads "<name>=used/total" from the prompt's budget line.
