@@ -3,9 +3,12 @@
 How NEXUS keeps a model's proposed action behind the control plane, and what
 that means for anyone operating it.
 
-The authoritative contract is
-[`contracts/AGENT_GOVERNANCE_CONTROL_CONTRACTS.md`](../contracts/AGENT_GOVERNANCE_CONTROL_CONTRACTS.md).
-This document is the operational reading of it.
+The authoritative contracts are
+[`contracts/AGENT_GOVERNANCE_CONTROL_CONTRACTS.md`](../contracts/AGENT_GOVERNANCE_CONTROL_CONTRACTS.md)
+and
+[`contracts/APPROVAL_LIFECYCLE_CONTRACTS.md`](../contracts/APPROVAL_LIFECYCLE_CONTRACTS.md)
+(request, wait, decide, resume). This document is the operational reading of
+them.
 
 ## The shape of the control loop
 
@@ -170,8 +173,10 @@ Rules worth knowing:
 ## Approvals
 
 ```text
-proposal → REQUIRE_APPROVAL → record → approver → APPROVED
-         → RE-EVALUATE GOVERNANCE → ALLOW → capability
+proposal → REQUIRE_APPROVAL → waiting (record) → decision
+         → APPROVED  → RE-EVALUATE GOVERNANCE → ALLOW → effect, exactly once
+         → DENIED    → blocked for good (a fresh proposal needs a fresh record)
+         → cancelled → the record is invalidated; nothing revives
 ```
 
 The record is bound to a fingerprint over the correlation, execution, objective,
@@ -191,6 +196,22 @@ operation and the constraint set. Consequences:
 Approving is `POST /api/v1/approvals/{id}/approve?business_id=…` and returns 202:
 the resume is an asynchronous re-run. Watch
 `GET /api/v1/intelligence/{id}?business_id=…` for the outcome.
+
+Cancellation beats waiting: cancelling a waiting execution invalidates the
+approvals it opened, stores a terminal `cancelled` result, and makes a late
+decision in either direction return 404. Approval never revives a cancelled
+execution, and a cancelled request opens no new approval.
+
+The resume **continues** the waiting execution instead of restarting it: the
+runtime restores the paused run's own state for the same execution id (plan,
+ledger, observations, spent counters and the ORIGINAL deadline), the next
+decision is a fresh model proposal against full context, and only the
+fingerprint-bound action can consume the approval — anything else needs fresh
+admission. Budgets and deadlines continue from the snapshot, so waiting on
+approval buys no extra time, and repeated or concurrent resumes cannot
+duplicate decisions or effects: the snapshot is consumed once and the approval
+admits exactly one admission. A governance pause is never an execution — it
+is re-proposed on resume, and only an executed effect counts as progress.
 
 ## Escalation
 
