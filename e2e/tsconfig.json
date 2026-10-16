@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["fixtures/auth.ts", "fixtures/auth.test.ts", "fixtures/api.ts", "fixtures/nexus.ts", "fixtures/test.ts"],
+  "exclude": ["node_modules", "tests"]
+}

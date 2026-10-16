@@ -5,9 +5,13 @@
   "description": "Black-box HTTP E2E suite for the NEXUS gateway. Runs the real compiled binary as a child process and talks to it only over HTTP.",
   "scripts": {
     "test": "playwright test",
+    "test:unit": "vitest run",
     "test:report": "playwright show-report"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0"
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2",
+    "vitest": "^2.1.0"
   }
 }

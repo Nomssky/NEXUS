@@ -1,5 +1,6 @@
 import type { APIRequestContext, APIResponse } from '@playwright/test';
 import { expect } from '@playwright/test';
+import { ActorAuthStrategy } from './auth';
 import type { NexusHandle } from './nexus';
 
 /** The error envelope mandated by contracts/CORE_INTERFACE_CONTRACTS.md §3. */
@@ -34,16 +35,21 @@ export const CATEGORIES = [
   'INTERNAL_FAILURE',
 ] as const;
 
+/**
+ * Auth header helpers — thin wrappers over the auth strategies exposed by
+ * NexusHandle. These preserve the ergonomic call-sites across the suite while
+ * the real logic lives in the injectable AuthStrategy classes.
+ */
 export function actorHeaders(actorID: string, credential: string): Record<string, string> {
-  return { 'X-Actor-ID': actorID, 'X-Actor-Credential': credential };
+  return new ActorAuthStrategy(actorID, credential).headers();
 }
 
 export function bootstrapHeaders(nexus: NexusHandle): Record<string, string> {
-  return actorHeaders(nexus.actorID, nexus.credential);
+  return nexus.authStrategy.headers();
 }
 
 export function controlHeaders(nexus: NexusHandle): Record<string, string> {
-  return { 'X-API-Key': nexus.controlKey };
+  return nexus.controlAuthStrategy.headers();
 }
 
 /**
@@ -205,7 +211,7 @@ export async function listPolicies(
   nexus: NexusHandle,
 ): Promise<APIResponse> {
   return request.get(`${nexus.baseURL}/api/v1/control/policies`, {
-    headers: controlHeaders(nexus),
+    headers: nexus.controlAuthStrategy.headers(),
   });
 }
 
@@ -216,7 +222,7 @@ export async function getPolicy(
 ): Promise<APIResponse> {
   return request.get(
     `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
-    { headers: controlHeaders(nexus) },
+    { headers: nexus.controlAuthStrategy.headers() },
   );
 }
 
@@ -228,7 +234,7 @@ export async function putPolicy(
 ): Promise<APIResponse> {
   return request.put(
     `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
-    { headers: { ...controlHeaders(nexus), 'Content-Type': 'application/json' }, data: body },
+    { headers: { ...nexus.controlAuthStrategy.headers(), 'Content-Type': 'application/json' }, data: body },
   );
 }
 
@@ -239,7 +245,7 @@ export async function deletePolicy(
 ): Promise<APIResponse> {
   return request.delete(
     `${nexus.baseURL}/api/v1/control/policies/${encodeURIComponent(policyID)}`,
-    { headers: controlHeaders(nexus) },
+    { headers: nexus.controlAuthStrategy.headers() },
   );
 }
 

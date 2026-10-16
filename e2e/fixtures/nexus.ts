@@ -3,6 +3,13 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
+import {
+  ActorAuthStrategy,
+  AuthStrategy,
+  ControlAuthStrategy,
+  CredentialProvider,
+  RandomCredentialProvider,
+} from './auth';
 
 const execFileAsync = promisify(execFile);
 
@@ -28,6 +35,10 @@ export interface NexusHandle {
   actorID: string;
   /** Bootstrap business id. */
   businessID: string;
+  /** Auth strategy for identity-scoped endpoints (X-Actor-ID + X-Actor-Credential). */
+  authStrategy: AuthStrategy;
+  /** Auth strategy for control-plane endpoints (X-API-Key). */
+  controlAuthStrategy: AuthStrategy;
   dataDir: string;
   healthPort: number;
   gatewayPort: number;
@@ -113,6 +124,12 @@ interface StartOptions {
   dataDir?: string;
   ports?: { healthPort: number; gatewayPort: number };
   /**
+   * CredentialProvider for this process. Defaults to RandomCredentialProvider.
+   * Inject a custom provider to control credential generation (deterministic
+   * values, fixture-loaded secrets, etc.) without touching process-spawn logic.
+   */
+  credentialProvider?: CredentialProvider;
+  /**
    * Extra environment variables for the child process, merged over the
    * harness defaults. Used for configuration that only exists at boot
    * (PROVIDER_CONTRACTS §12): the harness still owns the credentials.
@@ -138,8 +155,9 @@ export async function startNexus(opts: StartOptions = {}): Promise<NexusHandle> 
   fs.mkdirSync(dataDir, { recursive: true });
 
   const ports = opts.ports ?? (await reservePortPair());
-  const credential = `e2e-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-  const controlKey = `e2e-control-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+  const credentialProvider = opts.credentialProvider ?? new RandomCredentialProvider();
+  const credential = credentialProvider.generateActorCredential();
+  const controlKey = credentialProvider.generateControlKey();
 
   let child: ChildProcess | null = null;
   let stdout = '';
@@ -222,6 +240,8 @@ export async function startNexus(opts: StartOptions = {}): Promise<NexusHandle> 
     controlKey,
     actorID: BOOTSTRAP_ACTOR,
     businessID: DEFAULT_BUSINESS,
+    authStrategy: new ActorAuthStrategy(BOOTSTRAP_ACTOR, credential),
+    controlAuthStrategy: new ControlAuthStrategy(controlKey),
     dataDir,
     healthPort: ports.healthPort,
     gatewayPort: ports.gatewayPort,
