@@ -640,6 +640,98 @@ not fail. Any other value for the variable is a `VALIDATION` boot error.
 
 ---
 
+## Rate limiting & browser security (Production Hardening v2)
+
+### Rate limiting (F4)
+
+A bounded, **process-local** token-bucket limiter (complementing queue-level
+backpressure) runs in the request chain. It is **not** a distributed quota: with
+multiple instances each has its own buckets, so a global limit needs an external
+limiter (out of scope).
+
+Three classes:
+
+| Class | Applies to | Key | Default (`/min`) |
+|---|---|---|---|
+| `submit` | `POST /api/v1/requests`, `/api/v1/executions`, `/api/v1/intelligence/execute` | validated `IdentityID` | 60 |
+| `api` | other scoped **writes** (agent registration, memory writes, approvals, escalations, cancellation, org transitions) | validated `IdentityID` | 600 |
+| `ip` | every non-exempt request (all methods) | direct peer IP | 6000 |
+
+Design points:
+
+- The actor classes key on the **validated identity** bound by the identity
+  middleware — never on the caller-supplied `X-Actor-ID` header. An unauthenticated
+  or spoofed request cannot consume or choose another actor's bucket.
+- `submit` and `api` are **separate buckets**, so exhausting submission can never
+  block cancellation or other safety-relevant operations.
+- **Read methods (`GET`/`HEAD`/`OPTIONS`) are not per-actor limited.** Polling
+  execution status is high-frequency and cheap; conflating it with writes would
+  let one actor's polling throttle an unrelated write (e.g. agent registration).
+  Reads remain bounded by the coarse `ip` class and the existing queue
+  backpressure.
+- `/health`, `/ready`, and `/status` are **exempt** so deployment monitoring is
+  never throttled.
+- Exceeding a limit returns `429` in the standard error envelope
+  (`code: RATE_LIMIT`, category `RATE_LIMIT`, `retryable: true`) with an accurate
+  `Retry-After` (seconds). No key, credential or IP is disclosed.
+
+Configuration (`rate_limit.*`, env `NEXUS_RATE_LIMIT_*`):
+
+```json
+{ "rate_limit": { "enabled": true, "submit_per_minute": 60,
+                  "request_per_minute": 600, "per_ip_per_minute": 6000 } }
+```
+
+`enabled` defaults to `true`; each per-minute value must be `>= 1` when enabled
+(a zero/negative value fails validation rather than silently disabling
+protection). `NEXUS_RATE_LIMIT_ENABLED` must be `true`/`false`.
+
+**Proxy trust:** the `ip` class uses the direct TCP peer address and deliberately
+ignores `X-Forwarded-For`/`Forwarded`. With no trusted-proxy contract those
+headers are caller-controlled; behind a reverse proxy all clients would therefore
+share the proxy's IP for the `ip` class, and the per-actor classes remain the
+effective control. A trusted-proxy mode is future work.
+
+### CORS (F5)
+
+Cross-origin policy is explicit and secure by default. An **empty** allow-list is
+the same-origin default: the gateway emits **no** CORS headers at all
+(same-origin deployments need no configuration). For a cross-origin browser
+deployment, list exact origins (`http.cors_allowed_origins`, env
+`NEXUS_HTTP_CORS_ALLOWED_ORIGINS` as a comma-separated list):
+
+```json
+{ "http": { "cors_allowed_origins": ["https://app.example"] } }
+```
+
+- Origins must be a real origin (`scheme://host[:port]`); wildcards, paths,
+  queries, fragments and non-http(s) schemes fail validation at startup.
+- An allowed origin is echoed **exactly** (never a wildcard, never an arbitrary
+  origin); responses carry `Vary: Origin`. Disallowed origins receive no
+  permission headers.
+- Preflight (`OPTIONS`) for an allowed origin answers `204` with
+  `Access-Control-Allow-Methods` / `-Headers` / `Max-Age`. `Access-Control-
+  Allow-Credentials` is never set: the API authenticates with headers, not
+  cookies.
+- CORS is a browser policy only — it is **not** authentication or authorization
+  and never bypasses them.
+
+### Security headers
+
+The API gateway emits, on every response (including errors):
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+`Referrer-Policy: no-referrer`.
+
+It deliberately does **not** emit `Strict-Transport-Security`,
+`Content-Security-Policy` or `Permissions-Policy`: those belong to the
+frontend/reverse-proxy layer that terminates TLS and serves browser content.
+Emitting HSTS here would be wrong on plain-HTTP local development and would not
+reflect this layer's TLS contract. **Ownership: browser-document headers
+(HSTS/CSP/Permissions-Policy) are the reverse proxy's responsibility; API
+response-hardening headers are the gateway's.**
+
+---
+
 ## Layout
 
 ```

@@ -279,6 +279,103 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 	return nil
 }
 
+// DeleteBatchHard physically removes every id as ONE atomic step and reclaims
+// the disk DeleteBatch only marks free. It is the destructive primitive
+// retention uses (contracts/EXECUTION_JOURNAL_RETENTION_CONTRACTS.md §3). It
+// shares the store's single batch-journal protocol with DeleteBatch — the
+// pre-batch records are journaled durably BEFORE anything is removed — so an
+// interrupted hard batch is rolled back (the files are re-created from the
+// journal) on the next open, and a committed one leaves nothing behind. The
+// same journal serves soft and physical batches; a physical batch never nests
+// or introduces a second journal.
+func (fs *FileStore) DeleteBatchHard(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Validate the whole batch before mutating anything.
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return &StoreError{Code: "INVALID_RECORD", Message: "record ID required"}
+		}
+		if _, ok := fs.index[id]; !ok {
+			return &StoreError{Code: "NOT_FOUND", Message: fmt.Sprintf("record %s not found", id)}
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+
+	originals := make([]*Record, 0, len(unique))
+	paths := make([]string, 0, len(unique))
+	for _, id := range unique {
+		original := *fs.index[id]
+		originals = append(originals, &original)
+		paths = append(paths, fs.recordPath(&original))
+	}
+
+	// Journal the pre-batch records durably BEFORE removing anything. Recovery
+	// evidence can therefore never be lost before the transaction is committed.
+	if err := fs.publishBatchJournal(originals); err != nil {
+		return err
+	}
+
+	// Remove the files. On failure, restore the pre-batch state synchronously
+	// and drop the journal — the batch is entirely unapplied.
+	for i, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			for j := 0; j <= i; j++ {
+				if rerr := fs.writeRecord(originals[j]); rerr != nil {
+					return &StoreError{
+						Code:    "IO_ERROR",
+						Message: fmt.Sprintf("hard delete batch rollback of %s failed: %v", originals[j].ID, rerr),
+					}
+				}
+			}
+			if jerr := fs.removeBatchJournal(); jerr != nil {
+				return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("hard delete batch journal cleanup: %v", jerr)}
+			}
+			return &StoreError{
+				Code:    "IO_ERROR",
+				Message: fmt.Sprintf("hard delete batch unlink %s: %v", originals[i].ID, err),
+			}
+		}
+	}
+
+	// Durability: the unlinks must survive a crash, so sync each touched type
+	// directory before the batch counts as committed.
+	syncedDirs := map[string]struct{}{}
+	for _, p := range paths {
+		dir := filepath.Dir(p)
+		if _, ok := syncedDirs[dir]; ok {
+			continue
+		}
+		if err := syncDir(dir); err != nil {
+			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync %s: %v", dir, err)}
+		}
+		syncedDirs[dir] = struct{}{}
+	}
+
+	// Commit: the batch is fully applied, so the journal goes away. From this
+	// point on the outcome no longer depends on recovery.
+	if err := fs.removeBatchJournal(); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("hard delete batch commit: %v", err)}
+	}
+
+	// The index describes only committed state, so it is updated last.
+	for _, id := range unique {
+		delete(fs.index, id)
+	}
+	return nil
+}
+
 // batchJournalName is the store-wide marker that exactly one delete batch was
 // in flight. It lives at the store root so discovery does not depend on type
 // directories, and the record payload is generic store data — it carries no
@@ -487,6 +584,11 @@ func (fs *FileStore) writeRecord(record *Record) error {
 	return nil
 }
 
+// recordPath is the on-disk path of a record's file: <dir>/<type>/<id>.json.
+func (fs *FileStore) recordPath(record *Record) string {
+	return filepath.Join(fs.dir, string(record.Type), record.ID+".json")
+}
+
 // stageRecord writes the record's JSON into a synced temp file next to its
 // target and returns that temp path together with the target path. The caller
 // publishes it with os.Rename, which is what makes the publish atomic; a
@@ -497,7 +599,7 @@ func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, e
 		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
 	}
 
-	path = filepath.Join(typeDir, record.ID+".json")
+	path = fs.recordPath(record)
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return "", "", &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("marshal: %v", err)}

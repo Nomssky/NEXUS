@@ -18,6 +18,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
+	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
@@ -46,6 +47,7 @@ func capabilityPlatform(
 	members *identity.MembershipSet,
 	bus *event.MemBus,
 	opts CapabilityOptions,
+	m *metrics.Metrics,
 ) (*capability.Platform, error) {
 	resolver := capability.NewScopedCredentialResolver(security.NewDevResolver())
 	// The operator-provided credential value is registered under its named
@@ -60,6 +62,9 @@ func capabilityPlatform(
 		}
 	}
 	platform := capability.New(tools, members, resolver, bus)
+	if m != nil {
+		platform.Metrics = m
+	}
 	if dataDir == "" {
 		dataDir = env("NEXUS_DATA_DIR")
 	}

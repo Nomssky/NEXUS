@@ -123,6 +123,26 @@ may have changed. Constraints enforce against the actual runtime target;
 unenforceable constraints fail closed. Approval never substitutes for
 current governance and never widens authority.
 
+A resume is admitted atomically with respect to a run that is still finishing
+its teardown. Publishing a run's terminal result and releasing the state that
+run was admitted with (its in-flight registration, its request reference, and
+the approvals it consumed) are not one step, so an approval can be granted in
+between. Therefore:
+
+- a finishing run releases ONLY the approvals it was authorized by when it
+  began (captured before it ran) — an approval granted while it finishes
+  belongs to the resume that approval triggers and is never consumed by the
+  earlier run;
+- a finishing run deregisters/untracks the request only while it still owns
+  the registration; once a resume re-admits the request the earlier run leaves
+  that state alone, so a reader never sees the request disappear from both the
+  in-flight registry and the results map (which would answer 404 mid-resume);
+- re-admission is serialized with teardown, so neither can clobber the other.
+
+A resume is refused (not silently retried, not fabricated) when it cannot be
+admitted, and an unresumable approval never leaves a decided record without a
+run.
+
 ## 8. Cancellation and deadlines win
 
 - Cancelling a waiting (`pending_approval`) execution is allowed: it stores
@@ -131,6 +151,13 @@ current governance and never widens authority.
 - A cancelled request ID is recorded in a bounded set; any later approve or
   resume for it is refused — an approval arriving after cancellation never
   revives the execution.
+- A resume admitted **concurrently** with a cancellation of the same waiting
+  execution linearizes to `cancelled`, never to a failure: the chain consults
+  the recorded cancellation set (not only the in-flight flag) at dequeue, at
+  executor submit, and in the executor-denial arbitration, so the canceled
+  terminal is never overwritten by a `failed`/`POLICY_DENIED` outcome that the
+  cancelled re-admission produced. A cancellation that landed before the
+  effect is dispatched prevents the effect.
 - The waiting period never extends the caller deadline (§6).
 - In-flight effect semantics are unchanged: an already-dispatched effect
   reports honestly; cancellation only prevents NEW effects.

@@ -165,7 +165,7 @@ func (e *Engine) approvalStateFor(requestID string) *governance.ApprovalState {
 		return nil
 	}
 	entry := e.approvals[id]
-	if entry == nil || entry.ar.Status != governance.ApprovalStateApproved {
+	if entry == nil || e.approvalEngine.DecisionOf(entry.ar).Status != governance.ApprovalStateApproved {
 		return nil
 	}
 	state := governance.ApprovalStateApproved
@@ -205,13 +205,17 @@ func (e *Engine) ListApprovals(businessID string) []ApprovalRecord {
 	e.approvalMu.Lock()
 	records := make([]ApprovalRecord, 0, len(e.approvals))
 	for _, entry := range e.approvals {
-		if entry.ar.Status != governance.ApprovalStatePending {
+		// Read the decision fields through the engine's lock: the engine mutates
+		// them under ae.mu while this loop holds approvalMu, so a direct read of
+		// entry.ar.Status would be a data race (and could list a stale state).
+		decision := e.approvalEngine.DecisionOf(entry.ar)
+		if decision.Status != governance.ApprovalStatePending {
 			continue // decided, awaiting resume cleanup — not actionable
 		}
 		if businessID != "" && entry.businessID != businessID {
 			continue
 		}
-		records = append(records, projectApproval(entry))
+		records = append(records, projectApproval(entry, decision))
 	}
 	e.approvalMu.Unlock()
 
@@ -280,11 +284,6 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 			"decision_rationale": reason,
 		})
 
-	// Resume: drop the stale APPROVAL_REQUIRED result, re-admit the
-	// original request. On the re-run approvalStateFor(req.ID) returns
-	// approved, so both governance gates pass and the handler executes.
-	old, hadResult := e.dropResult(entry.requestID)
-
 	// C-018: the dequeue path Releases a slot for every item it pops
 	// (engine.go:453) and SubmitRequest pairs that with an Accept. Resume
 	// re-admits through that same queue, so it must take an Accept slot
@@ -296,22 +295,34 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 	// saturated queue waits for a slot rather than failing: returning an
 	// error would strand an approved record with no run and no way to
 	// re-decide it. The send below already blocks on the buffered channel,
-	// so this adds no new blocking behaviour — only an honest count.
+	// so this adds no new blocking behaviour — only an honest count. The slot
+	// is taken before the re-admission lock so this never blocks a finishing
+	// run's teardown (no deadlock through admitMu).
 	if !e.acceptResumeSlot(shutdownCh) {
-		if hadResult {
-			e.restoreResult(entry.requestID, old)
-		}
 		return fmt.Errorf("%w: engine shutting down during resume", ErrApprovalNotResumable)
 	}
+
+	// Resume: drop the stale APPROVAL_REQUIRED result and re-admit the original
+	// request. On the re-run approvalStateFor(req.ID) returns approved, so both
+	// governance gates pass and the handler executes. The re-admission is
+	// serialized with a finishing run's teardown (admitMu) so the run that
+	// produced the APPROVAL_REQUIRED result cannot deregister/untrack the
+	// request this resume just claimed (engine.go processRequests).
+	e.admitMu.Lock()
+	old, hadResult := e.dropResult(entry.requestID)
 	e.registerInflight(entry.req)
 	// The resumed run re-proposes the gated ACTION, so the reference index must
 	// be live for the admission that consumes this approval
 	// (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5). It was dropped when the first run
 	// stored its terminal result.
 	e.trackRequestRef(entry.req)
+	e.admitMu.Unlock()
 
 	select {
 	case e.requests <- entry.req:
+		// The continuation is admitted: a new in-flight run of the same
+		// execution, counted as a successful resume.
+		e.metrics.ExecutionResumed()
 		return nil
 	case <-shutdownCh:
 		// Engine went down between the running check and the send: give the
@@ -320,10 +331,17 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 		// stays APPROVED (in-memory state dies with the process anyway) —
 		// surfaced so the client can resubmit.
 		e.backpressure.Release()
+		// Restore and deregister in ONE admitMu section so a concurrent reader
+		// (LookupExecution) sees either the restored result or the pre-resume
+		// state — never a gap where the request has neither a result nor a
+		// registration.
+		e.admitMu.Lock()
 		e.deregisterInflight(entry.requestID)
+		e.untrackRequestRef(entry.req)
 		if hadResult {
 			e.restoreResult(entry.requestID, old)
 		}
+		e.admitMu.Unlock()
 		return fmt.Errorf("%w: engine shutting down during resume", ErrApprovalNotResumable)
 	}
 }
@@ -384,30 +402,74 @@ func (e *Engine) DenyRequest(approvalID, businessID, approver, reason string) er
 	return nil
 }
 
-// cleanupResumeApproval drops the index entry once an approved approval's
-// resume run stored its terminal result — the record has served its purpose
-// (both gates consulted it during the run). Pending/denied entries are
-// untouched: pending waits for a decision, denied was already dropped.
+// approvedApprovalsFor returns the ids of the approvals bound to requestID that
+// are ALREADY approved when a run begins — exactly the approvals that run is
+// authorized by and will consume. It is captured at dequeue, BEFORE the run:
+// an approval granted DURING the run (a client reacting to this run's terminal
+// result) belongs to the resume it triggers and must not be consumed here.
 //
-// Action-level approvals (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5) are cleaned up
-// the same way, and their fingerprint index entry is dropped with them, so a
-// spent approval cannot authorize anything later.
-func (e *Engine) cleanupResumeApproval(requestID string) {
-	var fingerprints []string
+// Capturing up front closes the stale-cleanup race. Storing a run's terminal
+// result and cleaning up the approvals it consumed are not one atomic step —
+// processRequests stores the result, then (in v10, after a synchronous terminal
+// journal write) frees the approval index. A client can approve in that window.
+// A cleanup that keyed off "is this approval approved NOW" would delete the
+// just-granted approval, and the queued resume would re-evaluate governance to
+// REQUIRE_APPROVAL and store a failure instead of completing.
+func (e *Engine) approvedApprovalsFor(requestID string) []string {
 	e.approvalMu.Lock()
-	id, ok := e.approvalByReq[requestID]
-	entry := e.approvals[id]
-	if ok && entry != nil && entry.ar.Status == governance.ApprovalStateApproved {
-		delete(e.approvals, id)
-		delete(e.approvalByReq, requestID)
+	defer e.approvalMu.Unlock()
+	var ids []string
+	if id, ok := e.approvalByReq[requestID]; ok {
+		if entry := e.approvals[id]; entry != nil &&
+			e.approvalEngine.DecisionOf(entry.ar).Status == governance.ApprovalStateApproved {
+			ids = append(ids, id)
+		}
 	}
-	for approvalID, aEntry := range e.approvals {
-		if aEntry.requestID != requestID || aEntry.actionFingerprint == "" {
+	// Action-level approvals (AGENT_GOVERNANCE_CONTROL_CONTRACTS §5) bind per
+	// fingerprint and are not indexed through approvalByReq.
+	for id, entry := range e.approvals {
+		if entry == nil || entry.requestID != requestID || entry.actionFingerprint == "" {
 			continue
 		}
-		if aEntry.ar.Status == governance.ApprovalStateApproved {
-			delete(e.approvals, approvalID)
-			fingerprints = append(fingerprints, aEntry.actionFingerprint)
+		if e.approvalEngine.DecisionOf(entry.ar).Status == governance.ApprovalStateApproved {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// cleanupConsumedApprovals drops exactly the approvals a finished run was
+// authorized by (the ids captured by approvedApprovalsFor at dequeue) once that
+// run stored its terminal result. Deleting by id — never by "is it approved
+// NOW" — guarantees a run consumes only the approvals it actually ran with, so
+// an approval granted concurrently with the run's completion survives for its
+// own resume. Pending, denied, or later-granted entries are never touched.
+//
+// Action-level approvals also drop their fingerprint index entry, so a spent
+// approval cannot authorize anything later.
+func (e *Engine) cleanupConsumedApprovals(requestID string, approvalIDs []string) {
+	if len(approvalIDs) == 0 {
+		return
+	}
+	consumed := make(map[string]struct{}, len(approvalIDs))
+	for _, id := range approvalIDs {
+		consumed[id] = struct{}{}
+	}
+	var fingerprints []string
+	e.approvalMu.Lock()
+	for id := range consumed {
+		entry := e.approvals[id]
+		if entry == nil || entry.requestID != requestID {
+			continue
+		}
+		delete(e.approvals, id)
+		if entry.actionFingerprint != "" {
+			fingerprints = append(fingerprints, entry.actionFingerprint)
+		}
+	}
+	if id, ok := e.approvalByReq[requestID]; ok {
+		if _, was := consumed[id]; was {
+			delete(e.approvalByReq, requestID)
 		}
 	}
 	e.approvalMu.Unlock()
@@ -488,8 +550,10 @@ func (e *Engine) emitApprovalEvent(req *Request, typ event.EventType, ar *govern
 }
 
 // projectApproval maps an indexed entry to the contract record shape
-// (SCHEMA_WORK §6.2/§6.3). Called with approvalMu held.
-func projectApproval(entry *approvalEntry) ApprovalRecord {
+// (SCHEMA_WORK §6.2/§6.3). Called with approvalMu held. decision is the
+// engine-locked snapshot of the entry's mutable decision fields; the remaining
+// fields are write-once and safe to read directly.
+func projectApproval(entry *approvalEntry, decision governance.ApprovalDecision) ApprovalRecord {
 	ar := entry.ar
 	rec := ApprovalRecord{
 		SchemaVersion:          "1.0.0",
@@ -508,7 +572,7 @@ func projectApproval(entry *approvalEntry) ApprovalRecord {
 		DelegationAllowed:      ar.Config.DelegationAllowed,
 		AuditRef:               entry.requestID,
 	}
-	switch ar.Status {
+	switch decision.Status {
 	case governance.ApprovalStateApproved:
 		rec.Status = "APPROVED"
 	case governance.ApprovalStateDenied:
@@ -519,10 +583,10 @@ func projectApproval(entry *approvalEntry) ApprovalRecord {
 		exp := ar.RequestedAt.Add(time.Duration(ar.Config.TimeoutSeconds) * time.Second)
 		rec.ExpiresAt = &exp
 	}
-	if ar.ResolvedAt != nil {
-		rec.DecidedAt = ar.ResolvedAt
-		rec.DecisionRationale = ar.Reason
-		rec.ApproverID = ar.Approver
+	if decision.ResolvedAt != nil {
+		rec.DecidedAt = decision.ResolvedAt
+		rec.DecisionRationale = decision.Reason
+		rec.ApproverID = decision.Approver
 	}
 	if entry.req.Context != nil {
 		rec.CorrelationID = entry.req.Context.CorrelationID

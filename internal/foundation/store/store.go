@@ -131,6 +131,19 @@ type Store interface {
 	// prevent.
 	DeleteBatch(ids []string) error
 
+	// DeleteBatchHard physically removes every id as ONE atomic step and
+	// reclaims the space DeleteBatch only marks. It carries the same atomicity
+	// contract as DeleteBatch — all-or-nothing, one store-wide batch journal,
+	// interrupted batches rolled back on the next open, corrupt/ambiguous
+	// journals fail closed — except that a committed batch leaves no file
+	// behind (a soft batch rewrites the record; a hard batch unlinks it).
+	//
+	// It exists for retention: it is destructive and irreversible, so callers
+	// must have proven the records are disposable against an explicit,
+	// governed policy (contracts/EXECUTION_JOURNAL_RETENTION_CONTRACTS.md). It
+	// must never be used as a general-purpose delete.
+	DeleteBatchHard(ids []string) error
+
 	// List returns records matching the given filter.
 	List(filter Filter) ([]*Record, error)
 

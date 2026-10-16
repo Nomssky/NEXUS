@@ -105,7 +105,10 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 
 	// E-005: cancelled while queued — the request never executes beyond this
 	// point (objective/workflow creation and executor submission are skipped).
-	if e.isCancelRequested(req.ID) {
+	// cancelRecorded also honors the recorded cancellation set of a wait that
+	// was cancelled while paused for approval (§8), so its admitted resume is
+	// cancelled here rather than run and reported as a failure.
+	if e.cancelRecorded(req.ID) {
 		return e.chainCancelled(ctx, req, audit, start, "request cancelled before execution")
 	}
 
@@ -280,7 +283,7 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	// an explicit user cancellation is never downgraded — so the chain
 	// re-checks the cancel flag BEFORE recording a circuit-breaker failure
 	// and a recovery record, which user cancellations must never cause.
-	if execErr != nil && e.isCancelRequested(req.ID) {
+	if execErr != nil && e.cancelRecorded(req.ID) {
 		_ = e.workflowEng.Cancel(wf.ID)
 		return e.chainCancelled(ctx, req, audit, start, "request cancelled before completion")
 	}
@@ -385,6 +388,16 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		// which would otherwise fall through to the default "completed" status.
 		// REQUIRE_APPROVAL (pending_approval → D2) and ESCALATE (escalated
 		// → D3) have their own Step-12 branches below.
+		//
+		// §8 (cancellation wins): the tightest race — a resume admitted just
+		// before the wait was cancelled — can still reach the executor, whose
+		// re-admission refuses the now-invalidated action and returns DENY. That
+		// refusal IS the cancellation winning, not a policy denial, so report
+		// cancelled and never overwrite the cancelled terminal with a failure.
+		if e.cancelRecorded(req.ID) {
+			_ = e.workflowEng.Cancel(wf.ID)
+			return e.chainCancelled(ctx, req, audit, start, "request cancelled before completion")
+		}
 		status = "failed"
 		outcomeResult = &Outcome{
 			Metrics: map[string]interface{}{
@@ -983,7 +996,11 @@ func (e *Engine) chainExecute(ctx context.Context, req *Request, wf *workflow.Wo
 	inf := e.inflight[req.ID]
 	cancelledEarly := inf != nil && inf.cancelRequested
 	e.inflightMu.RUnlock()
-	if cancelledEarly {
+	// A waiting execution cancelled through the stored-result path records the
+	// cancellation set without setting the inflight flag; honor it here too so a
+	// racing resume never reaches the executor (§8: cancellation only prevents
+	// NEW effects). wasCancelledReq is checked with no lock held (leaf-lock rule).
+	if cancelledEarly || e.wasCancelledReq(req.ID) {
 		return nil, errCancelledBeforeSubmit
 	}
 

@@ -17,12 +17,15 @@ import (
 	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/agentintel"
 	"github.com/Nomssky/NEXUS/internal/core"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
+	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/gateway"
@@ -39,9 +42,23 @@ type Launcher struct {
 	life    *lifecycle.Manager
 	addr    string // actual gateway listen address
 	initErr error
+	// metrics is the process-local operational metrics owner (v15). It is
+	// shared by the engine, the capability platform and the agent runtime, and
+	// it records the startup recovery outcome the launcher performs itself.
+	metrics *metrics.Metrics
 	// startupTimeout bounds the startup barrier only (L-002). It must never
 	// be inherited by components as a lifetime context — see Run.
 	startupTimeout time.Duration
+}
+
+// Metrics returns the process-local operational metrics owner
+// (contracts/OPERATIONAL_OBSERVABILITY_CONTRACTS.md). It is read-only from the
+// caller's perspective; a nil result is safe to snapshot.
+func (l *Launcher) Metrics() *metrics.Metrics {
+	if l == nil {
+		return nil
+	}
+	return l.metrics
 }
 
 // Options configures the launcher.
@@ -80,15 +97,33 @@ type Options struct {
 	// GatewayOptions are passed through to the gateway server (L-002 test
 	// seam for deterministic listen behavior). Nil/empty in production.
 	GatewayOptions []gateway.ServerOption
+
+	// Now is an optional clock for the durable execution journal (test seam).
+	// Nil uses time.Now.
+	Now func() time.Time
 }
 
 // New creates a new launcher with all components wired.
 func New(opts Options) *Launcher {
+	// Durable execution journal (v10). Nil when no durable store is configured
+	// (in-memory/dev installs) — execution state stays process-local there.
+	journal := execjournal.New(opts.Store, opts.Now)
+
+	// Operational metrics (v15, process-local, bounded). Nil in any test that
+	// constructs an engine without it stays a safe no-op.
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	m := metrics.New()
+
 	// Identity-bound admission stages (A: chain IDENTITY/AUTHORIZATION)
 	// share the A6 flags and membership store — one posture for both
 	// boundaries (gateway edge, chain defense in depth).
 	engine, err := core.NewEngine(&opts.Config,
 		core.WithIdentity(opts.Memberships, opts.RequireAuthentication, opts.EnforceBusinessScope),
+		core.WithExecutionJournal(journal),
+		core.WithMetrics(m),
 	)
 	if err != nil {
 		// Store error; will be returned by Start
@@ -97,8 +132,38 @@ func New(opts Options) *Launcher {
 			log:            opts.Logger,
 			health:         opts.Health,
 			life:           opts.Lifecycle,
+			metrics:        m,
 			initErr:        err,
 			startupTimeout: 30 * time.Second,
+		}
+	}
+
+	// Startup recovery: after the durable store has been opened and its own
+	// journal recovery has run (app.openStore), and BEFORE the gateway accepts
+	// new work, classify interrupted executions. Corrupt/unsupported records
+	// abort startup (fail closed) — never serve partial durable state.
+	if journal != nil {
+		rep, rerr := journal.Recover()
+		if rerr != nil {
+			m.RecoveryFailed()
+			return &Launcher{
+				cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				metrics: m,
+				initErr: fmt.Errorf("durable execution recovery failed: %w", rerr),
+			}
+		}
+		// Operational metrics (v15): the counts this recovery pass actually
+		// classified, plus the time it completed. This is a startup snapshot of
+		// durable journal evidence — never a live count of running executions.
+		m.RecoveryCompleted(
+			int64(rep.Scanned), int64(rep.Terminal), int64(rep.Recovered), int64(rep.UnknownInvocations), now())
+		if opts.Logger != nil && (rep.Recovered > 0 || rep.UnknownInvocations > 0) {
+			opts.Logger.Warn("durable execution recovery classified interrupted work", logging.Fields{
+				Context: map[string]any{
+					"scanned": rep.Scanned, "terminal": rep.Terminal,
+					"recovered_unknown": rep.Recovered, "unknown_invocations": rep.UnknownInvocations,
+				},
+			})
 		}
 	}
 	// Seed the model layer when nothing is registered (docs/m6-model-router.md:
@@ -127,7 +192,7 @@ func New(opts Options) *Launcher {
 		})
 		if err != nil {
 			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
-				initErr: fmt.Errorf("model provider %q: %w", prov.ID, err)}
+				metrics: m, initErr: fmt.Errorf("model provider %q: %w", prov.ID, err)}
 		}
 		engine.ModelRouter().RegisterProvider(p)
 		caps := make([]modelrouter.ModelCapability, 0, len(prov.Capabilities))
@@ -156,7 +221,7 @@ func New(opts Options) *Launcher {
 			DataRetention:    "standard",
 		}); regErr != nil {
 			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
-				initErr: fmt.Errorf("register model %q: %w", prov.ModelID, regErr)}
+				metrics: m, initErr: fmt.Errorf("register model %q: %w", prov.ModelID, regErr)}
 		}
 		if opts.Logger != nil {
 			opts.Logger.Info("production model provider registered", logging.Fields{
@@ -166,6 +231,24 @@ func New(opts Options) *Launcher {
 	}
 
 	if engine.ModelRegistry().ModelCount() == 0 {
+		// F1 (production hardening): production must NEVER silently substitute
+		// a simulated/scripted provider for a real one. config.Validate already
+		// rejects a production configuration with no configured provider before
+		// the launcher runs; this guard is the defense-in-depth for any path
+		// that reaches New with production and an empty registry (including a
+		// provider-registration that produced zero models). Fail closed; never
+		// seed a simulator into production.
+		if opts.Config.IsProduction() {
+			return &Launcher{
+				cfg:     opts.Config,
+				log:     opts.Logger,
+				health:  opts.Health,
+				life:    opts.Lifecycle,
+				metrics: m,
+				initErr: nerrors.Configuration("launcher.provider_missing",
+					"production refuses to start without a registered real model provider; the simulated/scripted provider is development-only"),
+			}
+		}
 		seedStatus := modelrouter.ProviderStatus(opts.Config.Models.SeededProviderStatus)
 		if seedStatus == "" {
 			seedStatus = modelrouter.ProviderStatusHealthy
@@ -227,13 +310,22 @@ func New(opts Options) *Launcher {
 		gateway.WithNexusID(opts.Config.Nexus.ID),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
+		// F4: process-local HTTP rate limiting (config defaults: enabled).
+		gateway.WithRateLimit(gateway.RateLimitPolicy{
+			Enabled:          opts.Config.RateLimit.Enabled,
+			SubmitPerMinute:  opts.Config.RateLimit.SubmitPerMinute,
+			RequestPerMinute: opts.Config.RateLimit.RequestPerMinute,
+			PerIPPerMinute:   opts.Config.RateLimit.PerIPPerMinute,
+		}),
+		// F5: explicit CORS allow-list (empty = same-origin default).
+		gateway.WithCORS(gateway.CORSPolicy{AllowedOrigins: opts.Config.HTTP.CORSAllowedOrigins}),
 	}
 	// Agent execution layer v1: durable agent definitions + runtime wired
 	// through the canonical request path (governance inherits unchanged).
 	agentTools := tool.NewToolRegistry()
 	agentReg, err := agentexec.OpenRegistry(opts.Config.Nexus.ID, opts.Registry, agentTools, opts.Store)
 	if err != nil {
-		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
+		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
 	}
 	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
 	// Agent Governance & Control Integration v1: the admission controller is
@@ -242,6 +334,13 @@ func New(opts Options) *Launcher {
 	// decision path instead of duplicating it. Every mediated agent tool call
 	// passes through it before Platform.Invoke (contract §6).
 	agentRt.Controller = engine.Controller()
+	// Durable execution journal (v10): the runtime records acceptance, dispatch
+	// intent, and outcome so a safe restart classification can be made.
+	agentRt.Journal = journal
+	// Operational metrics (v15): the runtime records durable journal write
+	// failures on the dispatch path; tool-call counters live in the capability
+	// platform, execution-lifecycle counters in the engine.
+	agentRt.Metrics = m
 	gwOpts = append(gwOpts, gateway.WithAgentExecution(agentReg, agentRt))
 
 	// Capability & Tool Platform v1 (contracts/CAPABILITY_TOOL_CONTRACTS.md):
@@ -251,7 +350,7 @@ func New(opts Options) *Launcher {
 	// boundary and one result/redaction pipeline. Governance stays upstream
 	// and unchanged — the platform performs no policy evaluation of its own.
 	platform, capErr := capabilityPlatform(os.Getenv, opts.Config.Storage.DataDir,
-		agentTools, opts.Memberships, engine.EventBus(), opts.Capability)
+		agentTools, opts.Memberships, engine.EventBus(), opts.Capability, m)
 	if capErr != nil {
 		if opts.Logger != nil {
 			opts.Logger.Error("capability platform not registered", logging.Fields{
@@ -286,7 +385,7 @@ func New(opts Options) *Launcher {
 	}
 	intelMem, err := agentintel.OpenMemory(opts.Store, memDeps)
 	if err != nil {
-		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, initErr: err}
+		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
 	}
 	intelRt := agentintel.New(agentReg, agentRt,
 		&agentintel.Decision{Router: engine.ModelRouter()}, engine.EventBus(), intelMem)
@@ -309,6 +408,7 @@ func New(opts Options) *Launcher {
 		engine:  engine,
 		gateway: gw,
 		life:    opts.Lifecycle,
+		metrics: m,
 		addr:    opts.Addr,
 		// C-1: default 30s, bounds the startup barrier only.
 		startupTimeout: 30 * time.Second,

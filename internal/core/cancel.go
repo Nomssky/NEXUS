@@ -122,6 +122,32 @@ func (e *Engine) deregisterInflight(requestID string) {
 	delete(e.inflight, requestID)
 }
 
+// inflightRef returns the current in-flight registry entry for requestID, or
+// nil. Its pointer identity is a run's ownership token: registerInflight
+// replaces the entry, so a re-admission (resume) yields a different pointer.
+func (e *Engine) inflightRef(requestID string) *inflightRequest {
+	e.inflightMu.RLock()
+	defer e.inflightMu.RUnlock()
+	return e.inflight[requestID]
+}
+
+// deregisterInflightIf removes the in-flight entry only while it is still the
+// one the finished run registered (owned). A resume admitted in the window
+// between a run's terminal store and its teardown re-registers the request with
+// a new entry; removing that entry would blank the request out of the registry
+// — a concurrent reader would find neither a result nor a pending state (404) —
+// and would hand the resume a request it can no longer locate. Reports whether
+// the entry was removed (the run still owned the registration).
+func (e *Engine) deregisterInflightIf(requestID string, owned *inflightRequest) bool {
+	e.inflightMu.Lock()
+	defer e.inflightMu.Unlock()
+	if e.inflight[requestID] != owned {
+		return false
+	}
+	delete(e.inflight, requestID)
+	return true
+}
+
 // PendingInfo describes an admitted request that has not reached a terminal
 // state yet.
 type PendingInfo struct {
@@ -162,12 +188,66 @@ func (e *Engine) Pending(requestID string) (PendingInfo, bool) {
 	}, true
 }
 
+// ExecutionView is one coherent snapshot of how an execution id is known to the
+// engine: a terminal result, an in-flight (pending) admission, or neither.
+type ExecutionView struct {
+	// Result is the stored terminal result, when one exists.
+	Result *Response
+	// Pending describes the admitted-but-not-terminal execution when InFlight.
+	Pending PendingInfo
+	// InFlight reports whether the id is currently admitted and not terminal.
+	InFlight bool
+}
+
+// Known reports whether the id is an execution the engine can describe.
+func (v ExecutionView) Known() bool { return v.Result != nil || v.InFlight }
+
+// LookupExecution composes the results and in-flight registries into ONE view.
+//
+// Both mutations that can move a known id between those two registries happen
+// under admitMu: a resume's re-admission (ApproveRequest drops the stale
+// result, then re-registers the request) and a finished run's teardown. Holding
+// admitMu for the whole composition therefore gives a reader either the
+// pre-transition or the post-transition state — never the transient gap where a
+// known request has neither a result nor a registration. A reader that instead
+// acquired resultsMu and inflightMu separately could observe that gap (result
+// dropped, registration not yet re-established) and answer 404 for a request it
+// had just seen. A terminal result takes precedence over a pending admission,
+// matching the existing read endpoints. This is a process-local view only; it
+// makes nothing durable.
+func (e *Engine) LookupExecution(requestID string) ExecutionView {
+	e.admitMu.Lock()
+	defer e.admitMu.Unlock()
+	if res, ok := e.GetResult(requestID); ok {
+		return ExecutionView{Result: res}
+	}
+	if pending, ok := e.Pending(requestID); ok {
+		return ExecutionView{Pending: pending, InFlight: true}
+	}
+	return ExecutionView{}
+}
+
 // isCancelRequested reports whether cancellation was requested for requestID.
 func (e *Engine) isCancelRequested(requestID string) bool {
 	e.inflightMu.RLock()
 	defer e.inflightMu.RUnlock()
 	inf := e.inflight[requestID]
 	return inf != nil && inf.cancelRequested
+}
+
+// cancelRecorded reports whether requestID is terminally cancelled: an
+// in-flight cancellation flag OR a recorded terminal cancellation. Cancelling
+// a WAITING execution goes through the stored-result path, which records the
+// cancellation set (markCancelledReq) but does not set the inflight flag on the
+// request's re-registered resume entry. The chain must therefore consult both,
+// or a resume admitted concurrently with the cancellation reaches the executor
+// and surfaces a failed outcome instead of the cancelled one the contract
+// promises (APPROVAL_LIFECYCLE §8: cancellation wins).
+//
+// Call with no engine lock held (isCancelRequested and wasCancelledReq each take
+// a leaf lock).
+func (e *Engine) cancelRecorded(requestID string) bool {
+	return e.isCancelRequested(requestID) || e.wasCancelledReq(requestID)
 }
 
 // CancelRequest cancels an in-flight request owned by businessID.
@@ -193,7 +273,27 @@ func (e *Engine) isCancelRequested(requestID string) bool {
 // Division narrowing runs outside inflightMu (leaf-lock rule: membership
 // lookups never happen under it) and only where a division is recorded — a
 // divisionless request keeps the business-only check.
+// CancelRequest cancels an in-flight or waiting execution and records the
+// operational outcome (contracts/OPERATIONAL_OBSERVABILITY_CONTRACTS.md): every
+// call is a request; a call that actually took effect is recorded at the point
+// it wins; a call refused because the request was already terminal, unknown or
+// out of scope is recorded as refused — never as a successful cancellation.
 func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
+	e.metrics.CancellationRequested()
+	err := e.cancelRequest(requestID, businessID, actorID)
+	switch {
+	case err == nil:
+		// Flagged or won — the "won" outcome is recorded where it is decided.
+	case errors.Is(err, ErrRequestNotFound),
+		errors.Is(err, ErrScopeMismatch),
+		errors.Is(err, ErrDivisionScopeMismatch),
+		errors.Is(err, ErrAlreadyCompleted):
+		e.metrics.CancellationRefused()
+	}
+	return err
+}
+
+func (e *Engine) cancelRequest(requestID, businessID, actorID string) error {
 	if requestID == "" {
 		return ErrRequestNotFound
 	}
@@ -217,10 +317,7 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 		// nothing revives (APPROVAL_LIFECYCLE_CONTRACTS §8). Every other
 		// terminal status keeps the existing 409 arbitration.
 		if isApprovalWaiting(result) {
-			e.invalidateApprovalsForRequest(requestID)
-			e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
-			e.markCancelledReq(requestID)
-			return nil
+			return e.cancelWaitingExecution(requestID, result.BusinessID, result.DivisionID)
 		}
 		return terminalCancelError(result.Status)
 	}
@@ -238,10 +335,7 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 				return ErrDivisionScopeMismatch
 			}
 			if isApprovalWaiting(result) {
-				e.invalidateApprovalsForRequest(requestID)
-				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
-				e.markCancelledReq(requestID)
-				return nil
+				return e.cancelWaitingExecution(requestID, result.BusinessID, result.DivisionID)
 			}
 			return terminalCancelError(result.Status)
 		}
@@ -268,10 +362,7 @@ func (e *Engine) CancelRequest(requestID, businessID, actorID string) error {
 		// It became terminal between the two sections.
 		if result, ok := e.GetResult(requestID); ok {
 			if isApprovalWaiting(result) {
-				e.invalidateApprovalsForRequest(requestID)
-				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
-				e.markCancelledReq(requestID)
-				return nil
+				return e.cancelWaitingExecution(requestID, result.BusinessID, result.DivisionID)
 			}
 			return terminalCancelError(result.Status)
 		}
@@ -313,6 +404,7 @@ func (e *Engine) cancelExecutorTask(requestID, businessID, taskID, reason, actor
 		err := e.taskExec.CancelTask(taskID, reason, actor)
 		switch {
 		case err == nil:
+			e.metrics.CancellationWon()
 			return nil
 		case errors.Is(err, executor.ErrTaskCompleted):
 			// The task finished racing the cancel; the chain stores its result
@@ -347,10 +439,7 @@ func (e *Engine) awaitTerminalResult(requestID, businessID string) error {
 				return ErrScopeMismatch
 			}
 			if isApprovalWaiting(result) {
-				e.invalidateApprovalsForRequest(requestID)
-				e.storeCancelledResult(requestID, result.BusinessID, result.DivisionID)
-				e.markCancelledReq(requestID)
-				return nil
+				return e.cancelWaitingExecution(requestID, result.BusinessID, result.DivisionID)
 			}
 			return terminalCancelError(result.Status)
 		}
