@@ -488,11 +488,36 @@ func (e *Engine) SubmitRequest(req *Request) error {
 		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
 	}
 
-	// E-005: register before the channel send so a cancellation can always
-	// find the request (queued or executing) from the moment it is admitted.
-	// admission registration is serialized with a finishing run's teardown
-	// (admitMu) so neither can clobber the other.
+	// Duplicate detection: an in-flight or terminal request with the same ID
+	// must not be re-admitted, or the same execution would run twice and
+	// produce duplicate side effects.
+	//
+	// Both checks run inside the admitMu critical section so they are atomic
+	// with respect to concurrent completions. processRequests stores the
+	// terminal result under resultsMu before deregistering inflight under
+	// admitMu; holding admitMu for both checks means a caller either sees the
+	// stored result or the live registration — never the gap between them.
+	// Lock ordering: resultsMu is always released before admitMu is acquired
+	// (processRequests), so nesting resultsMu.RLock inside admitMu.Lock here
+	// cannot deadlock.
 	e.admitMu.Lock()
+	e.resultsMu.RLock()
+	if e.results[req.ID] != nil {
+		e.resultsMu.RUnlock()
+		e.admitMu.Unlock()
+		e.backpressure.Release()
+		return fmt.Errorf("duplicate request: %q already completed", req.ID)
+	}
+	e.resultsMu.RUnlock()
+
+	// inflightRef reads e.inflight under inflightMu.RLock, which is compatible
+	// with deregisterInflight's inflightMu.Lock. Reading e.inflight directly
+	// under admitMu would race with those paths.
+	if e.inflightRef(req.ID) != nil {
+		e.admitMu.Unlock()
+		e.backpressure.Release()
+		return fmt.Errorf("duplicate request: %q already in flight", req.ID)
+	}
 	e.registerInflight(req)
 	// Index the request so an action-level approval raised inside it can bind
 	// to it and resume it (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5).
