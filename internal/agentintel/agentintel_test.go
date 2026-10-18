@@ -277,10 +277,15 @@ func TestIterationBudgetExhausted(t *testing.T) {
 	}
 }
 
+// A criteria-free objective that only ever says "continue" still terminates
+// and still terminates as a failure. Under contract §7 the stall first spends
+// replans from the shared budget; only their exhaustion ends the run, and it
+// ends honestly rather than grinding on.
 func TestNoProgressTermination(t *testing.T) {
 	rt, _ := newIntelFixture(t, nil, &scriptedDecider{plan: goodPlan, answers: []string{`{"type":"continue"}`}})
 	out, _ := rt.Run(context.Background(), workRequest(t, Objective{Description: "say nothing useful"}, ""), nil)
-	if out.Status != "failed" || !strings.Contains(out.Error, "no actionable output") {
+	if out.Status != "failed" || !strings.Contains(out.Error, "state=budget_exhausted") ||
+		!strings.Contains(out.Error, "progress stalled") {
 		t.Fatalf("no-progress termination expected: %s / %s", out.Status, out.Error)
 	}
 }
