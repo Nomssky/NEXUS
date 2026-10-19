@@ -225,7 +225,14 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	}
 	res.Operation = req.Operation
 	if req.Operation == "" {
-		req.Operation = defaultOperation(manifest)
+		// Reject empty operations for multi-operation tools — never default
+		// to the first operation, which could be destructive (e.g. DELETE).
+		// Single-operation tools are unambiguous and safe to default.
+		if len(manifest.Operations) > 1 {
+			return p.deny(req, res, start, ErrValidation,
+				fmt.Sprintf("tool %q requires an explicit operation", req.ToolID), "tool.invocation.rejected")
+		}
+		req.Operation = manifest.Operations[0]
 		res.Operation = req.Operation
 	}
 	if !manifest.Supports(req.Operation) {

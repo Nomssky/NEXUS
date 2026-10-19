@@ -330,6 +330,47 @@ func TestPlatformSchemaAndOperationValidation(t *testing.T) {
 	}
 }
 
+// TestPlatformRejectsEmptyOperation verifies that an omitted operation is
+// rejected for multi-operation tools instead of defaulting to the first one
+// (which could be destructive, e.g. DELETE for http.request).
+func TestPlatformRejectsEmptyOperation(t *testing.T) {
+	adapter := &stubAdapter{ops: []string{"delete", "get"}, result: tool.RawResult{Result: map[string]string{"output": "ok"}}}
+	p, _, _ := newPlatform(t, func(reg *tool.ToolRegistry) {
+		_ = reg.Register(baseManifest("multi-op", "delete", "get"), adapter)
+	})
+
+	// Empty operation must be refused for multi-operation tools.
+	req := allowedRequest("multi-op")
+	if res := p.Invoke(context.Background(), req); res.Status != tool.StatusDenied {
+		t.Fatalf("empty operation must be rejected for multi-op tools, got %+v", res)
+	}
+	if len(adapter.operated) != 0 {
+		t.Fatalf("adapter must not be invoked for empty operation, got %d", len(adapter.operated))
+	}
+
+	// Explicit operations must still work.
+	req = allowedRequest("multi-op")
+	req.Operation = "get"
+	if res := p.Invoke(context.Background(), req); res.Status != tool.StatusSuccess {
+		t.Fatalf("explicit operation must run, got %+v", res)
+	}
+	req = allowedRequest("multi-op")
+	req.Operation = "delete"
+	if res := p.Invoke(context.Background(), req); res.Status != tool.StatusSuccess {
+		t.Fatalf("explicit DELETE must run, got %+v", res)
+	}
+
+	// Single-operation tools are unambiguous: empty operation is fine.
+	single := &stubAdapter{ops: []string{"execute"}, result: tool.RawResult{Result: map[string]string{"output": "ok"}}}
+	p2, _, _ := newPlatform(t, func(reg *tool.ToolRegistry) {
+		_ = reg.Register(baseManifest("single-op", "execute"), single)
+	})
+	req = allowedRequest("single-op")
+	if res := p2.Invoke(context.Background(), req); res.Status != tool.StatusSuccess {
+		t.Fatalf("single-op tool with empty operation must run, got %+v", res)
+	}
+}
+
 func TestPlatformRequiredFieldAndBounds(t *testing.T) {
 	m := baseManifest("strict")
 	m.InputSchema = tool.Schema{Fields: []tool.SchemaField{
@@ -888,6 +929,43 @@ func TestFilesystemSandbox(t *testing.T) {
 		})
 	}
 
+	// .git metadata must not be readable, writable, or listable — any path
+	// component equal to ".git" is rejected, including nested repos, gitfiles,
+	// and traversal variants.
+	gitEscapes := map[string]string{
+		".git config":          ".git/config",
+		".git hooks":           ".git/hooks/pre-commit",
+		".git objects":         ".git/objects/pack/pack-000.idx",
+		".git refs":            ".git/refs/heads/main",
+		"nested .git/config":   "sub/.git/config",
+		"dotgit root":          ".git",
+		"dotgit via traversal": "../.git/config",
+	}
+	for name, p := range gitEscapes {
+		t.Run(name, func(t *testing.T) {
+			for _, op := range []string{"read", "write", "list"} {
+				in := map[string]string{"path": p}
+				if op == "write" {
+					in["content"] = "x"
+				}
+				if _, err := fs.Invoke(context.Background(), tool.Invocation{Operation: op, Input: in}); err == nil {
+					t.Fatalf("%s must be refused for operation %s (path %q)", name, op, p)
+				}
+			}
+		})
+	}
+
+	// Ordinary project files containing ".git" as part of a longer name must
+	// still be accessible — only the exact ".git" path component is reserved.
+	if _, err := fs.Invoke(context.Background(), tool.Invocation{Operation: "write",
+		Input: map[string]string{"path": "docs/git-tool.md", "content": "# Git Tool"}}); err != nil {
+		t.Fatalf("ordinary file with git in the name must be writable: %v", err)
+	}
+	if r, err := fs.Invoke(context.Background(), tool.Invocation{Operation: "read",
+		Input: map[string]string{"path": "docs/git-tool.md"}}); err != nil || r.Result["content"] != "# Git Tool" {
+		t.Fatalf("ordinary file with git in the name must be readable: %v %+v", err, r)
+	}
+
 	// oversized file
 	big := filepath.Join(root, "big.bin")
 	if err := os.WriteFile(big, make([]byte, 2048), 0o600); err != nil {
@@ -1002,8 +1080,111 @@ func TestGitToolBoundaries(t *testing.T) {
 			t.Fatalf("model input must not reach git argv: %v", args)
 		}
 	}
-	if args[3] != "-n200" {
+	if args[4] != "-n200" {
 		t.Fatalf("log limit must be clamped, got %v", args)
+	}
+}
+
+// TestGitRepoConfigCannotExecute verifies that repo-local git configuration
+// cannot be used to execute arbitrary commands through the git capability.
+// A hostile core.fsmonitor command would execute during git status if the
+// capability did not disable it.
+func TestGitRepoConfigCannotExecute(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary unavailable in this environment")
+	}
+	root := t.TempDir()
+	marker := filepath.Join(root, "fsmonitor-marker")
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Initialize a minimal repo with a committed file so git status runs cleanly.
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	run("init", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "a.txt")
+	run("commit", "-qm", "init")
+
+	// Hostile repo-local config: core.fsmonitor runs an arbitrary command.
+	// This file is NOT writable through the capability (filesystem test above),
+	// but we plant it directly to prove the git invocation itself neutralizes it.
+	cmd := exec.Command("git", "config", "core.fsmonitor", "touch "+marker)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("planting hostile fsmonitor config: %v (%s)", err, out)
+	}
+
+	gitTool := &GitTool{Policy: GitPolicy{Roots: []string{root}, MaxOutputBytes: 64 * 1024, Timeout: 5 * time.Second}}
+	if _, err := gitTool.Invoke(context.Background(), tool.Invocation{Operation: "status",
+		Input: map[string]string{"repo": "repo"}, Limits: tool2Limits(4096)}); err != nil {
+		t.Fatalf("git status must work despite hostile config: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("core.fsmonitor command must not execute: marker %s exists", marker)
+	}
+}
+
+// TestGitTextconvCannotExecute verifies that repo-local diff.*.textconv
+// configuration cannot execute arbitrary commands through git diff.
+func TestGitTextconvCannotExecute(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git binary unavailable in this environment")
+	}
+	root := t.TempDir()
+	marker := filepath.Join(root, "textconv-marker")
+	repo := filepath.Join(root, "repo")
+	if err := os.MkdirAll(repo, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@example.com")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+	run("init", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "data.bin"), []byte("binary content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "data.bin")
+	run("commit", "-qm", "init")
+
+	// Hostile repo-local config: diff.evil.textconv runs an arbitrary command,
+	// and .gitattributes marks data.bin for that driver.
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("data.bin diff=evil\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("git", "config", "diff.evil.textconv", "touch "+marker)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("planting hostile textconv config: %v (%s)", err, out)
+	}
+
+	gitTool := &GitTool{Policy: GitPolicy{Roots: []string{root}, MaxOutputBytes: 64 * 1024, Timeout: 5 * time.Second}}
+	if _, err := gitTool.Invoke(context.Background(), tool.Invocation{Operation: "diff",
+		Input: map[string]string{"repo": "repo"}, Limits: tool2Limits(4096)}); err != nil {
+		t.Fatalf("git diff must work despite hostile textconv config: %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("textconv command must not execute: marker %s exists", marker)
 	}
 }
 

@@ -73,6 +73,14 @@ func (t *FilesystemTool) resolve(rel string) (abs string, relOut string, err err
 		strings.Contains(cleanRel, string(os.PathSeparator)+"..") {
 		return "", "", fmt.Errorf("%w: path traversal is not permitted", ErrScope)
 	}
+	// Reject any path that traverses into .git metadata. This prevents agents
+	// from reading or writing Git internals (e.g. .git/config, .git/hooks,
+	// .git/objects) that could be used to execute commands via repo-local config.
+	for _, part := range strings.Split(cleanRel, string(os.PathSeparator)) {
+		if part == ".git" {
+			return "", "", fmt.Errorf("%w: git metadata paths are not permitted", ErrScope)
+		}
+	}
 	joined := filepath.Join(root, cleanRel)
 	abs, err = filepath.Abs(joined)
 	if err != nil {

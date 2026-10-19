@@ -28,6 +28,8 @@ func testOrg(t *testing.T) *identity.Registry {
 	reg.CreateBusiness(identity.Business{EntityID: "biz-1", Name: "b", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
 	reg.CreateDivision(identity.Division{EntityID: "div-1", BusinessID: "biz-1", Name: "d", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
 	reg.CreateDivision(identity.Division{EntityID: "other", BusinessID: "biz-1", Name: "other", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
+	reg.CreateBusiness(identity.Business{EntityID: "biz-2", Name: "b2", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
+	reg.CreateDivision(identity.Division{EntityID: "div-2", BusinessID: "biz-1", Name: "d2", OwnerIdentityID: "owner-1", CreatedAt: now}, "t")
 	return reg
 }
 

@@ -1160,12 +1160,22 @@ func (s *execScope) AgentAllowsTool(agentID, toolID string) bool {
 
 // resolveAgent picks the acting agent: an explicit, scope-visible agent when
 // the objective names one, otherwise the deterministic selector's winner.
+//
+// An explicit agent_id must satisfy the same eligibility rules as the selector:
+// active status, business ownership, and division visibility. If the explicit
+// selection fails these checks, we do NOT fall back to a different agent —
+// that would silently invoke an unauthorized agent and obscure the failure.
 func (r *Runtime) resolveAgent(obj Objective, req *executor.WorkRequest) string {
 	if obj.Context != nil {
 		if id := obj.Context["agent_id"]; id != "" {
 			if d, ok := r.Registry.Get(id); ok && d.BusinessID == req.BusinessID {
-				return id
+				if d.Status == agentexec.AgentActive &&
+					(d.DivisionID == "" || d.DivisionID == req.DivisionID) {
+					return id
+				}
 			}
+			// Explicit selection failed — do not fall back to a different agent.
+			return ""
 		}
 	}
 	sel := agentexec.Select(r.Registry, &agentexec.SelectionRequest{
