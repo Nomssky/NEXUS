@@ -220,6 +220,23 @@ func TestResumedCompletionRecordsTheTruthfulDurableOutcome(t *testing.T) {
 	if approvalID == "" {
 		t.Fatal("expected an approval id")
 	}
+	// journalFinalize (Terminal + ApprovalRequested) runs after the result
+	// is stored; wait for it so ApproveRequest doesn't race it and skip the
+	// ApprovalRequested entry.
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rec, ok, _ := j.Get("exec-approve")
+		if ok && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for journal approval-requested entry")
+		case <-tick.C:
+		}
+	}
 	// While paused the record is the provisional approval pause.
 	if rec, _, _ := j.Get("exec-approve"); rec.State != execjournal.StateFailed || rec.ErrorClass != "APPROVAL_REQUIRED" {
 		t.Fatalf("a pause must be recorded as failed/APPROVAL_REQUIRED, got %+v", rec)
@@ -747,6 +764,23 @@ func TestSecondDenyRequestFailsWithApprovalNotFound(t *testing.T) {
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-deny-twice"))
 	if approvalID == "" {
 		t.Fatal("expected an approval id")
+	}
+	// journalFinalize (Terminal + ApprovalRequested) runs after the result
+	// is stored; wait for it so DenyRequest doesn't race it and skip the
+	// ApprovalRequested entry.
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rec, ok, _ := j.Get("exec-deny-twice")
+		if ok && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for journal approval-requested entry")
+		case <-tick.C:
+		}
 	}
 	if err := e.DenyRequest(approvalID, "biz-1", "approver-1", ""); err != nil {
 		t.Fatalf("deny: %v", err)
