@@ -326,9 +326,11 @@ func TestCancelAccepted202(t *testing.T) {
 	if result.Error == nil || result.Error.Code != "CANCELLED" || result.Error.Category != "CANCELLATION" {
 		t.Errorf("expected contract CANCELLED/CANCELLATION error, got %+v", result.Error)
 	}
-	if !p.cancelled() {
-		t.Error("provider must observe context cancellation (ctx threading)")
-	}
+	// The provider observes cancellation asynchronously: CancelTask cancels
+	// the task context, but the provider goroutine may not have been scheduled
+	// to observe ctx.Done() before WaitOutcome returns the cancelled result.
+	// Poll with a bounded deadline — the assertion is unchanged.
+	waitUntil(t, "provider cancellation observation", p.cancelled)
 }
 
 // TEST-GW-E005-05: terminal request → 409 CONFLICT with the terminal status.
