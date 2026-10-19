@@ -266,6 +266,25 @@ func TestDeniedApprovalIsDurablyRecorded(t *testing.T) {
 	if approvalID == "" {
 		t.Fatal("expected an approval id")
 	}
+	// awaitResult observes the in-memory result map; journalFinalize (which
+	// durably records Terminal + ApprovalRequested) runs after the result is
+	// stored. Wait for it so DenyRequest doesn't race it and skip the
+	// ApprovalRequested entry — the same class of test synchronization defect
+	// fixed in cancel_test.go.
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rec, ok, _ := j.Get("exec-denied")
+		if ok && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for journal approval-requested entry")
+		case <-tick.C:
+		}
+	}
 	if err := e.DenyRequest(approvalID, "biz-1", "approver-9", "not authorized"); err != nil {
 		t.Fatalf("deny: %v", err)
 	}
