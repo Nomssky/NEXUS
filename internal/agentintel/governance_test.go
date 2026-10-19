@@ -30,6 +30,9 @@ import (
 type governedEchoAdapter struct {
 	mu    sync.Mutex
 	calls int
+	// invs records every physical dispatch with its logical-call identity, so a
+	// test can assert that one logical call keeps one idempotency key.
+	invs []tool.Invocation
 }
 
 func (g *governedEchoAdapter) Operations() []string { return []string{"execute"} }
@@ -37,6 +40,7 @@ func (g *governedEchoAdapter) Operations() []string { return []string{"execute"}
 func (g *governedEchoAdapter) Invoke(_ context.Context, inv tool.Invocation) (tool.RawResult, error) {
 	g.mu.Lock()
 	g.calls++
+	g.invs = append(g.invs, inv)
 	g.mu.Unlock()
 	return tool.RawResult{Result: map[string]string{"echoed": inv.Input["text"]}}, nil
 }
@@ -45,6 +49,13 @@ func (g *governedEchoAdapter) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls
+}
+
+// invocations returns a copy of every dispatch this adapter received.
+func (g *governedEchoAdapter) invocations() []tool.Invocation {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]tool.Invocation(nil), g.invs...)
 }
 
 func governedEchoManifest() tool.ToolManifest {

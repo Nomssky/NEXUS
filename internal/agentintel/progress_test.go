@@ -18,6 +18,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/control"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
+	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
 // ---- grammar ---------------------------------------------------------------
@@ -710,5 +711,271 @@ func TestCancellationBeatsTheCompletionGate(t *testing.T) {
 	}
 	if strings.Contains(out.Output, "state=completed") {
 		t.Fatal("a cancelled run must never report completed")
+	}
+}
+
+// ---- effects_completed across the approval boundary ------------------------
+//
+// Contract §7: `effects_completed` counts the completed consequential effects
+// recorded by the runtime in this execution, and "excludes attempted,
+// rejected, awaiting-approval, cancelled, failed and unknown outcomes". The
+// approval pause is where that boundary is easiest to get wrong — it is the one
+// place where an action really did start, really did reach the adapter, and
+// still must not count as done.
+
+const durableWriteAnswer = `{"type":"memory_write","key":"k","value":"v","memory_type":"fact"}`
+
+// TestAwaitingApprovalEffectIsNotACompletedEffect proves an action that is only
+// AWAITING approval is not yet a completed effect. The run below performs a
+// durable write (which succeeds and is fingerprinted) and then proposes a
+// governed tool call that stops at REQUIRE_APPROVAL. The snapshot must carry
+// exactly one effect: the write that finished, not the tool call that paused.
+func TestAwaitingApprovalEffectIsNotACompletedEffect(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionToolCall, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{durableWriteAnswer, governedToolCallAnswer}}
+	obj := Objective{Description: "store then echo",
+		SuccessCriteria: []string{"effects_completed>=1"}}
+
+	out, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if out.Status != "pending_approval" {
+		t.Fatalf("the run must pause pending approval: %s (%s)", out.Status, out.Error)
+	}
+
+	g.rt.mu.Lock()
+	snap := g.rt.resumes["exec-1"]
+	g.rt.mu.Unlock()
+	if snap == nil {
+		t.Fatal("the paused run must leave a snapshot")
+	}
+	// Exactly the completed durable write. The governed tool call is still
+	// awaiting approval: it ran no effect, so it must not be counted.
+	if len(snap.effects) != 1 {
+		t.Fatalf("only the completed write may be a completed effect, got %d: %v", len(snap.effects), snap.effects)
+	}
+	if n := restoreWorking(snap).EffectCount(); n != 1 {
+		t.Fatalf("restored working memory must carry exactly one completed effect, got %d", n)
+	}
+	// The write really did execute: the paused run is not vacuously empty.
+	res, _ := g.rt.Memory.Query(
+		memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1"})
+	if len(res.Records) != 1 {
+		t.Fatalf("the durable write must have executed, got %d records", len(res.Records))
+	}
+}
+
+// TestCompletedEffectsSurviveApprovalResume proves the completed-effect count
+// is scoped to the EXECUTION, not to a single process step of it. The write
+// completed before the pause, so the resumed run must still count it. If the
+// restored working memory forgot the fingerprint, the resumed run would see an
+// empty effect ledger, reject `effects_completed>=1`, and fail an objective
+// that had in fact already done its work.
+func TestCompletedEffectsSurviveApprovalResume(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionToolCall, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{durableWriteAnswer, governedToolCallAnswer}}
+	obj := Objective{Description: "store then echo",
+		SuccessCriteria: []string{"effects_completed>=1", "source==memory"}}
+
+	first, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if first.Status != "pending_approval" {
+		t.Fatalf("the first run must pause pending approval: %s (%s)", first.Status, first.Error)
+	}
+	g.approver.approveAll()
+
+	// Resume: the approved tool call runs, then the model completes. The
+	// criteria are satisfied by the PRE-PAUSE write plus the restored window.
+	g.rt.Decider = &obsAwareDecider{plan: goodPlan}
+	resumed, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if resumed.Status != "completed" {
+		t.Fatalf("a resumed run must still count the effect completed before the pause: %s (%s)",
+			resumed.Status, resumed.Error)
+	}
+	// The durable write must not have been repeated by the resumed run.
+	res, _ := g.rt.Memory.Query(
+		memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1"})
+	if len(res.Records) != 1 {
+		t.Fatalf("the completed write must exist exactly once across the resume, got %d", len(res.Records))
+	}
+}
+
+// TestResumedRunEarnsNoFreeProgressReset proves progress accounting is honest
+// across the pause. The resumed run starts with a FRESH criteria tracker, so
+// without seeding it would re-evaluate already-satisfied criteria as newly
+// satisfied and take a free no-progress reset it never earned — masking a
+// genuinely stalled execution. With seeding, the first barren iteration of the
+// resumed run must stall and spend a replan, exactly as it would have without
+// any pause.
+func TestResumedRunEarnsNoFreeProgressReset(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionToolCall, ""))
+	d := &planCountingDecider{answers: []string{durableWriteAnswer, governedToolCallAnswer}}
+	g.rt.Decider = d
+	// One barren iteration is a stall, so the reset cannot hide behind the
+	// default grace of two.
+	g.rt.Caps.MaxConsecutiveNoProgress = 1
+	obj := Objective{Description: "store then echo",
+		SuccessCriteria: []string{"source==memory"}}
+
+	first, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if first.Status != "pending_approval" {
+		t.Fatalf("the first run must pause pending approval: %s (%s)", first.Status, first.Error)
+	}
+	if d.plans != 1 {
+		t.Fatalf("the first run must not replan, planning rounds=%d", d.plans)
+	}
+	g.approver.approveAll()
+
+	// Resume: the approved tool call produces an observation that satisfies
+	// nothing new, so it must count as no progress.
+	d.script(governedToolCallAnswer, governedCompleteAnswer)
+	resumed, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if resumed.Status != "completed" {
+		t.Fatalf("the resumed run must still complete: %s (%s)", resumed.Status, resumed.Error)
+	}
+	// 1 initial plan + exactly 1 stall-driven replan. Without seeding the
+	// resumed run would credit its restored criteria as new progress and stop
+	// at 1 planning round.
+	if d.plans != 2 {
+		t.Fatalf("a resumed run must not take a free progress reset: planning rounds=%d, want 2", d.plans)
+	}
+}
+
+// planCountingDecider answers from a replaceable script and counts planning
+// rounds, so a test can observe replanning without reaching into internals.
+type planCountingDecider struct {
+	plans   int
+	answers []string
+	idx     int
+}
+
+func (d *planCountingDecider) Plan(context.Context, PlanPrompt) (string, error) {
+	d.plans++
+	return goodPlan, nil
+}
+
+func (d *planCountingDecider) Decide(context.Context, DecisionPrompt) (string, error) {
+	if d.idx < len(d.answers) {
+		a := d.answers[d.idx]
+		d.idx++
+		return a, nil
+	}
+	return governedCompleteAnswer, nil
+}
+
+// script replaces the answer script and rewinds, so a second run of the same
+// execution can be driven from the start.
+func (d *planCountingDecider) script(answers ...string) {
+	d.answers = answers
+	d.idx = 0
+}
+
+// ---- cancellation vs completion in the same execution window --------------
+//
+// The v18 gate proves a cancellation that is ALREADY visible when the run
+// starts wins. This proves the harder ordering: evidence that satisfied the
+// objective was already collected, and only THEN the caller cancelled — while
+// the model was mid-decision. A satisfied criterion must never rescue a
+// completion that a later cancellation has already invalidated.
+
+// cancellingDecider cancels the caller's context as a side effect of deciding,
+// so cancellation lands at a known point in the iteration: after the model has
+// answered, before the action is dispatched. No sleeps, no timing.
+type cancellingDecider struct {
+	plan    string
+	answers []string
+	idx     int
+	cancel  context.CancelFunc
+}
+
+func (d *cancellingDecider) Plan(context.Context, PlanPrompt) (string, error) { return d.plan, nil }
+
+func (d *cancellingDecider) Decide(context.Context, DecisionPrompt) (string, error) {
+	a := d.answers[d.idx]
+	if d.idx < len(d.answers)-1 {
+		d.idx++
+	} else {
+		// The final decision is the completion claim; cancelling here means the
+		// cancellation and the completion claim become eligible in the same
+		// iteration, with the cancellation first.
+		d.cancel()
+	}
+	return a, nil
+}
+
+// TestCancellationDuringIterationBeatsAlreadySatisfiedCriteria proves a
+// cancellation arriving mid-iteration ends the run cancelled even though the
+// objective's criteria were already satisfied by real runtime evidence.
+func TestCancellationDuringIterationBeatsAlreadySatisfiedCriteria(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &cancellingDecider{
+		plan: goodPlan,
+		// Iteration 1 produces evidence satisfying every criterion below.
+		// Iteration 2 claims completion, and cancels on the way out.
+		answers: []string{
+			`{"type":"tool_call","tool":"calculator","input":{"a":"6","b":"7","op":"mul"}}`,
+			`{"type":"complete","result":"42"}`,
+		},
+		cancel: cancel,
+	}
+	rt, _ := newIntelFixture(t, nil, d)
+	obj := Objective{Description: "multiply then finish",
+		SuccessCriteria: []string{"source==tool:calculator", "action_type==tool_call", "status==ok"}}
+
+	out, _ := rt.Run(ctx, workRequest(t, obj, ""), nil)
+
+	// The criteria WERE satisfiable — proven by running the same script with no
+	// cancellation at all (below). So a completed result here would mean the
+	// cancellation lost to evidence.
+	if out.Status != "cancelled" {
+		t.Fatalf("a cancellation accepted mid-iteration must end the run cancelled: %s (%s)", out.Status, out.Error)
+	}
+	if strings.Contains(out.Output, "state=completed") || strings.Contains(out.Error, "complete rejected") == false && strings.Contains(out.Error, "state=completed") {
+		t.Fatalf("a cancelled run must not report a completed terminal state: %s", out.Output)
+	}
+
+	// Control: the identical objective and script WITHOUT cancellation really
+	// does complete, so the assertions above are about ordering, not about
+	// criteria that could never be met.
+	ok := &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"calculator","input":{"a":"6","b":"7","op":"mul"}}`,
+		`{"type":"complete","result":"42"}`,
+	}}
+	rt2, _ := newIntelFixture(t, nil, ok)
+	ctrl, _ := rt2.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if ctrl.Status != "completed" {
+		t.Fatalf("the control run must complete, proving the criteria are satisfiable: %s (%s)", ctrl.Status, ctrl.Error)
+	}
+}
+
+// TestRerunningAnExecutionIDInheritsNoEvidence proves an execution cannot be
+// "reactivated" by reusing its id. The loop's scratch state is per-execution:
+// a second run under the same execution id starts with no observations, no
+// completed-effect ledger and zeroed counters, so criteria that the first run
+// satisfied are NOT satisfied by the second.
+func TestRerunningAnExecutionIDInheritsNoEvidence(t *testing.T) {
+	first := &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"calculator","input":{"a":"6","b":"7","op":"mul"}}`,
+		`{"type":"complete","result":"42"}`,
+	}}
+	rt, _ := newIntelFixture(t, nil, first)
+	// `workRequest` always uses execution id exec-1, so both runs share an id.
+	satisfied := Objective{Description: "multiply", SuccessCriteria: []string{"source==tool:calculator"}}
+	out, _ := rt.Run(context.Background(), workRequest(t, satisfied, ""), nil)
+	if out.Status != "completed" {
+		t.Fatalf("the first run must complete: %s (%s)", out.Status, out.Error)
+	}
+
+	// Same execution id, a criterion this run cannot satisfy. If any evidence
+	// carried over, this would complete on the FIRST run's observation.
+	second := &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"model_call","prompt":"think"}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	rt.Decider = second
+	unsatisfiable := Objective{Description: "multiply", SuccessCriteria: []string{"source==tool:ledger"}}
+	out2, _ := rt.Run(context.Background(), workRequest(t, unsatisfiable, ""), nil)
+	if out2.Status != "failed" || !strings.Contains(out2.Error, "source==tool:ledger") {
+		t.Fatalf("a re-used execution id must inherit no evidence: %s (%s)", out2.Status, out2.Error)
 	}
 }

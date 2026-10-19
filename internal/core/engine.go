@@ -617,15 +617,9 @@ func (e *Engine) processRequests(ctx context.Context) {
 			}
 			e.resultsMu.Unlock()
 
-			// Durable terminal state (v10): record the terminal outcome after
-			// the result is stored. A write failure leaves the record
-			// nonterminal so recovery classifies it as unknown — never a
-			// fabricated completion.
-			if e.journal != nil {
-				if terr := e.journal.Terminal(req.ID, journalState(result), journalErrorClass(result)); terr != nil {
-					e.metrics.JournalWriteFailure()
-				}
-			}
+			// Durable state (v10): record how the run ended. An approval pause is
+			// provisional and supersedable; every other end is first-wins.
+			e.journalFinalize(req.ID, result)
 
 			// Operational metrics (v15, process-local, bounded): close the run's
 			// in-flight interval, record the exact terminal status, classify a

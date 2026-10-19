@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
@@ -277,6 +278,21 @@ func (e *Engine) ApproveRequest(approvalID, businessID, approver, reason string)
 	if err := e.approvalEngine.Approve(approvalID, approver, reason); err != nil {
 		return mapApprovalErr(err)
 	}
+
+	// The grant is durable evidence and must outlive this process: it is
+	// what makes the pause auditable once the resumed run reaches its own
+	// terminal outcome. The durable write must succeed BEFORE the resume
+	// becomes irreversible (event emission, backpressure, queue admission).
+	// If it fails, the execution must not run — an approval without durable
+	// grant evidence is not a committed grant.
+	if e.journal != nil {
+		if err := e.journal.RecordApproval(entry.requestID, approvalID,
+			execjournal.ApprovalGranted, approver); err != nil {
+			e.metrics.JournalWriteFailure()
+			return fmt.Errorf("record approval grant: %w", err)
+		}
+	}
+
 	e.emitApprovalEvent(entry.req, event.EventTypeApprovalApproved, entry.ar,
 		map[string]string{
 			"status":             "APPROVED",
@@ -399,6 +415,32 @@ func (e *Engine) DenyRequest(approvalID, businessID, approver, reason string) er
 
 	// Resolved without resume — drop the index entry.
 	e.dropApproval(approvalID)
+
+	// A denial is durable evidence too. Without this the record keeps its
+	// provisional pause class, so after a restart a denied execution is
+	// indistinguishable from one still waiting for an approval that can no
+	// longer be granted. Supersede the pause with the truthful terminal.
+	//
+	// Both durable writes must succeed for the denial to be reported as done:
+	// the approval history is what makes the denial "durable and
+	// distinguishable from a still-pending pause" (recovery contract §2), and
+	// the supersede is what moves the execution to the denial's terminal class.
+	// If the history write fails, the pause is left untouched (never falsely
+	// marked denied) and the caller is told; if the supersede fails, the caller
+	// is told rather than handed a success the durable state does not support.
+	if e.journal != nil {
+		if err := e.journal.RecordApproval(entry.requestID, approvalID,
+			execjournal.ApprovalDenied, approver); err != nil {
+			e.metrics.JournalWriteFailure()
+			return fmt.Errorf("record approval denial: %w", err)
+		}
+		if err := e.journal.SupersedeApprovedPause(entry.requestID,
+			execjournal.StateFailed, execjournal.ApprovalDeniedClass); err != nil &&
+			!errors.Is(err, execjournal.ErrNotApprovalPause) {
+			e.metrics.JournalWriteFailure()
+			return fmt.Errorf("supersede approval pause: %w", err)
+		}
+	}
 	return nil
 }
 

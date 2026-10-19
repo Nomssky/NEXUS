@@ -34,6 +34,24 @@ type durableExecutionView struct {
 	CreatedAt   time.Time            `json:"created_at"`
 	UpdatedAt   time.Time            `json:"updated_at"`
 	Recovery    *durableRecoveryView `json:"recovery,omitempty"`
+	// Approvals is the durable approval history for THIS execution, in the
+	// order it was recorded. It is omitted entirely when the execution never
+	// went through an approval gate, so an unapproved execution's response is
+	// exactly what it was before history was exposed.
+	Approvals []durableApprovalView `json:"approvals,omitempty"`
+}
+
+// durableApprovalView is the allow-listed projection of one approval decision.
+//
+// The approver identity is deliberately NOT projected: the durable read
+// contract excludes identity references, and the live approval surface gates
+// approver identity behind business-wide membership — a strictly higher bar
+// than this division-scoped read. Exposing it here would weaken that, so
+// whether the decider is ever exposed is an open contract decision (v34).
+type durableApprovalView struct {
+	ApprovalID string    `json:"approval_id"`
+	Outcome    string    `json:"outcome"`
+	DecidedAt  time.Time `json:"decided_at"`
 }
 
 type durableRecoveryView struct {
@@ -58,6 +76,21 @@ func durableView(er execjournal.ExecutionRecord) durableExecutionView {
 			Recovered:   true,
 			PriorState:  string(er.Recovery.PriorState),
 			RecoveredAt: er.Recovery.RecoveredAt,
+		}
+	}
+	// Approval history is projected only as recorded: append order is preserved,
+	// and nothing is synthesized. A superseded pause still appears as the
+	// recorded `requested` entry; the execution's own `state` is what carries
+	// the outcome, so a reader can never mistake a historical decision for a
+	// currently effective one.
+	if len(er.Approvals) > 0 {
+		v.Approvals = make([]durableApprovalView, 0, len(er.Approvals))
+		for _, a := range er.Approvals {
+			v.Approvals = append(v.Approvals, durableApprovalView{
+				ApprovalID: a.ApprovalID,
+				Outcome:    a.Outcome,
+				DecidedAt:  a.DecidedAt,
+			})
 		}
 	}
 	return v

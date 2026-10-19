@@ -73,9 +73,14 @@ func (fs *FileStore) Put(record *Record) error {
 
 	now := fs.now()
 
-	// Check for existing record (optimistic concurrency)
+	// Optimistic concurrency. A record that already exists is only ever updated
+	// by a caller that read it and carried its version forward, so the version
+	// must match exactly. A zero version means "I have no prior record": it is a
+	// CREATE, and must never silently overwrite an existing record (v32). This
+	// matches MemStore and the Store contract, and matches MemStore's behaviour
+	// of starting every new record at version 1 (SCHEMA_COMMON §3.9).
 	if existing, ok := fs.index[record.ID]; ok {
-		if record.Version != 0 && existing.Version != record.Version {
+		if existing.Version != record.Version {
 			return &StoreError{
 				Code:    "VERSION_CONFLICT",
 				Message: fmt.Sprintf("expected version %d, got %d", existing.Version, record.Version),
@@ -84,9 +89,7 @@ func (fs *FileStore) Put(record *Record) error {
 		record.Version = existing.Version + 1
 		record.CreatedAt = existing.CreatedAt
 	} else {
-		if record.Version == 0 {
-			record.Version = 1
-		}
+		record.Version = 1
 		record.CreatedAt = now
 	}
 
@@ -98,8 +101,8 @@ func (fs *FileStore) Put(record *Record) error {
 	}
 
 	// Update cache
-	cp := *record
-	fs.index[record.ID] = &cp
+	cp := record.clone()
+	fs.index[record.ID] = cp
 	return nil
 }
 
@@ -114,11 +117,15 @@ func (fs *FileStore) Get(id string) (*Record, error) {
 	}
 
 	// Return a copy to prevent mutation
-	cp := *record
-	return &cp, nil
+	return record.clone(), nil
 }
 
 // Delete removes a record by ID (soft delete).
+//
+// Deleting an already-deleted record is a NO-OP: it is not a further update, so
+// it advances neither Version nor updated_at. That makes a retried delete safe
+// — a client that read the version the first delete produced keeps a valid
+// version (v32). It mirrors core's "idempotent repeat cancel".
 func (fs *FileStore) Delete(id string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -126,6 +133,9 @@ func (fs *FileStore) Delete(id string) error {
 	record, ok := fs.index[id]
 	if !ok {
 		return &StoreError{Code: "NOT_FOUND", Message: fmt.Sprintf("record %s not found", id)}
+	}
+	if record.Status == RecordStatusDeleted {
+		return nil // already deleted: repeating changes nothing
 	}
 
 	record.Status = RecordStatusDeleted
@@ -179,6 +189,22 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 		seen[id] = struct{}{}
 		unique = append(unique, id)
 	}
+
+	// Ids already deleted are already in the target state. Repeating the batch
+	// over them changes nothing, so they are dropped BEFORE anything is staged
+	// or journalled: a fully-repeated batch therefore performs no transaction at
+	// all (v32, matching Delete and MemStore).
+	pending := unique[:0]
+	for _, id := range unique {
+		if rec := fs.index[id]; rec != nil && rec.Status == RecordStatusDeleted {
+			continue
+		}
+		pending = append(pending, id)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	unique = pending
 
 	now := fs.now()
 	originals := make([]*Record, 0, len(unique))
@@ -515,8 +541,7 @@ func (fs *FileStore) List(filter Filter) ([]*Record, error) {
 		if !matchesFilter(r, filter) {
 			continue
 		}
-		cp := *r
-		results = append(results, &cp)
+		results = append(results, r.clone())
 	}
 
 	// Sort by CreatedAt ascending

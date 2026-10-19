@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/control"
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
@@ -876,5 +877,121 @@ func TestCriteriaIdentityIgnoresSpellingAndOrder(t *testing.T) {
 		if base.matches(parse(t, raw...)) {
 			t.Fatalf("%v must NOT share the base identity", raw)
 		}
+	}
+}
+
+// ---- external duplicate protection across a pause -------------------------
+//
+// An effect fingerprint is process-local: it stops the RUNTIME from re-running
+// the same mutation inside one process. It cannot help once the process is
+// gone, and it cannot help a remote system that never saw the fingerprint. The
+// mechanism that carries dedupe ACROSS a pause and across a restart is the
+// idempotency key, which the capability layer derives from the logical call id
+// (OPERATIONAL_RELIABILITY_CONTRACTS §7). So the logical call id must be the
+// execution identity — deterministic, and identical on every dispatch of the
+// same execution.
+
+// TestToolIdempotencyKeyIsTheExecutionIdentity pins that relationship. The loop
+// accepts a request whose CorrelationID is empty and falls back to TaskID for
+// its own identity; the dispatch must use that SAME resolved identity, or the
+// capability layer falls back to a timestamp and mints a fresh key per
+// dispatch — which is precisely the case where a remote system cannot dedupe.
+func TestToolIdempotencyKeyIsTheExecutionIdentity(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy())
+
+	// CorrelationID deliberately empty; TaskID is the execution's real identity.
+	req := func() *executor.WorkRequest {
+		return &executor.WorkRequest{
+			TaskID:     "wf-identity", // CorrelationID intentionally omitted
+			BusinessID: "biz-1", ActorID: "owner-1", Intent: "echo",
+			Input: map[string]string{"agent_objective": EncodeObjective(Objective{Description: "echo twice"})},
+		}
+	}
+	for i := 0; i < 2; i++ {
+		g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{governedToolCallAnswer, governedCompleteAnswer}}
+		out, _ := g.rt.Run(context.Background(), req(), nil)
+		if out.Status != "completed" {
+			t.Fatalf("run %d must complete: %s (%s)", i, out.Status, out.Error)
+		}
+	}
+	invs := g.adapter.invocations()
+	if len(invs) != 2 {
+		t.Fatalf("expected one dispatch per run, got %d", len(invs))
+	}
+	// The key must be the execution identity, so the same execution always
+	// presents the same dedupe token to a remote system.
+	if invs[0].IdempotencyKey != "wf-identity" {
+		t.Fatalf("the idempotency key must be the execution identity, got %q", invs[0].IdempotencyKey)
+	}
+	if invs[0].IdempotencyKey != invs[1].IdempotencyKey {
+		t.Fatalf("the same execution must present one stable idempotency key: %q then %q",
+			invs[0].IdempotencyKey, invs[1].IdempotencyKey)
+	}
+}
+
+// TestResumeReDispatchKeepsTheExecutionIdempotencyKey pins the same
+// relationship AT the approval boundary. The paused half and the resumed half
+// are separate runs of one execution, so the dispatch the resumed run makes
+// must carry the execution's identity — the token a remote system needs to
+// recognise it as the same logical call rather than a new one.
+func TestResumeReDispatchKeepsTheExecutionIdempotencyKey(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionToolCall, ""))
+	obj := Objective{Description: "echo something"}
+
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{governedToolCallAnswer}}
+	first, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if first.Status != "pending_approval" {
+		t.Fatalf("the first run must pause pending approval: %s (%s)", first.Status, first.Error)
+	}
+	if n := len(g.adapter.invocations()); n != 0 {
+		t.Fatalf("an approval-pending action must not be dispatched, got %d", n)
+	}
+	g.approver.approveAll()
+
+	g.rt.Decider = &obsAwareDecider{plan: goodPlan}
+	resumed, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if resumed.Status != "completed" {
+		t.Fatalf("the resumed run must complete: %s (%s)", resumed.Status, resumed.Error)
+	}
+	invs := g.adapter.invocations()
+	if len(invs) != 1 {
+		t.Fatalf("the approved action must dispatch exactly once, got %d", len(invs))
+	}
+	if invs[0].IdempotencyKey != "exec-1" {
+		t.Fatalf("a resumed dispatch must keep the execution's idempotency key, got %q", invs[0].IdempotencyKey)
+	}
+	if invs[0].CallID != "exec-1" {
+		t.Fatalf("a resumed dispatch must keep the execution's logical call id, got %q", invs[0].CallID)
+	}
+}
+
+// TestRestoredEffectIsNotCountedTwiceAcrossResume pins the upper bound as well
+// as the lower one. A resumed run must remember the effect that completed
+// before the pause, and must not re-register it when it restores: exactly one
+// completed effect, never two.
+func TestRestoredEffectIsNotCountedTwiceAcrossResume(t *testing.T) {
+	g := newGovernedFixture(t, seededAllowPolicy(), approvalPolicy(control.ActionToolCall, ""))
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{durableWriteAnswer, governedToolCallAnswer}}
+	obj := Objective{Description: "store then echo",
+		SuccessCriteria: []string{"effects_completed>=1", "effects_completed<=1"}}
+
+	first, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	if first.Status != "pending_approval" {
+		t.Fatalf("the first run must pause pending approval: %s (%s)", first.Status, first.Error)
+	}
+	g.approver.approveAll()
+
+	g.rt.Decider = &obsAwareDecider{plan: goodPlan}
+	resumed, _ := g.rt.Run(context.Background(), workRequest(t, obj, ""), nil)
+	// effects_completed<=1 can only hold if the restored fingerprint is counted
+	// exactly once: a double count would reject this completion.
+	if resumed.Status != "completed" {
+		t.Fatalf("a restored effect must be counted exactly once: %s (%s)", resumed.Status, resumed.Error)
+	}
+	res, _ := g.rt.Memory.Query(
+		memory.Identity{ActorID: "owner-1", BusinessID: "biz-1", AgentID: "governed-agent"},
+		memory.Query{BusinessID: "biz-1"})
+	if len(res.Records) != 1 {
+		t.Fatalf("the durable write must exist exactly once across the resume, got %d", len(res.Records))
 	}
 }

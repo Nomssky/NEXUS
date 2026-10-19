@@ -14,6 +14,7 @@ package execjournal
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -85,6 +86,45 @@ type RecoveryMeta struct {
 	Reason      string    `json:"reason,omitempty"`
 }
 
+// Approval outcomes recorded in an execution's durable approval history. They
+// are facts ABOUT the approval, kept separate from the execution's own terminal
+// outcome so the two can never be conflated.
+const (
+	ApprovalRequested = "requested" // the execution parked on an approval gate
+	ApprovalGranted   = "granted"   // an approver authorized the gated action
+	ApprovalDenied    = "denied"    // an approver refused it
+)
+
+// Coarse error classes the journal itself recognises. They are stored as the
+// record's error_class so the durable verdict stays machine-readable; they are
+// never a raw message.
+const (
+	// ApprovalRequiredClass marks the provisional pause written when an
+	// execution parks on an approval gate.
+	ApprovalRequiredClass = "APPROVAL_REQUIRED"
+	// ApprovalDeniedClass marks the terminal verdict of a denied approval.
+	ApprovalDeniedClass = "POLICY_DENIED"
+)
+
+// ErrNotFound reports that an operation named a durable record that does not
+// exist. Callers match with errors.Is.
+var ErrNotFound = errors.New("execjournal: execution not found")
+
+// validApprovalOutcomes is the closed vocabulary for durable approval history.
+var validApprovalOutcomes = map[string]struct{}{
+	ApprovalRequested: {}, ApprovalGranted: {}, ApprovalDenied: {},
+}
+
+// ApprovalDecision is one durable, ordered approval fact for an execution. It
+// is append-only and independent of the execution's terminal state, so the
+// history survives the terminal outcome and is readable after it.
+type ApprovalDecision struct {
+	ApprovalID string    `json:"approval_id"`
+	Outcome    string    `json:"outcome"`
+	DecidedBy  string    `json:"decided_by,omitempty"`
+	DecidedAt  time.Time `json:"decided_at"`
+}
+
 // ExecutionRecord is the durable per-execution evidence.
 type ExecutionRecord struct {
 	Version    int           `json:"version"`
@@ -97,6 +137,10 @@ type ExecutionRecord struct {
 	CreatedAt  time.Time     `json:"created_at"`
 	UpdatedAt  time.Time     `json:"updated_at"`
 	Recovery   *RecoveryMeta `json:"recovery,omitempty"`
+	// Approvals is the durable approval history, appended in decision order. It
+	// is additive and optional: a record written before this field existed
+	// decodes with no history, and nothing is ever fabricated to fill it.
+	Approvals []ApprovalDecision `json:"approvals,omitempty"`
 }
 
 // InvocationRecord is the durable dispatch-intent/outcome evidence for one
@@ -144,14 +188,41 @@ func New(st store.Store, now func() time.Time) *Journal {
 	return &Journal{st: st, now: now}
 }
 
+// ErrAlreadyRecorded reports an execution id that already carries settled
+// durable evidence: a terminal state, or recovery's unknown verdict. Callers
+// match with errors.Is.
+var ErrAlreadyRecorded = errors.New("execjournal: execution already recorded")
+
 // Accepted durably records a newly accepted execution. It MUST succeed before
 // the caller reports durable acceptance.
+//
+// Terminal is final in BOTH directions, mirroring Terminal(). A record that is
+// already terminal, or that recovery classified unknown, is settled evidence
+// and is never re-armed: rewriting it as accepted would erase the only durable
+// record distinguishing completed from failed from unknown, and would let an
+// execution that already finished — or whose side effect may already have
+// occurred — be admitted and run a second time. This is the same guarantee
+// Terminal() provides, and it is what EXECUTION_JOURNAL_RETENTION_CONTRACTS
+// §"Journal disjointness" relies on when it states that a concurrent write to
+// an eligible terminal record cannot occur.
+//
+// The guard is durable, not process-local, on purpose: core's duplicate
+// detection reads the in-memory results and inflight maps, which a restart
+// empties, and the execution id originates from the caller's X-Correlation-ID.
+// Without this check the durable record would be re-armed across the boundary.
 func (j *Journal) Accepted(id, businessID, divisionID, actorID string) error {
 	if j == nil {
 		return nil
 	}
 	if id == "" {
 		return fmt.Errorf("execjournal: execution id required")
+	}
+	existing, ok, err := j.getExecution(id)
+	if err != nil {
+		return err
+	}
+	if ok && (existing.State.Terminal() || existing.State == StateUnknown) {
+		return fmt.Errorf("%w: %s is %s", ErrAlreadyRecorded, id, existing.State)
 	}
 	now := j.now().UTC()
 	rec := ExecutionRecord{
@@ -184,6 +255,80 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 	}
 	if existing.State.Terminal() {
 		return nil // already terminal; terminal is final
+	}
+	existing.State = state
+	existing.ErrorClass = errClass // coarse class only; never a raw message
+	existing.UpdatedAt = j.now().UTC()
+	return j.putExecution(existing)
+}
+
+// ErrNotApprovalPause reports that an execution carries no provisional approval
+// pause to supersede. It is a normal, expected outcome on the ordinary terminal
+// path, not a failure: callers fall back to Terminal.
+var ErrNotApprovalPause = errors.New("execjournal: execution carries no approval pause")
+
+// RecordApproval durably appends one approval fact to an execution's history.
+// History is append-only and survives every later state change, including the
+// final terminal outcome, so an approval remains auditable after the execution
+// that requested it has finished. It is associated with the execution by id and
+// ordered by decision time.
+func (j *Journal) RecordApproval(id, approvalID, outcome, decidedBy string) error {
+	if j == nil {
+		return nil
+	}
+	if id == "" {
+		return fmt.Errorf("execjournal: execution id required")
+	}
+	if _, ok := validApprovalOutcomes[outcome]; !ok {
+		return fmt.Errorf("execjournal: invalid approval outcome %q", outcome)
+	}
+	existing, ok, err := j.getExecution(id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// Approval history is evidence about a known execution. Never invent a
+		// record for an execution that was never durably accepted.
+		return fmt.Errorf("%w: %s has no durable record", ErrNotFound, id)
+	}
+	existing.Approvals = append(existing.Approvals, ApprovalDecision{
+		ApprovalID: approvalID, Outcome: outcome, DecidedBy: decidedBy, DecidedAt: j.now().UTC(),
+	})
+	existing.UpdatedAt = j.now().UTC()
+	return j.putExecution(existing)
+}
+
+// SupersedeApprovedPause replaces a provisional approval pause with the real
+// terminal outcome of the resumed execution. It is the one, and only, way a
+// terminal execution record ever changes, and it is deliberately narrow:
+//
+//   - the record must be exactly failed + APPROVAL_REQUIRED (the pause the
+//     engine writes when it parks on an approval gate);
+//   - it must carry no recovery metadata, so a record recovery has already
+//     classified can never be resurrected;
+//   - it moves only to another terminal state, never to a nonterminal or
+//     unknown one.
+//
+// Terminal() keeps first-wins semantics and is otherwise untouched, so every
+// ordinary terminal write is still final. ErrNotApprovalPause is returned when
+// there is simply no pause to supersede; the caller then uses Terminal().
+func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string) error {
+	if j == nil {
+		return nil
+	}
+	if id == "" {
+		return fmt.Errorf("execjournal: execution id required")
+	}
+	if !state.Terminal() {
+		return fmt.Errorf("execjournal: %q is not a terminal state", state)
+	}
+	existing, ok, err := j.getExecution(id)
+	if err != nil {
+		return err
+	}
+	if !ok || existing.State != StateFailed || existing.ErrorClass != ApprovalRequiredClass ||
+		(existing.Recovery != nil && existing.Recovery.Recovered) {
+		return fmt.Errorf("%w: %s", ErrNotApprovalPause, id)
 	}
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
@@ -398,9 +543,22 @@ func (j *Journal) putInvocation(rec InvocationRecord) error {
 	return j.st.Put(sr)
 }
 
+// getExecution reads one durable execution record.
+//
+// A backend signals absence in one of two ways: FileStore follows the Store
+// contract ("returns nil if not found") and yields (nil, nil), while MemStore
+// yields (nil, store.ErrNotFound). Both mean exactly the same thing — there is
+// no record — and neither is a failure, so absence is normalized to ok=false
+// with a nil error here. Normalizing at this single internal boundary keeps
+// every journal operation backend-independent without changing either store's
+// public semantics, and it keeps the ok flag meaningful. A genuine I/O or
+// corruption failure still propagates and is never mistaken for absence.
 func (j *Journal) getExecution(id string) (ExecutionRecord, bool, error) {
 	r, err := j.st.Get(execKey(id))
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ExecutionRecord{}, false, nil
+		}
 		return ExecutionRecord{}, false, err
 	}
 	if r == nil || r.Type != recordTypeExecution {
@@ -413,9 +571,14 @@ func (j *Journal) getExecution(id string) (ExecutionRecord, bool, error) {
 	return er, true, nil
 }
 
+// getInvocation reads one durable invocation record, with the same absence
+// normalization as getExecution.
 func (j *Journal) getInvocation(id string) (InvocationRecord, bool, error) {
 	r, err := j.st.Get(invKey(id))
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return InvocationRecord{}, false, nil
+		}
 		return InvocationRecord{}, false, err
 	}
 	if r == nil || r.Type != recordTypeInvocation {
@@ -426,6 +589,36 @@ func (j *Journal) getInvocation(id string) (InvocationRecord, bool, error) {
 		return InvocationRecord{}, false, err
 	}
 	return iv, true, nil
+}
+
+// validateApprovals checks a durable approval history at decode time.
+//
+// Only the OUTCOME is validated: it is the one field with an established closed
+// vocabulary, already enforced on every write by RecordApproval. Validating it
+// on read therefore makes a reader agree with what the write path guarantees,
+// and mirrors exactly how unmarshalExecution validates the execution STATE.
+//
+// Deliberately NOT validated:
+//
+//   - ApprovalID — may legitimately be empty. When createApproval fails the
+//     engine surfaces APPROVAL_REQUIRED without an approval_id (graceful
+//     degradation), so a real pause entry can carry no id.
+//   - DecidedBy — omitempty, and a pause entry is recorded with no decider.
+//
+// An unknown outcome fails closed for the same reason an unknown state does:
+// SchemaVersion is the documented forward-compatibility mechanism, so a version
+// that extends this vocabulary must bump it, and a record of another version
+// already fails closed. Within one version the vocabulary is closed, and
+// returning the surrounding valid entries as though the record were intact
+// would be a silently partial history.
+func validateApprovals(rec ExecutionRecord) error {
+	for i, a := range rec.Approvals {
+		if _, ok := validApprovalOutcomes[a.Outcome]; !ok {
+			return fmt.Errorf("execjournal: execution record %s has invalid approval outcome %q at index %d",
+				rec.ID, a.Outcome, i)
+		}
+	}
+	return nil
 }
 
 func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
@@ -441,6 +634,9 @@ func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
 	}
 	if _, ok := validStates[er.State]; !ok {
 		return er, fmt.Errorf("execjournal: execution record %s has invalid state %q", er.ID, er.State)
+	}
+	if err := validateApprovals(er); err != nil {
+		return er, err
 	}
 	return er, nil
 }

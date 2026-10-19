@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -139,10 +140,23 @@ func TestMemStoreDelete(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	// Should not be found after delete
-	_, err = s.Get("rec-1")
-	if err != ErrNotFound {
-		t.Errorf("expected ErrNotFound after delete, got %v", err)
+	// A soft delete marks the record; it does not remove it. Get therefore
+	// still returns it, carrying status deleted. Visibility narrowing to live
+	// records is List's job (v30 soft-delete contract). Asserting the status is
+	// stricter than asserting an error: it proves the record survived as a
+	// tombstone rather than silently vanishing.
+	rec, err := s.Get("rec-1")
+	if err != nil {
+		t.Fatalf("a soft-deleted record must still be readable: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("a soft-deleted record must not vanish")
+	}
+	if rec.Status != RecordStatusDeleted {
+		t.Errorf("expected status %q after delete, got %q", RecordStatusDeleted, rec.Status)
+	}
+	if rec.ID != "rec-1" {
+		t.Errorf("the tombstone must keep its identity, got %q", rec.ID)
 	}
 }
 
@@ -288,8 +302,15 @@ func TestMemStoreDeleteBatchIsAllOrNothing(t *testing.T) {
 		t.Fatalf("delete batch: %v", err)
 	}
 	for _, id := range []string{"r1", "r2"} {
-		if rec, err := s.Get(id); err == nil && rec != nil {
-			t.Errorf("%s must be deleted", id)
+		// "Deleted" means marked, not removed: the record is still there and
+		// carries status deleted (v30 contract).
+		rec, err := s.Get(id)
+		if err != nil || rec == nil {
+			t.Errorf("%s must survive as a tombstone: %v", id, err)
+			continue
+		}
+		if rec.Status != RecordStatusDeleted {
+			t.Errorf("%s must be marked deleted, got status %q", id, rec.Status)
 		}
 	}
 	if rec, err := s.Get("r3"); err != nil || rec == nil {
@@ -307,11 +328,102 @@ func TestMemStoreDeleteBatchIsAllOrNothing(t *testing.T) {
 	if err := s.DeleteBatch([]string{"r3", "r3"}); err != nil {
 		t.Errorf("duplicate ids in a batch: %v", err)
 	}
-	if rec, err := s.Get("r3"); err == nil && rec != nil {
-		t.Error("r3 must be deleted")
+	if rec, err := s.Get("r3"); err != nil || rec == nil || rec.Status != RecordStatusDeleted {
+		t.Errorf("r3 must be marked deleted: %v", err)
 	}
 	// An empty batch is a no-op, not an error.
 	if err := s.DeleteBatch(nil); err != nil {
 		t.Errorf("empty batch: %v", err)
 	}
+}
+
+// ---- v28: documented backend semantics for Get ---------------------------
+//
+// The Store interface documents "Get retrieves a record by ID. Returns nil if
+// not found". FileStore honors that. MemStore signals absence with ErrNotFound
+// instead, and additionally hides soft-deleted records while FileStore returns
+// them. These are pinned here so the difference is documented rather than
+// implicit, and so it cannot drift unnoticed.
+//
+// v28 normalized the absence signal at the execution journal's internal
+// boundary (getExecution/getInvocation), which makes every journal operation
+// backend-independent without changing either store. Aligning MemStore with
+// the interface is deliberately NOT done here: it would also force a decision
+// on the undocumented soft-deleted case, which is a separate contract choice.
+
+func TestBackendGetSemanticsArePinned(t *testing.T) {
+	newBackends := func(t *testing.T) map[string]Store {
+		t.Helper()
+		fs, err := NewFileStore(t.TempDir())
+		if err != nil {
+			t.Fatalf("open filestore: %v", err)
+		}
+		return map[string]Store{"MemStore": NewMemStore(), "FileStore": fs}
+	}
+
+	for name, st := range newBackends(t) {
+		t.Run(name+"/missing", func(t *testing.T) {
+			rec, err := st.Get("absent")
+			if rec != nil {
+				t.Fatalf("a missing record must never be returned: %+v", rec)
+			}
+			// Absence must stay DISTINCT from a genuine failure: the only error
+			// either backend may report here is the not-found signal, never an
+			// I/O or corruption error.
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				t.Fatalf("absence must not be reported as a failure: %v", err)
+			}
+		})
+	}
+
+	for name, st := range newBackends(t) {
+		t.Run(name+"/existing", func(t *testing.T) {
+			if err := st.Put(&Record{ID: "k", Type: RecordTypeMemory, Status: RecordStatusActive}); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			rec, err := st.Get("k")
+			if err != nil || rec == nil || rec.ID != "k" {
+				t.Fatalf("an existing record must be returned: rec=%v err=%v", rec, err)
+			}
+		})
+	}
+
+	// Soft-deleted visibility is now AGREED (v30): the record still exists, so
+	// Get returns it with status deleted on BOTH backends, and only List's
+	// default filter narrows it away. This pins that agreement so the two
+	// backends cannot drift apart again.
+	t.Run("soft-deleted is returned by Get on both backends", func(t *testing.T) {
+		ms := NewMemStore()
+		fs, err := NewFileStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range []Store{ms, fs} {
+			if err := st.Put(&Record{ID: "d", Type: RecordTypeMemory, Status: RecordStatusActive}); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Delete("d"); err != nil {
+				t.Fatal(err)
+			}
+			rec, err := st.Get("d")
+			if err != nil || rec == nil || rec.Status != RecordStatusDeleted {
+				t.Fatalf("a soft-deleted record must be returned as a tombstone: rec=%v err=%v", rec, err)
+			}
+			// And List is where the narrowing happens.
+			live, err := st.List(Filter{Type: RecordTypeMemory})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(live) != 0 {
+				t.Fatalf("the default list must hide deleted records, got %v", ids(live))
+			}
+			deleted, err := st.List(Filter{Type: RecordTypeMemory, Status: RecordStatusDeleted})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(deleted) != 1 {
+				t.Fatalf("an explicit deleted filter must return it, got %v", ids(deleted))
+			}
+		}
+	})
 }

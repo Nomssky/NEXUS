@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,8 +17,10 @@ import (
 )
 
 type recoveryFixture struct {
-	srv    *Server
-	engine *core.Engine
+	srv      *Server
+	engine   *core.Engine
+	storeDir string      // so tests can reopen the real store (restart durability)
+	store    store.Store // the SAME store the engine's journal reads through
 }
 
 const (
@@ -44,7 +45,8 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 	auth.SetRegistry(reg)
 	members := identity.NewMembershipSet()
 
-	st, err := store.NewFileStore(filepath.Join(t.TempDir()))
+	storeDir := t.TempDir()
+	st, err := store.NewFileStore(storeDir)
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -96,7 +98,7 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 	srv := NewServer(engine, ":0",
 		WithRegistry(reg), WithIdentity(auth, members),
 		WithRequireAuthentication(true), WithEnforceBusinessScope(true))
-	return &recoveryFixture{srv: srv, engine: engine}
+	return &recoveryFixture{srv: srv, engine: engine, storeDir: storeDir, store: st}
 }
 
 func (f *recoveryFixture) get(t *testing.T, path string, headers map[string]string) *httptest.ResponseRecorder {

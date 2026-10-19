@@ -53,6 +53,25 @@ A durable **execution** record is *eligible* for removal only if **all** hold:
 1. **Terminal:** `state ∈ {completed, failed, cancelled, timed_out}`. A
    nonterminal state (`accepted`, `running`, `pending_approval`) is never
    eligible. `unknown` is never eligible (it is not terminal).
+
+   > **v27 (ratified) — the approval pause is deliberately terminal.** An
+   > execution awaiting approval is journaled `failed` with
+   > `error_class = APPROVAL_REQUIRED`, and is treated here as a **provisional
+   > terminal**. That is what makes an abandoned approval reclaimable without a
+   > new expiry knob: it ages on the ordinary `UpdatedAt` basis and becomes
+   > eligible after `MinAge` like any other terminal record.
+   >
+   > The alternative — a nonterminal `pending_approval` — was rejected because
+   > rule 1 would make every abandoned approval permanently ineligible, and
+   > carving out an exception for `pending_approval` alone would be
+   > inconsistent (an equally-abandoned `accepted` record stays ineligible) and
+   > would change eligibility for a state nothing currently writes.
+   > `pending_approval` therefore remains **reserved and unreachable**; see the
+   > read contract §4.
+   >
+   > Provisional does not mean weak: the pause is a full terminal for
+   > eligibility, for crash recovery and for the §4 disjointness argument. It is
+   > supersedable exactly once, in-process only — see the recovery contract §2.
 2. **Old enough:** `now - UpdatedAt >= MinAge`, where `UpdatedAt` is the
    record's last durable transition time and `now` is the operation's clock.
    The boundary is inclusive: a record exactly `MinAge` old is eligible.
@@ -113,6 +132,13 @@ mechanism). Its observable states:
   `dispatched` invocations; retention removes only terminal executions and
   terminal-known invocations. The two sets are disjoint, so retention and
   recovery never touch the same record.
+  > **v27 (ratified).** The in-process approval supersede is a third writer.
+  > It writes only to a record that is *already terminal*
+  > (`failed` + `APPROVAL_REQUIRED`), so it is disjoint from recovery in the
+  > same way, and it is disjoint from retention by the offline precondition
+  > below: a supersede requires a live process holding a live approval, and
+  > retention requires a quiesced store. The two preconditions are mutually
+  > exclusive, so no supersede can be in flight during a retention run.
 - **New records are never lost.** Eligibility is decided from durable state;
   a record written after (or concurrently with) the decision has a new id and
   is not in the removal set. A concurrent write to an eligible record cannot
@@ -128,7 +154,20 @@ mechanism). Its observable states:
 
 - `unknown` recovery semantics are preserved: retention never converts a state
   and never redispacts an uncertain effect.
-- Terminal-is-final is preserved.
+- Terminal-is-final is preserved apart from the one ratified narrowing: the
+  in-process supersede of an approval pause (recovery contract §2), scoped to a
+  record that is already terminal, never moving it to a nonterminal or
+  `unknown` state, and refused once recovery has classified it.
+- Approval history lives on the execution record itself, so it is retained and
+  reclaimed with that record: a retained execution keeps its approval history,
+  and removing the execution removes both together. No separate record class,
+  scan or eligibility rule is introduced.
+- Existing durable records need no migration. A record already written as
+  `failed` + `APPROVAL_REQUIRED` is interpreted identically before and after
+  this change: it is eligible for removal after `MinAge` either way. A supersede
+  can only be triggered by a live approval held by the live process, which a
+  pre-upgrade record cannot have, so an existing record is never rewritten by an
+  unrelated run. `SchemaVersion` stays `1`.
 - The v10 recovery pass and the v11 read API keep their response contracts; the
   read API's statuses, authorization, bounds and allow-listed fields are
   unchanged.

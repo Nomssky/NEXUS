@@ -80,6 +80,108 @@ Terminal transitions are final. A terminal record is never moved back to a
 runnable state by recovery. There is no automatic continuation in this
 milestone.
 
+> **v27 (ratified) — provisional approval pause, its one-shot supersede, and
+> durable approval history.** Read together with §3 row 7 and the retention
+> contract §2.
+>
+> Today the engine records an approval pause as terminal `failed` with
+> `error_class = APPROVAL_REQUIRED`, and the durable record never changes
+> afterwards — even when the approval is granted and the resumed execution
+> completes successfully in-process. The in-process result and the durable
+> record then permanently disagree.
+>
+> That pause is a **provisional terminal**: terminal for
+> retention and for crash semantics, but supersedable exactly once, only by the
+> same live process that holds the approval, and only to a real terminal state.
+>
+> - **The pause is provisional only while `error_class = APPROVAL_REQUIRED` and
+>   no recovery metadata is present.** Any other terminal is final as today.
+> - **Supersede is one-shot and in-process.** A distinct journal entry point
+>   (not `Terminal`) performs it, gated on exactly `state = failed` **and**
+>   `error_class = APPROVAL_REQUIRED`. Every other starting state is refused.
+>   It never moves a record to a nonterminal or `unknown` state.
+> - **Crash behaviour is unchanged.** A restart during a pause leaves the
+>   provisional terminal untouched, because approvals are process-local and the
+>   approval can no longer be granted — so "failed, awaiting approval" remains
+>   the truthful durable verdict. This is already the documented §3 row 7
+>   behavior and needs no recovery change.
+> - **Recovery is unaffected.** Recovery never rewrites a terminal record, and a
+>   provisional pause is terminal, so the supersede can never be resurrected by
+>   a later startup.
+>
+> - **Approval history is durable and separate from the outcome.** Each approval
+>   fact — requested, granted, denied — is appended to the execution record's
+>   `approvals` history with its approval id, decider and time. History is
+>   append-only, is never rewritten by recovery, and survives the execution's
+>   final terminal state. It is independent of `state` and of `error_class`, so
+>   neither is overloaded to carry it.
+>
+> "Terminal is final" is therefore narrowed from an absolute to a scoped rule,
+> in exchange for a durable record that states the true outcome. This is the
+> ratified trade-off.
+
+### State-transition table (v27, ratified)
+
+| From | Event | To | Writer | History appended | Notes |
+|---|---|---|---|---|---|
+| *(absent)* | `SubmitRequest` accepted | `accepted` | `Accepted` | — | durable acceptance precedes the 202 |
+| `accepted` | run terminates | `completed` / `failed` / `cancelled` | `Terminal` | — | first terminal wins, unchanged |
+| `accepted` | approval gate reached | `failed` + `APPROVAL_REQUIRED` | `Terminal` | `requested` | **provisional** pause |
+| `failed` + `APPROVAL_REQUIRED`, no recovery meta | approval granted | *unchanged* | `RecordApproval` | `granted` | recorded at grant time, before the resumed run ends |
+| `failed` + `APPROVAL_REQUIRED`, no recovery meta | resumed run terminates | `completed` / `failed` / `cancelled` | `SupersedeApprovedPause` | — | once only; the truthful outcome replaces the pause |
+| `failed` + `APPROVAL_REQUIRED` | approval **denied** | `failed` + `POLICY_DENIED` | `RecordApproval` + `SupersedeApprovedPause` | `denied` | no resume; the denial is durable and distinguishable from a pending pause |
+| `failed` + `APPROVAL_REQUIRED` | process exits; approval abandoned | *unchanged* | — | `requested` only | still terminal, ages on `UpdatedAt`, eligible after `MinAge`, **not** resumable |
+| any nonterminal | startup recovery | `unknown` | `Recover` | — | unchanged; never re-driven |
+| any terminal | startup recovery | *unchanged* | — | — | unchanged; history is never rewritten |
+| any terminal / `unknown` | re-submitting the same execution id | *unchanged*, refused | `Accepted` | — | already shipped in v25 |
+
+Every transition not in this table is refused. In particular `accepted` is
+never written back over a terminal, `unknown` is never rewritten, a supersede
+never produces a nonterminal state, and history is never fabricated for an
+execution that was not durably accepted.
+
+### Duplicate-submission behaviour (v27, ratified)
+
+Submitting an execution id that already carries a terminal or `unknown` durable
+record is refused at durable acceptance; the record is left untouched and the
+execution does not run. This is already implemented (v25) and is unchanged here.
+It is restated because the supersede relies on the same rule: a pause record is
+terminal, so its id cannot be re-admitted as fresh work.
+
+### Acceptance criteria (v27, ratified)
+
+1. An approval pause is journaled `failed` + `APPROVAL_REQUIRED` and is
+   immediately readable as such.
+2. After a grant, a completed execution reads `completed` durably — the
+   in-process result and the durable record agree.
+3. `Terminal()` keeps first-wins semantics unchanged; a second ordinary terminal
+   write is still a no-op.
+4. A supersede is refused unless the record is exactly `failed` +
+   `APPROVAL_REQUIRED` with no recovery metadata; every other starting state is
+   refused without mutating the record.
+5. A supersede never yields a nonterminal or `unknown` state, and never moves a
+   record that recovery has already classified.
+6. After a restart with a pending approval, the record is unchanged, the
+   approval is gone, and the execution is not resumable.
+7. An abandoned approval becomes retention-eligible on the ordinary `MinAge`
+   basis; no new policy knob is introduced.
+8. Every pre-existing test keeps passing **without changing its expectation** —
+   in particular `TestTerminalIsMonotonic`, `TestTerminalRejectsNonTerminalState`
+   and the retention suite.
+
+### Regression scenarios (v27, ratified)
+
+Pause then grant then complete → durable `completed`; pause then deny → durable
+`failed` with the denial class, distinguishable from a still-pending pause;
+pause then cancel → durable `cancelled`;
+supersede twice → second refused, record unchanged; supersede from `completed`,
+`cancelled`, `timed_out`, `unknown` or `accepted` → refused; supersede after
+recovery has classified the record → refused; restart during a pause → record
+unchanged and not resumable; abandoned approval past `MinAge` → retention
+eligible and removed; abandoned approval before `MinAge` → retained; a completed
+id re-submitted → refused at acceptance and the record unchanged; the full
+existing journal, recovery, retention, gateway and E2E suites unchanged.
+
 ## 3. Crash windows (contract §C)
 
 | # | Crash point | Recovered state | May the effect be dispatched again? |

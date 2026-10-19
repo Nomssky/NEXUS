@@ -50,6 +50,7 @@ truth, no duplicated state).
 | `recovery.recovered` | whether the recovery pass classified this record |
 | `recovery.prior_state` | state before recovery (when recovered) |
 | `recovery.recovered_at` | when recovery classified it |
+| `approvals` | durable approval history for this execution (v34) |
 
 **Internal / never exposed:** `actor_id` (identity reference),
 `recovery.reason` (free text), the store key, and the raw durable bytes.
@@ -71,6 +72,46 @@ args/results, credentials and chain-of-thought are never persisted or exposed.
   not collapsed into `failed`).
 - `error_class` distinguishes a known failure reason where available; an absent
   `error_class` is not a claim of success.
+
+> **v27 (ratified) — reserved states, and how an approval pause is
+> presented.** `running` and `pending_approval` are part of the durable
+> vocabulary but are **reserved: no current code path writes them.** This was
+> previously ambiguous — the retention contract §2 listed `pending_approval` as
+> a nonterminal retention class while the recovery contract §2/§3 never
+> produced it. Both stay reserved rather than introducing one.
+>
+> An execution awaiting approval is presented as `state = failed` with
+> `error_class = APPROVAL_REQUIRED`. A reader must treat that pair as "waiting
+> for approval", not as an ordinary failure — and must recognise that a later
+> grant, if it happens in the same process, changes `state` to the real terminal
+> outcome (recovery contract §2).
+>
+> No field is added, removed or renamed. The `state` and `error_class`
+> projections are unchanged; only which values can occur is clarified.
+>
+> **Approval history (v34) IS now exposed, additively.** The journal record
+> carries an `approvals` history (requested / granted / denied with the approval
+> id and time) that survives the final outcome. It is projected onto this
+> response as an ordered array and is **omitted entirely** when the execution
+> never passed an approval gate, so every pre-existing response is unchanged.
+>
+> The history is a field **on the very `ExecutionRecord` this endpoint already
+> gates**, so exposing it reuses the existing boundary unchanged — business
+> membership, exact business match, and division scope — and cannot widen who
+> may see an execution. There is no new endpoint and no new authority source.
+>
+> Each entry is only what was recorded: append order is preserved and nothing is
+> synthesized. A superseded pause still appears as its recorded `requested`
+> entry, and the execution's own `state` carries the outcome — so a historical
+> decision is never presented as a currently effective one.
+>
+> **The decider is NOT exposed, and that is an open decision.** `decided_by` is
+> omitted because this contract excludes identity references, and because the
+> live approval surface (`GET /api/v1/approvals`) gates approver identity behind
+> **business-wide** membership — a strictly higher bar than this
+> division-scoped read. Projecting the decider here would expose decided-approval
+> identities at a weaker scope than the surface that already exposes them.
+> Whether to add it (and at what scope) requires an explicit decision.
 
 ## 5. Read API
 

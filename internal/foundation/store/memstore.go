@@ -54,8 +54,14 @@ func (s *MemStore) Put(record *Record) error {
 			return ErrConflict
 		}
 		record.Version++
+		// created_at is set once, by the store, at creation; an update may never
+		// rewrite it (AGENT_MEMORY_CONTEXT §9, "preserving created_at"). This
+		// also covers recreation over a tombstone: the id keeps one identity, so
+		// it keeps one creation time. Matching FileStore here is what makes both
+		// backends agree on the Create -> Delete -> Recreate lifecycle.
+		record.CreatedAt = existing.CreatedAt
 		record.UpdatedAt = now
-		s.records[record.ID] = record
+		s.records[record.ID] = record.clone()
 		return nil
 	}
 
@@ -66,23 +72,37 @@ func (s *MemStore) Put(record *Record) error {
 	if record.Status == "" {
 		record.Status = RecordStatusActive
 	}
-	s.records[record.ID] = record
+	s.records[record.ID] = record.clone()
 	return nil
 }
 
 // Get retrieves a record by ID.
+//
+// A soft-deleted record still exists and is returned with its status, matching
+// FileStore and the Store contract: absence means "no such record", not
+// "deleted". Narrowing visibility to live records is List's job, via the
+// deleted-status filter.
 func (s *MemStore) Get(id string) (*Record, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	record, exists := s.records[id]
-	if !exists || record.Status == RecordStatusDeleted {
+	if !exists {
 		return nil, ErrNotFound
 	}
-	return record, nil
+	return record.clone(), nil
 }
 
 // Delete removes a record by ID (soft delete).
+//
+// A soft delete mutates the record, so it is an update and increments the
+// version, matching FileStore and SCHEMA_COMMON §3.9 ("increments on each
+// update"). Without that increment a writer holding the pre-delete version
+// could still match it and silently resurrect the record.
+//
+// Deleting an ALREADY-deleted record is a no-op: it is not a further update, so
+// it advances neither Version nor updated_at. That makes a retried delete safe
+// and matches FileStore (v32).
 func (s *MemStore) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -91,9 +111,13 @@ func (s *MemStore) Delete(id string) error {
 	if !exists {
 		return ErrNotFound
 	}
+	if record.Status == RecordStatusDeleted {
+		return nil // already deleted: repeating changes nothing
+	}
 
 	record.Status = RecordStatusDeleted
 	record.UpdatedAt = s.now()
+	record.Version++
 	return nil
 }
 
@@ -120,14 +144,28 @@ func (s *MemStore) DeleteBatch(ids []string) error {
 		seen[id] = struct{}{}
 	}
 
-	now := s.now()
+	// Ids that are already deleted are already in the target state: repeating
+	// the batch over them changes nothing, so they are skipped rather than
+	// counted as a further update (v32, matching Delete).
+	targets := make([]string, 0, len(seen))
 	for id := range seen {
-		record := s.records[id]
-		if record == nil {
+		if rec := s.records[id]; rec == nil || rec.Status == RecordStatusDeleted {
 			continue
 		}
+		targets = append(targets, id)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+
+	now := s.now()
+	for _, id := range targets {
+		record := s.records[id]
 		record.Status = RecordStatusDeleted
 		record.UpdatedAt = now
+		// Same rule as Delete: a batch soft delete is an update, so it
+		// increments the version exactly as FileStore's DeleteBatch does.
+		record.Version++
 	}
 	return nil
 }
@@ -173,7 +211,7 @@ func (s *MemStore) List(filter Filter) ([]*Record, error) {
 		if !matchesFilter(record, filter) {
 			continue
 		}
-		result = append(result, record)
+		result = append(result, record.clone())
 	}
 
 	// Apply pagination

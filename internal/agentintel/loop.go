@@ -791,9 +791,18 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		usage.ToolCalls++
 		obs := &Observation{ObservationID: newID("obs"), Source: "tool:" + a.Tool, ActionType: ActionToolCall,
 			Status: "ok", Timestamp: r.now()}
+		// The correlation carried into the tool scope is this execution's resolved
+		// identity, not the raw request field: the capability layer derives the
+		// logical call id — and therefore the mutation idempotency key — from it
+		// (OPERATIONAL_RELIABILITY_CONTRACTS §7). A request without a CorrelationID
+		// falls back to TaskID up here; passing the empty field instead would make
+		// the capability layer mint a timestamp, so every dispatch of the SAME
+		// execution would present a different dedupe token and a remote system
+		// could not recognise a replay. This is the same identity events, memory
+		// writes and delegation already carry.
 		out, err := r.Exec.InvokeToolScoped(ctx, agentexec.ToolScope{
 			ActorID: rn.req.ActorID, BusinessID: rn.businessID, DivisionID: rn.divisionID,
-			AgentTools: r.agentTools(agentID), CorrelationID: rn.req.CorrelationID,
+			AgentTools: r.agentTools(agentID), CorrelationID: rn.execID,
 		}, agentID, agentexec.ToolCallSpec{ToolID: a.Tool, Operation: a.Operation, Input: a.Input})
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
