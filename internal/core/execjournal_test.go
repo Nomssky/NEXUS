@@ -567,7 +567,23 @@ func TestApproveRequestGrantSuccessEnablesResume(t *testing.T) {
 	if approvalID == "" {
 		t.Fatal("expected an approval id")
 	}
-
+	// journalFinalize (Terminal + ApprovalRequested) runs after the result
+	// is stored; wait for it so ApproveRequest doesn't race it and skip the
+	// ApprovalRequested entry.
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rec, ok, _ := j.Get("exec-grant-success")
+		if ok && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for journal approval-requested entry")
+		case <-tick.C:
+		}
+	}
 	// The grant write succeeds: ApproveRequest returns nil and the execution resumes.
 	if err := e.ApproveRequest(approvalID, "biz-1", "approver-1", ""); err != nil {
 		t.Fatalf("ApproveRequest must succeed when the grant write succeeds: %v", err)
@@ -678,6 +694,23 @@ func TestRestartAfterPartialDenialPreservesHistory(t *testing.T) {
 	approvalID := approvalIDFrom(awaitResult(t, e2, "exec-deny-restart"))
 	if approvalID == "" {
 		t.Fatal("expected an approval id")
+	}
+	// journalFinalize (Terminal + ApprovalRequested) runs after the result
+	// is stored; wait for it so DenyRequest doesn't race it and skip the
+	// ApprovalRequested entry.
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(2 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		rec, ok, _ := j2.Get("exec-deny-restart")
+		if ok && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for journal approval-requested entry")
+		case <-tick.C:
+		}
 	}
 	if err := e2.DenyRequest(approvalID, "biz-1", "approver-1", ""); err == nil {
 		t.Fatal("DenyRequest must return an error when the supersede fails")
