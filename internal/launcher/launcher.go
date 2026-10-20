@@ -484,10 +484,10 @@ func (l *Launcher) Start(ctx context.Context) error {
 		<-gwErr
 		return fmt.Errorf("gateway start: startup timeout after %s", l.startupTimeout)
 	case <-ctx.Done():
-		// Cancellation during startup: wait for gateway goroutine cleanup,
-		// then abort owned components and report cancellation.
-		<-gwErr
-		// Use a fresh context — ctx is already cancelled.
+		// Cancellation during startup: abort owned components and report
+		// cancellation. Don't wait for gwErr — the gateway goroutine may be
+		// blocked in Serve and will only exit when Stop shuts it down, which
+		// abortStart triggers.
 		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		l.abortStart(abortCtx)

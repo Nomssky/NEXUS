@@ -66,9 +66,7 @@ export interface ExecutionStatus {
   };
   output?: string;
   duration_ms?: number;
-  /** created_at/completed_at are not on the backend intelligence response;
-   * they are only available from the durable recovery read. */
-  created_at?: string;
+  created_at: string;
   completed_at?: string;
 }
 
