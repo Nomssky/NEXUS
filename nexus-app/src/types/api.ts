@@ -1,0 +1,463 @@
+/**
+ * NEXUS API Types
+ * Based on the actual backend contracts and HTTP routes
+ */
+
+// Base types
+export interface Envelope {
+  code: string;
+  category: string;
+  message: string;
+  details?: Record<string, unknown>;
+  retryable: boolean;
+  correlation_id: string;
+  timestamp: string;
+}
+
+export type EnvelopeCategory =
+  | 'VALIDATION'
+  | 'AUTH'
+  | 'AUTHORIZATION'
+  | 'POLICY_DENIED'
+  | 'APPROVAL_REQUIRED'
+  | 'RESOURCE_UNAVAILABLE'
+  | 'TIMEOUT'
+  | 'DEPENDENCY_FAILURE'
+  | 'RATE_LIMIT'
+  | 'CONFLICT'
+  | 'UNKNOWN_OUTCOME'
+  | 'CANCELLATION'
+  | 'SECURITY_REJECTION'
+  | 'INTERNAL_FAILURE';
+
+// Authentication
+export interface AuthHeaders {
+  'X-Actor-ID': string;
+  'X-Actor-Credential': string;
+}
+
+export interface ControlHeaders {
+  'X-API-Key': string;
+}
+
+// Execution / Intelligence
+export interface SubmitIntelligenceRequest {
+  business_id: string;
+  actor_id: string;
+  objective: {
+    description: string;
+  };
+  /** Agent/execution context. Use agent_id to select a specific registered agent. */
+  context?: Record<string, string>;
+}
+
+export interface SubmitIntelligenceResponse {
+  execution_id: string;
+}
+
+export interface ExecutionStatus {
+  execution_id: string;
+  status: ExecutionStatusValue;
+  error?: {
+    code: string;
+    category: string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+  output?: string;
+  duration_ms?: number;
+  created_at: string;
+  completed_at?: string;
+}
+
+export type ExecutionStatusValue =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'unknown';
+
+export interface ExecutionTrace {
+  execution_id: string;
+  correlation_id: string;
+  business_id: string;
+  status: string;
+  durability: 'process_local';
+  capture: {
+    available: boolean;
+    entries: number;
+    dropped: number;
+    limit: number;
+    truncated: boolean;
+    first_seq: number;
+    last_seq: number;
+    terminal_seq?: number;
+    post_terminal?: number;
+    has_more?: boolean;
+  };
+  entries: TraceEntry[];
+}
+
+export interface TraceEntry {
+  seq: number;
+  event_id: string;
+  type: string;
+  source: string;
+  timestamp: string;
+  data?: Record<string, string>;
+  redacted_keys?: string[];
+  data_unparseable?: boolean;
+}
+
+export type TraceEventType =
+  | 'action.proposed'
+  | 'action.rejected'
+  | 'governance.decided'
+  | 'tool.invocation.started'
+  | 'tool.invocation.completed'
+  | 'tool.invocation.failed'
+  | 'tool.invocation.unknown'
+  | 'tool.invocation.rejected'
+  | 'tool.attempt.started'
+  | 'tool.attempt.completed'
+  | 'tool.retry.scheduled'
+  | 'tool.requested'
+  | 'observation.created'
+  | 'objective.started'
+  | 'objective.completed'
+  | 'chain.started'
+  | 'chain.completed'
+  | 'chain.failed'
+  | 'approval.requested'
+  | 'approval.approved'
+  | 'approval.denied'
+  | 'agent.delegated';
+
+// Alias for backward compatibility
+export type ExecutionTraceEntry = TraceEntry;
+
+// Agents
+export interface Agent {
+  entity_id: string;
+  name: string;
+  business_id: string;
+  capabilities: string[];
+  allowed_tools: string[];
+  status: 'active' | 'suspended' | 'archived';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateAgentRequest {
+  entity_id: string;
+  name: string;
+  business_id: string;
+  capabilities: string[];
+  allowed_tools: string[];
+}
+
+// Approvals
+export interface Approval {
+  entity_id: string;
+  status: 'PENDING' | 'APPROVED' | 'DENIED' | 'EXPIRED';
+  audit_ref: string; // the execution/request ID this approval is for
+  approver_type: string;
+  approver_id?: string;
+  created_at: string;
+  decided_at?: string;
+  decision_rationale?: string;
+}
+
+export interface ApproveRequest {
+  reason: string;
+}
+
+// Tools
+export interface Tool {
+  id: string;
+  name: string;
+  version: string;
+  category: string;
+  description: string;
+  side_effect_class: 'read' | 'write' | 'mutation';
+  operations: string[];
+}
+
+// Web Search (research capability)
+export interface WebSearchInput {
+  query: string;
+  limit?: number;
+}
+
+export interface WebSearchSource {
+  title: string;
+  url: string;
+  snippet: string;
+  source: string;
+  published_at?: string;
+}
+
+export interface WebSearchResult {
+  sources: string;  // Concatenated list of "1. Title | URL | Source | Snippet"
+  count: string;
+}
+
+export interface ParsedWebSearchSource {
+  index: number;
+  title: string;
+  url: string;
+  source: string;
+  snippet: string;
+}
+
+export function parseWebSearchResult(result: WebSearchResult): ParsedWebSearchSource[] {
+  if (!result.sources) return [];
+  return result.sources.split('\n')
+    .filter(line => line.trim())
+    .map((line, index) => {
+      const parts = line.split(' | ');
+      if (parts.length < 4) return null;
+      const titlePart = parts[0].trim();
+      const match = titlePart.match(/^(\d+)\.\s*(.+)$/);
+      const title = match ? match[2] : titlePart;
+      return {
+        index: index + 1,
+        title,
+        url: parts[1].trim(),
+        source: parts[2].trim(),
+        snippet: parts[3].trim(),
+      };
+    })
+    .filter((item): item is ParsedWebSearchSource => item !== null);
+}
+
+// Git (read-only, sandboxed)
+export type GitOperation = 'status' | 'diff' | 'log';
+
+export interface GitInput {
+  repo?: string;
+  path?: string;
+  limit?: number;
+}
+
+export interface GitResult {
+  output: string;
+  truncated: string;  // "true" or "false"
+  repo: string;
+}
+
+export interface ParsedGitStatus {
+  branch?: string;
+  staged: Array<{ status: string; path: string }>;
+  unstaged: Array<{ status: string; path: string }>;
+  untracked: string[];
+}
+
+export function parseGitStatus(output: string): ParsedGitStatus {
+  const lines = output.split('\n').filter(l => l.trim());
+  const result: ParsedGitStatus = {
+    staged: [],
+    unstaged: [],
+    untracked: [],
+  };
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      // Branch info: "## branch-name...origin/branch-name [ahead X, behind Y]"
+      result.branch = line.slice(3).trim();
+      continue;
+    }
+    if (line.length < 3) continue;
+    const status = line.slice(0, 2);
+    const path = line.slice(3);
+    if (status[0] !== ' ' && status[0] !== '?') {
+      // Staged change
+      result.staged.push({ status: status[0], path });
+    }
+    if (status[1] !== ' ' && status[1] !== '?') {
+      // Unstaged change
+      result.unstaged.push({ status: status[1], path });
+    }
+    if (status === '??') {
+      // Untracked
+      result.untracked.push(path);
+    }
+  }
+  return result;
+}
+
+export interface ParsedGitLogEntry {
+  hash: string;
+  author: string;
+  message: string;
+}
+
+export function parseGitLog(output: string): ParsedGitLogEntry[] {
+  const lines = output.split('\n').filter(l => l.trim());
+  return lines.map(line => {
+    const match = line.match(/^([a-f0-9]+)\s+([^ ]+)\s+(.+)$/);
+    if (match) {
+      return { hash: match[1], author: match[2], message: match[3] };
+    }
+    return { hash: '', author: '', message: line };
+  });
+}
+
+export interface ParsedGitDiffHunk {
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  lines: Array<{ type: 'context' | 'add' | 'remove'; content: string }>;
+}
+
+export interface ParsedGitDiffFile {
+  oldPath: string;
+  newPath: string;
+  hunks: ParsedGitDiffHunk[];
+  isBinary: boolean;
+  isNew: boolean;
+  isDeleted: boolean;
+}
+
+export function parseGitDiff(output: string): ParsedGitDiffFile[] {
+  const files: ParsedGitDiffFile[] = [];
+  const lines = output.split('\n');
+  let currentFile: ParsedGitDiffFile | null = null;
+  let currentHunk: ParsedGitDiffHunk | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    // File header
+    if (line.startsWith('diff --git ')) {
+      if (currentFile) files.push(currentFile);
+      const match = line.match(/diff --git a\/(.+) b\/(.+)/);
+      currentFile = {
+        oldPath: match ? match[1] : '',
+        newPath: match ? match[2] : '',
+        hunks: [],
+        isBinary: false,
+        isNew: false,
+        isDeleted: false,
+      };
+      currentHunk = null;
+      continue;
+    }
+
+    if (!currentFile) continue;
+
+    // Binary file
+    if (line.startsWith('Binary files ')) {
+      currentFile.isBinary = true;
+      continue;
+    }
+
+    // New file
+    if (line.startsWith('new file mode ')) {
+      currentFile.isNew = true;
+      continue;
+    }
+
+    // Deleted file
+    if (line.startsWith('deleted file mode ')) {
+      currentFile.isDeleted = true;
+      continue;
+    }
+
+    // Hunk header
+    const hunkMatch = line.match(/^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@/);
+    if (hunkMatch) {
+      currentHunk = {
+        oldStart: parseInt(hunkMatch[1], 10),
+        oldLines: parseInt(hunkMatch[2] || '1', 10),
+        newStart: parseInt(hunkMatch[3], 10),
+        newLines: parseInt(hunkMatch[4] || '1', 10),
+        lines: [],
+      };
+      currentFile.hunks.push(currentHunk);
+      continue;
+    }
+
+    // Hunk content
+    if (currentHunk) {
+      if (line.startsWith('+')) {
+        currentHunk.lines.push({ type: 'add', content: line.slice(1) });
+      } else if (line.startsWith('-')) {
+        currentHunk.lines.push({ type: 'remove', content: line.slice(1) });
+      } else if (line.startsWith(' ')) {
+        currentHunk.lines.push({ type: 'context', content: line.slice(1) });
+      }
+    }
+  }
+
+  if (currentFile) files.push(currentFile);
+  return files;
+}
+
+// Memory
+export interface MemoryRecord {
+  id: string;
+  kind: string;
+  key: string;
+  value: unknown;
+  business_id: string;
+  division_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryQueryRequest {
+  business_id: string;
+  key?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface MemoryQueryResponse {
+  records: MemoryRecord[];
+  total: number;
+  has_more: boolean;
+}
+
+// Capabilities
+export interface CapabilityState {
+  tool_id: string;
+  state: 'enabled' | 'disabled' | 'deprecated';
+  reason?: string;
+}
+
+// Events (SSE)
+export interface SSEEvent {
+  event: string;
+  data: string;
+  id?: string;
+  retry?: number;
+}
+
+// Health / Status
+export interface HealthResponse {
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  version: string;
+  uptime_seconds: number;
+}
+
+export interface StatusResponse {
+  status: string;
+  components: Record<string, { status: string; details?: string }>;
+}
+
+// Pagination
+export interface PaginationParams {
+  limit?: number;
+  after_seq?: number;
+  after_id?: string;
+}
+
+// Error response wrapper
+export interface APIError extends Error {
+  status: number;
+  envelope?: Envelope;
+}

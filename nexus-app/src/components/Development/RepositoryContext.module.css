@@ -1,0 +1,363 @@
+.card {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-6);
+  border-bottom: 1px solid var(--color-surface-border);
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.headerLeft {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+}
+
+.title {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.repoName {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-regular);
+  color: var(--color-text-muted);
+}
+
+.badges {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.traceButton {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  font-family: var(--font-family-ui);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  background-color: transparent;
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.traceButton:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-text-muted);
+  background-color: var(--color-surface-overlay);
+}
+
+.traceButton:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
+.content {
+  flex: 1;
+  overflow: auto;
+  padding: var(--space-4) var(--space-6);
+}
+
+.truncatedNotice {
+  padding: var(--space-3) var(--space-6);
+  background-color: rgba(245, 166, 35, 0.1);
+  border-top: 1px solid rgba(245, 166, 35, 0.3);
+  font-size: var(--font-size-sm);
+  color: var(--color-state-warning);
+}
+
+/* Status View */
+.statusView {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.statusHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-surface-border);
+}
+
+.branch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
+.section {
+  margin-top: var(--space-4);
+}
+
+.sectionTitle {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-secondary);
+  margin: 0 0 var(--space-2);
+  text-transform: uppercase;
+  letter-spacing: var(--letter-spacing-wide);
+}
+
+.fileList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fileItem {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background-color: var(--color-surface-base);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+}
+
+.statusBadge {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  min-width: 28px;
+  text-align: center;
+}
+
+.statusBadge.staged {
+  background-color: rgba(0, 212, 170, 0.15);
+  color: var(--color-state-success);
+}
+
+.statusBadge.unstaged {
+  background-color: rgba(245, 166, 35, 0.15);
+  color: var(--color-state-warning);
+}
+
+.statusBadge.untracked {
+  background-color: rgba(140, 140, 140, 0.15);
+  color: var(--color-state-unknown);
+}
+
+.filePath {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cleanMessage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-8);
+  text-align: center;
+  color: var(--color-text-muted);
+  gap: var(--space-3);
+}
+
+.cleanMessage svg {
+  color: var(--color-state-success);
+}
+
+.cleanMessage p {
+  margin: 0;
+  font-size: var(--font-size-base);
+  color: var(--color-text-secondary);
+}
+
+/* Diff View */
+.diffView {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.diffSummary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--color-surface-border);
+}
+
+.diffFiles {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.diffFile {
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.diffFileHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  background-color: var(--color-surface-base);
+  border-bottom: 1px solid var(--color-surface-border);
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.diffFilePath {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 400px;
+}
+
+.diffHunk {
+  border-top: 1px solid var(--color-surface-border);
+}
+
+.hunkHeader {
+  padding: var(--space-2) var(--space-4);
+  background-color: var(--color-surface-base);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-surface-border);
+}
+
+.hunkContent {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-normal);
+  background-color: var(--color-surface-elevated);
+  overflow-x: auto;
+}
+
+.diffLine {
+  display: block;
+  white-space: pre;
+}
+
+.diffLineAdd {
+  color: var(--color-state-success);
+  background-color: rgba(0, 212, 170, 0.05);
+}
+
+.diffLineRemove {
+  color: var(--color-state-error);
+  background-color: rgba(255, 77, 79, 0.05);
+}
+
+.diffLineContext {
+  color: var(--color-text-secondary);
+}
+
+/* Log View */
+.logView {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.logEntry {
+  padding: var(--space-4);
+  background-color: var(--color-surface-base);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+}
+
+.logEntryHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.commitHash {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-accent-primary);
+  background-color: var(--color-surface-elevated);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+}
+
+.commitAuthor {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.commitMessage {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+  line-height: var(--line-height-relaxed);
+}
+
+/* Empty state */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-12) var(--space-8);
+  text-align: center;
+  color: var(--color-text-muted);
+  gap: var(--space-4);
+}
+
+.empty p {
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+.empty span {
+  font-size: var(--font-size-base);
+  margin: 0;
+}

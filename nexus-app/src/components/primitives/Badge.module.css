@@ -1,0 +1,111 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-family-ui);
+  font-weight: var(--font-weight-medium);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.sm {
+  height: 20px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
+.md {
+  height: 24px;
+  padding: 0 var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
+.dot {
+  padding-left: var(--space-2);
+}
+
+.dotIndicator {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background-color: currentColor;
+  flex-shrink: 0;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Base variants */
+.default {
+  background-color: var(--color-surface-border);
+  color: var(--color-text-secondary);
+}
+
+.success {
+  background-color: rgba(0, 212, 170, 0.15);
+  color: var(--color-state-success);
+}
+
+.warning {
+  background-color: rgba(245, 166, 35, 0.15);
+  color: var(--color-state-warning);
+}
+
+.error {
+  background-color: rgba(255, 77, 79, 0.15);
+  color: var(--color-state-error);
+}
+
+.info {
+  background-color: rgba(24, 144, 255, 0.15);
+  color: var(--color-state-info);
+}
+
+.unknown {
+  background-color: rgba(140, 140, 140, 0.15);
+  color: var(--color-state-unknown);
+}
+
+/* Agent status variants */
+.idle {
+  background-color: rgba(107, 116, 128, 0.15);
+  color: var(--color-agent-idle);
+}
+
+.running {
+  background-color: rgba(24, 144, 255, 0.15);
+  color: var(--color-agent-running);
+}
+
+.pending_approval {
+  background-color: rgba(245, 166, 35, 0.15);
+  color: var(--color-agent-pending_approval);
+}
+
+.completed {
+  background-color: rgba(0, 212, 170, 0.15);
+  color: var(--color-agent-completed);
+}
+
+.failed {
+  background-color: rgba(255, 77, 79, 0.15);
+  color: var(--color-agent-failed);
+}
+
+.cancelled {
+  background-color: rgba(140, 140, 140, 0.15);
+  color: var(--color-agent-cancelled);
+}
+
+.timed_out {
+  background-color: rgba(255, 77, 79, 0.15);
+  color: var(--color-agent-timed_out);
+}
