@@ -53,16 +53,19 @@ describe('submit → approve → resume → result journey', () => {
     expect(submitRes.execution_id).toBe(EXECUTION_ID);
 
     // 2. Execution is in approval-required state
+    // Backend returns { request_id, status, outcome.summary, ... }
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'pending',
         error: {
           code: 'APPROVAL_REQUIRED',
           category: 'APPROVAL_REQUIRED',
           message: 'approval required',
         },
-        created_at: '2026-01-01T00:00:00Z',
+        audit_trace: [],
+        duration: 1234,
       })
     );
     const status1 = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
@@ -100,18 +103,26 @@ describe('submit → approve → resume → result journey', () => {
     expect(approveRes.status).toBe('APPROVED');
 
     // 5. Resumed execution → completed
+    // Backend returns { request_id, status, outcome: { summary }, duration, ... }
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'completed',
-        output: 'Report analysis complete',
-        created_at: '2026-01-01T00:00:00Z',
-        completed_at: '2026-01-01T00:01:00Z',
+        outcome: {
+          summary: 'Report analysis complete',
+          artifacts: [],
+          metrics: { duration_ms: 1234 },
+        },
+        error: null,
+        audit_trace: [],
+        duration: 1234,
       })
     );
     const status2 = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
     expect(status2.status).toBe('completed');
     expect(status2.output).toBe('Report analysis complete');
+    expect(status2.duration_ms).toBe(1234);
 
     // Verify all requests used correct auth headers and endpoints
     const urls = mockFetch.mock.calls.map((c) => c[0] as string);
@@ -141,13 +152,15 @@ describe('submit → approve → resume → result journey', () => {
       objective: { description: 'Do something questionable' },
     });
 
-    // 2. Execution is in approval-required state
+    // 2. Execution is in approval-required state.
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'pending',
         error: { code: 'APPROVAL_REQUIRED', category: 'APPROVAL_REQUIRED', message: 'approval required' },
-        created_at: '2026-01-01T00:00:00Z',
+        audit_trace: [],
+        duration: 1234,
       })
     );
     await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
@@ -182,14 +195,16 @@ describe('submit → approve → resume → result journey', () => {
     // 5. Execution remains failed/pending (no resume)
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'pending',
         error: {
           code: 'APPROVAL_REQUIRED',
           category: 'APPROVAL_REQUIRED',
           message: 'approval required',
         },
-        created_at: '2026-01-01T00:00:00Z',
+        audit_trace: [],
+        duration: 1234,
       })
     );
     const status = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
@@ -232,9 +247,13 @@ describe('reconnect → reconcile → approve → final result', () => {
     // 2. Observe running state.
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'running',
-        created_at: '2026-01-01T00:00:00Z',
+        outcome: null,
+        error: null,
+        audit_trace: [],
+        duration: 500,
       })
     );
     const running = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
@@ -321,11 +340,17 @@ describe('reconnect → reconcile → approve → final result', () => {
     // 6. Reconcile again — the resumed execution completed.
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {
-        execution_id: EXECUTION_ID,
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
         status: 'completed',
-        output: 'Analysis complete',
-        created_at: '2026-01-01T00:00:00Z',
-        completed_at: '2026-01-01T00:01:00Z',
+        outcome: {
+          summary: 'Analysis complete',
+          artifacts: [],
+          metrics: { duration_ms: 1234 },
+        },
+        error: null,
+        audit_trace: [],
+        duration: 1234,
       })
     );
     const final = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);

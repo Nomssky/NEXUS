@@ -166,7 +166,44 @@ class NexusAPIClient {
   }
 
   async getIntelligence(id: string, businessId: string): Promise<ExecutionStatus> {
-    return this.request<ExecutionStatus>('GET', `/intelligence/${encodeURIComponent(id)}?business_id=${businessId}`);
+    // Backend Response has request_id, outcome.summary, duration — map to
+    // frontend ExecutionStatus shape (execution_id, output, duration_ms).
+    const raw = await this.request<{
+      request_id: string;
+      business_id: string;
+      division_id?: string;
+      status: string;
+      outcome?: {
+        summary?: string;
+        artifacts?: string[];
+        metrics?: Record<string, unknown>;
+      };
+      error?: {
+        code: string;
+        category: string;
+        message: string;
+        details?: Record<string, unknown>;
+      };
+      audit_trace?: Array<{
+        step: string;
+        action: string;
+        actor: string;
+        timestamp: string;
+        duration: number;
+        outcome: string;
+      }>;
+      duration?: number;
+    }>('GET', `/intelligence/${encodeURIComponent(id)}?business_id=${businessId}`);
+
+    return {
+      execution_id: raw.request_id,
+      status: raw.status as ExecutionStatusValue,
+      error: raw.error,
+      output: raw.outcome?.summary,
+      duration_ms: raw.duration,
+      created_at: undefined,
+      completed_at: undefined,
+    };
   }
 
   async getIntelligenceTrace(
