@@ -166,7 +166,47 @@ class NexusAPIClient {
   }
 
   async getIntelligence(id: string, businessId: string): Promise<ExecutionStatus> {
-    return this.request<ExecutionStatus>('GET', `/intelligence/${encodeURIComponent(id)}?business_id=${businessId}`);
+    const raw = await this.request<{
+      request_id: string;
+      business_id: string;
+      division_id?: string;
+      status: string;
+      constraints?: string[];
+      outcome?: {
+        summary?: string;
+        artifacts?: string[];
+        metrics?: Record<string, unknown>;
+      } | null;
+      error?: {
+        code: string;
+        category: string;
+        message: string;
+        details?: Record<string, unknown>;
+      };
+      audit_trace?: Array<{
+        step: string;
+        action: string;
+        actor: string;
+        timestamp: string;
+        duration: number;
+        outcome: string;
+      }>;
+      duration?: number;
+    }>('GET', `/intelligence/${encodeURIComponent(id)}?business_id=${businessId}`);
+
+    // Map backend Response to frontend ExecutionStatus contract.
+    // Backend sends request_id/outcome.summary/duration; frontend expects
+    // execution_id/output/duration_ms. created_at/completed_at are not on the
+    // backend Response, so they are left undefined here.
+    return {
+      execution_id: raw.request_id,
+      status: raw.status as ExecutionStatusValue,
+      error: raw.error,
+      output: raw.outcome?.summary,
+      duration_ms: raw.duration,
+      created_at: undefined,
+      completed_at: undefined,
+    };
   }
 
   async getIntelligenceTrace(

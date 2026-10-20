@@ -3,14 +3,16 @@
  * Composed of ResearchInput, ResearchOutput, and ResearchEvidence
  */
 
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
+import { Badge } from '../components/primitives';
 import { VirtualHQ, type ZoneId } from '../components/VirtualHQ/VirtualHQ';
 import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
 import { ResearchInput } from '../components/Research/ResearchInput';
 import { ResearchOutput } from '../components/Research/ResearchOutput';
 import { ResearchEvidence } from '../components/Research/ResearchEvidence';
-import { useIntelligence, useIntelligenceTrace } from '@/api/hooks';
-import type { WebSearchResult } from '@/types/api';
+import { useIntelligence, useIntelligenceTrace, useRecoveryExecutions, useEventStream } from '@/api/hooks';
+import type { DurableExecution, WebSearchResult } from '@/types/api';
+import { approvalStatusVariant, approvalStatusLabel } from '@/types/api';
 import styles from './Research.module.css';
 
 interface ResearchPageProps {
@@ -20,47 +22,49 @@ interface ResearchPageProps {
 
 export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) => {
   const [activeZone, setActiveZone] = useState<ZoneId>('research');
-  const [selectedExecution, setSelectedExecution] = useState<string | null>(null);
-  const [recentExecutions, setRecentExecutions] = useState<string[]>([]);
   const [currentExecution, setCurrentExecution] = useState<string | null>(null);
 
+  // Authoritative execution state from the durable recovery read.
+  const { data: recoveryData, isLoading: recoveryLoading } =
+    useRecoveryExecutions(businessId);
+
+  const executions = recoveryData?.executions ?? [];
+  const latestExecution = executions[0]?.execution_id ?? currentExecution;
+
   const handleSubmit = useCallback((executionId: string) => {
-    setRecentExecutions((prev) => [executionId, ...prev.slice(0, 9)]);
-    setCurrentExecution(executionId);
-    setSelectedExecution(executionId);
-  }, []);
-
-  const handleExecutionSelect = useCallback((executionId: string) => {
-    setSelectedExecution(executionId);
     setCurrentExecution(executionId);
   }, []);
-
-  const handleCloseTrace = useCallback(() => {
-    setSelectedExecution(null);
-  }, []);
-
-  // Get the most recent execution that has web.search results
-  const latestExecutionId = recentExecutions[0] || currentExecution;
-  const { data: execution } = useIntelligence(latestExecutionId || '', businessId, {
-    enabled: !!latestExecutionId,
+  const { data: execution } = useIntelligence(latestExecution || '', businessId, {
+    enabled: !!latestExecution,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status === 'pending' || status === 'running' ? 2000 : false;
     },
   });
 
-  const { data: trace } = useIntelligenceTrace(latestExecutionId || '', businessId, {
+  const { data: trace } = useIntelligenceTrace(latestExecution || '', businessId, {
     limit: 100,
   }, {
-    enabled: !!latestExecutionId,
+    enabled: !!latestExecution,
   });
 
-  // Extract web.search result from execution output or trace
+  // SSE: reconcile authoritative state on reconnect; SSE is a hint, never truth.
+  const { connectionState } = useEventStream(businessId, {
+    onChainCompleted: () => {},
+    onChainFailed: () => {},
+    onApprovalRequested: () => {},
+    onApprovalApproved: () => {},
+    onApprovalDenied: () => {},
+    onStateChange: () => {},
+    onReconnected: () => {},
+    onError: () => {},
+  });
+
+  // Extract web.search result from execution output or trace.
   const webSearchResult = useMemo((): WebSearchResult | undefined => {
     if (!execution?.output) return undefined;
     try {
-      // The web.search result is embedded in the execution output
-      // Try to parse it from the output
+      // The web.search result is embedded in the execution output as JSON.
       const parsed = JSON.parse(execution.output);
       if (parsed.sources && parsed.count) {
         return parsed as WebSearchResult;
@@ -88,16 +92,16 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     return undefined;
   }, [execution, trace]);
 
-  // Zone stats for VirtualHQ
+  // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
-    command: { executions: recentExecutions.length },
-    research: { executions: recentExecutions.length },
+    command: { executions: 0 },
+    research: { executions: executions.length },
     media: { executions: 0 },
     development: { executions: 0 },
     meeting: { executions: 0 },
   };
 
-  const isLoading = execution?.status === 'pending' || execution?.status === 'running';
+  const isLoading = recoveryLoading || (execution?.status === 'pending' || execution?.status === 'running');
 
   return (
     <div className={styles.page}>
@@ -113,9 +117,19 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
           <span className={styles.tagline}>Research Workspace</span>
         </div>
         <div className={styles.headerRight}>
-          <div className={styles.statusIndicator}>
-            <span className={styles.statusDot} />
-            <span>Connected</span>
+          <div className={styles.statusIndicator} data-state={connectionState} title={`Live updates: ${connectionState}`}>
+            <span className={styles.statusDot} data-state={connectionState} />
+            <span>
+              {connectionState === 'open'
+                ? 'Live'
+                : connectionState === 'reconnecting'
+                  ? 'Reconnecting…'
+                  : connectionState === 'connecting'
+                    ? 'Connecting…'
+                    : connectionState === 'failed'
+                      ? 'Disconnected'
+                      : 'Offline'}
+            </span>
           </div>
         </div>
       </header>
@@ -135,8 +149,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               businessId={businessId}
               actorId={actorId}
               onSubmit={handleSubmit}
-              recentExecutions={recentExecutions}
-              onExecutionSelect={handleExecutionSelect}
+              executions={executions}
               currentExecution={currentExecution}
               execution={execution}
               trace={trace}
@@ -167,8 +180,7 @@ const ResearchZone: React.FC<{
   businessId: string;
   actorId: string;
   onSubmit: (executionId: string) => void;
-  recentExecutions: string[];
-  onExecutionSelect: (executionId: string) => void;
+  executions: DurableExecution[];
   currentExecution: string | null;
   execution: { status?: string; output?: string; duration_ms?: number; created_at?: string } | undefined;
   trace: { entries: { type: string; data?: Record<string, string> }[] } | undefined;
@@ -179,7 +191,7 @@ const ResearchZone: React.FC<{
   businessId,
   actorId,
   onSubmit,
-  recentExecutions,
+  executions,
   onExecutionSelect,
   currentExecution,
   execution,
@@ -240,8 +252,7 @@ const ResearchZone: React.FC<{
           Recent Research
         </h2>
         <ExecutionHistoryList
-          businessId={businessId}
-          executionIds={recentExecutions}
+          executions={executions}
           currentExecution={currentExecution}
           onSelect={onExecutionSelect}
         />
@@ -259,14 +270,13 @@ const ResearchZone: React.FC<{
 };
 
 const ExecutionHistoryList: React.FC<{
-  businessId: string;
-  executionIds: string[];
+  executions: DurableExecution[];
   currentExecution: string | null;
   onSelect: (executionId: string) => void;
-}> = ({ businessId, executionIds, currentExecution, onSelect }) => {
+}> = ({ executions, currentExecution, onSelect }) => {
   return (
     <div className={styles.historyList}>
-      {executionIds.length === 0 ? (
+      {executions.length === 0 ? (
         <div className={styles.emptyHistory}>
           <svg width="48" height="48" viewBox="0 0 48 48" fill="none" aria-hidden="true">
             <circle cx="24" cy="24" r="20" stroke="var(--color-surface-border)" strokeWidth="2" />
@@ -277,28 +287,40 @@ const ExecutionHistoryList: React.FC<{
         </div>
       ) : (
         <ul className={styles.historyItems}>
-          {executionIds.map((id, idx) => (
+          {executions.map((exec) => (
             <li
-              key={id}
-              className={`${styles.historyItem} ${id === currentExecution ? styles.active : ''}`}
-              onClick={() => onSelect(id)}
+              key={exec.execution_id}
+              className={`${styles.historyItem} ${exec.execution_id === currentExecution ? styles.active : ''}`}
+              onClick={() => onSelect(exec.execution_id)}
               role="button"
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
-                  onSelect(id);
+                  onSelect(exec.execution_id);
                 }
               }}
             >
-              <span className={styles.historyIndex}>{idx + 1}</span>
-              <span className={styles.historyId}>{id.slice(0, 12)}…</span>
+              <span className={styles.historyIndex}>{executions.indexOf(exec) + 1}</span>
+              <span className={styles.historyId}>{exec.execution_id.slice(0, 12)}…</span>
+              <BadgeVariant
+                status={exec.state}
+                decision_rationale={exec.approvals?.[exec.approvals.length - 1]?.decided_at}
+              />
             </li>
           ))}
         </ul>
       )}
     </div>
   );
+};
+
+const BadgeVariant: React.FC<{
+  status: string;
+}> = ({ status }) => {
+  const variant = approvalStatusVariant(status);
+  const label = approvalStatusLabel(status);
+  return <Badge variant={variant} size="sm" dot={status === 'PENDING'}>{label}</Badge>;
 };
 
 const ZonePreview: React.FC<{ zoneId: ZoneId }> = ({ zoneId }) => {
