@@ -685,7 +685,7 @@ func mustStore(t *testing.T, dir string) store.Store {
 // API, so a test can construct records that no ordinary path produces (a
 // recovered `unknown`, for example) and prove the supersede refuses them.
 func (j *Journal) seedState(id string, state State, class string) error {
-	rec, ok, err := j.getExecution(id)
+	rec, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
@@ -695,7 +695,7 @@ func (j *Journal) seedState(id string, state State, class string) error {
 	rec.State = state
 	rec.ErrorClass = class
 	rec.UpdatedAt = j.now().UTC()
-	return j.putExecution(rec)
+	return j.putExecution(rec, version)
 }
 
 // ---- v28: backend parity for a missing durable record ----------------------

@@ -217,7 +217,9 @@ func (j *Journal) Accepted(id, businessID, divisionID, actorID string) error {
 	if id == "" {
 		return fmt.Errorf("execjournal: execution id required")
 	}
-	existing, ok, err := j.getExecution(id)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
@@ -229,7 +231,7 @@ func (j *Journal) Accepted(id, businessID, divisionID, actorID string) error {
 		Version: SchemaVersion, ID: id, BusinessID: businessID, DivisionID: divisionID,
 		ActorID: actorID, State: StateAccepted, CreatedAt: now, UpdatedAt: now,
 	}
-	return j.putExecution(rec)
+	return j.putExecution(rec, version)
 }
 
 // Terminal durably records a terminal lifecycle state. `errClass` is a coarse
@@ -244,7 +246,9 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
 	}
-	existing, ok, err := j.getExecution(id)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
@@ -252,6 +256,7 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 		// A terminal transition without a prior accepted record still records
 		// the fact; the id is authoritative.
 		existing = ExecutionRecord{Version: SchemaVersion, ID: id, CreatedAt: j.now().UTC()}
+		version = 0
 	}
 	if existing.State.Terminal() {
 		return nil // already terminal; terminal is final
@@ -259,7 +264,7 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
 	existing.UpdatedAt = j.now().UTC()
-	return j.putExecution(existing)
+	return j.putExecution(existing, version)
 }
 
 // ErrNotApprovalPause reports that an execution carries no provisional approval
@@ -282,7 +287,9 @@ func (j *Journal) RecordApproval(id, approvalID, outcome, decidedBy string) erro
 	if _, ok := validApprovalOutcomes[outcome]; !ok {
 		return fmt.Errorf("execjournal: invalid approval outcome %q", outcome)
 	}
-	existing, ok, err := j.getExecution(id)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
@@ -295,7 +302,7 @@ func (j *Journal) RecordApproval(id, approvalID, outcome, decidedBy string) erro
 		ApprovalID: approvalID, Outcome: outcome, DecidedBy: decidedBy, DecidedAt: j.now().UTC(),
 	})
 	existing.UpdatedAt = j.now().UTC()
-	return j.putExecution(existing)
+	return j.putExecution(existing, version)
 }
 
 // SupersedeApprovedPause replaces a provisional approval pause with the real
@@ -322,7 +329,9 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
 	}
-	existing, ok, err := j.getExecution(id)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
@@ -333,7 +342,7 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
 	existing.UpdatedAt = j.now().UTC()
-	return j.putExecution(existing)
+	return j.putExecution(existing, version)
 }
 
 // RecordDispatchIntent durably records that a consequential invocation is about
@@ -357,7 +366,7 @@ func (j *Journal) RecordDispatchIntent(executionID, callID, toolID, operation, s
 		ToolID: toolID, Operation: operation, SideEffectClass: sideEffectClass,
 		Status: InvDispatched, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := j.putInvocation(rec); err != nil {
+	if err := j.putInvocation(rec, 0); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -374,7 +383,9 @@ func (j *Journal) RecordOutcome(invocationID, status, errorClass string) error {
 	default:
 		return fmt.Errorf("execjournal: invalid invocation status %q", status)
 	}
-	existing, ok, err := j.getInvocation(invocationID)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	existing, version, ok, err := j.getInvocation(invocationID)
 	if err != nil {
 		return err
 	}
@@ -384,7 +395,7 @@ func (j *Journal) RecordOutcome(invocationID, status, errorClass string) error {
 	existing.Status = status
 	existing.ErrorClass = errorClass
 	existing.UpdatedAt = j.now().UTC()
-	return j.putInvocation(existing)
+	return j.putInvocation(existing, version)
 }
 
 // Get returns a durable execution record (for operators/tests).
@@ -392,7 +403,8 @@ func (j *Journal) Get(id string) (ExecutionRecord, bool, error) {
 	if j == nil {
 		return ExecutionRecord{}, false, nil
 	}
-	return j.getExecution(id)
+	er, _, ok, err := j.getExecution(id)
+	return er, ok, err
 }
 
 // ListByBusiness returns up to maxRecords durable execution records for
@@ -443,6 +455,8 @@ func (j *Journal) Recover() (Report, error) {
 	if j == nil {
 		return rep, nil
 	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	recs, err := j.st.List(store.Filter{Type: recordTypeExecution})
 	if err != nil {
 		return rep, fmt.Errorf("execjournal: list executions: %w", err)
@@ -469,7 +483,7 @@ func (j *Journal) Recover() (Report, error) {
 		er.Recovery = &RecoveryMeta{Recovered: true, PriorState: prior, RecoveredAt: j.now().UTC(),
 			Reason: "interrupted before a durable terminal state; outcome may be unknown"}
 		er.UpdatedAt = j.now().UTC()
-		if err := j.putExecution(er); err != nil {
+		if err := j.putExecution(er, r.Version); err != nil {
 			return rep, fmt.Errorf("execjournal: classify %s: %w", er.ID, err)
 		}
 		nonterminal[er.ID] = true
@@ -494,7 +508,7 @@ func (j *Journal) Recover() (Report, error) {
 		iv.Status = InvUnknown
 		iv.ErrorClass = "interrupted"
 		iv.UpdatedAt = j.now().UTC()
-		if err := j.putInvocation(iv); err != nil {
+		if err := j.putInvocation(iv, r.Version); err != nil {
 			return rep, fmt.Errorf("execjournal: classify invocation %s: %w", iv.ID, err)
 		}
 		rep.UnknownInvocations++
@@ -510,7 +524,7 @@ func (j *Journal) Recover() (Report, error) {
 func execKey(id string) string { return "nexus.execution:" + id }
 func invKey(id string) string  { return "nexus.invocation:" + id }
 
-func (j *Journal) putExecution(rec ExecutionRecord) error {
+func (j *Journal) putExecution(rec ExecutionRecord, version int) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("execjournal: marshal execution: %w", err)
@@ -519,15 +533,16 @@ func (j *Journal) putExecution(rec ExecutionRecord) error {
 		ID: execKey(rec.ID), Type: recordTypeExecution, Status: store.RecordStatusActive,
 		BusinessID: rec.BusinessID, DivisionID: rec.DivisionID, Data: data,
 	}
-	// Carry the current store version so both MemStore (strict equality) and
-	// FileStore (0 = no check) accept the update consistently.
-	if existing, gerr := j.st.Get(sr.ID); gerr == nil && existing != nil {
-		sr.Version = existing.Version
-	}
+	// Carry the version from the getExecution read forward. Do NOT re-read the
+	// store version here: re-reading would launder a stale snapshot's version
+	// and let a writer overwrite a newer record it never saw. The store's
+	// optimistic concurrency check rejects any version mismatch as
+	// VERSION_CONFLICT, which callers can handle as an explicit conflict.
+	sr.Version = version
 	return j.st.Put(sr)
 }
 
-func (j *Journal) putInvocation(rec InvocationRecord) error {
+func (j *Journal) putInvocation(rec InvocationRecord, version int) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("execjournal: marshal invocation: %w", err)
@@ -537,13 +552,14 @@ func (j *Journal) putInvocation(rec InvocationRecord) error {
 		BusinessID: "",
 		Data:       data,
 	}
-	if existing, gerr := j.st.Get(sr.ID); gerr == nil && existing != nil {
-		sr.Version = existing.Version
-	}
+	sr.Version = version
 	return j.st.Put(sr)
 }
 
-// getExecution reads one durable execution record.
+// getExecution reads one durable execution record, returning the store record's
+// current version so callers can carry it forward into a subsequent Put instead
+// of re-reading it (which would defeat optimistic concurrency by laundering a
+// stale snapshot's version).
 //
 // A backend signals absence in one of two ways: FileStore follows the Store
 // contract ("returns nil if not found") and yields (nil, nil), while MemStore
@@ -553,42 +569,42 @@ func (j *Journal) putInvocation(rec InvocationRecord) error {
 // every journal operation backend-independent without changing either store's
 // public semantics, and it keeps the ok flag meaningful. A genuine I/O or
 // corruption failure still propagates and is never mistaken for absence.
-func (j *Journal) getExecution(id string) (ExecutionRecord, bool, error) {
+func (j *Journal) getExecution(id string) (ExecutionRecord, int, bool, error) {
 	r, err := j.st.Get(execKey(id))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return ExecutionRecord{}, false, nil
+			return ExecutionRecord{}, 0, false, nil
 		}
-		return ExecutionRecord{}, false, err
+		return ExecutionRecord{}, 0, false, err
 	}
 	if r == nil || r.Type != recordTypeExecution {
-		return ExecutionRecord{}, false, nil
+		return ExecutionRecord{}, 0, false, nil
 	}
 	er, err := unmarshalExecution(r)
 	if err != nil {
-		return ExecutionRecord{}, false, err
+		return ExecutionRecord{}, 0, false, err
 	}
-	return er, true, nil
+	return er, r.Version, true, nil
 }
 
 // getInvocation reads one durable invocation record, with the same absence
-// normalization as getExecution.
-func (j *Journal) getInvocation(id string) (InvocationRecord, bool, error) {
+// normalization and version return as getExecution.
+func (j *Journal) getInvocation(id string) (InvocationRecord, int, bool, error) {
 	r, err := j.st.Get(invKey(id))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return InvocationRecord{}, false, nil
+			return InvocationRecord{}, 0, false, nil
 		}
-		return InvocationRecord{}, false, err
+		return InvocationRecord{}, 0, false, err
 	}
 	if r == nil || r.Type != recordTypeInvocation {
-		return InvocationRecord{}, false, nil
+		return InvocationRecord{}, 0, false, nil
 	}
 	iv, err := unmarshalInvocation(r)
 	if err != nil {
-		return InvocationRecord{}, false, err
+		return InvocationRecord{}, 0, false, err
 	}
-	return iv, true, nil
+	return iv, r.Version, true, nil
 }
 
 // validateApprovals checks a durable approval history at decode time.

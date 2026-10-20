@@ -138,14 +138,19 @@ func (fs *FileStore) Delete(id string) error {
 		return nil // already deleted: repeating changes nothing
 	}
 
-	record.Status = RecordStatusDeleted
-	record.UpdatedAt = fs.now()
-	record.Version++
+	// Copy before mutating: the index entry must not reflect a deleted state
+	// until the durable write has succeeded. A write failure must leave the
+	// index and the disk in agreement.
+	updated := *record
+	updated.Status = RecordStatusDeleted
+	updated.UpdatedAt = fs.now()
+	updated.Version++
 
-	if err := fs.writeRecord(record); err != nil {
+	if err := fs.writeRecord(&updated); err != nil {
 		return err
 	}
 
+	fs.index[id] = &updated
 	return nil
 }
 

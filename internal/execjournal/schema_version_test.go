@@ -80,7 +80,7 @@ func TestNewRecordsCarryTheCurrentSchemaVersion(t *testing.T) {
 	if err := j.RecordOutcome(invID, InvCompleted, ""); err != nil {
 		t.Fatal(err)
 	}
-	if inv, ok, err := j.getInvocation(invID); err != nil || !ok || inv.Version != SchemaVersion {
+	if inv, _, ok, err := j.getInvocation(invID); err != nil || !ok || inv.Version != SchemaVersion {
 		t.Fatalf("invocation must be versioned at the current version: %+v ok=%v err=%v", inv, ok, err)
 	}
 }
