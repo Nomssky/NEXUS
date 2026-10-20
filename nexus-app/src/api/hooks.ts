@@ -3,8 +3,9 @@
  * Provides typed, cached data fetching with proper error handling
  */
 
+import { useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient, type UseQueryOptions, type UseMutationOptions } from '@tanstack/react-query';
-import { apiClient } from './client';
+import { apiClient, EventStream, type EventStreamState } from './client';
 import type {
   ExecutionStatus,
   ExecutionTrace,
@@ -23,6 +24,7 @@ import type {
   ApproveRequest,
   CreateAgentRequest,
   PaginationParams,
+  DurableExecutionList,
 } from '../types/api';
 
 // Type for query options that excludes queryKey (provided by the hook)
@@ -41,6 +43,7 @@ export const queryKeys = {
   tools: ['tools'] as const,
   capabilities: ['capabilities'] as const,
   memory: (params: MemoryQueryRequest) => ['memory', params] as const,
+  recoveryExecutions: (businessId: string) => ['recoveryExecutions', businessId] as const,
 };
 
 // Health & Status
@@ -220,9 +223,35 @@ export function useMemory(params: MemoryQueryRequest, options?: QueryOptions<Mem
   });
 }
 
+// Durable recovery executions — the authoritative execution state. Polled on a
+// moderate interval and reconciled after SSE reconnects (see useEventStream).
+export function useRecoveryExecutions(
+  businessId: string,
+  options?: QueryOptions<DurableExecutionList>
+) {
+  return useQuery({
+    queryKey: queryKeys.recoveryExecutions(businessId),
+    queryFn: () => apiClient.listRecoveryExecutions(businessId, { limit: 50 }),
+    enabled: !!businessId,
+    refetchInterval: 5000,
+    ...options,
+  });
+}
+
 // SSE hook for real-time execution events.
+//
 // Connects to /events?business_id=... with auth headers and dispatches events
-// to callbacks. Automatically reconnects on disconnect.
+// to callbacks. The underlying EventStream reconnects with bounded exponential
+// backoff after transient failures and never retries permanent auth failures.
+//
+// Reconciliation strategy: SSE is a hint, never the source of truth. Polling
+// (useIntelligence / useApprovals) remains authoritative. On reconnect the hook
+// invalidates those queries so the UI reconciles from the backend, and callers
+// receive onReconnected to trigger any additional authoritative reads.
+//
+// Handler changes do not tear down the connection: handlers are kept in a ref
+// so the latest callbacks are always invoked. Only a businessId change (or
+// unmount) closes and recreates the stream.
 export function useEventStream(
   businessId: string,
   handlers: {
@@ -232,50 +261,76 @@ export function useEventStream(
     onApprovalDenied?: (data: unknown) => void;
     onChainCompleted?: (data: unknown) => void;
     onChainFailed?: (data: unknown) => void;
+    onStateChange?: (state: EventStreamState) => void;
+    onReconnected?: () => void;
     onError?: (error: Event) => void;
   } = {}
 ) {
   const streamRef = useRef<EventStream | null>(null);
+  const [connectionState, setConnectionState] = useState<EventStreamState>('closed');
+  const handlersRef = useRef(handlers);
+  // Keep the latest handlers available to the stream without tearing down the
+  // connection on every callback identity change. Updated after render.
+  useEffect(() => {
+    handlersRef.current = handlers;
+  });
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     if (!businessId) return;
 
-    const stream = createEventStream(
-      businessId,
-      (msg: MessageEvent) => {
-        const data = msg.data as { type?: string; [key: string]: unknown };
-        handlers.onEvent?.({ type: data.type ?? 'unknown', data });
-        switch (data.type) {
-          case 'approval.requested':
-            handlers.onApprovalRequested?.(data);
-            break;
-          case 'approval.approved':
-            handlers.onApprovalApproved?.(data);
-            break;
-          case 'approval.denied':
-            handlers.onApprovalDenied?.(data);
-            break;
-          case 'chain.completed':
-            handlers.onChainCompleted?.(data);
-            break;
-          case 'chain.failed':
-            handlers.onChainFailed?.(data);
-            break;
-        }
+    const dispatch = (msg: MessageEvent) => {
+      const data = msg.data as { event_type?: string; type?: string; [key: string]: unknown };
+      const type = data.event_type ?? data.type ?? 'unknown';
+      handlersRef.current.onEvent?.({ type, data });
+      switch (type) {
+        case 'approval.requested':
+          handlersRef.current.onApprovalRequested?.(data);
+          break;
+        case 'approval.approved':
+          handlersRef.current.onApprovalApproved?.(data);
+          break;
+        case 'approval.denied':
+          handlersRef.current.onApprovalDenied?.(data);
+          break;
+        case 'chain.completed':
+          handlersRef.current.onChainCompleted?.(data);
+          break;
+        case 'chain.failed':
+          handlersRef.current.onChainFailed?.(data);
+          break;
+      }
+    };
+
+    const stream = new EventStream(apiClient, businessId, {
+      onMessage: dispatch,
+      onOpen: () => handlersRef.current.onOpen?.(),
+      onError: (err) => handlersRef.current.onError?.(err),
+      onStateChange: (state) => {
+        setConnectionState(state);
+        handlersRef.current.onStateChange?.(state);
       },
-      (err) => {
-        handlers.onError?.(err);
+      onReconnected: () => {
+        // Reconcile authoritative state after a reconnect: invalidate the
+        // queries so the UI reflects the backend, not just SSE hints.
+        queryClient.invalidateQueries({ queryKey: ['intelligence'] });
+        queryClient.invalidateQueries({ queryKey: ['approvals'] });
+        queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
+        handlersRef.current.onReconnected?.();
       },
-    );
+    });
     streamRef.current = stream;
+    stream.connect();
 
     return () => {
+      // Cleanup: abort active fetch, clear pending retry timer.
       stream.close();
       streamRef.current = null;
     };
-  }, [businessId, handlers]);
+  }, [businessId, queryClient]);
 
   return {
+    connectionState,
     close: () => streamRef.current?.close(),
   };
 }

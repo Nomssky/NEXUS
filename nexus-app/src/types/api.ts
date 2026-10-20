@@ -158,20 +158,61 @@ export interface CreateAgentRequest {
   allowed_tools: string[];
 }
 
-// Approvals
+// Approvals — mirrors the backend ApprovalRecord JSON contract.
 export interface Approval {
   entity_id: string;
   status: 'PENDING' | 'APPROVED' | 'DENIED' | 'EXPIRED';
-  audit_ref: string; // the execution/request ID this approval is for
-  approver_type: string;
+  requested_action: string;
+  requester_id: string;
   approver_id?: string;
+  approver_type: string;
+  authority_context?: string;
+  policy_ref?: string;
+  scope?: string;
   created_at: string;
+  expires_at?: string;
   decided_at?: string;
   decision_rationale?: string;
+  self_approval_prohibited: boolean;
+  delegation_allowed: boolean;
+  audit_ref: string; // the execution/request ID this approval is for
+  correlation_id?: string;
 }
 
 export interface ApproveRequest {
   reason: string;
+}
+
+/** Map a backend approval status to a Badge variant. */
+export function approvalStatusVariant(status: string): 'pending_approval' | 'completed' | 'failed' | 'warning' | 'default' {
+  switch (status) {
+    case 'PENDING':
+      return 'pending_approval';
+    case 'APPROVED':
+      return 'completed';
+    case 'DENIED':
+      return 'failed';
+    case 'EXPIRED':
+      return 'warning';
+    default:
+      return 'default';
+  }
+}
+
+/** Human-readable label for an approval status. */
+export function approvalStatusLabel(status: string): string {
+  switch (status) {
+    case 'PENDING':
+      return 'Pending';
+    case 'APPROVED':
+      return 'Approved';
+    case 'DENIED':
+      return 'Denied';
+    case 'EXPIRED':
+      return 'Expired';
+    default:
+      return status;
+  }
 }
 
 // Tools
@@ -454,6 +495,53 @@ export interface PaginationParams {
   limit?: number;
   after_seq?: number;
   after_id?: string;
+}
+
+// ---- Durable recovery read (authoritative execution state) ----
+// Mirrors the gateway's durableExecutionView projection.
+
+export type DurableExecutionState =
+  | 'accepted'
+  | 'running'
+  | 'pending_approval'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'unknown';
+
+export interface DurableApprovalView {
+  approval_id: string;
+  outcome: string;
+  decided_at: string;
+}
+
+export interface DurableRecoveryView {
+  recovered?: boolean;
+  prior_state?: string;
+  recovered_at?: string;
+}
+
+export interface DurableExecution {
+  source: string;
+  execution_id: string;
+  business_id: string;
+  division_id?: string;
+  state: DurableExecutionState;
+  error_class?: string;
+  created_at: string;
+  updated_at: string;
+  recovery?: DurableRecoveryView;
+  approvals?: DurableApprovalView[];
+}
+
+export interface DurableExecutionList {
+  source: string;
+  executions: DurableExecution[];
+  count: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 // Error response wrapper

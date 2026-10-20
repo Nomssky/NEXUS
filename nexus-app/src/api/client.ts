@@ -25,6 +25,7 @@ import type {
   StatusResponse,
   PaginationParams,
   APIError,
+  DurableExecutionList,
 } from '../types/api';
 
 const DEFAULT_BASE_URL = '/api/v1';
@@ -184,6 +185,18 @@ class NexusAPIClient {
     return this.request('POST', `/intelligence/${encodeURIComponent(id)}/cancel?business_id=${businessId}`);
   }
 
+  // Durable recovery read (authoritative execution state)
+  async listRecoveryExecutions(
+    businessId: string,
+    params?: { limit?: number; offset?: number; divisionId?: string }
+  ): Promise<DurableExecutionList> {
+    const searchParams = new URLSearchParams({ business_id: businessId });
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset) searchParams.set('offset', params.offset.toString());
+    if (params?.divisionId) searchParams.set('division_id', params.divisionId);
+    return this.request<DurableExecutionList>('GET', `/recovery/executions?${searchParams}`);
+  }
+
   // Approvals
   async listApprovals(businessId: string): Promise<{ approvals: Approval[] }> {
     return this.request('GET', `/approvals?business_id=${businessId}`);
@@ -268,31 +281,108 @@ class NexusAPIClient {
 //
 // Browser EventSource cannot send custom headers (X-Actor-ID / X-Actor-Credential),
 // but the backend requires authentication on /events. We therefore implement a
-// fetch-based SSE client that sends the auth headers, matching the EventSource
-// callback interface (onmessage / onerror / close).
+// fetch-based SSE client that sends the auth headers and reconnects with
+// bounded exponential backoff after transient failures.
 //
+// Lifecycle guarantees:
+//   - Transient failures (network error, non-2xx except 401/403, stream end)
+//     trigger a reconnect with exponential backoff + jitter, capped at maxDelayMs.
+//   - A successful connection resets the backoff.
+//   - Permanent authorization failures (401/403) do NOT retry.
+//   - close()/dispose() clears pending retries and aborts the active fetch.
+//   - Malformed frames are emitted raw and never crash the consumer.
+//   - Duplicate events (same event_id) are dropped via a bounded set.
+//   - onReconnected fires after a successful reconnect so callers can reconcile
+//     authoritative state; SSE is a hint, never the source of truth.
+//
+export type EventStreamState = 'closed' | 'connecting' | 'open' | 'reconnecting' | 'failed';
+
 export type EventStreamHandlers = {
   onMessage?: (event: MessageEvent) => void;
-  onError?: (error: Event) => void;
   onOpen?: () => void;
+  onError?: (error: Event) => void;
+  onStateChange?: (state: EventStreamState) => void;
+  /** Fired once after a successful reconnect (not on the initial connection). */
+  onReconnected?: () => void;
 };
+
+export interface EventStreamOptions {
+  /** Base backoff delay in ms (default 500). */
+  baseDelayMs?: number;
+  /** Maximum backoff delay in ms (default 30000). */
+  maxDelayMs?: number;
+  /** Maximum jitter added to each delay in ms (default 250). */
+  jitterMs?: number;
+  /** Maximum number of event IDs retained for duplicate suppression (default 1000). */
+  maxEvents?: number;
+}
 
 export class EventStream {
   private controller: AbortController | null = null;
   private handlers: EventStreamHandlers;
+  private options: Required<EventStreamOptions>;
+  private retryAttempt = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
+  private state: EventStreamState = 'closed';
+  private seenEventIds = new Set<string>();
 
   constructor(
     private api: NexusAPIClient,
     private businessId: string,
-    handlers: EventStreamHandlers = {}
+    handlers: EventStreamHandlers = {},
+    options: EventStreamOptions = {}
   ) {
     this.handlers = handlers;
+    this.options = {
+      baseDelayMs: options.baseDelayMs ?? 500,
+      maxDelayMs: options.maxDelayMs ?? 30000,
+      jitterMs: options.jitterMs ?? 250,
+      maxEvents: options.maxEvents ?? 1000,
+    };
+  }
+
+  getState(): EventStreamState {
+    return this.state;
   }
 
   connect(): void {
+    if (this.disposed) return;
+    this.retryAttempt = 0;
+    this.scheduleConnect(0);
+  }
+
+  close(): void {
+    this.disposed = true;
+    this.clearRetryTimer();
+    this.abortFetch();
+    this.setState('closed');
+  }
+
+  dispose(): void {
     this.close();
+  }
+
+  private scheduleConnect(delayMs: number): void {
+    if (this.disposed) return;
+    this.clearRetryTimer();
+    if (delayMs <= 0) {
+      this.attemptConnect();
+      return;
+    }
+    this.setState('reconnecting');
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.attemptConnect();
+    }, delayMs);
+  }
+
+  private attemptConnect(): void {
+    if (this.disposed) return;
+    this.abortFetch();
     const controller = new AbortController();
     this.controller = controller;
+    this.setState('connecting');
 
     const base = this.api.baseUrl();
     const url = `${base.replace('/api/v1', '')}/events?business_id=${encodeURIComponent(this.businessId)}`;
@@ -308,54 +398,125 @@ export class EventStream {
       signal: controller.signal,
     })
       .then((response) => {
-        if (!response.ok || !response.body) {
-          throw new Error(`SSE connection failed: HTTP ${response.status}`);
+        if (this.disposed || controller.signal.aborted) return;
+        // Permanent authorization failure: do not retry.
+        if (response.status === 401 || response.status === 403) {
+          this.setState('failed');
+          this.handlers.onError?.(new Event('auth-error'));
+          return;
         }
+        if (!response.ok || !response.body) {
+          this.scheduleReconnect();
+          return;
+        }
+        const wasReconnect = this.retryAttempt > 0;
+        this.retryAttempt = 0;
+        this.setState('open');
         this.handlers.onOpen?.();
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        const pump = () => {
-          reader.read().then(({ done, value }) => {
-            if (done) {
-              this.handlers.onError?.(
-                new Event('error', { bubbles: false, cancelable: false })
-              );
-              return;
-            }
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() ?? ''; // keep incomplete last line
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                try {
-                  const parsed = JSON.parse(data);
-                  const msg = new MessageEvent('message', { data: parsed });
-                  this.handlers.onMessage?.(msg);
-                } catch {
-                  // non-JSON data frame — emit raw
-                  const msg = new MessageEvent('message', { data });
-                  this.handlers.onMessage?.(msg);
-                }
-              }
-            }
-            pump();
-          });
-        };
-        pump();
+        if (wasReconnect) {
+          this.handlers.onReconnected?.();
+        }
+        this.readStream(response.body);
       })
-      .catch((err) => {
-        if (err.name === 'AbortError') return;
-        this.handlers.onError?.(
-          new Event('error', { bubbles: false, cancelable: false })
-        );
+      .catch((err: unknown) => {
+        if (this.disposed) return;
+        if (err instanceof Error && err.name === 'AbortError') return;
+        this.scheduleReconnect();
       });
   }
 
-  close(): void {
-    this.controller?.abort();
-    this.controller = null;
+  private readStream(body: ReadableStream<Uint8Array>): void {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const pump = (): void => {
+      reader
+        .read()
+        .then(({ done, value }) => {
+          if (this.disposed) {
+            reader.releaseLock();
+            return;
+          }
+          if (done) {
+            reader.releaseLock();
+            this.scheduleReconnect();
+            return;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          for (const line of lines) {
+            this.handleLine(line);
+          }
+          pump();
+        })
+        .catch((err: unknown) => {
+          if (this.disposed) return;
+          if (err instanceof Error && err.name === 'AbortError') return;
+          this.scheduleReconnect();
+        });
+    };
+    pump();
+  }
+
+  private handleLine(line: string): void {
+    if (!line.startsWith('data: ')) return;
+    const data = line.slice(6);
+    let parsed: { event_id?: string; [key: string]: unknown };
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      // Malformed frame — emit raw without crashing the consumer.
+      this.handlers.onMessage?.(new MessageEvent('message', { data }));
+      return;
+    }
+    // Duplicate suppression: bounded set of seen event IDs (insertion order).
+    if (parsed.event_id) {
+      if (this.seenEventIds.has(parsed.event_id)) return;
+      this.seenEventIds.add(parsed.event_id);
+      if (this.seenEventIds.size > this.options.maxEvents) {
+        const excess = this.seenEventIds.size - this.options.maxEvents;
+        let i = 0;
+        for (const id of this.seenEventIds) {
+          if (i >= excess) break;
+          this.seenEventIds.delete(id);
+          i++;
+        }
+      }
+    }
+    this.handlers.onMessage?.(new MessageEvent('message', { data: parsed }));
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed) return;
+    this.setState('reconnecting');
+    const expDelay = this.options.baseDelayMs * Math.pow(2, this.retryAttempt);
+    const jitter = Math.random() * this.options.jitterMs;
+    const delay = Math.min(this.options.maxDelayMs, expDelay + jitter);
+    this.retryAttempt = Math.min(this.retryAttempt + 1, 32);
+    this.scheduleConnect(delay);
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  private abortFetch(): void {
+    if (this.controller) {
+      this.controller.abort();
+      this.controller = null;
+    }
+  }
+
+  private setState(state: EventStreamState): void {
+    if (this.state !== state) {
+      this.state = state;
+      this.handlers.onStateChange?.(state);
+    }
   }
 }
 

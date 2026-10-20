@@ -217,3 +217,146 @@ describe('submit → approve → resume → result journey', () => {
     expect(mockFetch.mock.calls[0][0]).toBe('/api/v1/intelligence/execute');
   });
 });
+
+describe('reconnect → reconcile → approve → final result', () => {
+  it('reconciles authoritative recovery state after an event-stream interruption', async () => {
+    // 1. Submit.
+    mockFetch.mockResolvedValueOnce(mockJson(202, { execution_id: EXECUTION_ID }));
+    const submitted = await apiClient.submitIntelligence({
+      business_id: BUSINESS_ID,
+      actor_id: ACTOR_ID,
+      objective: { description: 'Quarterly analysis' },
+    });
+    expect(submitted.execution_id).toBe(EXECUTION_ID);
+
+    // 2. Observe running state.
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        execution_id: EXECUTION_ID,
+        status: 'running',
+        created_at: '2026-01-01T00:00:00Z',
+      })
+    );
+    const running = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+    expect(running.status).toBe('running');
+
+    // 3. Authoritative recovery list reflects the running execution.
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        source: 'durable',
+        executions: [
+          {
+            source: 'durable',
+            execution_id: EXECUTION_ID,
+            business_id: BUSINESS_ID,
+            state: 'running',
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        count: 1,
+        limit: 50,
+        offset: 0,
+        has_more: false,
+      })
+    );
+    const beforeReconnect = await apiClient.listRecoveryExecutions(BUSINESS_ID);
+    expect(beforeReconnect.executions[0].state).toBe('running');
+
+    // 4. Event stream interrupted → reconnect reconciles from the authoritative
+    //    recovery read (this is the useEventStream onReconnected behavior).
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        source: 'durable',
+        executions: [
+          {
+            source: 'durable',
+            execution_id: EXECUTION_ID,
+            business_id: BUSINESS_ID,
+            state: 'pending_approval',
+            error_class: 'APPROVAL_REQUIRED',
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:00:05Z',
+          },
+        ],
+        count: 1,
+        limit: 50,
+        offset: 0,
+        has_more: false,
+      })
+    );
+    const reconciled = await apiClient.listRecoveryExecutions(BUSINESS_ID);
+    expect(reconciled.executions[0].state).toBe('pending_approval');
+    expect(reconciled.executions[0].error_class).toBe('APPROVAL_REQUIRED');
+
+    // 5. Approval is required; approve it.
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        approvals: [
+          {
+            entity_id: APPROVAL_ID,
+            status: 'PENDING',
+            requested_action: 'execute_tool',
+            requester_id: ACTOR_ID,
+            approver_type: 'human',
+            created_at: '2026-01-01T00:00:05Z',
+            audit_ref: EXECUTION_ID,
+            self_approval_prohibited: true,
+            delegation_allowed: false,
+          },
+        ],
+      })
+    );
+    const pending = await apiClient.listApprovals(BUSINESS_ID);
+    expect(pending.approvals[0].status).toBe('PENDING');
+
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, { approval_id: APPROVAL_ID, status: 'APPROVED' })
+    );
+    const approved = await apiClient.approveApproval(APPROVAL_ID, BUSINESS_ID, {
+      reason: 'Looks good',
+    });
+    expect(approved.status).toBe('APPROVED');
+
+    // 6. Reconcile again — the resumed execution completed.
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        execution_id: EXECUTION_ID,
+        status: 'completed',
+        output: 'Analysis complete',
+        created_at: '2026-01-01T00:00:00Z',
+        completed_at: '2026-01-01T00:01:00Z',
+      })
+    );
+    const final = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+    expect(final.status).toBe('completed');
+    expect(final.output).toBe('Analysis complete');
+
+    // 7. The authoritative recovery read agrees.
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        source: 'durable',
+        executions: [
+          {
+            source: 'durable',
+            execution_id: EXECUTION_ID,
+            business_id: BUSINESS_ID,
+            state: 'completed',
+            created_at: '2026-01-01T00:00:00Z',
+            updated_at: '2026-01-01T00:01:00Z',
+            approvals: [
+              { approval_id: APPROVAL_ID, outcome: 'granted', decided_at: '2026-01-01T00:00:30Z' },
+            ],
+          },
+        ],
+        count: 1,
+        limit: 50,
+        offset: 0,
+        has_more: false,
+      })
+    );
+    const finalList = await apiClient.listRecoveryExecutions(BUSINESS_ID);
+    expect(finalList.executions[0].state).toBe('completed');
+    expect(finalList.executions[0].approvals?.[0].outcome).toBe('granted');
+  });
+});

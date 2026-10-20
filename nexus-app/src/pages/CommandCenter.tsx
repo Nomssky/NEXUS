@@ -8,6 +8,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { VirtualHQ, type ZoneId } from '../components/VirtualHQ/VirtualHQ';
 import { CommandInput } from '../components/CommandCenter/CommandInput';
 import { ExecutionList } from '../components/CommandCenter/ExecutionList';
+import { ActivityPanel } from '../components/CommandCenter/ActivityPanel';
 import { ApprovalsPanel } from '../components/Approvals/ApprovalsPanel';
 import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
 import { useAgents, useTools, useIntelligence, useEventStream } from '../api/hooks';
@@ -27,24 +28,31 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
   const { data: toolsData } = useTools();
   const queryClient = useQueryClient();
 
-  // SSE: refetch executions and approvals when real-time events arrive.
-  useEventStream(businessId, {
+  // SSE: refetch executions, approvals, and authoritative activity when real-time
+  // events arrive. The connection state is surfaced so the UI can tell the user
+  // whether live updates are connected.
+  const { connectionState } = useEventStream(businessId, {
     onChainCompleted: () => {
       queryClient.invalidateQueries({ queryKey: ['intelligence'] });
       queryClient.invalidateQueries({ queryKey: ['approvals'] });
+      queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
     },
     onChainFailed: () => {
       queryClient.invalidateQueries({ queryKey: ['intelligence'] });
+      queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
     },
     onApprovalRequested: () => {
       queryClient.invalidateQueries({ queryKey: ['approvals'] });
+      queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
     },
     onApprovalApproved: () => {
       queryClient.invalidateQueries({ queryKey: ['approvals'] });
       queryClient.invalidateQueries({ queryKey: ['intelligence'] });
+      queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
     },
     onApprovalDenied: () => {
       queryClient.invalidateQueries({ queryKey: ['approvals'] });
+      queryClient.invalidateQueries({ queryKey: ['recoveryExecutions'] });
     },
   });
 
@@ -89,9 +97,31 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
           <span className={styles.tagline}>Command Center</span>
         </div>
         <div className={styles.headerRight}>
-          <div className={styles.statusIndicator}>
-            <span className={styles.statusDot} />
-            <span>Connected</span>
+          <div
+            className={styles.statusIndicator}
+            data-state={connectionState}
+            title={`Live updates: ${connectionState}`}
+          >
+            <span
+              className={`${styles.statusDot} ${
+                connectionState === 'open'
+                  ? styles.statusDotOpen
+                  : connectionState === 'reconnecting' || connectionState === 'connecting'
+                    ? styles.statusDotReconnecting
+                    : styles.statusDotOffline
+              }`}
+            />
+            <span>
+              {connectionState === 'open'
+                ? 'Live'
+                : connectionState === 'reconnecting'
+                  ? 'Reconnecting…'
+                  : connectionState === 'connecting'
+                    ? 'Connecting…'
+                    : connectionState === 'failed'
+                      ? 'Disconnected'
+                      : 'Offline'}
+            </span>
           </div>
         </div>
       </header>
@@ -149,6 +179,15 @@ const CommandCenterZone: React.FC<{
           actorId={actorId}
           onSubmit={onSubmit}
         />
+      </section>
+
+      <section className={styles.executionsSection} aria-labelledby="activity-heading">
+        <div className={styles.sectionHeader}>
+          <h2 id="activity-heading" className={styles.sectionTitle}>
+            Activity
+          </h2>
+        </div>
+        <ActivityPanel businessId={businessId} onSelect={onExecutionSelect} />
       </section>
 
       <section className={styles.executionsSection} aria-labelledby="executions-heading">

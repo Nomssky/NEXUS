@@ -192,3 +192,47 @@ describe('createAPIClient factory', () => {
     expect(client.baseUrl()).toBe('http://localhost:9090/api/v1');
   });
 });
+
+describe('recovery executions (authoritative activity)', () => {
+  it('calls the recovery list endpoint with business scope', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          source: 'durable',
+          executions: [],
+          count: 0,
+          limit: 50,
+          offset: 0,
+          has_more: false,
+        }),
+        { status: 200 }
+      )
+    );
+    await apiClient.listRecoveryExecutions('biz-1', { limit: 50 });
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/recovery/executions?business_id=biz-1'),
+      expect.anything()
+    );
+  });
+
+  it('includes division scope when requested', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          source: 'durable',
+          executions: [],
+          count: 0,
+          limit: 50,
+          offset: 0,
+          has_more: false,
+        }),
+        { status: 200 }
+      )
+    );
+    await apiClient.listRecoveryExecutions('biz-1', { divisionId: 'div-1' });
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('division_id=div-1'),
+      expect.anything()
+    );
+  });
+});

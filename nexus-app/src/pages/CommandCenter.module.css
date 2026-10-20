@@ -65,6 +65,20 @@
   animation: pulse 2s ease-in-out infinite;
 }
 
+.statusDotOpen {
+  background-color: var(--color-state-success);
+}
+
+.statusDotReconnecting {
+  background-color: var(--color-state-warning);
+  animation: pulse 0.8s ease-in-out infinite;
+}
+
+.statusDotOffline {
+  background-color: var(--color-state-error);
+  animation: none;
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
