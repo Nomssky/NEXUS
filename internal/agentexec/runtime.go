@@ -12,10 +12,12 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/control"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
@@ -114,8 +116,17 @@ type Runtime struct {
 	// invocation passes through it BEFORE Platform.Invoke. A nil controller
 	// fails closed: governance is never bypassed.
 	Controller *control.Controller
-	now        func() time.Time
-	maxDepth   int
+	// Journal is the durable execution journal (v10). When set, a
+	// consequential invocation records dispatch-intent BEFORE the effect and
+	// its outcome AFTER, so recovery can classify an ambiguous interruption as
+	// unknown and refuse to replay it. Nil = process-local only.
+	Journal *execjournal.Journal
+	// Metrics is the optional, bounded operational metrics owner (v15). Nil is
+	// a safe no-op. It records durable journal write failures on the dispatch
+	// path (the runtime records no execution-lifecycle metrics itself).
+	Metrics  *metrics.Metrics
+	now      func() time.Time
+	maxDepth int
 	// maxFan bounds total fan-out per execution: spec Delegates and
 	// coordination members alike (contract §3).
 	maxFan int
@@ -651,6 +662,24 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 		if aerr != nil {
 			return nil, aerr
 		}
+		// v10 durable dispatch evidence: for a CONSEQUENTIAL effect, persist the
+		// dispatch intent BEFORE the effect can occur, then the outcome AFTER.
+		// If the intent cannot be persisted we refuse the effect (fail closed):
+		// an unrecorded consequential dispatch could otherwise be replayed
+		// ambiguously after a crash. Reads are idempotent and are not recorded.
+		consequential := false
+		invID := ""
+		if r.Journal != nil {
+			if m, ok := r.Tools.Manifest(call.ToolID); ok && m.SideEffectClass != tool.SideEffectRead {
+				consequential = true
+				id, jerr := r.Journal.RecordDispatchIntent(corr, corr, call.ToolID, call.Operation, string(m.SideEffectClass))
+				if jerr != nil {
+					r.Metrics.JournalWriteFailure()
+					return nil, fmt.Errorf("durable dispatch intent failed for %s (refusing consequential effect): %w", call.ToolID, jerr)
+				}
+				invID = id
+			}
+		}
 		res := r.Platform.Invoke(ctx, capability.Request{
 			ToolID: call.ToolID, Operation: call.Operation, Input: call.Input,
 			AgentID: agentID, ActorID: scope.ActorID, BusinessID: businessID,
@@ -659,6 +688,14 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 			// constraint may tighten this call and nothing else may widen it.
 			MaxDuration: effective.MaxDuration,
 		})
+		if consequential {
+			// Best-effort: a failed outcome write leaves the intent record
+			// "dispatched", which recovery classifies as unknown (safe — never
+			// replayed, never fabricated as completed).
+			if err := r.Journal.RecordOutcome(invID, invocationStatus(res.Outcome), res.Outcome); err != nil {
+				r.Metrics.JournalWriteFailure()
+			}
+		}
 		if res.Status != tool.StatusSuccess {
 			return nil, &OutcomeError{
 				Outcome:                 res.Outcome,

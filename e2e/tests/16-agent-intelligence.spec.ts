@@ -109,6 +109,90 @@ test.describe('AGENT INTELLIGENCE LAYER', () => {
     expect(summary).toContain('observations=1');
   });
 
+  // ---- SUCCESS CRITERIA (AGENT_INTELLIGENCE_CONTRACTS §7) -----------------
+  //
+  // Black-box proof that a completion claim is only a REQUEST: the runtime
+  // accepts `complete` only when every objective criterion is satisfied by
+  // evidence it produced itself in this execution.
+  //
+  // The evidence these assertions are grounded in, read from the shipped
+  // implementation rather than assumed:
+  //   * a successful tool_call observation is built with Source "tool:"+tool,
+  //     ActionType tool_call, Status "ok" (agentintel/loop.go ActionToolCall);
+  //   * on success it carries Outcome "completed" and Result = the tool output;
+  //   * the shipped calculator builtin returns {"result": "42"} for 6*7;
+  //   * the scripted provider emits that calculator call for an objective
+  //     naming "calculator", then `complete` once the tool has been observed.
+  const calculatorObjective = 'multiply six by seven with the calculator and report the product';
+
+  test('SUCCESS CRITERIA: an unmet criterion rejects completion', async ({ request, nexus }) => {
+    await ensureAnalyst(request, nexus);
+    const res = await submitObjective(request, nexus, {
+      description: calculatorObjective,
+      success_criteria: ['source==tool:never'],
+    });
+    expect(res.status()).toBe(202);
+    const { execution_id } = await res.json();
+    const result = await pollObjective(request, nexus, execution_id);
+
+    expect(result.status).toBe('failed');
+    expect(result.error.message).toContain('state=failed');
+    expect(result.error.message).toContain(
+      'complete rejected: success criteria unmet: source==tool:never',
+    );
+    // No completed terminal state is reported anywhere in the envelope.
+    expect(result.outcome.summary).not.toContain('state=completed');
+    // The failure is attributable to the GATE, not to the execution path: the
+    // runtime only evaluates criteria AFTER the "at least one observation"
+    // evidence check, so reaching this message proves the calculator really
+    // ran. A broken tool would say "tool failed" instead.
+    expect(result.error.message).not.toContain('tool failed');
+  });
+
+  test('SUCCESS CRITERIA: satisfied criteria permit completion', async ({ request, nexus }) => {
+    await ensureAnalyst(request, nexus);
+    const res = await submitObjective(request, nexus, {
+      description: calculatorObjective,
+      success_criteria: [
+        'source==tool:calculator',
+        'action_type==tool_call',
+        'status==ok',
+        'outcome==completed',
+        'result.result==42',
+      ],
+    });
+    expect(res.status()).toBe(202);
+    const { execution_id } = await res.json();
+    const result = await pollObjective(request, nexus, execution_id);
+
+    expect(result.status).toBe('completed');
+    const summary = result.outcome.summary as string;
+    expect(summary).toContain('state=completed');
+    // Every criterion above was satisfied by the one real tool observation.
+    expect(summary).toContain('tool_calls=1');
+    expect(summary).toContain('observations=1');
+  });
+
+  test('SUCCESS CRITERIA: a malformed criterion fails closed', async ({ request, nexus }) => {
+    await ensureAnalyst(request, nexus);
+    // Objective validation checks the description only, so criteria are parsed
+    // when the execution runs: the submit is accepted and the run then fails
+    // honestly. That is the documented asynchronous semantics, asserted as-is.
+    const res = await submitObjective(request, nexus, {
+      description: calculatorObjective,
+      success_criteria: ['the report should be convincing'],
+    });
+    expect(res.status()).toBe(202);
+    const { execution_id } = await res.json();
+    const result = await pollObjective(request, nexus, execution_id);
+
+    expect(result.status).toBe('failed');
+    expect(result.error.message).toContain('state=failed');
+    expect(result.error.message).toContain('invalid success criteria');
+    // A criterion nobody can evaluate must never be read as success.
+    expect(result.outcome.summary).not.toContain('state=completed');
+  });
+
   test('multiple tool calls and memory read/write inside one objective', async ({ request, nexus }) => {
     await ensureAnalyst(request, nexus);
     const memory = await runObjective(request, nexus, 'remember the meeting notes in memory');
@@ -132,7 +216,7 @@ test.describe('AGENT INTELLIGENCE LAYER', () => {
     expect(result.outcome.summary).toContain('replans=1');
   });
 
-  test('iteration budget: a model that only says continue terminates as budget_exhausted', async ({
+  test('a model that only says continue stalls and terminates inside its budgets', async ({
     request,
     nexus,
   }) => {
@@ -143,7 +227,10 @@ test.describe('AGENT INTELLIGENCE LAYER', () => {
     const result = await pollObjective(request, nexus, execution_id);
     expect(result.status).toBe('failed');
     expect(result.error.message).toMatch(/state=(budget_exhausted|failed)/);
-    expect(result.error.message).toMatch(/no actionable output|iteration budget/);
+    // A stall spends the replan budget before it gives up (success criteria
+    // §7), so the honest reason names the stall and its exhaustion rather than
+    // the pre-v18 "no actionable output". What matters here is that it stops.
+    expect(result.error.message).toMatch(/progress stalled|iteration budget|replan budget/);
   });
 
   test('a tighter caller budget binds and a looser one cannot raise the caps', async ({

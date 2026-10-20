@@ -128,6 +128,137 @@ func TestDelegateUnknownChildAgentRejected(t *testing.T) {
 	}
 }
 
+// ---------- explicit agent selection authority ----------
+
+// TestExplicitAgentSameDivisionAllowed verifies that an explicit agent_id
+// selects an active, business-owned, division-visible agent.
+func TestExplicitAgentSameDivisionAllowed(t *testing.T) {
+	g := delegateFixture(t)
+	// governed-child is active in biz-1, no division (business-wide).
+	obj := Objective{Description: "delegate to same-division agent",
+		Context: map[string]string{"agent_id": "governed-child"}}
+	req := workRequest(t, obj, "")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"delegate","agent_id":"governed-child","objective":"do it",` +
+			`"delegate_tools":[{"tool":"governed.echo","operation":"execute","input":{"text":"hi"}}]}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	out, _ := g.rt.Run(context.Background(), req, nil)
+	if out.Status != "completed" {
+		t.Fatalf("same-division active agent must be invokable: %s / %s", out.Status, out.Error)
+	}
+	if g.adapter.count() != 1 {
+		t.Fatalf("exactly one tool ran, got %d", g.adapter.count())
+	}
+}
+
+// TestExplicitAgentSiblingDivisionRejected verifies that an explicit agent in
+// a sibling division is not selected, even though it shares the business.
+func TestExplicitAgentSiblingDivisionRejected(t *testing.T) {
+	g := delegateFixture(t)
+	if _, err := g.rt.Registry.Create(agentexec.Definition{
+		ID: "sibling-agent", Name: "Sibling", BusinessID: "biz-1", DivisionID: "div-2",
+		Capabilities: []string{"analysis"}, AllowedTools: []string{"governed.echo"},
+	}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	obj := Objective{Description: "delegate to sibling division agent",
+		Context: map[string]string{"agent_id": "sibling-agent"}}
+	req := workRequest(t, obj, "div-1")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"governed.echo","operation":"execute","input":{"text":"hi"}}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	_, _ = g.rt.Run(context.Background(), req, nil)
+	// The sibling agent is not selected -> agentTools("") is empty -> the tool
+	// call is denied at the platform boundary, never reaching the adapter.
+	if g.adapter.count() != 0 {
+		t.Fatalf("sibling-division agent must not be invokable, got %d tool calls", g.adapter.count())
+	}
+}
+
+// TestExplicitAgentDifferentBusinessRejected verifies that an explicit agent
+// in a different business is not selected.
+func TestExplicitAgentDifferentBusinessRejected(t *testing.T) {
+	g := delegateFixture(t)
+	if _, err := g.rt.Registry.Create(agentexec.Definition{
+		ID: "other-biz-agent", Name: "Other", BusinessID: "biz-2",
+		Capabilities: []string{"analysis"}, AllowedTools: []string{"governed.echo"},
+	}, "t"); err != nil {
+		t.Fatal(err)
+	}
+	obj := Objective{Description: "delegate to other-business agent",
+		Context: map[string]string{"agent_id": "other-biz-agent"}}
+	req := workRequest(t, obj, "")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"governed.echo","operation":"execute","input":{"text":"hi"}}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	_, _ = g.rt.Run(context.Background(), req, nil)
+	if g.adapter.count() != 0 {
+		t.Fatalf("different-business agent must not be invokable, got %d tool calls", g.adapter.count())
+	}
+}
+
+// TestExplicitAgentSuspendedRejected verifies that an explicit suspended
+// agent is not selected.
+func TestExplicitAgentSuspendedRejected(t *testing.T) {
+	g := delegateFixture(t)
+	if _, err := g.rt.Registry.SetStatus("governed-child", agentexec.AgentSuspended, "t"); err != nil {
+		t.Fatal(err)
+	}
+	obj := Objective{Description: "delegate to suspended agent",
+		Context: map[string]string{"agent_id": "governed-child"}}
+	req := workRequest(t, obj, "")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"governed.echo","operation":"execute","input":{"text":"hi"}}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	_, _ = g.rt.Run(context.Background(), req, nil)
+	if g.adapter.count() != 0 {
+		t.Fatalf("suspended agent must not be invokable, got %d tool calls", g.adapter.count())
+	}
+}
+
+// TestExplicitAgentUnknownRejected verifies that an unknown explicit agent is
+// not selected and does not fall back to another agent.
+func TestExplicitAgentUnknownRejected(t *testing.T) {
+	g := delegateFixture(t)
+	obj := Objective{Description: "delegate to unknown agent",
+		Context: map[string]string{"agent_id": "ghost-agent"}}
+	req := workRequest(t, obj, "")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"governed.echo","operation":"execute","input":{"text":"hi"}}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	_, _ = g.rt.Run(context.Background(), req, nil)
+	if g.adapter.count() != 0 {
+		t.Fatalf("unknown agent must not be invokable, got %d tool calls", g.adapter.count())
+	}
+}
+
+// TestDefaultSelectionUsesSelector verifies that no explicit agent_id falls
+// back to the standard selector (which enforces the same eligibility rules).
+func TestDefaultSelectionUsesSelector(t *testing.T) {
+	g := delegateFixture(t)
+	obj := Objective{Description: "delegate without explicit agent"}
+	req := workRequest(t, obj, "")
+	g.rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"delegate","agent_id":"governed-child","objective":"do it",` +
+			`"delegate_tools":[{"tool":"governed.echo","operation":"execute","input":{"text":"hi"}}]}`,
+		`{"type":"complete","result":"done"}`,
+	}}
+	out, _ := g.rt.Run(context.Background(), req, nil)
+	if out.Status != "completed" {
+		t.Fatalf("default selection must work: %s / %s", out.Status, out.Error)
+	}
+	if g.adapter.count() != 1 {
+		t.Fatalf("exactly one tool ran, got %d", g.adapter.count())
+	}
+}
+
+// ---------- delegation child outcome mapping ----------
+
 func TestDelegateChildOutcomeMapping(t *testing.T) {
 	rt, _ := newIntelFixture(t, nil, &scriptedDecider{plan: goodPlan})
 	mkOut := func(status string) *executor.Outcome {

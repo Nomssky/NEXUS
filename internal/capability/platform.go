@@ -22,6 +22,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
+	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
 
@@ -135,6 +136,9 @@ type Platform struct {
 	Auditor     Auditor
 	Caps        Caps
 	Now         func() time.Time
+	// Metrics is the optional, bounded operational metrics owner (v15). Nil is a
+	// safe no-op; instrumentation never blocks or changes a dispatch.
+	Metrics *metrics.Metrics
 	// secretMu guards secrets, the registered secret values used for
 	// redaction. Values never leave this struct (contract §7, §11).
 	secretMu sync.RWMutex
@@ -221,7 +225,14 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	}
 	res.Operation = req.Operation
 	if req.Operation == "" {
-		req.Operation = defaultOperation(manifest)
+		// Reject empty operations for multi-operation tools — never default
+		// to the first operation, which could be destructive (e.g. DELETE).
+		// Single-operation tools are unambiguous and safe to default.
+		if len(manifest.Operations) > 1 {
+			return p.deny(req, res, start, ErrValidation,
+				fmt.Sprintf("tool %q requires an explicit operation", req.ToolID), "tool.invocation.rejected")
+		}
+		req.Operation = manifest.Operations[0]
 		res.Operation = req.Operation
 	}
 	if !manifest.Supports(req.Operation) {
@@ -312,6 +323,10 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	class := EffectiveClass(manifest, adapter, req.Operation)
 	callCtx, cancel := context.WithTimeout(ctx, limits.MaxDuration)
 	defer cancel()
+	// One logical tool invocation has begun (its physical attempts and outcome
+	// are recorded below). Capability-state and permission denials that return
+	// before this point are refusals, not invocations.
+	p.Metrics.ToolCall()
 	p.Auditor.emit(event.EventTypeToolInvocationStarted, req, map[string]string{
 		"tool_id": req.ToolID, "operation": req.Operation, "agent_id": req.AgentID,
 		"side_effect_class": string(manifest.SideEffectClass), "call_id": callID,
@@ -326,6 +341,12 @@ func (p *Platform) Invoke(ctx context.Context, req Request) tool.Result {
 	res.Attempts = attempts
 	res.CapabilityState = string(state)
 	res.Outcome = classifyOutcome(err, ctx.Err())
+	// Operational metrics (v15, bounded): one logical call, its physical attempts
+	// (a retry never increments the logical call count), and its outcome. The
+	// closed outcome vocabulary includes `unknown`, which is never counted as
+	// completed.
+	p.Metrics.ToolAttempts(int64(attempts))
+	p.Metrics.ToolOutcome(res.Outcome)
 	// The surfaced verdict combines the class decision with the remaining
 	// budget: a spent attempt budget never recommends another attempt, and an
 	// unknown outcome never does either (§3).

@@ -732,7 +732,22 @@ func (p *Platform) load(memID string) (*Record, *store.Record, error) {
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, memID)
 	}
 	rec, err := p.st.Get(memID)
-	if err != nil || rec == nil || rec.Status == store.RecordStatusDeleted {
+	if err != nil {
+		// Absence is signalled two ways: (nil, nil), which is the documented
+		// Store contract and what FileStore returns, and (nil, ErrNotFound),
+		// which MemStore returns. Only those two mean "no record".
+		//
+		// A genuine read failure — I/O, corruption, permissions — is NOT
+		// absence and must reach the caller. Reporting it as not-found would
+		// claim a durable record does not exist when the truth is that the
+		// store could not be read, and would let a caller treat an unreadable
+		// record as safe to recreate or overwrite.
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, memID)
+		}
+		return nil, nil, fmt.Errorf("memory: read %q: %w", memID, err)
+	}
+	if rec == nil || rec.Status == store.RecordStatusDeleted {
 		// A soft-deleted record is invisible to normal reads, whichever store
 		// holds it (contract §10).
 		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, memID)

@@ -122,6 +122,18 @@ start with `require_authentication`, `enforce_business_scope`, `audit_enabled` o
 `sandbox_enabled` turned off (`config.security_unsafe`). Only outside production
 can the `NEXUS_SECURITY_*` variables relax them.
 
+Production additionally fails closed on two launch gates (`config.provider_missing`,
+`config.storage_missing`): it must configure at least one real model provider in
+`models.providers` (the simulated/scripted provider is development-only and is
+never an accidental fallback), and it must set a non-empty durable
+`storage.data_dir`. A provider entry needs `id`, `endpoint`, `model_id` and
+`api_key_env`; the credential value is read from that environment variable at
+startup and a missing/empty value fails closed (the variable is named in the
+error, never its value). These gates apply to production only; development and
+staging keep the in-memory + simulated posture.
+
+For backup/restore, rollback and secret rotation, see `docs/operations-runbook.md`.
+
 ### Public vs secret configuration
 
 - **Public configuration** (the table above) may be set in files or environment.

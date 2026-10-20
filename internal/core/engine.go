@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/attention"
@@ -18,6 +19,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/memory"
+	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/foundation/scheduler"
 	"github.com/Nomssky/NEXUS/internal/foundation/schema"
@@ -53,6 +55,17 @@ type Engine struct {
 	// Ownership: external API surface only — never engine-internal state.
 	store        store.Store
 	healthServer *health.Server
+
+	// journal is the durable execution journal (v10). Nil = no durable
+	// execution evidence (in-memory/dev installs). It records acceptance
+	// before the caller is told the execution is durable, and the terminal
+	// state after the result is stored.
+	journal *execjournal.Journal
+
+	// metrics is the optional, bounded, process-local operational metrics owner
+	// (contracts/OPERATIONAL_OBSERVABILITY_CONTRACTS.md). Nil disables metric
+	// instrumentation (a safe no-op); metrics never block execution.
+	metrics *metrics.Metrics
 
 	// Governance
 	govEngine *governance.Engine
@@ -135,6 +148,13 @@ type Engine struct {
 	inflightMu sync.RWMutex
 	inflight   map[string]*inflightRequest
 
+	// admitMu makes an admission's registration (inflight + requestRefs) and a
+	// finished run's teardown of the same state mutually exclusive, so a run
+	// that finishes can never remove the registration a resume re-established
+	// for it. Ordered outer of inflightMu/requestRefsMu; never held across a
+	// blocking operation (the resume slot/queue send happen outside it).
+	admitMu sync.Mutex
+
 	// Persistence
 	persistErr error
 
@@ -165,6 +185,20 @@ func WithPersistence(dir string) EngineOption {
 		}
 		e.store = fs
 	}
+}
+
+// WithExecutionJournal wires the durable execution journal (v10). With a
+// journal set, SubmitRequest persists durable acceptance before returning and
+// the processing loop persists the terminal state. A nil journal (the default)
+// leaves execution state process-local.
+func WithExecutionJournal(j *execjournal.Journal) EngineOption {
+	return func(e *Engine) { e.journal = j }
+}
+
+// WithMetrics wires the optional operational metrics owner (v15). A nil metrics
+// (the default) leaves instrumentation a no-op.
+func WithMetrics(m *metrics.Metrics) EngineOption {
+	return func(e *Engine) { e.metrics = m }
 }
 
 // WithIdentity wires the membership store and enforcement posture for the
@@ -454,21 +488,73 @@ func (e *Engine) SubmitRequest(req *Request) error {
 		return fmt.Errorf("backpressure: queue full (rejected=%d)", e.backpressure.RejectedCount())
 	}
 
-	// E-005: register before the channel send so a cancellation can always
-	// find the request (queued or executing) from the moment it is admitted.
+	// Duplicate detection: an in-flight or terminal request with the same ID
+	// must not be re-admitted, or the same execution would run twice and
+	// produce duplicate side effects.
+	//
+	// Both checks run inside the admitMu critical section so they are atomic
+	// with respect to concurrent completions. processRequests stores the
+	// terminal result under resultsMu before deregistering inflight under
+	// admitMu; holding admitMu for both checks means a caller either sees the
+	// stored result or the live registration — never the gap between them.
+	// Lock ordering: resultsMu is always released before admitMu is acquired
+	// (processRequests), so nesting resultsMu.RLock inside admitMu.Lock here
+	// cannot deadlock.
+	e.admitMu.Lock()
+	e.resultsMu.RLock()
+	if e.results[req.ID] != nil {
+		e.resultsMu.RUnlock()
+		e.admitMu.Unlock()
+		e.backpressure.Release()
+		return fmt.Errorf("duplicate request: %q already completed", req.ID)
+	}
+	e.resultsMu.RUnlock()
+
+	// inflightRef reads e.inflight under inflightMu.RLock, which is compatible
+	// with deregisterInflight's inflightMu.Lock. Reading e.inflight directly
+	// under admitMu would race with those paths.
+	if e.inflightRef(req.ID) != nil {
+		e.admitMu.Unlock()
+		e.backpressure.Release()
+		return fmt.Errorf("duplicate request: %q already in flight", req.ID)
+	}
 	e.registerInflight(req)
 	// Index the request so an action-level approval raised inside it can bind
 	// to it and resume it (AGENT_GOVERNANCE_CONTROL_CONTRACTS section 5).
 	e.trackRequestRef(req)
+	e.admitMu.Unlock()
+
+	// Durable acceptance (v10): persist the accepted execution BEFORE the
+	// caller is told the execution is durable. If this fails, the request is
+	// not enqueued and the caller gets an error — no 202 without a durable
+	// record.
+	if e.journal != nil {
+		var biz, div, actor string
+		if req.Context != nil {
+			biz, div, actor = req.Context.BusinessID, req.Context.DivisionID, req.Context.ActorID
+		}
+		if jerr := e.journal.Accepted(req.ID, biz, div, actor); jerr != nil {
+			e.metrics.JournalWriteFailure()
+			e.backpressure.Release()
+			e.deregisterInflight(req.ID)
+			e.untrackRequestRef(req)
+			return fmt.Errorf("durable acceptance failed: %w", jerr)
+		}
+	}
 
 	select {
 	case e.requests <- req:
+		// Admitted and durably accepted: one logical execution is now in flight.
+		e.metrics.ExecutionAccepted()
 		return nil
 	case <-shutdownCh:
 		e.backpressure.Release()
 		// Send never happened — drop the registration; exactly one Release
-		// follows the Accept above, none is skipped or duplicated.
+		// follows the Accept above, none is skipped or duplicated. The durable
+		// record remains "accepted"; recovery classifies it as unknown (safe,
+		// never replayed).
 		e.deregisterInflight(req.ID)
+		e.untrackRequestRef(req)
 		return fmt.Errorf("engine shutting down")
 	}
 }
@@ -506,6 +592,18 @@ func (e *Engine) processRequests(ctx context.Context) {
 			// must follow per Accept — never skip, never duplicate.
 			e.backpressure.Release()
 
+			// Capture the approvals this run is authorized by BEFORE it runs
+			// (approval.go: approvedApprovalsFor / cleanupConsumedApprovals):
+			// an approval granted in the window between this run's terminal
+			// store and its cleanup belongs to the resume it triggers, never
+			// to this run. Capturing here rather than keying cleanup off the
+			// current status is what keeps a concurrent approve from being
+			// deleted out from under its own resume.
+			consumedApprovals := e.approvedApprovalsFor(req.ID)
+			// Ownership token for the in-flight registration/deregistration
+			// pairing (see the guarded teardown below).
+			infAtDequeue := e.inflightRef(req.ID)
+
 			result := e.executeChain(ctx, req)
 			e.resultsMu.Lock()
 			e.results[req.ID] = result
@@ -519,19 +617,43 @@ func (e *Engine) processRequests(ctx context.Context) {
 			}
 			e.resultsMu.Unlock()
 
-			// E-005: deregister only after the terminal result is stored, so
-			// CancelRequest always finds either the registration or the result
-			// (no window where neither exists).
-			e.deregisterInflight(req.ID)
+			// Durable state (v10): record how the run ended. An approval pause is
+			// provisional and supersedable; every other end is first-wins.
+			e.journalFinalize(req.ID, result)
 
-			// Approval resume: once an approved approval's re-run stored its
-			// terminal result, the index entry has served its purpose.
-			e.cleanupResumeApproval(req.ID)
+			// Operational metrics (v15, process-local, bounded): close the run's
+			// in-flight interval, record the exact terminal status, classify a
+			// failure by its coarse code, and count a stored approval wait. These
+			// never change execution semantics and never block.
+			e.metrics.ExecutionFinished()
+			e.metrics.TerminalOutcome(result.Status)
+			if result.Status == "failed" {
+				e.metrics.TerminalErrorClass(journalErrorClass(result))
+			}
+			if isApprovalWaiting(result) {
+				e.metrics.ApprovalPaused()
+			}
 
-			// The reference index has served its purpose too: an action-level
-			// approval raised inside this run is already bound to it, and any
-			// later admission resolves its own request.
-			e.untrackRequestRef(req)
+			// E-005 teardown, serialized with resume re-admission (admitMu): a run
+			// releases the in-flight registration and the request reference ONLY
+			// while it still owns them. A resume admitted in the window between
+			// the terminal store and here re-registered the request; removing
+			// that registration would blank the request out of the registry
+			// (GetResult and Pending both miss → a concurrent reader sees 404)
+			// and drop the reference the resume's action admission needs
+			// (APPROVAL_LIFECYCLE §8 / AGENT_GOVERNANCE_CONTROL §5).
+			e.admitMu.Lock()
+			if e.inflightRef(req.ID) == infAtDequeue {
+				e.deregisterInflight(req.ID)
+				e.untrackRequestRef(req)
+			}
+			e.admitMu.Unlock()
+
+			// Approval resume: release exactly the approvals this run was
+			// authorized by (captured at dequeue). An approval granted
+			// concurrently with this run's completion is left for the resume it
+			// triggers; deleting by id never touches it.
+			e.cleanupConsumedApprovals(req.ID, consumedApprovals)
 
 			// Emit completion event
 			_ = e.eventBus.Publish(&event.Event{
@@ -566,6 +688,22 @@ func (e *Engine) EventBus() *event.MemBus {
 // defaulting to MemStore. Never nil after NewEngine succeeds.
 func (e *Engine) Store() store.Store {
 	return e.store
+}
+
+// ExecutionJournal returns the durable execution journal, or nil when no
+// durable store is configured. The v11 read API uses it to expose durable
+// lifecycle evidence (contracts/DURABLE_EXECUTION_READ_AND_RECONCILIATION_CONTRACTS.md).
+func (e *Engine) ExecutionJournal() *execjournal.Journal {
+	return e.journal
+}
+
+// MetricsSnapshot returns a bounded, process-local operational metrics view
+// (contracts/OPERATIONAL_OBSERVABILITY_CONTRACTS.md). It is nil-safe (an empty
+// snapshot when no metrics owner is wired) and performs no I/O — it never
+// touches the store or the journal, so it cannot recursively depend on a
+// failing subsystem.
+func (e *Engine) MetricsSnapshot() metrics.Snapshot {
+	return e.metrics.Snapshot()
 }
 
 // ToolRegistry returns the engine's tool registry.

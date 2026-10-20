@@ -2,6 +2,7 @@ package agentintel
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/executor"
@@ -27,11 +28,54 @@ import (
 // wrongly — verification would reject a mismatched snapshot anyway.
 const maxResumeSnapshots = 256
 
+// objectiveIdentity is what a re-submitted objective must still say for a
+// re-entry to CONTINUE the waiting execution instead of silently replacing it
+// (APPROVAL_LIFECYCLE_CONTRACTS §6: "Approving re-submits the SAME request").
+//
+// The description alone is not that identity. An objective also carries its
+// success criteria and its effective budget, and a resume inherits the ORIGINAL
+// plan, ledger, observations, completed-effect fingerprints and consumed
+// counters. Matching on the description alone would let a re-submission swap in
+// weaker criteria or a wider budget while keeping the original run's authority
+// and its protection against re-executing completed effects. Both are bound
+// here so the restore is verified against what actually governs the execution.
+//
+// The budget bound is the CLAMPED budget — the autonomy the run actually got —
+// not the raw request. Callers may only tighten (§9), so an unset field and an
+// explicitly-cap value are the same grant and must not read as a change.
+type objectiveIdentity struct {
+	description string
+	criteria    []criterionKey
+	budget      Budget
+}
+
+// newObjectiveIdentity captures an objective's resume identity from its parsed
+// description, its parsed criteria and its already-clamped budget. Both inputs
+// are the normalized forms the loop itself uses, so nothing here re-parses or
+// re-normalizes anything that could drift from the running execution.
+func newObjectiveIdentity(obj Objective, budget Budget, crits []criterion) objectiveIdentity {
+	return objectiveIdentity{
+		description: obj.Description,
+		criteria:    criteriaIdentity(crits),
+		budget:      budget,
+	}
+}
+
+// matches reports whether a re-submitted objective is the same objective.
+// Comparison is by value over immutable data, and the criteria slice is
+// compared element-wise, so a snapshot and a live request share no mutable
+// state.
+func (id objectiveIdentity) matches(other objectiveIdentity) bool {
+	return id.description == other.description &&
+		id.budget == other.budget &&
+		slices.Equal(id.criteria, other.criteria)
+}
+
 // runSnapshot is the authoritative scratch state of one paused execution:
 // everything the loop needs to continue instead of restarting.
 type runSnapshot struct {
 	// identity pins the snapshot to one execution of one objective.
-	objective  string
+	identity   objectiveIdentity
 	businessID string
 	divisionID string
 	actorID    string
@@ -56,10 +100,10 @@ type runSnapshot struct {
 
 // snapshotRun stores the paused run's state for its resume. Only the
 // pending_approval path calls this, right before returning.
-func (r *Runtime) snapshotRun(rn *run, obj Objective, plan *Plan, ledger *planLedger,
+func (r *Runtime) snapshotRun(rn *run, id objectiveIdentity, plan *Plan, ledger *planLedger,
 	observations []Observation, usage BudgetUsage, working *WorkingMemory, deadline time.Time) {
 	snap := &runSnapshot{
-		objective:    obj.Description,
+		identity:     id,
 		businessID:   rn.businessID,
 		divisionID:   rn.divisionID,
 		actorID:      rn.req.ActorID,
@@ -91,26 +135,36 @@ func (r *Runtime) snapshotRun(rn *run, obj Objective, plan *Plan, ledger *planLe
 	}
 }
 
-// takeResume loads and consumes the snapshot for an execution id, verifying
-// it belongs to this exact request. A mismatch (or no snapshot) means a
-// fresh start: the stale entry is dropped, never applied.
-func (r *Runtime) takeResume(execID string, obj Objective, req *executor.WorkRequest) (*runSnapshot, bool) {
+// takeResume loads the snapshot for an execution id and consumes it ONLY when
+// the request verifies as the same execution. A mismatch is not a resume: it
+// starts fresh (APPROVAL_LIFECYCLE_CONTRACTS §6, "mismatches start fresh") and
+// leaves the waiting execution's snapshot untouched, so a caller that
+// re-submitted the wrong objective cannot destroy a valid snapshot it was never
+// entitled to continue. The original attempt may still resume it afterwards.
+//
+// Verification and consumption share ONE critical section, so a pair of
+// concurrent matching callers cannot both win: the loser's lookup observes the
+// map after the winner's delete and finds nothing.
+func (r *Runtime) takeResume(execID string, id objectiveIdentity, req *executor.WorkRequest) (*runSnapshot, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	snap := r.resumes[execID]
 	if snap == nil {
 		return nil, false
 	}
+	// Verify before consuming. Nothing below this point has touched the
+	// registry, so a rejection here is non-destructive by construction rather
+	// than by cleanup after the fact.
+	if !snap.identity.matches(id) || snap.businessID != req.BusinessID ||
+		snap.divisionID != req.DivisionID || snap.actorID != req.ActorID {
+		return nil, false
+	}
 	delete(r.resumes, execID)
-	for i, id := range r.resumeOrder {
-		if id == execID {
+	for i, eid := range r.resumeOrder {
+		if eid == execID {
 			r.resumeOrder = append(r.resumeOrder[:i], r.resumeOrder[i+1:]...)
 			break
 		}
-	}
-	if snap.objective != obj.Description || snap.businessID != req.BusinessID ||
-		snap.divisionID != req.DivisionID || snap.actorID != req.ActorID {
-		return nil, false
 	}
 	return snap, true
 }
@@ -120,7 +174,7 @@ func (r *Runtime) takeResume(execID string, obj Objective, req *executor.WorkReq
 // so replaying oldest-first restores the newest-first invariant).
 func restoreWorking(snap *runSnapshot) *WorkingMemory {
 	working := NewWorkingMemory()
-	working.Bind(snap.objective)
+	working.Bind(snap.identity.description)
 	working.SetDeadline(snap.deadline)
 	for fp := range snap.effects {
 		_, _ = working.NoteEffect(fp)

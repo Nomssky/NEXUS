@@ -133,30 +133,33 @@ func (s *Server) handleGetIntelligence(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "execution ID required")
 		return
 	}
-	result, ok := s.engine.GetResult(id)
-	if !ok {
-		if pending, inFlight := s.engine.Pending(id); inFlight {
-			if pending.BusinessID != businessID {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
-				return
-			}
-			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Correlation-ID", pending.CorrelationID)
-			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"execution_id": id, "correlation_id": pending.CorrelationID, "status": "pending",
-			})
-			return
-		}
-		if result, ok = s.engine.GetResult(id); !ok {
+	// One coherent read: a resume's re-admission moves a known execution
+	// between the results and in-flight registries, so composing them with
+	// separate lookups could observe it as absent (404).
+	view := s.engine.LookupExecution(id)
+	if view.Result == nil && !view.InFlight {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+		return
+	}
+	if view.Result == nil {
+		pending := view.Pending
+		if pending.BusinessID != businessID {
 			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
 			return
 		}
+		if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", pending.CorrelationID)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"execution_id": id, "correlation_id": pending.CorrelationID, "status": "pending",
+		})
+		return
 	}
+	result := view.Result
 	if result.BusinessID != businessID {
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
 		return
@@ -269,26 +272,27 @@ func (s *Server) handleGetIntelligenceTrace(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Same 404 semantics as the detail read: unknown, foreign-business and
-	// unreadable-division executions are indistinguishable (G5).
+	// unreadable-division executions are indistinguishable (G5). One coherent
+	// view so a resume transition is never observed as absent.
 	var divisionID, status string
-	result, ok := s.engine.GetResult(id)
-	if !ok {
-		if pending, inFlight := s.engine.Pending(id); inFlight {
-			if pending.BusinessID != businessID {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
-				return
-			}
-			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
-				return
-			}
-			divisionID, status = pending.DivisionID, "pending"
-		} else if result, ok = s.engine.GetResult(id); !ok {
+	view := s.engine.LookupExecution(id)
+	if view.Result == nil && !view.InFlight {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+		return
+	}
+	if view.Result == nil {
+		pending := view.Pending
+		if pending.BusinessID != businessID {
 			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
 			return
 		}
-	}
-	if result != nil {
+		if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
+			return
+		}
+		divisionID, status = pending.DivisionID, "pending"
+	} else {
+		result := view.Result
 		if result.BusinessID != businessID {
 			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "execution not found")
 			return

@@ -83,10 +83,18 @@ func (e *Engine) invalidateApprovalsForRequest(requestID string) {
 }
 
 // storeCancelledResult records the terminal cancelled outcome for a request
-// that will never execute (cancel of a waiting execution). It mirrors the
-// processRequests store path including FIFO eviction, and the cancelled
-// shape mirrors chainCancelled (Status cancelled with a CANCELLED error).
-func (e *Engine) storeCancelledResult(requestID, businessID, divisionID string) {
+// whose wait is being cancelled. It is a compare-and-set against the in-memory
+// results map: cancellation may replace ONLY a waiting (or absent) result.
+// A committed terminal that landed after the caller observed the wait — for
+// example a resume that finished committing its effect — is left untouched, so
+// a late cancellation never overwrites a committed terminal
+// (APPROVAL_LIFECYCLE §8: an already-dispatched effect reports honestly).
+// Reports whether the cancelled result was stored.
+//
+// The cancelled shape mirrors chainCancelled (Status cancelled with a CANCELLED
+// error) and the FIFO bookkeeping mirrors the processRequests store path; a
+// move from waiting→cancelled does not add a second FIFO position for the id.
+func (e *Engine) storeCancelledResult(requestID, businessID, divisionID string) bool {
 	res := &Response{
 		RequestID:  requestID,
 		BusinessID: businessID,
@@ -107,12 +115,47 @@ func (e *Engine) storeCancelledResult(requestID, businessID, divisionID string) 
 	}
 	e.resultsMu.Lock()
 	defer e.resultsMu.Unlock()
+	if cur, ok := e.results[requestID]; ok {
+		if !isApprovalWaiting(cur) {
+			return false // a committed terminal already won; never overwrite it
+		}
+	} else {
+		e.resultOrder = append(e.resultOrder, requestID)
+	}
 	e.results[requestID] = res
-	e.resultOrder = append(e.resultOrder, requestID)
 	for len(e.resultOrder) > maxResults {
 		delete(e.results, e.resultOrder[0])
 		e.resultOrder = e.resultOrder[1:]
 	}
+	return true
+}
+
+// cancelWaitingExecution arbitrates a cancellation against a stored waiting
+// result. Cancellation wins only while the wait is still the live terminal
+// result: it stores the cancelled result, invalidates every approval bound to
+// the request, and records the terminal cancellation so a later approve or
+// resume never revives it (APPROVAL_LIFECYCLE §8). If a committed terminal
+// landed first, the cancellation does not overwrite it and the caller
+// arbitrates against the committed status instead.
+func (e *Engine) cancelWaitingExecution(requestID, businessID, divisionID string) error {
+	if !e.storeCancelledResult(requestID, businessID, divisionID) {
+		if cur, ok := e.GetResult(requestID); ok {
+			return terminalCancelError(cur.Status)
+		}
+		// The waiting result was removed and not yet replaced: a resume was
+		// re-admitted concurrently. Report the completion race honestly rather
+		// than claim a cancellation that did not take effect.
+		return ErrCompletionRace
+	}
+	e.invalidateApprovalsForRequest(requestID)
+	e.markCancelledReq(requestID)
+	// Operational metrics (v15): the cancellation took effect. The cancelled
+	// result is committed here and ONLY here, so this is the single site that
+	// records its terminal status. No run is in flight at this point (the wait
+	// ended in a previous terminal store), so the in-flight gauge is untouched.
+	e.metrics.CancellationWon()
+	e.metrics.TerminalOutcome("cancelled")
+	return nil
 }
 
 // cancelGuardErr maps a cancelled request to the sentinel the admission and

@@ -93,7 +93,7 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 	// Fast path: an identical pending approval already covers this action.
 	e.approvalMu.Lock()
 	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
-		if rec, ok := e.approvalEngine.GetApproval(id); ok && rec.Status == governance.ApprovalStatePending {
+		if rec, ok := e.approvalEngine.GetApproval(id); ok && e.approvalEngine.DecisionOf(rec).Status == governance.ApprovalStatePending {
 			e.approvalMu.Unlock()
 			return id, nil
 		}
@@ -113,7 +113,7 @@ func (e *Engine) RequestApproval(p control.Proposal, decision governance.Decisio
 	// won while this one was in the engine. The loser revokes its orphan so
 	// exactly one record per fingerprint survives — no leak, no duplicate.
 	if id, found := e.actionApprovals.get(requestID, fingerprint); found {
-		if rec, ok := e.approvalEngine.GetApproval(id); ok && rec.Status == governance.ApprovalStatePending {
+		if rec, ok := e.approvalEngine.GetApproval(id); ok && e.approvalEngine.DecisionOf(rec).Status == governance.ApprovalStatePending {
 			e.approvalMu.Unlock()
 			_ = e.approvalEngine.Revoke(ar.DecisionID)
 			return id, nil
@@ -161,7 +161,11 @@ func (e *Engine) ApprovedState(p control.Proposal, fingerprint string) (governan
 	if entry == nil || entry.actionFingerprint != fingerprint || entry.requestID != req.ID {
 		return "", false
 	}
-	return entry.ar.Status, true
+	// Read the decision fields through the engine's lock — never the shared
+	// record directly: the engine mutates ar.Status under ae.mu, and an
+	// unsynchronized read here could observe a torn/stale decision and refuse a
+	// legitimately approved resume.
+	return e.approvalEngine.DecisionOf(entry.ar).Status, true
 }
 
 // proposalRequestKey is the proposal field the parent request is looked up by:

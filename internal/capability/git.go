@@ -78,7 +78,9 @@ func (t *GitTool) Invoke(ctx context.Context, inv tool.Invocation) (tool.RawResu
 
 	// Fixed argv: -c core.hooksPath=/dev/null disables hooks; --no-pager and
 	// -c core.pager=cat keep output deterministic and non-interactive.
-	full := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "--no-pager"}, args...)
+	// -c core.fsmonitor=false disables the fsmonitor hook (a repo-local
+	// core.fsmonitor command would otherwise execute during status/diff/log).
+	full := append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.pager=cat", "-c", "core.fsmonitor=false", "--no-pager"}, args...)
 	cmd := exec.CommandContext(runCtx, bin, full...)
 	cmd.Dir = resolved
 	cmd.Env = []string{
@@ -121,14 +123,18 @@ func gitArgs(op string, input map[string]string) ([]string, error) {
 	case "status":
 		return []string{"status", "--porcelain=v1", "--branch"}, nil
 	case "diff":
-		args := []string{"diff", "--no-color", "--no-ext-diff"}
+		// --no-textconv disables textconv filters (a repo-local diff.*.textconv
+		// command would otherwise execute during diff).
+		args := []string{"diff", "--no-color", "--no-ext-diff", "--no-textconv"}
 		if p := strings.TrimSpace(input["path"]); p != "" {
 			args = append(args, "--", p)
 		}
 		return args, nil
 	case "log":
 		n := boundedInt(input["limit"], 20, 1, 200)
-		return []string{"log", "--no-color", "--no-ext-diff", fmt.Sprintf("-n%d", n), "--pretty=format:%h %an %s"}, nil
+		// --no-textconv disables textconv filters (a repo-local diff.*.textconv
+		// command would otherwise execute during log).
+		return []string{"log", "--no-color", "--no-ext-diff", "--no-textconv", fmt.Sprintf("-n%d", n), "--pretty=format:%h %an %s"}, nil
 	default:
 		return nil, fmt.Errorf("%w: unsupported git operation %q", ErrValidation, op)
 	}

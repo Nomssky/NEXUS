@@ -73,9 +73,14 @@ func (fs *FileStore) Put(record *Record) error {
 
 	now := fs.now()
 
-	// Check for existing record (optimistic concurrency)
+	// Optimistic concurrency. A record that already exists is only ever updated
+	// by a caller that read it and carried its version forward, so the version
+	// must match exactly. A zero version means "I have no prior record": it is a
+	// CREATE, and must never silently overwrite an existing record (v32). This
+	// matches MemStore and the Store contract, and matches MemStore's behaviour
+	// of starting every new record at version 1 (SCHEMA_COMMON §3.9).
 	if existing, ok := fs.index[record.ID]; ok {
-		if record.Version != 0 && existing.Version != record.Version {
+		if existing.Version != record.Version {
 			return &StoreError{
 				Code:    "VERSION_CONFLICT",
 				Message: fmt.Sprintf("expected version %d, got %d", existing.Version, record.Version),
@@ -84,9 +89,7 @@ func (fs *FileStore) Put(record *Record) error {
 		record.Version = existing.Version + 1
 		record.CreatedAt = existing.CreatedAt
 	} else {
-		if record.Version == 0 {
-			record.Version = 1
-		}
+		record.Version = 1
 		record.CreatedAt = now
 	}
 
@@ -98,8 +101,8 @@ func (fs *FileStore) Put(record *Record) error {
 	}
 
 	// Update cache
-	cp := *record
-	fs.index[record.ID] = &cp
+	cp := record.clone()
+	fs.index[record.ID] = cp
 	return nil
 }
 
@@ -114,11 +117,15 @@ func (fs *FileStore) Get(id string) (*Record, error) {
 	}
 
 	// Return a copy to prevent mutation
-	cp := *record
-	return &cp, nil
+	return record.clone(), nil
 }
 
 // Delete removes a record by ID (soft delete).
+//
+// Deleting an already-deleted record is a NO-OP: it is not a further update, so
+// it advances neither Version nor updated_at. That makes a retried delete safe
+// — a client that read the version the first delete produced keeps a valid
+// version (v32). It mirrors core's "idempotent repeat cancel".
 func (fs *FileStore) Delete(id string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -127,15 +134,23 @@ func (fs *FileStore) Delete(id string) error {
 	if !ok {
 		return &StoreError{Code: "NOT_FOUND", Message: fmt.Sprintf("record %s not found", id)}
 	}
+	if record.Status == RecordStatusDeleted {
+		return nil // already deleted: repeating changes nothing
+	}
 
-	record.Status = RecordStatusDeleted
-	record.UpdatedAt = fs.now()
-	record.Version++
+	// Copy before mutating: the index entry must not reflect a deleted state
+	// until the durable write has succeeded. A write failure must leave the
+	// index and the disk in agreement.
+	updated := *record
+	updated.Status = RecordStatusDeleted
+	updated.UpdatedAt = fs.now()
+	updated.Version++
 
-	if err := fs.writeRecord(record); err != nil {
+	if err := fs.writeRecord(&updated); err != nil {
 		return err
 	}
 
+	fs.index[id] = &updated
 	return nil
 }
 
@@ -179,6 +194,22 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 		seen[id] = struct{}{}
 		unique = append(unique, id)
 	}
+
+	// Ids already deleted are already in the target state. Repeating the batch
+	// over them changes nothing, so they are dropped BEFORE anything is staged
+	// or journalled: a fully-repeated batch therefore performs no transaction at
+	// all (v32, matching Delete and MemStore).
+	pending := unique[:0]
+	for _, id := range unique {
+		if rec := fs.index[id]; rec != nil && rec.Status == RecordStatusDeleted {
+			continue
+		}
+		pending = append(pending, id)
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	unique = pending
 
 	now := fs.now()
 	originals := make([]*Record, 0, len(unique))
@@ -275,6 +306,103 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 	for _, updated := range updates {
 		cp := *updated
 		fs.index[updated.ID] = &cp
+	}
+	return nil
+}
+
+// DeleteBatchHard physically removes every id as ONE atomic step and reclaims
+// the disk DeleteBatch only marks free. It is the destructive primitive
+// retention uses (contracts/EXECUTION_JOURNAL_RETENTION_CONTRACTS.md §3). It
+// shares the store's single batch-journal protocol with DeleteBatch — the
+// pre-batch records are journaled durably BEFORE anything is removed — so an
+// interrupted hard batch is rolled back (the files are re-created from the
+// journal) on the next open, and a committed one leaves nothing behind. The
+// same journal serves soft and physical batches; a physical batch never nests
+// or introduces a second journal.
+func (fs *FileStore) DeleteBatchHard(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Validate the whole batch before mutating anything.
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			return &StoreError{Code: "INVALID_RECORD", Message: "record ID required"}
+		}
+		if _, ok := fs.index[id]; !ok {
+			return &StoreError{Code: "NOT_FOUND", Message: fmt.Sprintf("record %s not found", id)}
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+
+	originals := make([]*Record, 0, len(unique))
+	paths := make([]string, 0, len(unique))
+	for _, id := range unique {
+		original := *fs.index[id]
+		originals = append(originals, &original)
+		paths = append(paths, fs.recordPath(&original))
+	}
+
+	// Journal the pre-batch records durably BEFORE removing anything. Recovery
+	// evidence can therefore never be lost before the transaction is committed.
+	if err := fs.publishBatchJournal(originals); err != nil {
+		return err
+	}
+
+	// Remove the files. On failure, restore the pre-batch state synchronously
+	// and drop the journal — the batch is entirely unapplied.
+	for i, p := range paths {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			for j := 0; j <= i; j++ {
+				if rerr := fs.writeRecord(originals[j]); rerr != nil {
+					return &StoreError{
+						Code:    "IO_ERROR",
+						Message: fmt.Sprintf("hard delete batch rollback of %s failed: %v", originals[j].ID, rerr),
+					}
+				}
+			}
+			if jerr := fs.removeBatchJournal(); jerr != nil {
+				return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("hard delete batch journal cleanup: %v", jerr)}
+			}
+			return &StoreError{
+				Code:    "IO_ERROR",
+				Message: fmt.Sprintf("hard delete batch unlink %s: %v", originals[i].ID, err),
+			}
+		}
+	}
+
+	// Durability: the unlinks must survive a crash, so sync each touched type
+	// directory before the batch counts as committed.
+	syncedDirs := map[string]struct{}{}
+	for _, p := range paths {
+		dir := filepath.Dir(p)
+		if _, ok := syncedDirs[dir]; ok {
+			continue
+		}
+		if err := syncDir(dir); err != nil {
+			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("sync %s: %v", dir, err)}
+		}
+		syncedDirs[dir] = struct{}{}
+	}
+
+	// Commit: the batch is fully applied, so the journal goes away. From this
+	// point on the outcome no longer depends on recovery.
+	if err := fs.removeBatchJournal(); err != nil {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("hard delete batch commit: %v", err)}
+	}
+
+	// The index describes only committed state, so it is updated last.
+	for _, id := range unique {
+		delete(fs.index, id)
 	}
 	return nil
 }
@@ -418,8 +546,7 @@ func (fs *FileStore) List(filter Filter) ([]*Record, error) {
 		if !matchesFilter(r, filter) {
 			continue
 		}
-		cp := *r
-		results = append(results, &cp)
+		results = append(results, r.clone())
 	}
 
 	// Sort by CreatedAt ascending
@@ -487,6 +614,11 @@ func (fs *FileStore) writeRecord(record *Record) error {
 	return nil
 }
 
+// recordPath is the on-disk path of a record's file: <dir>/<type>/<id>.json.
+func (fs *FileStore) recordPath(record *Record) string {
+	return filepath.Join(fs.dir, string(record.Type), record.ID+".json")
+}
+
 // stageRecord writes the record's JSON into a synced temp file next to its
 // target and returns that temp path together with the target path. The caller
 // publishes it with os.Rename, which is what makes the publish atomic; a
@@ -497,7 +629,7 @@ func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, e
 		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
 	}
 
-	path = filepath.Join(typeDir, record.ID+".json")
+	path = fs.recordPath(record)
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return "", "", &StoreError{Code: "SERIALIZATION_ERROR", Message: fmt.Sprintf("marshal: %v", err)}

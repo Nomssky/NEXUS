@@ -6,6 +6,7 @@ import {
   expectEnvelope,
   randomSuffix,
 } from '../fixtures/api';
+import { ActorAuthStrategy } from '../fixtures/auth';
 
 /**
  * §5 — authentication against the real gateway.
@@ -131,9 +132,10 @@ test.describe('AUTH', () => {
   });
 
   test('HTTP Basic credentials are equivalent to the header form', async ({ request, nexus }) => {
-    const basic = Buffer.from(`${nexus.actorID}:${nexus.credential}`).toString('base64');
+    // Use the auth strategy's toBasicAuth() — a clean DI consumer
+    const basic = (nexus.authStrategy as ActorAuthStrategy).toBasicAuth();
     const res = await request.get(`${nexus.baseURL}/api/v1/identities/${nexus.actorID}`, {
-      headers: { Authorization: `Basic ${basic}` },
+      headers: basic,
     });
     expect(res.status(), 'basic auth').toBe(200);
   });

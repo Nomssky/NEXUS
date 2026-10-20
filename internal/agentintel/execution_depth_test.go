@@ -205,14 +205,20 @@ func TestUnknownOutcomeStaysUnknownAtLoopLevel(t *testing.T) {
 	}
 }
 
+// A stalled loop must still terminate and still fail closed. Stalls spend the
+// shared replan budget first (contract §7), so the terminal reason is replan
+// exhaustion — never a success, never an unbounded spin.
 func TestBudgetExhaustionTerminates(t *testing.T) {
 	rt, _ := newIntelFixture(t, nil, &scriptedDecider{
 		plan:    goodPlan,
 		answers: []string{`{"type":"continue"}`},
 	})
 	out, _ := rt.Run(context.Background(), workRequest(t, Objective{Description: "stall"}, ""), nil)
-	if out.Status != "failed" || !strings.Contains(out.Error, "no actionable output") {
+	if out.Status != "failed" || !strings.Contains(out.Error, "replan budget exhausted") {
 		t.Fatalf("a stalled loop must fail closed: %s / %s", out.Status, out.Error)
+	}
+	if !strings.Contains(out.Error, "state=budget_exhausted") {
+		t.Fatalf("stall exhaustion must name its terminal state: %s / %s", out.Status, out.Error)
 	}
 }
 

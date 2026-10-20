@@ -90,20 +90,79 @@ func (r *Record) IsExpired(now time.Time) bool {
 	return now.After(*r.ExpiresAt)
 }
 
+// clone returns a fully independent copy of a record.
+//
+// A shallow struct copy is NOT enough: Record carries Data []byte and
+// ExpiresAt *time.Time, so a copied record would still share the payload's
+// backing array and the expiry pointer with stored state. Either could then be
+// mutated by a caller without ever passing through the store's validated
+// mutation paths — bypassing optimistic concurrency, version rules and
+// persistence entirely. Deep-copying both reference fields makes a record
+// crossing the store boundary a true value (v33).
+func (r *Record) clone() *Record {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	if r.Data != nil {
+		cp.Data = make([]byte, len(r.Data))
+		copy(cp.Data, r.Data)
+	}
+	if r.ExpiresAt != nil {
+		exp := *r.ExpiresAt
+		cp.ExpiresAt = &exp
+	}
+	return &cp
+}
+
 // Store is the core persistence interface.
 // It provides generic CRUD operations for records.
 //
 // C05 is forbidden from making decisions or knowing domain semantics
 // beyond storage. The store is the source of truth.
 type Store interface {
-	// Put stores a record. If the record exists, it is updated with
-	// optimistic concurrency (version must match).
+	// Put stores a record.
+	//
+	// If the record exists it is updated, and the caller's version MUST equal
+	// the stored version (optimistic concurrency); anything else is
+	// ErrConflict and nothing is written. A zero Version therefore means "I
+	// have no prior record" — a CREATE — and must never overwrite an existing
+	// record, live or deleted. Callers that update an existing record read it
+	// first and carry its version forward (v32).
+	//
+	// Creation always yields Version 1, whatever version the caller supplied
+	// (SCHEMA_COMMON §3.9). An update preserves the stored CreatedAt and
+	// refreshes UpdatedAt.
 	Put(record *Record) error
 
-	// Get retrieves a record by ID. Returns nil if not found.
+	// Get retrieves a record by ID.
+	//
+	// Absence and soft deletion are DIFFERENT states, and a backend must not
+	// conflate them:
+	//
+	//   - absent: there is no such record. A backend signals this as a nil
+	//     record; whether it also returns ErrNotFound is backend-specific and
+	//     callers must tolerate both. A genuine read failure is never absence
+	//     and is always returned as a distinct error.
+	//   - soft-deleted: the record still EXISTS with Status == deleted. Get
+	//     returns it with that status. Hiding it would claim it never existed,
+	//     and would lose the version and timestamps a caller needs to reason
+	//     about recreation.
+	//
+	// List is where visibility is narrowed: matchesFilter skips soft-deleted
+	// records unless the filter explicitly asks for RecordStatusDeleted. A
+	// caller that needs live records therefore checks Status after Get, and a
+	// caller that needs deleted ones may use either Get or an explicit
+	// List filter.
 	Get(id string) (*Record, error)
 
 	// Delete removes a record by ID (soft delete sets status to deleted).
+	//
+	// Deleting an ALREADY-deleted record is a no-op: it returns success and
+	// advances neither Version nor UpdatedAt, so a retried delete is safe and
+	// cannot invalidate the version a client read from the first one (v32).
+	// This mirrors core's "idempotent repeat cancel". An unknown id is still an
+	// error.
 	Delete(id string) error
 
 	// DeleteBatch soft-deletes every id as ONE atomic step: either every
@@ -130,6 +189,19 @@ type Store interface {
 	// a fallback reintroduces the partial mutation this method exists to
 	// prevent.
 	DeleteBatch(ids []string) error
+
+	// DeleteBatchHard physically removes every id as ONE atomic step and
+	// reclaims the space DeleteBatch only marks. It carries the same atomicity
+	// contract as DeleteBatch — all-or-nothing, one store-wide batch journal,
+	// interrupted batches rolled back on the next open, corrupt/ambiguous
+	// journals fail closed — except that a committed batch leaves no file
+	// behind (a soft batch rewrites the record; a hard batch unlinks it).
+	//
+	// It exists for retention: it is destructive and irreversible, so callers
+	// must have proven the records are disposable against an explicit,
+	// governed policy (contracts/EXECUTION_JOURNAL_RETENTION_CONTRACTS.md). It
+	// must never be used as a general-purpose delete.
+	DeleteBatchHard(ids []string) error
 
 	// List returns records matching the given filter.
 	List(filter Filter) ([]*Record, error)
@@ -168,6 +240,23 @@ type StoreError struct {
 
 func (e *StoreError) Error() string {
 	return fmt.Sprintf("store error [%s]: %s", e.Code, e.Message)
+}
+
+// Is lets callers match store sentinels uniformly across backends. VERSION_CONFLICT
+// is FileStore's descriptive form of the CONFLICT sentinel (it keeps the
+// "expected N, got M" detail in its message), so errors.Is(err, ErrConflict)
+// must recognise both spellings; otherwise a version conflict raised by the
+// durable backend would silently miss a caller checking the exported sentinel.
+func (e *StoreError) Is(target error) bool {
+	t, ok := target.(*StoreError)
+	if !ok || t == nil {
+		return false
+	}
+	if e.Code == t.Code {
+		return true
+	}
+	return (e.Code == "VERSION_CONFLICT" && t.Code == "CONFLICT") ||
+		(e.Code == "CONFLICT" && t.Code == "VERSION_CONFLICT")
 }
 
 var (

@@ -208,4 +208,138 @@ func TestOutcomeErrorUnwrapsToCause(t *testing.T) {
 	}
 }
 
+// ---- pre-send failure vs post-send uncertainty (contract §2, §3) ----------
+//
+// The two are the sharpest distinction the reliability model makes, and they
+// differ in exactly the way recovery depends on:
+//
+//   - NOT SENT   — provably nothing left this process. The operation did not
+//                  take effect, so re-issuing it cannot duplicate anything.
+//   - UNKNOWN    — the request may have reached the remote system and the
+//                  response was lost. Re-issuing may duplicate a real effect.
+//
+// At the capability layer only `ErrNotSent` admits a mutation retry
+// (`RetryAdmitted`), and only when the adapter supports idempotency. These
+// tests prove the loop-level consequence, which is what an agent's evidence
+// actually says.
+
+// notSentThenOKAdapter fails its FIRST dispatch as provably not sent, then
+// succeeds. It advertises idempotency support, which is the second half of the
+// mutation-retry gate.
+type notSentThenOKAdapter struct {
+	attempts int
+	invs     []tool.Invocation
+}
+
+func (a *notSentThenOKAdapter) Operations() []string { return []string{"execute", "commit"} }
+
+func (a *notSentThenOKAdapter) SupportsIdempotency() bool { return true }
+
+func (a *notSentThenOKAdapter) Invoke(_ context.Context, inv tool.Invocation) (tool.RawResult, error) {
+	a.attempts++
+	a.invs = append(a.invs, inv)
+	if a.attempts == 1 {
+		return tool.RawResult{}, fmt.Errorf("%w: dial tcp: connect: connection refused", capability.ErrNotSent)
+	}
+	return tool.RawResult{Result: map[string]string{"output": "committed"}}, nil
+}
+
+// TestNotSentMutationIsRetriedAndUnknownIsNot is the pre-send / post-send
+// contrast, driven through the real loop against a real capability platform.
+//
+// Both cases use the SAME objective and the SAME write-class tool; only the
+// adapter's first-dispatch failure differs. The loop's verdict must differ with
+// it.
+func TestNotSentMutationIsRetriedAndUnknownIsNot(t *testing.T) {
+	notSent := &notSentThenOKAdapter{}
+	rt, _ := newReliabilityFixture(t, notSent, tool.SideEffectExternalMutation)
+	rt.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"ledger","operation":"commit","input":{"amount":"10"}}`,
+		`{"type":"complete","result":"committed"}`,
+	}}
+	out, _ := rt.Run(context.Background(), workRequest(t, Objective{
+		Description: "commit once",
+		// The retry really happened, so a completed effect now exists.
+		SuccessCriteria: []string{"effects_completed>=1"},
+	}, ""), nil)
+
+	// Provably-not-sent: nothing was committed remotely, so re-issuing is safe.
+	if notSent.attempts != 2 {
+		t.Fatalf("a provably not-sent mutation must be re-dispatched once, got %d attempts", notSent.attempts)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("the retried mutation must let the objective complete: %s (%s)", out.Status, out.Error)
+	}
+	// Both physical attempts belonged to ONE logical call, so they presented
+	// one idempotency token — the retry cannot duplicate the first attempt.
+	if len(notSent.invs) != 2 {
+		t.Fatalf("expected two physical attempts, got %d", len(notSent.invs))
+	}
+	if notSent.invs[0].IdempotencyKey != notSent.invs[1].IdempotencyKey ||
+		notSent.invs[0].IdempotencyKey == "" {
+		t.Fatalf("a retry must reuse the logical call's idempotency key: %q then %q",
+			notSent.invs[0].IdempotencyKey, notSent.invs[1].IdempotencyKey)
+	}
+
+	// The same tool and objective, but the first dispatch MIGHT have taken
+	// effect: the loop must not re-issue it.
+	unknown := &outcomeStubAdapter{err: fmt.Errorf("%w: response lost after dispatch", capability.ErrUnknownOutcome)}
+	rt2, _ := newReliabilityFixture(t, unknown, tool.SideEffectExternalMutation)
+	rt2.Decider = &scriptedDecider{plan: goodPlan, answers: []string{
+		`{"type":"tool_call","tool":"ledger","operation":"commit","input":{"amount":"10"}}`,
+	}}
+	out2, _ := rt2.Run(context.Background(), workRequest(t, Objective{Description: "commit once"}, ""), nil)
+
+	if unknown.attempts != 1 {
+		t.Fatalf("an unknown outcome must never be re-dispatched, got %d attempts", unknown.attempts)
+	}
+	if out2.Status != "failed" || !strings.Contains(out2.Error, "unknown") {
+		t.Fatalf("an unknown outcome must stay unknown and terminal: %s (%s)", out2.Status, out2.Error)
+	}
+}
+
+// TestNotSentAndUnknownCarryDifferentRecoveryPosture pins the evidence the
+// observation itself carries, which is what any later recovery decision reads.
+// A provably-not-sent failure is a definite non-effect and is surfaced as such;
+// an unknown outcome is never a retry recommendation and instead demands
+// reconciliation.
+func TestNotSentAndUnknownCarryDifferentRecoveryPosture(t *testing.T) {
+	notSent := &notSentThenOKAdapter{}
+	rt, _ := newReliabilityFixture(t, notSent, tool.SideEffectRead)
+	rn := ledgerRun(t, rt)
+	obs, _, state, _ := rt.perform(rn, context.Background(), Objective{Description: "read"},
+		Action{Type: ActionToolCall, Tool: "ledger", Operation: "execute", Input: map[string]string{"amount": "10"}},
+		"bookkeeper", nil, BudgetUsage{}, Budget{})
+	if state != "" && state != StateFailed {
+		t.Fatalf("unexpected terminal state %s", state)
+	}
+	// The read retried and succeeded, so it is a completed outcome and never a
+	// reconciliation case.
+	if obs.Outcome != "completed" {
+		t.Fatalf("a retried not-sent read must complete, got outcome %q", obs.Outcome)
+	}
+	if obs.ReconciliationRequired {
+		t.Fatal("a completed outcome must never demand reconciliation")
+	}
+
+	unknown := &outcomeStubAdapter{err: fmt.Errorf("%w: response lost after dispatch", capability.ErrUnknownOutcome)}
+	rt2, _ := newReliabilityFixture(t, unknown, tool.SideEffectExternalMutation)
+	rn2 := ledgerRun(t, rt2)
+	obs2, _, state2, _ := rt2.perform(rn2, context.Background(), Objective{Description: "commit"},
+		Action{Type: ActionToolCall, Tool: "ledger", Operation: "commit", Input: map[string]string{"amount": "10"}},
+		"bookkeeper", nil, BudgetUsage{}, Budget{})
+	if state2 != StateFailed {
+		t.Fatalf("an unknown outcome must be terminal, got %s", state2)
+	}
+	if obs2.Outcome != "unknown" {
+		t.Fatalf("the outcome must stay unknown, got %q", obs2.Outcome)
+	}
+	if obs2.RetryRecommended {
+		t.Fatal("an unknown outcome must never carry a retry recommendation")
+	}
+	if !obs2.ReconciliationRequired {
+		t.Fatal("an unknown outcome must surface its reconciliation requirement")
+	}
+}
+
 var _ = executor.Outcome{}

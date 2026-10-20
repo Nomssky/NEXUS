@@ -1319,3 +1319,218 @@ func TestWriteBoundUnderConcurrentRevocationNeverPersistsAnUnadmittedTarget(t *t
 		t.Fatal("the concurrency test never persisted anything; it proves nothing")
 	}
 }
+
+// ---------- v29: a failed read is not an absent record ----------------------
+//
+// Neither shipped backend can currently fail a Get (FileStore.Get is a pure
+// in-memory index read whose open already fails closed on corruption, and
+// MemStore.Get is a map lookup). The branch still has to be correct: the Store
+// interface does not forbid a read failure, and load() sits on the boundary of
+// durable memory. This double arms a genuine failure after setup, so the
+// failure is deterministic and independent of any write path.
+
+type failReadStore struct {
+	store.Store
+	mu      sync.Mutex
+	armed   bool
+	err     error
+	puts    int
+	deletes int
+}
+
+func (s *failReadStore) Get(id string) (*store.Record, error) {
+	s.mu.Lock()
+	armed, err := s.armed, s.err
+	s.mu.Unlock()
+	if armed {
+		return nil, err
+	}
+	return s.Store.Get(id)
+}
+
+func (s *failReadStore) Put(r *store.Record) error {
+	s.mu.Lock()
+	s.puts++
+	s.mu.Unlock()
+	return s.Store.Put(r)
+}
+
+func (s *failReadStore) Delete(id string) error {
+	s.mu.Lock()
+	s.deletes++
+	s.mu.Unlock()
+	return s.Store.Delete(id)
+}
+
+func (s *failReadStore) arm(err error) {
+	s.mu.Lock()
+	s.armed, s.err = true, err
+	s.mu.Unlock()
+}
+
+func (s *failReadStore) mutations() (puts, deletes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.puts, s.deletes
+}
+
+func newFailReadFixture(t *testing.T) (*Platform, *failReadStore, Identity) {
+	t.Helper()
+	st := &failReadStore{Store: store.NewMemStore()}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p, err := Open(st, Options{
+		Now:    func() time.Time { return now },
+		Scopes: NewMembershipScopes(memberships(t).AllowsScope),
+		Redact: secretRedactor("tok-abcdef-123456"),
+		Bus:    &sink{},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return p, st, owner("a1")
+}
+
+// A genuine storage read failure must reach the caller. Reporting it as
+// "not found" would tell the caller a durable record does not exist when in
+// fact the store could not be read.
+func TestGenuineStoreReadFailureIsNotAbsence(t *testing.T) {
+	p, st, id := newFailReadFixture(t)
+	rec, err := p.Write(id, WriterUser, Candidate{Key: "k", Value: "v"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	boom := errors.New("storage: device I/O error")
+	st.arm(boom)
+
+	_, gotErr := p.Get(id, rec.ID)
+	if gotErr == nil {
+		t.Fatal("a failed read must be reported, not silently answered")
+	}
+	if errors.Is(gotErr, ErrNotFound) {
+		t.Fatalf("a read failure must not be reported as a missing record: %v", gotErr)
+	}
+	if !errors.Is(gotErr, boom) {
+		t.Fatalf("the genuine storage failure must be propagated, got %v", gotErr)
+	}
+}
+
+// A failed read must not cause a durable mutation: Update and Delete must
+// refuse rather than overwrite or remove a record they could not read.
+func TestGenuineStoreReadFailureCausesNoMutation(t *testing.T) {
+	p, st, id := newFailReadFixture(t)
+	rec, err := p.Write(id, WriterUser, Candidate{Key: "k", Value: "v"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	st.arm(errors.New("storage: device I/O error"))
+	putsBefore, deletesBefore := st.mutations()
+
+	if _, err := p.Update(id, rec.ID, rec.Version, Candidate{Key: "k", Value: "other"}); err == nil {
+		t.Fatal("update must fail when the record cannot be read")
+	} else if errors.Is(err, ErrNotFound) {
+		t.Fatalf("update must not report a read failure as a missing record: %v", err)
+	}
+	if err := p.Delete(id, rec.ID); err == nil {
+		t.Fatal("delete must fail when the record cannot be read")
+	} else if errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete must not report a read failure as a missing record: %v", err)
+	}
+	putsAfter, deletesAfter := st.mutations()
+	if putsAfter != putsBefore || deletesAfter != deletesBefore {
+		t.Fatalf("a failed read must cause no durable mutation: puts %d->%d deletes %d->%d",
+			putsBefore, putsAfter, deletesBefore, deletesAfter)
+	}
+}
+
+// Absence must keep reading as absence on BOTH shipped backends after the
+// change, and a soft-deleted record must keep its current invisibility. This
+// pins the compatibility surface load() is allowed to alter: nothing here.
+func TestAbsenceAndSoftDeleteRemainCompatibleOnBothBackends(t *testing.T) {
+	dir := t.TempDir()
+	fs, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("open filestore: %v", err)
+	}
+	backends := map[string]store.Store{"MemStore": store.NewMemStore(), "FileStore": fs}
+
+	for name, st := range backends {
+		t.Run(name, func(t *testing.T) {
+			now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+			p, err := Open(st, Options{
+				Now:    func() time.Time { return now },
+				Scopes: NewMembershipScopes(memberships(t).AllowsScope),
+				Redact: secretRedactor("tok-abcdef-123456"),
+				Bus:    &sink{},
+			})
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			id := owner("a1")
+
+			// Missing record: still ErrNotFound, never an opaque failure.
+			if _, err := p.Get(id, "mem:biz-1:a1:never-written"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("a missing record must stay ErrNotFound on %s, got %v", name, err)
+			}
+			// Existing record: loads normally.
+			rec, err := p.Write(id, WriterUser, Candidate{Key: "k", Value: "v"})
+			if err != nil {
+				t.Fatalf("write on %s: %v", name, err)
+			}
+			got, err := p.Get(id, rec.ID)
+			if err != nil {
+				t.Fatalf("get on %s: %v", name, err)
+			}
+			if got.Key != "k" || got.Value != "v" {
+				t.Fatalf("existing record must load intact on %s: %+v", name, got)
+			}
+			// Soft-deleted record: keeps its current invisibility.
+			if err := p.Delete(id, rec.ID); err != nil {
+				t.Fatalf("delete on %s: %v", name, err)
+			}
+			if _, err := p.Get(id, rec.ID); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("a soft-deleted record must stay invisible on %s, got %v", name, err)
+			}
+		})
+	}
+}
+
+// Corrupt PAYLOAD data is already distinguished from absence, and must stay so:
+// it reports corruption, never "not found".
+func TestCorruptPayloadIsNotReportedAsMissing(t *testing.T) {
+	spy := &spyStore{Store: store.NewMemStore()}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	p, err := Open(spy, Options{
+		Now:    func() time.Time { return now },
+		Scopes: NewMembershipScopes(memberships(t).AllowsScope),
+		Redact: secretRedactor("tok-abcdef-123456"),
+		Bus:    &sink{},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	id := owner("a1")
+	rec, err := p.Write(id, WriterUser, Candidate{Key: "k", Value: "v"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Corrupt the stored payload through the store's VALIDATED mutation path:
+	// read the envelope, then Put it back carrying the version we just read.
+	// (This used to mutate a Get result in place, which only worked while the
+	// store leaked its internal pointer, and it wrote back with version 0.)
+	env, err := spy.Get(rec.ID)
+	if err != nil || env == nil {
+		t.Fatalf("setup: %v", err)
+	}
+	env.Data = []byte("{ this is not json")
+	if err := spy.Put(env); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+
+	_, gotErr := p.Get(id, rec.ID)
+	if gotErr == nil {
+		t.Fatal("a corrupt record must be reported")
+	}
+	if errors.Is(gotErr, ErrNotFound) {
+		t.Fatalf("corruption must not be converted into a missing record: %v", gotErr)
+	}
+}

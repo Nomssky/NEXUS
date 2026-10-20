@@ -133,12 +133,73 @@ Unknown action types, extra verbs and non-JSON responses are protocol errors
 * `complete` is accepted only when the loop has produced at least one
   observation **or** the plan has no steps requiring work; the terminal state
   records `completed_by: model_request`.
-* Semantic verification of `success_criteria` strings is **out of scope for
-  v1** — v1 verifies structural success (bounded loop, terminal state, no
-  rejected action, result produced). Machine-checkable criteria are a future
-  contract decision.
+* When the objective supplies `success_criteria`, `complete` is accepted only
+  when every criterion is satisfied by structured runtime evidence produced in
+  this execution. Criteria are machine-checkable references to observation
+  fields (`source`, `action_type`, `status`, `outcome`, `result.<key>`) and to
+  the completed-effects count (`effects_completed`). Each criterion has one of
+  the forms:
+
+      <field>==<value>    <field>!=<value>    <field> present   <field> absent
+      effects_completed>=<n>    effects_completed<=<n>
+
+  with whitespace trimmed around the field, operator and value. All criteria
+  are ANDed. Unknown fields, empty values for field operators, malformed
+  integers, unsupported operators, and any other malformed criterion are
+  rejected deterministically and never treated as success. Duplicate criteria
+  are permitted and evaluated independently.
+
+* Evidence provenance and scope: criteria use only observations produced by
+  the current execution (newest-first, bounded by the loop's observation
+  window of 16 records). `result.<key>` is matched against the `Result` map of
+  each observation. `source`, `action_type`, `status` and `outcome` are matched
+  against the corresponding observation fields. An observation satisfies an
+  existence criterion (`==`, `present`) when the field carries a known value
+  matching the criterion; `!=` requires at least one applicable observation
+  with a known field value different from the criterion value; `present`
+  requires the field to be set; `absent` requires it not to be set. `unknown`
+  outcomes and missing fields never become implicit proof of success.
+  Contradictory observations are resolved existentially: a criterion is
+  satisfied if any observation in the window satisfies it. Repeated
+  observations are each evaluated independently. Evidence from historical
+  memory, model assertions, or another execution is never mixed into the
+  completion gate.
+
+* The observation window is bounded (16 records, newest first). Criteria
+  evaluate against this bounded window; an observation that aged out no longer
+  counts. This behavior is deliberate and tested. No unbounded storage is
+  added.
+
+* `effects_completed` counts the completed consequential effects recorded by
+  the runtime in this execution (the effect fingerprints recorded by
+  `WorkingMemory.NoteEffect`). It excludes attempted, rejected,
+  awaiting-approval, cancelled, failed and unknown outcomes. The count is
+  scoped to the current execution and is monotonic within it.
+
+* Progress and replanning: each iteration that produces no new evidence
+  satisfying an unmet criterion increments the no-progress counter
+  (`MaxConsecutiveNoProgress`); evidence satisfying at least one unmet
+  criterion resets it. When the counter reaches `MaxConsecutiveNoProgress`,
+  progress is stalled. Stalled progress triggers replanning within the existing
+  `MaxReplans` budget (model-initiated and progress-triggered replans share
+  the same `Replans` counter); if the replan budget is exhausted, the execution
+  terminates honestly as `budget_exhausted` or `failed`. Progress evaluation
+  never extends the original deadline or widens execution budgets, and
+  cancellation still wins over completion or replanning. A rejected `complete`
+  is terminal under the existing strict policy (§6): it ends the execution as
+  `failed`; it is not recoverable by another iteration within the same
+  execution.
+
+* Unknown outcomes are never replayed by progress evaluation: an `unknown`
+  observation is evidence that the outcome could not be determined, not
+  evidence that a criterion is satisfied.
+
+* Objectives without `success_criteria` retain the existing v1 requirement of
+  at least one observation (or a plan with no steps requiring work).
+
 * The runtime decides termination, not the model: a model that never completes
-  terminates through budgets (§9) or the no-progress rule (§4).
+  terminates through budgets (§9), the no-progress rule (§4), or the
+  success-criteria gate (§7).
 
 ## 8. Observations and prompt-injection boundary
 

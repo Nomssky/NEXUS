@@ -180,6 +180,60 @@ func (ae *ApprovalEngine) GetApproval(decisionID string) (*ApprovalRequest, bool
 	return ar, ok
 }
 
+// ApprovalDecision is a value snapshot of an approval record's DECISION
+// fields. The engine mutates those fields (Status/Approver/Reason/ResolvedAt)
+// in place while holding ae.mu; every other reader must take this snapshot
+// instead of reading the shared *ApprovalRequest directly. ApprovalState is a
+// string, so an unsynchronized read is a data race that can also observe a
+// torn or stale decision — e.g. a resume re-admission reading a non-approved
+// status after an approve and re-gating a request that was legitimately
+// approved.
+//
+// A record leaves ae.pending on Approve/Deny/CheckTimeouts, but the fields are
+// still only written under ae.mu; DecisionOf therefore synchronizes on the
+// pointer identity, so callers that already hold the record (core keeps the
+// same *ApprovalRequest the engine created) can read it safely afterwards.
+type ApprovalDecision struct {
+	Status     ApprovalState
+	Approver   string
+	Reason     string
+	ResolvedAt *time.Time
+}
+
+// DecisionOf snapshots ar's decision fields under the engine's lock. It is the
+// only safe way for a holder of the record pointer to read the mutable fields.
+func (ae *ApprovalEngine) DecisionOf(ar *ApprovalRequest) ApprovalDecision {
+	ae.mu.RLock()
+	defer ae.mu.RUnlock()
+	return decisionFrom(ar)
+}
+
+// Decision snapshots the decision fields of decisionID. ok is false when the
+// engine holds no such record (never created, or already revoked).
+func (ae *ApprovalEngine) Decision(decisionID string) (ApprovalDecision, bool) {
+	ae.mu.RLock()
+	defer ae.mu.RUnlock()
+	ar, ok := ae.pending[decisionID]
+	if !ok {
+		return ApprovalDecision{}, false
+	}
+	return decisionFrom(ar), true
+}
+
+// decisionFrom copies a record's mutable decision fields. Call only with ae.mu
+// held (read or write).
+func decisionFrom(ar *ApprovalRequest) ApprovalDecision {
+	if ar == nil {
+		return ApprovalDecision{}
+	}
+	d := ApprovalDecision{Status: ar.Status, Approver: ar.Approver, Reason: ar.Reason}
+	if ar.ResolvedAt != nil {
+		t := *ar.ResolvedAt
+		d.ResolvedAt = &t
+	}
+	return d
+}
+
 // PendingApprovals returns all pending approval requests.
 func (ae *ApprovalEngine) PendingApprovals() []*ApprovalRequest {
 	ae.mu.RLock()

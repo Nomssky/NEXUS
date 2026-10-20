@@ -125,6 +125,12 @@ type Server struct {
 	maxResponseBytes int
 	maxSSEEventBytes int
 
+	// F4/F5 (Production Hardening v2): the process-local HTTP rate limiter and
+	// the explicit CORS allow-list. Both are nil/empty unless configured.
+	rateLimiter *rateLimiter
+	rlPolicy    *RateLimitPolicy
+	corsOrigins map[string]struct{}
+
 	// SSE concurrency limiter — buffered channel acts as a semaphore.
 	// Max 10 concurrent SSE clients to prevent unbounded goroutine creation.
 	sseClients chan struct{}
@@ -176,6 +182,19 @@ func WithListenFunc(fn func(network, addr string) (net.Listener, error)) ServerO
 	return func(s *Server) { s.listenFunc = fn }
 }
 
+// WithRateLimit installs the process-local HTTP rate limiter (F4). When the
+// policy is not Enabled, no limiter is installed. The limiter honours a
+// WithClock override (built after all options are applied).
+func WithRateLimit(policy RateLimitPolicy) ServerOption {
+	return func(s *Server) { p := policy; s.rlPolicy = &p }
+}
+
+// WithCORS installs the explicit cross-origin allow-list (F5). An empty list
+// keeps the secure same-origin default (no CORS headers emitted).
+func WithCORS(policy CORSPolicy) ServerOption {
+	return func(s *Server) { s.corsOrigins = buildCORSOrigins(policy.AllowedOrigins) }
+}
+
 // WithNexusID sets the installation identity stamped onto external event
 // projections (SSE frames). Empty leaves nexus_id empty on the wire.
 func WithNexusID(id string) ServerOption {
@@ -198,6 +217,11 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 		opt(s)
 	}
 	s.startedAt = s.now()
+
+	// F4: build the rate limiter after options so a WithClock seam is honoured.
+	if s.rlPolicy != nil && s.rlPolicy.Enabled {
+		s.rateLimiter = newRateLimiter(s.now, *s.rlPolicy)
+	}
 
 	// Registry audit trail (SCHEMA_IDENTITIES_ORG §9): bind the registry's
 	// event publisher to the engine bus so creates/transitions are observed
@@ -305,6 +329,13 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /api/v1/intelligence/{id}/trace", s.handleGetIntelligenceTrace)
 	s.mux.HandleFunc("POST /api/v1/intelligence/{id}/cancel", s.handleCancelIntelligence)
 
+	// Durable execution read API (v11): read-only inspection of recovered
+	// lifecycle evidence. A separate route so the process-local result
+	// semantics (and the frozen post-restart 404) are untouched. No mutation
+	// endpoint exists (reconciliation is deferred).
+	s.mux.HandleFunc("GET /api/v1/recovery/executions", s.handleListRecoveryExecutions)
+	s.mux.HandleFunc("GET /api/v1/recovery/executions/{id}", s.handleGetRecoveryExecution)
+
 	// Control surface endpoints
 	s.mux.HandleFunc("GET /api/v1/control/status", s.handleControlStatus)
 	s.mux.HandleFunc("POST /api/v1/control/pause", s.handleControlPause)
@@ -400,7 +431,14 @@ func (s *Server) dispatchLoop(ctx context.Context) {
 // on the server; security regression tests must exercise this (not raw Mux())
 // so the real request path is covered.
 func (s *Server) Handler() http.Handler {
-	return s.identityMiddleware(s.authMiddleware(s.envelopeRoutes()))
+	// Composition (outermost first): security headers on every response →
+	// CORS (preflight short-circuits before auth) → per-IP throttle →
+	// identity binding → per-actor throttle (validated identity only) →
+	// control-plane API key → routes.
+	inner := s.identityMiddleware(s.actorRateLimitMiddleware(s.authMiddleware(s.envelopeRoutes())))
+	inner = s.ipRateLimitMiddleware(inner)
+	inner = s.corsMiddleware(inner)
+	return securityHeadersMiddleware(inner)
 }
 
 // envelopeRoutes wraps the route mux so unrouted paths (404) and method
@@ -703,40 +741,38 @@ func (s *Server) handleGetResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, ok := s.engine.GetResult(id)
-	if !ok {
-		// F6: results are only stored when the chain reaches a terminal
-		// state, so an admitted request had no result to return and this
-		// endpoint answered 404 for the whole run — indistinguishable from
-		// a typo'd id, over the very path docs/http-gateway.md tells a
-		// client to observe. Known but running → 202 pending.
-		if pending, inFlight := s.engine.Pending(id); inFlight {
-			if pending.BusinessID != businessID {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
-				return
-			}
-			// §4.3/G3: a division recorded at admission narrows the read;
-			// outside the caller's scope the request is invisible (404).
-			if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
-				s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("X-Correlation-ID", pending.CorrelationID)
-			w.WriteHeader(http.StatusAccepted)
-			json.NewEncoder(w).Encode(map[string]string{
-				"request_id":     id,
-				"correlation_id": pending.CorrelationID,
-				"status":         "pending",
-			})
-			return
-		}
-		// The result may have landed between the two lookups.
-		if result, ok = s.engine.GetResult(id); !ok {
+	// One coherent read of the execution state: a resume's re-admission moves a
+	// known request between the results and in-flight registries, so composing
+	// them with separate lookups could observe the request as absent (404). The
+	// view holds that transition atomic per reader.
+	view := s.engine.LookupExecution(id)
+	if view.Result == nil && !view.InFlight {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
+		return
+	}
+	if view.Result == nil {
+		pending := view.Pending
+		if pending.BusinessID != businessID {
 			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
 			return
 		}
+		// §4.3/G3: a division recorded at admission narrows the read;
+		// outside the caller's scope the request is invisible (404).
+		if !s.authorizeDivisionRead(res.IdentityID, businessID, pending.DivisionID) {
+			s.writeError(w, r, http.StatusNotFound, "VALIDATION", "request not found")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Correlation-ID", pending.CorrelationID)
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{
+			"request_id":     id,
+			"correlation_id": pending.CorrelationID,
+			"status":         "pending",
+		})
+		return
 	}
+	result := view.Result
 
 	// Enforce scope match: a request outside the caller's scope is
 	// indistinguishable from an unknown id (G5 visibility model).
@@ -1301,6 +1337,51 @@ type MetricsResponse struct {
 	Backpressure   BackpressureMetrics   `json:"backpressure"`
 	CircuitBreaker CircuitBreakerMetrics `json:"circuit_breaker"`
 	Recovery       RecoveryMetrics       `json:"recovery"`
+	Execution      ExecutionMetrics      `json:"execution"`
+	Tools          ToolMetrics           `json:"tools"`
+	Journal        JournalMetrics        `json:"journal"`
+}
+
+// ExecutionMetrics holds bounded execution-lifecycle metrics (process-local).
+type ExecutionMetrics struct {
+	Accepted                 int64 `json:"accepted"`
+	InFlight                 int64 `json:"in_flight"`
+	Completed                int64 `json:"completed"`
+	Failed                   int64 `json:"failed"`
+	Cancelled                int64 `json:"cancelled"`
+	ApprovalPauses           int64 `json:"approval_pauses"`
+	ApprovalResumes          int64 `json:"approval_resumes"`
+	CancellationsRequested   int64 `json:"cancellations_requested"`
+	CancellationsWon         int64 `json:"cancellations_won"`
+	CancellationsRefused     int64 `json:"cancellations_refused"`
+	TerminalApprovalRequired int64 `json:"terminal_approval_required"`
+	TerminalPolicyDenied     int64 `json:"terminal_policy_denied"`
+	TerminalEscalationReq    int64 `json:"terminal_escalation_required"`
+	TerminalDeadlineExceeded int64 `json:"terminal_deadline_exceeded"`
+	TerminalOtherFailure     int64 `json:"terminal_other_failure"`
+}
+
+// ToolMetrics holds bounded tool-invocation metrics from the capability platform.
+type ToolMetrics struct {
+	Calls     int64 `json:"calls"`
+	Attempts  int64 `json:"attempts"`
+	Retries   int64 `json:"retries"`
+	Completed int64 `json:"completed"`
+	Failed    int64 `json:"failed"`
+	Unknown   int64 `json:"unknown"`
+	TimedOut  int64 `json:"timed_out"`
+	Cancelled int64 `json:"cancelled"`
+}
+
+// JournalMetrics holds bounded durable-journal operational metrics.
+type JournalMetrics struct {
+	WriteFailures              int64 `json:"write_failures"`
+	RecoveryExecutionsScanned  int64 `json:"recovery_executions_scanned"`
+	RecoveryTerminal           int64 `json:"recovery_terminal"`
+	RecoveryClassifiedUnknown  int64 `json:"recovery_classified_unknown"`
+	RecoveryUnknownInvocations int64 `json:"recovery_unknown_invocations"`
+	RecoveryFailures           int64 `json:"recovery_failures"`
+	LastRecoveryUnixSeconds    int64 `json:"last_recovery_unix_seconds"`
 }
 
 // ExecutorMetrics holds executor statistics.
@@ -1331,6 +1412,7 @@ type RecoveryMetrics struct {
 // handleControlMetrics returns runtime metrics.
 func (s *Server) handleControlMetrics(w http.ResponseWriter, r *http.Request) {
 	executed, failed, denied := s.engine.TaskExecutor().Metrics()
+	snap := s.engine.MetricsSnapshot()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(MetricsResponse{
@@ -1350,6 +1432,38 @@ func (s *Server) handleControlMetrics(w http.ResponseWriter, r *http.Request) {
 		},
 		Recovery: RecoveryMetrics{
 			FailureCount: s.engine.RecoveryManager().RecordCount(),
+		},
+		Execution: ExecutionMetrics{
+			Accepted:                 snap.ExecutionsAccepted,
+			InFlight:                 snap.ExecutionsInFlight,
+			Completed:                snap.ExecutionsCompleted,
+			Failed:                   snap.ExecutionsFailed,
+			Cancelled:                snap.ExecutionsCancelled,
+			ApprovalPauses:           snap.ApprovalPauses,
+			ApprovalResumes:          snap.ApprovalResumes,
+			CancellationsRequested:   snap.CancellationsRequested,
+			CancellationsWon:         snap.CancellationsWon,
+			CancellationsRefused:     snap.CancellationsRefused,
+			TerminalApprovalRequired: snap.TerminalApprovalRequired,
+			TerminalPolicyDenied:     snap.TerminalPolicyDenied,
+			TerminalEscalationReq:    snap.TerminalEscalationReq,
+			TerminalDeadlineExceeded: snap.TerminalDeadlineExceeded,
+			TerminalOtherFailure:     snap.TerminalOtherFailure,
+		},
+		Tools: ToolMetrics{
+			Calls: snap.ToolCalls, Attempts: snap.ToolAttempts,
+			Retries: snap.ToolRetries, Completed: snap.ToolCompleted,
+			Failed: snap.ToolFailed, Unknown: snap.ToolUnknown,
+			TimedOut: snap.ToolTimedOut, Cancelled: snap.ToolCancelled,
+		},
+		Journal: JournalMetrics{
+			WriteFailures:              snap.JournalWriteFailures,
+			RecoveryExecutionsScanned:  snap.RecoveryExecutionsScanned,
+			RecoveryTerminal:           snap.RecoveryTerminal,
+			RecoveryClassifiedUnknown:  snap.RecoveryClassifiedUnknown,
+			RecoveryUnknownInvocations: snap.RecoveryUnknownInvocations,
+			RecoveryFailures:           snap.RecoveryFailures,
+			LastRecoveryUnixSeconds:    snap.LastRecoveryUnixSeconds,
 		},
 	})
 }

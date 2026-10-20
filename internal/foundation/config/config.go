@@ -26,6 +26,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -44,6 +45,8 @@ type Config struct {
 	Security  SecurityConfig  `json:"security"`
 	Storage   StorageConfig   `json:"storage"`
 	Models    ModelsConfig    `json:"models"`
+	RateLimit RateLimitConfig `json:"rate_limit"`
+	HTTP      HTTPConfig      `json:"http"`
 }
 
 // ModelsConfig configures the model layer's seeded simulated provider
@@ -98,6 +101,38 @@ type StorageConfig struct {
 	// DataDir is the root directory for durable JSON records. Empty disables
 	// persistence entirely (no partial durability — nothing is written).
 	DataDir string `json:"data_dir"`
+}
+
+// RateLimitConfig configures the process-local HTTP rate limiter
+// (Production Hardening v2, F4). It complements queue-level backpressure; it is
+// NOT a distributed quota (multi-instance global limits need an external
+// limiter). Values are requests per minute.
+type RateLimitConfig struct {
+	// Enabled turns the limiter on. Default true. Explicit per-minute values
+	// must be >= 1; a zero/negative value fails validation rather than
+	// silently disabling protection.
+	Enabled bool `json:"enabled"`
+	// SubmitPerMinute bounds the expensive work-creation endpoints
+	// (POST /api/v1/requests, /api/v1/executions, /api/v1/intelligence/execute)
+	// per authenticated actor.
+	SubmitPerMinute int `json:"submit_per_minute"`
+	// RequestPerMinute bounds every other scoped API request per authenticated
+	// actor (separate bucket, so exhausting submit cannot block cancellation).
+	RequestPerMinute int `json:"request_per_minute"`
+	// PerIPPerMinute bounds every non-exempt request per direct peer address,
+	// bounding unauthenticated flooding and control-plane traffic.
+	PerIPPerMinute int `json:"per_ip_per_minute"`
+}
+
+// HTTPConfig configures the browser-facing HTTP policy (Production Hardening
+// v2, F5). An empty CORS allow-list keeps the secure same-origin default: the
+// gateway emits no CORS permission headers.
+type HTTPConfig struct {
+	// CORSAllowedOrigins is the explicit cross-origin allow-list. Each entry
+	// must be an origin (scheme://host[:port]); wildcards, paths, queries and
+	// fragments are rejected at startup. Used only for cross-origin browser
+	// deployments; same-origin needs no configuration.
+	CORSAllowedOrigins []string `json:"cors_allowed_origins"`
 }
 
 // SecurityConfig configures the security primitives foundation (component C04
@@ -205,6 +240,15 @@ func Defaults() Config {
 		Models: ModelsConfig{
 			SeededProviderStatus: "", // seeded provider starts healthy (PROVIDER_CONTRACTS §12)
 		},
+		RateLimit: RateLimitConfig{
+			Enabled:          true,
+			SubmitPerMinute:  60,
+			RequestPerMinute: 600,
+			PerIPPerMinute:   6000,
+		},
+		HTTP: HTTPConfig{
+			CORSAllowedOrigins: nil, // same-origin default: no CORS headers
+		},
 	}
 }
 
@@ -297,6 +341,15 @@ type fileConfig struct {
 			Capabilities      []string `json:"capabilities"`
 		} `json:"providers"`
 	} `json:"models"`
+	RateLimit *struct {
+		Enabled          *bool `json:"enabled"`
+		SubmitPerMinute  *int  `json:"submit_per_minute"`
+		RequestPerMinute *int  `json:"request_per_minute"`
+		PerIPPerMinute   *int  `json:"per_ip_per_minute"`
+	} `json:"rate_limit"`
+	HTTP *struct {
+		CORSAllowedOrigins []string `json:"cors_allowed_origins"`
+	} `json:"http"`
 }
 
 func loadFile(path string) (fileConfig, error) {
@@ -382,6 +435,25 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 			cfg.Models.Providers = append(cfg.Models.Providers, entry)
 		}
 	}
+	if fc.RateLimit != nil {
+		if fc.RateLimit.Enabled != nil {
+			cfg.RateLimit.Enabled = *fc.RateLimit.Enabled
+		}
+		if fc.RateLimit.SubmitPerMinute != nil {
+			cfg.RateLimit.SubmitPerMinute = *fc.RateLimit.SubmitPerMinute
+		}
+		if fc.RateLimit.RequestPerMinute != nil {
+			cfg.RateLimit.RequestPerMinute = *fc.RateLimit.RequestPerMinute
+		}
+		if fc.RateLimit.PerIPPerMinute != nil {
+			cfg.RateLimit.PerIPPerMinute = *fc.RateLimit.PerIPPerMinute
+		}
+	}
+	if fc.HTTP != nil {
+		if fc.HTTP.CORSAllowedOrigins != nil {
+			cfg.HTTP.CORSAllowedOrigins = append([]string(nil), fc.HTTP.CORSAllowedOrigins...)
+		}
+	}
 	if fc.Security != nil {
 		s := fc.Security
 		if s.AuditEnabled != nil {
@@ -433,6 +505,16 @@ const (
 	// "scripted" = deterministic decision-table provider for the agent
 	// intelligence control loop). Non-secret operational setting.
 	EnvSeededProviderMode = "NEXUS_SEEDED_PROVIDER_MODE"
+
+	// Rate limiting (F4). Non-secret operational settings.
+	EnvRateLimitEnabled          = "NEXUS_RATE_LIMIT_ENABLED"
+	EnvRateLimitSubmitPerMinute  = "NEXUS_RATE_LIMIT_SUBMIT_PER_MINUTE"
+	EnvRateLimitRequestPerMinute = "NEXUS_RATE_LIMIT_REQUEST_PER_MINUTE"
+	EnvRateLimitPerIPPerMinute   = "NEXUS_RATE_LIMIT_PER_IP_PER_MINUTE"
+
+	// EnvHTTPCORSAllowedOrigins overrides http.cors_allowed_origins as a
+	// comma-separated list of origins (F5). Non-secret operational setting.
+	EnvHTTPCORSAllowedOrigins = "NEXUS_HTTP_CORS_ALLOWED_ORIGINS"
 
 	// M1 security keys. Enforcement defaults on (Defaults() sets both true);
 	// outside production they may be relaxed through these variables, while
@@ -508,6 +590,39 @@ func applyEnv(cfg *Config, environ []string) error {
 	if v, ok := envMap[EnvSeededProviderMode]; ok {
 		cfg.Models.SeededProviderMode = v
 	}
+	if v, ok := envMap[EnvRateLimitEnabled]; ok {
+		b, err := parseStrictBool(v)
+		if err != nil {
+			return nerrors.Configuration("config.env_invalid",
+				fmt.Sprintf("%s must be true or false", EnvRateLimitEnabled)).WithDetail("env", EnvRateLimitEnabled)
+		}
+		cfg.RateLimit.Enabled = b
+	}
+	rateInt := func(key string, dst *int) error {
+		v, ok := envMap[key]
+		if !ok {
+			return nil
+		}
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err != nil {
+			return nerrors.Configuration("config.env_invalid",
+				fmt.Sprintf("%s must be an integer", key)).WithDetail("env", key)
+		}
+		*dst = n
+		return nil
+	}
+	if err := rateInt(EnvRateLimitSubmitPerMinute, &cfg.RateLimit.SubmitPerMinute); err != nil {
+		return err
+	}
+	if err := rateInt(EnvRateLimitRequestPerMinute, &cfg.RateLimit.RequestPerMinute); err != nil {
+		return err
+	}
+	if err := rateInt(EnvRateLimitPerIPPerMinute, &cfg.RateLimit.PerIPPerMinute); err != nil {
+		return err
+	}
+	if v, ok := envMap[EnvHTTPCORSAllowedOrigins]; ok {
+		cfg.HTTP.CORSAllowedOrigins = splitCommaList(v)
+	}
 
 	// Security-sensitive environment values fail closed on malformed input: a
 	// typo must not silently leave a security switch in a weaker state.
@@ -575,6 +690,49 @@ func parseStrictBool(v string) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid bool %q", v)
 	}
+}
+
+// splitCommaList splits a comma-separated environment value into trimmed,
+// non-empty entries. An empty value yields an empty slice.
+func splitCommaList(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if s := strings.TrimSpace(p); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// validateOrigin accepts only a bare origin: an http(s) scheme, a host, and an
+// optional port. Wildcards, paths, queries, fragments and userinfo are
+// rejected, so a configured CORS allow-list cannot silently match more than a
+// single exact origin.
+func validateOrigin(origin string) error {
+	if strings.Contains(origin, "*") {
+		return fmt.Errorf("wildcards are not allowed")
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("not a URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("scheme must be http or https")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("host is required")
+	}
+	if u.User != nil {
+		return fmt.Errorf("userinfo is not allowed")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("a path is not allowed")
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("a query or fragment is not allowed")
+	}
+	return nil
 }
 
 func parseEnviron(environ []string) map[string]string {
@@ -666,9 +824,70 @@ func (c Config) Validate() error {
 			fmt.Sprintf("models.seeded_provider_mode must be one of %s", keys(validSeededProviderModes))).
 			WithDetail("value", c.Models.SeededProviderMode)
 	}
+	// Each configured provider must be complete before the launcher attempts to
+	// build it. This is a shape check only — the secret VALUE is read from the
+	// named environment variable at provider construction (NewOpenAIProvider),
+	// never here, and a missing/empty secret fails closed there.
+	for i, p := range c.Models.Providers {
+		switch {
+		case strings.TrimSpace(p.ID) == "":
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("models.providers[%d].id is required", i))
+		case strings.TrimSpace(p.Endpoint) == "":
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("models.providers[%d].endpoint is required", i)).WithDetail("provider", p.ID)
+		case strings.TrimSpace(p.ModelID) == "":
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("models.providers[%d].model_id is required", i)).WithDetail("provider", p.ID)
+		case strings.TrimSpace(p.APIKeyEnv) == "":
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("models.providers[%d].api_key_env must name the environment variable that carries the credential", i)).WithDetail("provider", p.ID)
+		}
+	}
 	// Security-sensitive configuration fails closed (§18). These checks only
 	// ever reject unsafe combinations; none of them can grant authority.
+	if c.RateLimit.Enabled {
+		for _, r := range []struct {
+			name  string
+			value int
+		}{
+			{"rate_limit.submit_per_minute", c.RateLimit.SubmitPerMinute},
+			{"rate_limit.request_per_minute", c.RateLimit.RequestPerMinute},
+			{"rate_limit.per_ip_per_minute", c.RateLimit.PerIPPerMinute},
+		} {
+			if r.value < 1 {
+				return nerrors.Configuration("config.invalid",
+					fmt.Sprintf("%s must be >= 1 when rate limiting is enabled", r.name)).
+					WithDetail("value", r.value)
+			}
+		}
+	}
+	// CORS origins must be real origins (scheme://host[:port]); a wildcard,
+	// path, query or fragment is rejected so the policy can never silently
+	// open access wider than intended (F5).
+	for i, origin := range c.HTTP.CORSAllowedOrigins {
+		if err := validateOrigin(origin); err != nil {
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("http.cors_allowed_origins[%d] is not a valid origin (scheme://host[:port]): %v", i, err)).
+				WithDetail("value", origin)
+		}
+	}
 	if c.IsProduction() {
+		// F1: production must never silently substitute a simulated/scripted
+		// provider for a real one. A real provider is an explicit configuration
+		// choice; without one, startup fails before the server accepts work.
+		if len(c.Models.Providers) == 0 {
+			return nerrors.Configuration("config.provider_missing",
+				"production requires at least one real model provider in models.providers; the simulated/scripted provider is development-only")
+		}
+		// F2: production must not start with an accidental in-memory store.
+		// Require an explicit durable storage directory (execution, approval,
+		// escalation, cancellation and trace state remain process-local and are
+		// NOT made durable by this requirement).
+		if strings.TrimSpace(c.Storage.DataDir) == "" {
+			return nerrors.Configuration("config.storage_missing",
+				"production requires storage.data_dir for durable organizational state (identities, businesses, divisions, memberships, agents)")
+		}
 		if !c.Security.AuditEnabled {
 			return nerrors.Configuration("config.security_unsafe",
 				"security.audit_enabled must be true in production")

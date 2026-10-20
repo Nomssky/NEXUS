@@ -123,6 +123,11 @@ func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/memory" || strings.HasPrefix(path, "/api/v1/memory/") {
 		return true
 	}
+	// Durable execution read API (v11): recovery evidence is business/division
+	// scoped and must be identity-bound like every other scoped surface.
+	if path == "/api/v1/recovery" || strings.HasPrefix(path, "/api/v1/recovery/") {
+		return true
+	}
 	return false
 }
 

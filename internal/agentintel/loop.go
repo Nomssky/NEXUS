@@ -207,6 +207,21 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	if err != nil {
 		return failedOutcome(req, start, r.now(), StateFailed, "invalid objective: "+err.Error()), nil
 	}
+	// Success criteria are parsed once, here, and fail closed: a malformed
+	// criterion is a defect in the objective, not something to skip silently
+	// and not something to guess at. The execution ends as `failed` before any
+	// plan is built and before any effect is possible (contract §7).
+	crits, cerr := parseCriteria(obj.SuccessCriteria)
+	if cerr != nil {
+		return failedOutcome(req, start, r.now(), StateFailed, "invalid success criteria: "+cerr.Error()), nil
+	}
+	criteria := newCriteriaTracker(crits)
+	// Resume identity is built from the already-normalized forms: the parsed
+	// description, the parsed criteria and the clamped budget. A re-submission
+	// that changes any of them is a different objective and must start fresh
+	// rather than inherit this execution's plan, effects and counters
+	// (APPROVAL_LIFECYCLE_CONTRACTS §6).
+	identity := newObjectiveIdentity(obj, budget, crits)
 	execID := req.CorrelationID
 	if execID == "" {
 		execID = req.TaskID
@@ -218,7 +233,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	// same plan, ledger, observations, budgets and deadline — instead of
 	// restarting blank (APPROVAL_LIFECYCLE_CONTRACTS §6). Anything else
 	// starts fresh.
-	snap, resumed := r.takeResume(execID, obj, req)
+	snap, resumed := r.takeResume(execID, identity, req)
 
 	deadline := start.Add(budget.MaxExecutionTime)
 	if resumed {
@@ -307,9 +322,20 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		working.SetDeadline(deadline)
 		observations = []Observation{}
 	}
+	// Criterion satisfaction is seeded with the evidence THIS execution already
+	// owns — an empty window for a fresh run, the restored window after an
+	// approval resume — so the first iteration's evidence counts as genuinely new
+	// progress instead of as a re-report of what already arrived (contract §7).
+	// No effect has run at this point, so seeding cannot grant a free reset.
+	criteria.advance(observationsFor(working), working.EffectCount())
+
 	memIdentity = r.memoryIdentity(rn, agentID)
 	contextAnnounced := false
 	contextTruncatedAnnounced := false
+	// stalls counts progress-triggered replans in this execution, so the
+	// terminal message can say the loop was stalled rather than merely
+	// out of replans.
+	stalls := 0
 
 	// ---- execute ⇄ observe ---------------------------------------------
 	for {
@@ -473,6 +499,21 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
 		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, agentID, working, usage, budget)
 		usage = next
+		// Completion gate (contract §7). With criteria on the objective, a
+		// completion claim is only a REQUEST: it is accepted when every
+		// criterion is satisfied by evidence from THIS execution. Rejection
+		// is terminal under the strict policy (§6) — it ends the execution as
+		// `failed` and is never recovered by a later iteration, so it is
+		// applied here, before the ledger settles the step or the loop counts
+		// progress, rather than inside perform's execution path.
+		if termState == StateCompleted && len(crits) > 0 {
+			if st := evaluateCriteria(crits, observationsFor(working), working.EffectCount()); !st.all {
+				reason := "success criteria unmet: " + strings.Join(st.unmet, ", ")
+				rn.emit(event.EventTypeActionRejected, map[string]string{
+					"action": string(ActionComplete), "reason": reason})
+				termState, termMsg = StateFailed, "complete rejected: "+reason
+			}
+		}
 		if obs != nil {
 			observations = append(observations, *obs)
 			working.AddObservation(*obs)
@@ -564,7 +605,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 					// The run pauses here: snapshot its authoritative state so
 					// the approval-driven re-submission continues instead of
 					// restarting blank (APPROVAL_LIFECYCLE_CONTRACTS §6).
-					r.snapshotRun(rn, obj, plan, ledger, observations, usage, working, deadline)
+					r.snapshotRun(rn, identity, plan, ledger, observations, usage, working, deadline)
 					return pendingApprovalOutcome(req, start, r.now(), termMsg, approvalID), nil
 				default:
 					return escalatedOutcome(req, start, r.now(), termMsg, escalationRef), nil
@@ -574,32 +615,69 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			return failedOutcome(req, start, r.now(), termState, termMsg), nil
 		}
 
-		if action.Type == ActionContinue {
+		// ---- progress and bounded replanning (contract §7) -----------------
+		// An iteration is progress only when it produced evidence that
+		// satisfies a criterion that was still unmet before it ran. Anything
+		// else — a bare `continue`, an observation that satisfies nothing new,
+		// a repeated evidence record — counts as no progress. Objectives
+		// without criteria keep the v1 rule, where only a `continue` is no
+		// progress and any other action clears the counter.
+		progressed := action.Type != ActionContinue
+		if len(crits) > 0 {
+			progressed = criteria.advance(observationsFor(working), working.EffectCount())
+		}
+		if progressed {
+			usage.NoProgress = 0
+		} else {
 			usage.NoProgress++
 			rn.emit(event.EventTypeBudgetExhausted, map[string]string{"budget": "no_progress", "used": fmt.Sprint(usage.NoProgress)})
-			if usage.NoProgress >= r.Caps.MaxConsecutiveNoProgress {
-				rn.transition(StateFailed, map[string]string{"reason": "no actionable output"})
-				return failedOutcome(req, start, r.now(), StateFailed,
-					fmt.Sprintf("model produced no actionable output %d times in a row", usage.NoProgress)), nil
-			}
+		}
+		stalled := usage.NoProgress >= stallLimit(r.Caps.MaxConsecutiveNoProgress)
+		if stalled {
+			stalls++
+		}
+
+		// A plain `continue` with progress still left just loops again.
+		if !stalled && action.Type == ActionContinue {
 			continue
 		}
-		usage.NoProgress = 0
 
-		switch action.Type {
-		case ActionReplan:
+		// Stalled progress and a model-initiated replan are the same bounded
+		// resource: they share `usage.Replans` and `budget.MaxReplans`, so
+		// neither can be used to escape the other's allowance. A stalled loop
+		// therefore spends a replan instead of grinding, and the exhaustion of
+		// the shared budget terminates the execution honestly rather than
+		// letting it spin.
+		if stalled || action.Type == ActionReplan {
+			reason := action.Reason
+			if stalled {
+				reason = "progress stalled: no new evidence for " + fmt.Sprint(stallLimit(r.Caps.MaxConsecutiveNoProgress)) + " iterations"
+				rn.emit(event.EventTypeAgentThinking, map[string]string{"phase": "stalled", "step": step.StepID,
+					"reason_category": "no_progress", "attempt": fmt.Sprint(usage.NoProgress)})
+			}
 			usage.Replans++
 			if usage.Replans > budget.MaxReplans {
 				rn.emit(event.EventTypeBudgetExhausted, map[string]string{"budget": "replans", "used": fmt.Sprint(usage.Replans)})
 				rn.transition(StateBudgetExhausted, nil)
-				return failedOutcome(req, start, r.now(), StateBudgetExhausted,
-					fmt.Sprintf("replan budget exhausted (%d)", budget.MaxReplans)), nil
+				// A stall-driven exhaustion names the stall: "replan budget
+				// exhausted" alone would hide why the loop was replanning.
+				msg := fmt.Sprintf("replan budget exhausted (%d)", budget.MaxReplans)
+				if stalls > 0 {
+					msg = fmt.Sprintf("progress stalled %d times with no new evidence; %s", stalls, msg)
+				}
+				return failedOutcome(req, start, r.now(), StateBudgetExhausted, msg), nil
 			}
+			// Cancellation still wins over a replan, and waiting never buys
+			// more time: the replan shares this run's original deadline.
 			if ctx.Err() != nil {
 				rn.transition(StateCancelled, nil)
 				return cancelledOutcome(req, start, r.now()), nil
 			}
-			rn.transition(StateReplanning, map[string]string{"reason": action.Reason, "version": fmt.Sprint(plan.Version + 1)})
+			if loopCtx.Err() != nil {
+				rn.transition(StateDeadlineExceeded, nil)
+				return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
+			}
+			rn.transition(StateReplanning, map[string]string{"reason": reason, "version": fmt.Sprint(plan.Version + 1)})
 			newSteps, perr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
 			if perr != nil {
 				if ctx.Err() != nil {
@@ -614,7 +692,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				return failedOutcome(req, start, r.now(), StateFailed, "replan failed: "+perr.Error()), nil
 			}
 			newPlan := &Plan{PlanID: execID, Version: plan.Version + 1, ParentVersion: plan.Version,
-				Reason: action.Reason, Steps: newSteps, ObjectiveID: obj.ObjectiveID,
+				Reason: reason, Steps: newSteps, ObjectiveID: obj.ObjectiveID,
 				CorrelationID: execID, BusinessID: req.BusinessID, DivisionID: req.DivisionID, CreatedAt: r.now()}
 			nres := ValidatePlan(newPlan, r.scope(), r.Caps)
 			if !nres.Valid {
@@ -629,9 +707,21 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			plan = newPlan
 			rn.planVersion = newPlan.Version
 			ledger = ledger.carryCompleted(newPlan)
-		case ActionToolCall, ActionDelegate, ActionCoordinate, ActionModelCall, ActionMemoryRead, ActionMemoryWrite, ActionMemoryDelete:
+			usage.NoProgress = 0
+			continue
 		}
 	}
+}
+
+// stallLimit normalises the no-progress threshold. A non-positive configured
+// limit still means "stall after one barren iteration", as it did before
+// stalled progress began spending replans; it must never mean "every iteration
+// is a stall", which would turn a degenerate cap into a replan storm.
+func stallLimit(configured int) int {
+	if configured < 1 {
+		return 1
+	}
+	return configured
 }
 
 // CatalogProvider yields the bounded capability catalog for one scope.
@@ -701,9 +791,18 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		usage.ToolCalls++
 		obs := &Observation{ObservationID: newID("obs"), Source: "tool:" + a.Tool, ActionType: ActionToolCall,
 			Status: "ok", Timestamp: r.now()}
+		// The correlation carried into the tool scope is this execution's resolved
+		// identity, not the raw request field: the capability layer derives the
+		// logical call id — and therefore the mutation idempotency key — from it
+		// (OPERATIONAL_RELIABILITY_CONTRACTS §7). A request without a CorrelationID
+		// falls back to TaskID up here; passing the empty field instead would make
+		// the capability layer mint a timestamp, so every dispatch of the SAME
+		// execution would present a different dedupe token and a remote system
+		// could not recognise a replay. This is the same identity events, memory
+		// writes and delegation already carry.
 		out, err := r.Exec.InvokeToolScoped(ctx, agentexec.ToolScope{
 			ActorID: rn.req.ActorID, BusinessID: rn.businessID, DivisionID: rn.divisionID,
-			AgentTools: r.agentTools(agentID), CorrelationID: rn.req.CorrelationID,
+			AgentTools: r.agentTools(agentID), CorrelationID: rn.execID,
 		}, agentID, agentexec.ToolCallSpec{ToolID: a.Tool, Operation: a.Operation, Input: a.Input})
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
@@ -1061,12 +1160,22 @@ func (s *execScope) AgentAllowsTool(agentID, toolID string) bool {
 
 // resolveAgent picks the acting agent: an explicit, scope-visible agent when
 // the objective names one, otherwise the deterministic selector's winner.
+//
+// An explicit agent_id must satisfy the same eligibility rules as the selector:
+// active status, business ownership, and division visibility. If the explicit
+// selection fails these checks, we do NOT fall back to a different agent —
+// that would silently invoke an unauthorized agent and obscure the failure.
 func (r *Runtime) resolveAgent(obj Objective, req *executor.WorkRequest) string {
 	if obj.Context != nil {
 		if id := obj.Context["agent_id"]; id != "" {
 			if d, ok := r.Registry.Get(id); ok && d.BusinessID == req.BusinessID {
-				return id
+				if d.Status == agentexec.AgentActive &&
+					(d.DivisionID == "" || d.DivisionID == req.DivisionID) {
+					return id
+				}
 			}
+			// Explicit selection failed — do not fall back to a different agent.
+			return ""
 		}
 	}
 	sel := agentexec.Select(r.Registry, &agentexec.SelectionRequest{
