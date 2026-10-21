@@ -279,6 +279,38 @@ export function useEventStream(
   });
   const queryClient = useQueryClient();
 
+  // refreshRetryDelay must be defined at the top level of the hook (not inside
+  // a useEffect) to comply with React's rules of hooks. It reads from a ref so
+  // it is referentially stable and does not need to be re-created.
+  const refreshRetryDelay = useCallback(() => {
+    setRetryDelayMs(streamRef.current?.getRetryDelayMs() ?? 0);
+  }, []);
+
+  // Refresh the retry countdown while reconnecting. The displayed value is
+  // always derived from the stream's own backoff scheduler; this interval
+  // only triggers re-renders so the countdown ticks down smoothly.
+  useEffect(() => {
+    if (connectionState === 'reconnecting') {
+      refreshRetryDelay();
+      if (!intervalRef.current) {
+        intervalRef.current = setInterval(refreshRetryDelay, 1000);
+      }
+    } else {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+      setRetryDelayMs(0);
+    }
+  }, [connectionState, refreshRetryDelay]);
+
+  // Cleanup interval on unmount.
+  useEffect(() => () => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+  }, []);
+
+  // Create and connect the EventStream. SSE reconnects internally on transient
+  // failures; permanent auth failures (401/403) are handled by the stream.
   useEffect(() => {
     if (!businessId) return;
 
@@ -305,10 +337,6 @@ export function useEventStream(
       }
     };
 
-    const refreshRetryDelay = useCallback(() => {
-      setRetryDelayMs(streamRef.current?.getRetryDelayMs() ?? 0);
-    }, []);
-
     const stream = new EventStream(apiClient, businessId, {
       onMessage: dispatch,
       onOpen: () => handlersRef.current.onOpen?.(),
@@ -330,30 +358,8 @@ export function useEventStream(
     streamRef.current = stream;
     stream.connect();
 
-    // Refresh the retry countdown while reconnecting. The displayed value is
-    // always derived from the stream's own backoff scheduler; this interval
-    // only triggers re-renders so the countdown ticks down smoothly.
-    useEffect(() => {
-      if (connectionState === 'reconnecting') {
-        refreshRetryDelay();
-        if (!intervalRef.current) {
-          intervalRef.current = setInterval(refreshRetryDelay, 1000);
-        }
-      } else {
-        if (intervalRef.current) {
-          clearInterval(intervalRef.current);
-          intervalRef.current = null;
-        }
-        setRetryDelayMs(0);
-      }
-    }, [connectionState, refreshRetryDelay]);
-
-    useEffect(() => () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    }, []);
-
+    // Cleanup: abort active fetch, clear pending retry timer.
     return () => {
-      // Cleanup: abort active fetch, clear pending retry timer.
       stream.close();
       streamRef.current = null;
     };
