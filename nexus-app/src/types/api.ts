@@ -183,6 +183,21 @@ export interface ApproveRequest {
   reason: string;
 }
 
+/**
+ * Approval context items for display. Returns only the fields that are
+ * populated on the backend ApprovalRecord, in a stable order suitable for
+ * rendering as a compact metadata line next to an approval item.
+ *
+ * Fields absent or empty on the backend are omitted rather than invented.
+ */
+export function approvalContextItems(approval: Approval): { label: string; value: string }[] {
+  const items: { label: string; value: string }[] = [];
+  if (approval.scope) items.push({ label: 'Scope', value: approval.scope });
+  if (approval.authority_context) items.push({ label: 'Authority context', value: approval.authority_context });
+  if (approval.policy_ref) items.push({ label: 'Policy ref', value: approval.policy_ref });
+  return items;
+}
+
 /** Map a backend approval status to a Badge variant. */
 export function approvalStatusVariant(status: string): 'pending_approval' | 'completed' | 'failed' | 'warning' | 'default' {
   switch (status) {
