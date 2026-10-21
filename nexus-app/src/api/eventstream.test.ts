@@ -319,4 +319,70 @@ describe('EventStream state transitions', () => {
     stream.close();
     expect(stream.getState()).toBe('closed');
   });
+
+  describe('EventStream retry delay exposure', () => {
+    it('returns null when no reconnect is pending', async () => {
+      const stream = new EventStream(apiClient, 'biz-1');
+      expect(stream.getRetryDelayMs()).toBeNull();
+      expect(stream.getRetryAttempt()).toBe(0);
+      stream.close();
+    });
+
+    it('returns null while connected', async () => {
+      vi.useFakeTimers();
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(openSseResponse([frame('chain.started', { task_id: 't1' })]));
+      const stream = new EventStream(apiClient, 'biz-1');
+      stream.connect();
+      await flush();
+      expect(stream.getRetryDelayMs()).toBeNull();
+      expect(stream.getState()).toBe('open');
+      stream.close();
+    });
+
+    it('reports a positive delay after a transient failure', async () => {
+      vi.useFakeTimers();
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValue(new TypeError('network error'));
+      const stream = new EventStream(apiClient, 'biz-1', {}, { baseDelayMs: 50, maxDelayMs: 100, jitterMs: 0 });
+      stream.connect();
+      await flush();
+
+      const delay = stream.getRetryDelayMs();
+      expect(delay).toBeGreaterThan(0);
+      expect(delay).toBeLessThanOrEqual(50);
+      expect(stream.getRetryAttempt()).toBe(1);
+      stream.close();
+    });
+
+    it('clears the delay after a successful reconnect', async () => {
+      vi.useFakeTimers();
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValue(new TypeError('network error'));
+      const stream = new EventStream(apiClient, 'biz-1', {}, { baseDelayMs: 50, maxDelayMs: 100, jitterMs: 0 });
+      stream.connect();
+      await flush();
+      expect(stream.getRetryDelayMs()).toBeGreaterThan(0);
+
+      // A successful reconnect clears the pending retry delay.
+      mockFetch.mockResolvedValue(openSseResponse([frame('chain.started', { task_id: 't1' })]));
+      stream.connect();
+      await flush();
+      expect(stream.getRetryDelayMs()).toBeNull();
+      expect(stream.getState()).toBe('open');
+      stream.close();
+    });
+
+    it('returns null after close', async () => {
+      vi.useFakeTimers();
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValue(new TypeError('network error'));
+      const stream = new EventStream(apiClient, 'biz-1');
+      stream.connect();
+      await flush();
+      expect(stream.getRetryDelayMs()).toBeGreaterThan(0);
+      stream.close();
+      expect(stream.getRetryDelayMs()).toBeNull();
+    });
+  });
 });

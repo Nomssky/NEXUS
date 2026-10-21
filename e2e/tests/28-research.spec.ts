@@ -65,9 +65,9 @@ class FrontendServer {
 
 test.describe('Research Workspace E2E', () => {
   let nexus: NexusHandle;
-  let frontend: FrontendServer | null = null;
-  let frontendURL: string = '';
-  let frontendPort: number = 0;
+  let frontend: FrontendServer;
+  let frontendURL: string;
+  let frontendPort: number;
 
   test.beforeAll(async () => {
     nexus = await startNexus();
@@ -82,33 +82,62 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: submit objective, observe execution, inspect result', async ({ page }) => {
+    // Set auth credentials via addInitScript so they are available before any page scripts run
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        credential,
+        businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    // Navigate to the frontend
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
 
-    await page.fill('input[id="actor-id"]', nexus.actorID);
-    await page.fill('input[id="credential"]', nexus.credential);
-    await page.fill('input[id="business-id"]', nexus.businessID);
-    await page.click('button[type="submit"]');
+    // Debug: check page state after load
+    console.log('DEBUG: page URL:', page.url());
+    console.log('DEBUG: page title:', await page.title());
+    const bodyText = await page.locator('body').textContent();
+    console.log('DEBUG: body text:', bodyText.substring(0, 500));
+    const btnCount = await page.locator('button').count();
+    console.log('DEBUG: button count:', btnCount);
 
+    // Wait for Command Center page to load (authentication successful via localStorage)
     await page.waitForSelector('text=Command Center', { timeout: 10000 });
 
+    // Navigate to Research workspace
     await page.click('button:has-text("Research")', { timeout: 5000 });
     await page.waitForSelector('text=Research Query', { timeout: 5000 });
 
+    // Submit a research objective
     await page.fill('textarea[placeholder*="research"]', 'Analyze the quarterly sales report and summarize key findings');
     await page.click('button:has-text("Research")', { timeout: 5000 });
 
-    // Execution ID may not be visible in UI; proceed to check status
-    // executionIdElement removed - not needed
-    // removed
-    // executionId removed
+    // Wait for execution to complete by polling status
+    let executionStatus = '';
+    let retries = 0;
+    const maxRetries = 60;
 
-    // Wait for the result to appear (indicates execution completed)
-    await page.waitForSelector('.output-content, .result-content, [class*="output"]', { timeout: 55000 });
-    const resultText = await page.locator('.output-content, .result-content, [class*="output"]').first().textContent() || '';
+    while (retries < maxRetries) {
+      const statusText = await page.locator('[class*="status"], .status-badge').first().textContent() || '';
+      if (statusText === 'completed' || statusText === 'failed' || statusText === 'cancelled') {
+        executionStatus = statusText;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+      retries++;
+    }
+
+    expect(executionStatus).toBe('completed');
+
+    // Verify the result is displayed
+    await page.waitForSelector('[class*="output"], .output-content, .result-content', { timeout: 5000 });
+    const resultText = await page.locator('[class*="output"], .output-content, .result-content').first().textContent() || '';
     expect(resultText.length).toBeGreaterThan(0);
 
+    // Return to Command Center
     await page.click('button:has-text("Command")', { timeout: 5000 });
     await page.waitForSelector('text=Command Center', { timeout: 5000 });
-    // executionId slice removed
   });
 });

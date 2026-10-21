@@ -3,7 +3,7 @@
  * Provides typed, cached data fetching with proper error handling
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery, useMutation, useQueryClient, type UseQueryOptions, type UseMutationOptions } from '@tanstack/react-query';
 import { apiClient, EventStream, type EventStreamState } from './client';
 import type {
@@ -269,7 +269,9 @@ export function useEventStream(
 ) {
   const streamRef = useRef<EventStream | null>(null);
   const [connectionState, setConnectionState] = useState<EventStreamState>('closed');
+  const [retryDelayMs, setRetryDelayMs] = useState(0);
   const handlersRef = useRef(handlers);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   // Keep the latest handlers available to the stream without tearing down the
   // connection on every callback identity change. Updated after render.
   useEffect(() => {
@@ -303,12 +305,17 @@ export function useEventStream(
       }
     };
 
+    const refreshRetryDelay = useCallback(() => {
+      setRetryDelayMs(streamRef.current?.getRetryDelayMs() ?? 0);
+    }, []);
+
     const stream = new EventStream(apiClient, businessId, {
       onMessage: dispatch,
       onOpen: () => handlersRef.current.onOpen?.(),
       onError: (err) => handlersRef.current.onError?.(err),
       onStateChange: (state) => {
         setConnectionState(state);
+        setRetryDelayMs(streamRef.current?.getRetryDelayMs() ?? 0);
         handlersRef.current.onStateChange?.(state);
       },
       onReconnected: () => {
@@ -323,6 +330,28 @@ export function useEventStream(
     streamRef.current = stream;
     stream.connect();
 
+    // Refresh the retry countdown while reconnecting. The displayed value is
+    // always derived from the stream's own backoff scheduler; this interval
+    // only triggers re-renders so the countdown ticks down smoothly.
+    useEffect(() => {
+      if (connectionState === 'reconnecting') {
+        refreshRetryDelay();
+        if (!intervalRef.current) {
+          intervalRef.current = setInterval(refreshRetryDelay, 1000);
+        }
+      } else {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+        setRetryDelayMs(0);
+      }
+    }, [connectionState, refreshRetryDelay]);
+
+    useEffect(() => () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    }, []);
+
     return () => {
       // Cleanup: abort active fetch, clear pending retry timer.
       stream.close();
@@ -332,6 +361,7 @@ export function useEventStream(
 
   return {
     connectionState,
+    retryDelayMs,
     close: () => streamRef.current?.close(),
   };
 }

@@ -4,8 +4,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { summarizeExecutions, orderRecent } from './activity';
-import { approvalStatusVariant, approvalStatusLabel } from '../types/api';
-import type { DurableExecution } from '../types/api';
+import { approvalContextItems, approvalStatusVariant, approvalStatusLabel } from '../types/api';
+import type { Approval, DurableExecution } from '../types/api';
 
 function execution(overrides: Partial<DurableExecution> = {}): DurableExecution {
   return {
@@ -99,5 +99,45 @@ describe('approvalStatusVariant / approvalStatusLabel', () => {
   it('falls back to default for unknown statuses', () => {
     expect(approvalStatusVariant('WEIRD')).toBe('default');
     expect(approvalStatusLabel('WEIRD')).toBe('WEIRD');
+  });
+});
+
+describe('approvalContextItems', () => {
+  const base: Approval = {
+    entity_id: 'exec-1',
+    status: 'PENDING',
+    requested_action: 'execute_tool',
+    requester_id: 'nx:human:alice',
+    approver_type: 'any',
+    created_at: '2026-01-01T00:00:00Z',
+    self_approval_prohibited: true,
+    delegation_allowed: false,
+    audit_ref: 'exec-1',
+  };
+
+  it('returns all present context fields in order', () => {
+    const approval: Approval = { ...base, scope: 'core', authority_context: 'execute requires approval', policy_ref: 'require-approval' };
+    const items = approvalContextItems(approval);
+    expect(items).toEqual([
+      { label: 'Scope', value: 'core' },
+      { label: 'Authority context', value: 'execute requires approval' },
+      { label: 'Policy ref', value: 'require-approval' },
+    ]);
+  });
+
+  it('returns only scope when other fields are absent', () => {
+    const approval: Approval = { ...base, scope: 'biz-1' };
+    expect(approvalContextItems(approval)).toEqual([
+      { label: 'Scope', value: 'biz-1' },
+    ]);
+  });
+
+  it('omits empty strings', () => {
+    const approval: Approval = { ...base, scope: '', authority_context: '', policy_ref: '' };
+    expect(approvalContextItems(approval)).toEqual([]);
+  });
+
+  it('returns an empty array when nothing is populated', () => {
+    expect(approvalContextItems(base)).toEqual([]);
   });
 });

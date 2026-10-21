@@ -362,6 +362,7 @@ export class EventStream {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
   private state: EventStreamState = 'closed';
+  private retryDelayMs: number | null = null;
   private seenEventIds = new Set<string>();
 
   constructor(
@@ -381,6 +382,18 @@ export class EventStream {
 
   getState(): EventStreamState {
     return this.state;
+  }
+
+  /** Delay in milliseconds for the next reconnect attempt, or null if none is scheduled.
+   *  Derived from the stream's own backoff scheduler, not a separate timer. */
+  getRetryDelayMs(): number | null {
+    if (this.retryTimer === null) return null;
+    return this.retryDelayMs ?? null;
+  }
+
+  /** Number of reconnect attempts made for the current connection attempt cycle. */
+  getRetryAttempt(): number {
+    return this.retryAttempt;
   }
 
   connect(): void {
@@ -404,12 +417,16 @@ export class EventStream {
     if (this.disposed) return;
     this.clearRetryTimer();
     if (delayMs <= 0) {
+      this.retryDelayMs = null;
+      this.retryScheduledAt = null;
       this.attemptConnect();
       return;
     }
+    this.retryDelayMs = delayMs;
     this.setState('reconnecting');
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
+      this.retryDelayMs = null;
       this.attemptConnect();
     }, delayMs);
   }

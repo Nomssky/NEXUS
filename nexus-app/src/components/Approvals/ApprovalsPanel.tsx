@@ -11,6 +11,7 @@ import React from 'react';
 import { Card, Button, Badge } from '../primitives';
 import { useApprovals, useApproveApproval, useDenyApproval } from '../../api/hooks';
 import {
+  approvalContextItems,
   approvalStatusVariant,
   approvalStatusLabel,
   type Approval,
@@ -217,6 +218,12 @@ const PendingApprovalItem: React.FC<PendingApprovalItemProps> = ({
             )}
             <span className={styles.separator} aria-hidden="true">·</span>
             <span>Approver: {approval.approver_type || 'any'}</span>
+            {approvalContextItems(approval).map((item) => (
+              <>
+                <span className={styles.separator} aria-hidden="true">·</span>
+                <span>{item.label}: {item.value}</span>
+              </>
+            ))}
           </div>
         </div>
         <Badge variant="pending_approval" size="md" dot>
@@ -355,6 +362,12 @@ const DecidedApprovalItem: React.FC<DecidedApprovalItemProps> = ({ approval }) =
                 <span>By {approval.approver_id}</span>
               </>
             )}
+            {approvalContextItems(approval).map((item) => (
+              <>
+                <span className={styles.separator} aria-hidden="true">·</span>
+                <span>{item.label}: {item.value}</span>
+              </>
+            ))}
           </div>
           {approval.decision_rationale && (
             <div className={styles.itemRationale}>

@@ -31,7 +31,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
   // SSE: refetch executions, approvals, and authoritative activity when real-time
   // events arrive. The connection state is surfaced so the UI can tell the user
   // whether live updates are connected.
-  const { connectionState } = useEventStream(businessId, {
+  const { connectionState, retryDelayMs } = useEventStream(businessId, {
     onChainCompleted: () => {
       queryClient.invalidateQueries({ queryKey: ['intelligence'] });
       queryClient.invalidateQueries({ queryKey: ['approvals'] });
@@ -112,15 +112,17 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
               }`}
             />
             <span>
-              {connectionState === 'open'
-                ? 'Live'
-                : connectionState === 'reconnecting'
-                  ? 'Reconnecting…'
+              {connectionState === 'reconnecting' && retryDelayMs > 0
+                ? `Reconnecting in ${Math.ceil(retryDelayMs / 1000)}s…`
+                : connectionState === 'open'
+                  ? 'Live'
                   : connectionState === 'connecting'
                     ? 'Connecting…'
-                    : connectionState === 'failed'
-                      ? 'Disconnected'
-                      : 'Offline'}
+                    : connectionState === 'reconnecting'
+                      ? 'Reconnecting…'
+                      : connectionState === 'failed'
+                        ? 'Disconnected'
+                        : 'Offline'}
             </span>
           </div>
         </div>

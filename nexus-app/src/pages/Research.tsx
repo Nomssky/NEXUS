@@ -57,7 +57,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
   });
 
   // SSE: reconcile authoritative state on reconnect; SSE is a hint, never truth.
-  const { connectionState } = useEventStream(businessId, {
+  const { connectionState, retryDelayMs } = useEventStream(businessId, {
     onChainCompleted: () => {},
     onChainFailed: () => {},
     onApprovalRequested: () => {},
@@ -128,15 +128,17 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
           <div className={styles.statusIndicator} data-state={connectionState} title={`Live updates: ${connectionState}`}>
             <span className={styles.statusDot} data-state={connectionState} />
             <span>
-              {connectionState === 'open'
-                ? 'Live'
-                : connectionState === 'reconnecting'
-                  ? 'Reconnecting…'
+              {connectionState === 'reconnecting' && retryDelayMs > 0
+                ? `Reconnecting in ${Math.ceil(retryDelayMs / 1000)}s…`
+                : connectionState === 'open'
+                  ? 'Live'
                   : connectionState === 'connecting'
                     ? 'Connecting…'
-                    : connectionState === 'failed'
-                      ? 'Disconnected'
-                      : 'Offline'}
+                    : connectionState === 'reconnecting'
+                      ? 'Reconnecting…'
+                      : connectionState === 'failed'
+                        ? 'Disconnected'
+                        : 'Offline'}
             </span>
           </div>
         </div>
