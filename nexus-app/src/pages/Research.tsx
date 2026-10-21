@@ -30,14 +30,17 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
   const [currentExecution, setCurrentExecution] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
+  const handleSubmit = useCallback((executionId: string) => {
+    setCurrentExecution(executionId);
+    setSelectedExecution(executionId);
+  }, []);
+
   // Authoritative execution list from the durable recovery read.
-  const { data: recoveryData, isLoading: recoveryLoading, isError: recoveryError, refetch: refetchExecutions } =
+  const { data: recoveryData, isLoading: recoveryLoading, isError: recoveryError } =
     useRecoveryExecutions(businessId);
 
   const executions: DurableExecution[] = recoveryData?.executions ?? [];
   const latestExecution = executions[0]?.execution_id ?? currentExecution;
-
-  const [currentExecution, setCurrentExecution] = useState<string | null>(null);
 
   const { data: execution } = useIntelligence(latestExecution || '', businessId, {
     enabled: !!latestExecution,
@@ -53,31 +56,15 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     enabled: !!latestExecution,
   });
 
-  // SSE connection for real-time updates; reconciles authoritative state on reconnect.
+  // SSE: reconcile authoritative state on reconnect; SSE is a hint, never truth.
   const { connectionState } = useEventStream(businessId, {
-    onChainCompleted: () => {
-      // A chain completion means an execution may have reached terminal state;
-      // refetch recovery + intelligence to reconcile.
-      queryClient?.invalidateQueries({ queryKey: ['recoveryExecutions'] });
-      queryClient?.invalidateQueries({ queryKey: ['intelligence'] });
-    },
-    onChainFailed: () => {
-      queryClient?.invalidateQueries({ queryKey: ['recoveryExecutions'] });
-      queryClient?.invalidateQueries({ queryKey: ['intelligence'] });
-    },
-    onApprovalRequested: () => {
-      queryClient?.invalidateQueries({ queryKey: ['approvals'] });
-      queryClient?.invalidateQueries({ queryKey: ['recoveryExecutions'] });
-    },
-    onApprovalApproved: () => {
-      queryClient?.invalidateQueries({ queryKey: ['approvals'] });
-      queryClient?.invalidateQueries({ queryKey: ['intelligence'] });
-      queryClient?.invalidateQueries({ queryKey: ['recoveryExecutions'] });
-    },
-    onApprovalDenied: () => {
-      queryClient?.invalidateQueries({ queryKey: ['approvals'] });
-      queryClient?.invalidateQueries({ queryKey: ['recoveryExecutions'] });
-    },
+    onChainCompleted: () => {},
+    onChainFailed: () => {},
+    onApprovalRequested: () => {},
+    onApprovalApproved: () => {},
+    onApprovalDenied: () => {},
+    onStateChange: () => {},
+    onReconnected: () => {},
     onError: () => {},
   });
 
@@ -113,7 +100,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     return undefined;
   }, [execution, trace]);
 
-  // Zone stats for VirtualHQ — counts come from the authoritative recovery list.
+  // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
     command: { executions: 0 },
     research: { executions: executions.length },
@@ -177,6 +164,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               webSearchResult={webSearchResult}
               isLoading={isLoading}
               onViewTrace={setSelectedExecution}
+              onExecutionSelect={setSelectedExecution}
             />
           )}
 
@@ -203,16 +191,12 @@ interface ResearchZoneProps {
   onSubmit: (executionId: string) => void;
   executions: DurableExecution[];
   currentExecution: string | null;
-  execution: {
-    status?: string;
-    output?: string;
-    duration_ms?: number;
-    created_at?: string;
-  } | undefined;
+  execution: { status?: string; output?: string; duration_ms?: number; created_at?: string } | undefined;
   trace: { entries: { type: string; data?: Record<string, string> }[] } | undefined;
   webSearchResult: { sources: string; count: string } | undefined;
   isLoading: boolean;
   onViewTrace: (executionId: string) => void;
+  onExecutionSelect: (executionId: string) => void;
 }
 
 const ResearchZone: React.FC<ResearchZoneProps> = ({
@@ -226,6 +210,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   webSearchResult,
   isLoading,
   onViewTrace,
+  onExecutionSelect,
 }) => {
   const selectedExecutionData = useMemo(() => {
     if (!currentExecution || !trace) return null;
@@ -330,25 +315,12 @@ const ExecutionHistoryList: React.FC<{
             >
               <span className={styles.historyIndex}>{executions.indexOf(exec) + 1}</span>
               <span className={styles.historyId}>{exec.execution_id.slice(0, 12)}…</span>
-              <BadgeVariant
-                status={exec.state}
-                decision_rationale={exec.approvals?.[exec.approvals.length - 1]?.decided_at}
-              />
             </li>
           ))}
         </ul>
       )}
     </div>
   );
-};
-
-const BadgeVariant: React.FC<{
-  status: DurableExecutionState;
-  decision_rationale?: string;
-}> = ({ status, decision_rationale }) => {
-  const variant = approvalStatusVariant(status);
-  const label = approvalStatusLabel(status);
-  return <Badge variant={variant} size="sm" dot={status === 'PENDING'}>{label}</Badge>;
 };
 
 const ZonePreview: React.FC<{ zoneId: ZoneId }> = ({ zoneId }) => {

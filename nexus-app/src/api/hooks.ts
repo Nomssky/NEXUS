@@ -264,6 +264,7 @@ export function useEventStream(
     onStateChange?: (state: EventStreamState) => void;
     onReconnected?: () => void;
     onError?: (error: Event) => void;
+    onOpen?: () => void;
   } = {}
 ) {
   const streamRef = useRef<EventStream | null>(null);

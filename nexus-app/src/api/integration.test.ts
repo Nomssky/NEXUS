@@ -9,7 +9,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { apiClient } from './client';
 import type { SubmitIntelligenceRequest, ExecutionStatus } from './types/api';
 
-const mockFetch = vi.fn() as unknown as typeof fetch;
+const mockFetch = vi.fn() as unknown as ReturnType<typeof fetch> & ReturnType<typeof vi.fn>;
 global.fetch = mockFetch;
 
 const BUSINESS_ID = 'biz-1';
