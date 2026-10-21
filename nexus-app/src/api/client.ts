@@ -10,6 +10,7 @@ import type {
   SubmitIntelligenceRequest,
   SubmitIntelligenceResponse,
   ExecutionStatus,
+  ExecutionStatusValue,
   ExecutionTrace,
   TraceEntry,
   Agent,
@@ -169,8 +170,9 @@ class NexusAPIClient {
     // Backend Response has request_id, outcome.summary, duration — map to
     // frontend ExecutionStatus shape (execution_id, output, duration_ms).
     const raw = await this.request<{
-      request_id: string;
-      business_id: string;
+      request_id?: string;
+      execution_id?: string;
+      business_id?: string;
       division_id?: string;
       status: string;
       outcome?: {
@@ -195,14 +197,27 @@ class NexusAPIClient {
       duration?: number;
     }>('GET', `/intelligence/${encodeURIComponent(id)}?business_id=${businessId}`);
 
+    // The gateway returns outcome.metrics.duration_ms for completed
+    // executions, and a Go time.Duration (nanoseconds) in `duration`.
+    // Prefer the explicit metric; otherwise convert nanoseconds to
+    // milliseconds. Never expose the raw nanoseconds value as duration_ms.
+    const metrics = raw.outcome?.metrics;
+    const metricDuration =
+      typeof metrics?.duration_ms === 'number' && Number.isFinite(metrics.duration_ms)
+        ? metrics.duration_ms
+        : undefined;
+    const durationMs =
+      metricDuration ??
+      (typeof raw.duration === 'number' && Number.isFinite(raw.duration)
+        ? Math.round(raw.duration / 1_000_000)
+        : undefined);
+
     return {
-      execution_id: raw.request_id,
+      execution_id: raw.request_id ?? raw.execution_id ?? id,
       status: raw.status as ExecutionStatusValue,
       error: raw.error,
       output: raw.outcome?.summary,
-      duration_ms: raw.duration,
-      created_at: undefined,
-      completed_at: undefined,
+      duration_ms: durationMs,
     };
   }
 
@@ -418,7 +433,6 @@ export class EventStream {
     this.clearRetryTimer();
     if (delayMs <= 0) {
       this.retryDelayMs = null;
-      this.retryScheduledAt = null;
       this.attemptConnect();
       return;
     }

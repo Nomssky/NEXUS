@@ -141,6 +141,15 @@
   border-radius: var(--radius-sm);
 }
 
+.recoveryError {
+  padding: var(--space-3) var(--space-4);
+  background-color: rgba(245, 166, 35, 0.08);
+  border: 1px solid rgba(245, 166, 35, 0.35);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
 .evidenceSection {
   grid-column: 1 / -1;
 }

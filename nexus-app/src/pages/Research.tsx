@@ -6,7 +6,7 @@
  * with SSE providing real-time hints that are reconciled on reconnect.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { VirtualHQ, type ZoneId } from '../components/VirtualHQ/VirtualHQ';
 import { Badge } from '../components/primitives';
@@ -15,8 +15,13 @@ import { ResearchInput } from '../components/Research/ResearchInput';
 import { ResearchOutput } from '../components/Research/ResearchOutput';
 import { ResearchEvidence } from '../components/Research/ResearchEvidence';
 import { useIntelligence, useIntelligenceTrace, useRecoveryExecutions, useEventStream } from '@/api/hooks';
-import type { DurableExecution, WebSearchResult } from '@/types/api';
-import { approvalStatusVariant, approvalStatusLabel } from '@/types/api';
+import type { DurableExecution, ExecutionStatus } from '@/types/api';
+import {
+  extractToolActivity,
+  parseResearchResult,
+  type ResearchResult,
+  type ResearchToolActivity,
+} from '@/types/research';
 import styles from './Research.module.css';
 
 interface ResearchPageProps {
@@ -31,30 +36,51 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
   const queryClient = useQueryClient();
 
   const handleSubmit = useCallback((executionId: string) => {
+    // Show the submitted execution. Do not open the trace overlay: the result
+    // must remain readable after submission.
     setCurrentExecution(executionId);
+  }, []);
+
+  const handleExecutionSelect = useCallback((executionId: string) => {
+    setCurrentExecution(executionId);
+  }, []);
+
+  const handleViewTrace = useCallback((executionId: string) => {
     setSelectedExecution(executionId);
   }, []);
 
-  // Authoritative execution list from the durable recovery read.
+  const handleCloseTrace = useCallback(() => {
+    setSelectedExecution(null);
+  }, []);
+
+  // Authoritative execution list from the durable recovery read. The newest
+  // recovered execution is the fallback selection after a reload; an explicit
+  // submission or history click takes precedence.
   const { data: recoveryData, isLoading: recoveryLoading, isError: recoveryError } =
     useRecoveryExecutions(businessId);
 
   const executions: DurableExecution[] = recoveryData?.executions ?? [];
-  const latestExecution = executions[0]?.execution_id ?? currentExecution;
+  const recoveredExecutionId = executions[0]?.execution_id ?? null;
+  const activeExecutionId = currentExecution ?? recoveredExecutionId;
 
-  const { data: execution } = useIntelligence(latestExecution || '', businessId, {
-    enabled: !!latestExecution,
-    refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return status === 'pending' || status === 'running' ? 2000 : false;
-    },
-  });
+  const { data: execution, isLoading: executionLoading } = useIntelligence(
+    activeExecutionId || '',
+    businessId,
+    {
+      enabled: !!activeExecutionId,
+      refetchInterval: (query) => {
+        const status = query.state.data?.status;
+        return status === 'pending' || status === 'running' ? 2000 : false;
+      },
+    }
+  );
 
-  const { data: trace } = useIntelligenceTrace(latestExecution || '', businessId, {
-    limit: 100,
-  }, {
-    enabled: !!latestExecution,
-  });
+  const { data: trace } = useIntelligenceTrace(
+    activeExecutionId || '',
+    businessId,
+    { limit: 100 },
+    { enabled: !!activeExecutionId }
+  );
 
   // SSE: reconcile authoritative state on reconnect; SSE is a hint, never truth.
   const { connectionState, retryDelayMs } = useEventStream(businessId, {
@@ -68,37 +94,14 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     onError: () => {},
   });
 
-  // Extract web.search result from execution output or trace.
-  const webSearchResult = useMemo((): WebSearchResult | undefined => {
-    if (!execution?.output) return undefined;
-    try {
-      // The web.search result is embedded in the execution output as JSON.
-      const parsed = JSON.parse(execution.output);
-      if (parsed.sources && parsed.count) {
-        return parsed as WebSearchResult;
-      }
-    } catch {
-      // Not JSON, try to extract from trace
-    }
-
-    // Try to find tool.invocation.completed with web.search in trace
-    if (trace?.entries) {
-      for (const entry of trace.entries) {
-        if (entry.type === 'tool.invocation.completed' && entry.data?.tool_id === 'web.search') {
-          try {
-            const data = JSON.parse(JSON.stringify(entry.data));
-            if (data.sources && data.count) {
-              return { sources: data.sources, count: data.count };
-            }
-          } catch {
-            // Ignore parse errors
-          }
-        }
-      }
-    }
-
-    return undefined;
-  }, [execution, trace]);
+  // Parse the real execution output. Source records are recognized only when
+  // the whole output is the documented web.search envelope; trace metadata is
+  // used only to explain tool activity, never as evidence.
+  const parsedResult = useMemo(() => parseResearchResult(execution?.output), [execution?.output]);
+  const toolActivity = useMemo(
+    () => extractToolActivity(trace?.entries, 'web.search'),
+    [trace?.entries]
+  );
 
   // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
@@ -109,7 +112,11 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     meeting: { executions: 0 },
   };
 
-  const isLoading = recoveryLoading || (execution?.status === 'pending' || execution?.status === 'running');
+  const isLoading =
+    recoveryLoading ||
+    executionLoading ||
+    execution?.status === 'pending' ||
+    execution?.status === 'running';
 
   return (
     <div className={styles.page}>
@@ -160,13 +167,16 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               actorId={actorId}
               onSubmit={handleSubmit}
               executions={executions}
-              currentExecution={currentExecution}
+              activeExecutionId={activeExecutionId}
               execution={execution}
-              trace={trace}
-              webSearchResult={webSearchResult}
+              parsedResult={parsedResult}
+              toolActivity={toolActivity}
               isLoading={isLoading}
-              onViewTrace={setSelectedExecution}
-              onExecutionSelect={setSelectedExecution}
+              recoveryError={recoveryError}
+              traceExecutionId={selectedExecution}
+              onViewTrace={handleViewTrace}
+              onExecutionSelect={handleExecutionSelect}
+              onCloseTrace={handleCloseTrace}
             />
           )}
 
@@ -192,13 +202,16 @@ interface ResearchZoneProps {
   actorId: string;
   onSubmit: (executionId: string) => void;
   executions: DurableExecution[];
-  currentExecution: string | null;
-  execution: { status?: string; output?: string; duration_ms?: number; created_at?: string } | undefined;
-  trace: { entries: { type: string; data?: Record<string, string> }[] } | undefined;
-  webSearchResult: { sources: string; count: string } | undefined;
+  activeExecutionId: string | null;
+  execution: ExecutionStatus | undefined;
+  parsedResult: ResearchResult;
+  toolActivity: ResearchToolActivity[];
   isLoading: boolean;
+  recoveryError: boolean;
+  traceExecutionId: string | null;
   onViewTrace: (executionId: string) => void;
   onExecutionSelect: (executionId: string) => void;
+  onCloseTrace: () => void;
 }
 
 const ResearchZone: React.FC<ResearchZoneProps> = ({
@@ -206,19 +219,17 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   actorId,
   onSubmit,
   executions,
-  currentExecution,
+  activeExecutionId,
   execution,
-  trace,
-  webSearchResult,
+  parsedResult,
+  toolActivity,
   isLoading,
+  recoveryError,
+  traceExecutionId,
   onViewTrace,
   onExecutionSelect,
+  onCloseTrace,
 }) => {
-  const selectedExecutionData = useMemo(() => {
-    if (!currentExecution || !trace) return null;
-    return { executionId: currentExecution, trace };
-  }, [currentExecution, trace]);
-
   return (
     <div className={styles.zone}>
       <section className={styles.inputSection} aria-labelledby="research-input-heading">
@@ -232,19 +243,27 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
         />
       </section>
 
+      {recoveryError && (
+        <div className={styles.recoveryError} role="alert">
+          Could not load recent research executions. The current result may be stale.
+        </div>
+      )}
+
       <div className={styles.resultsGrid}>
         <section className={styles.outputSection} aria-labelledby="research-output-heading">
           <h2 id="research-output-heading" className={styles.sectionTitle}>
             Research Output
-            {currentExecution && (
+            {activeExecutionId && (
               <span className={styles.executionBadge}>
-                {currentExecution.slice(0, 12)}…
+                {activeExecutionId.slice(0, 12)}…
               </span>
             )}
           </h2>
           <ResearchOutput
             output={execution?.output}
             status={execution?.status}
+            error={execution?.error}
+            durationMs={execution?.duration_ms}
             isLoading={isLoading}
           />
         </section>
@@ -254,8 +273,10 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             Sources & Evidence
           </h2>
           <ResearchEvidence
-            result={webSearchResult}
-            executionId={currentExecution || undefined}
+            result={parsedResult.webSearch}
+            toolActivity={toolActivity}
+            status={execution?.status}
+            executionId={activeExecutionId ?? undefined}
             onViewTrace={onViewTrace}
           />
         </section>
@@ -267,16 +288,16 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
         </h2>
         <ExecutionHistoryList
           executions={executions}
-          currentExecution={currentExecution}
+          currentExecution={activeExecutionId}
           onSelect={onExecutionSelect}
         />
       </section>
 
-      {selectedExecutionData && (
+      {traceExecutionId && (
         <ExecutionDetail
-          executionId={selectedExecutionData.executionId}
+          executionId={traceExecutionId}
           businessId={businessId}
-          onClose={() => {}}
+          onClose={onCloseTrace}
         />
       )}
     </div>

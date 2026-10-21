@@ -7,10 +7,10 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { apiClient } from './client';
-import type { SubmitIntelligenceRequest, ExecutionStatus } from './types/api';
+import type { SubmitIntelligenceRequest, ExecutionStatus } from '../types/api';
 
-const mockFetch = vi.fn() as unknown as ReturnType<typeof fetch> & ReturnType<typeof vi.fn>;
-global.fetch = mockFetch;
+const mockFetch = vi.fn<typeof fetch>();
+globalThis.fetch = mockFetch;
 
 const BUSINESS_ID = 'biz-1';
 const ACTOR_ID = 'nx:human:alice';
@@ -141,6 +141,51 @@ describe('submit → approve → resume → result journey', () => {
         'X-Actor-Credential': 'test-credential',
       });
     }
+  });
+
+  it('prefers outcome.metrics.duration_ms and converts Go nanoseconds otherwise', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
+        status: 'completed',
+        outcome: { summary: 'done', metrics: { duration_ms: 77 } },
+        duration: 123_456_789,
+        audit_trace: [],
+      })
+    );
+    const withMetric = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+    expect(withMetric.duration_ms).toBe(77);
+
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
+        status: 'completed',
+        outcome: { summary: 'done', metrics: {} },
+        duration: 12_345_678,
+        audit_trace: [],
+      })
+    );
+    const withoutMetric = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+    expect(withoutMetric.duration_ms).toBe(12);
+  });
+
+  it('maps the pending 202 execution id and does not invent a duration', async () => {
+    mockFetch.mockResolvedValueOnce(
+      mockJson(202, {
+        execution_id: EXECUTION_ID,
+        correlation_id: 'corr-1',
+        status: 'pending',
+      })
+    );
+
+    const pending = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+
+    expect(pending.execution_id).toBe(EXECUTION_ID);
+    expect(pending.status).toBe('pending');
+    expect(pending.duration_ms).toBeUndefined();
+    expect(pending.output).toBeUndefined();
   });
 
   it('denial path: submit → deny → execution stays failed', async () => {

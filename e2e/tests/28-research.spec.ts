@@ -1,11 +1,15 @@
 import { test, expect } from '@playwright/test';
 import { startNexus, type NexusHandle } from '../fixtures/nexus';
+import { bootstrapHeaders } from '../fixtures/api';
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as net from 'node:net';
 
 const FRONTEND_DIST = '/home/pc/NEXUS/nexus-app/dist';
+const RESEARCH_AGENT_ID = 'research-e2e-analyst';
+const RESEARCH_OBJECTIVE =
+  'Search the web for NEXUS runtime capabilities and summarize the sources';
 
 class FrontendServer {
   private server: http.Server | null = null;
@@ -72,7 +76,33 @@ test.describe('Research Workspace E2E', () => {
   let frontendPort: number;
 
   test.beforeAll(async () => {
-    nexus = await startNexus();
+    // Use the shipped deterministic provider and web capability so the E2E
+    // exercises a real completed agent-intelligence execution through the
+    // compiled Go binary. No API responses are mocked.
+    nexus = await startNexus({
+      extraEnv: {
+        NEXUS_SEEDED_PROVIDER_MODE: 'scripted',
+        NEXUS_CAPABILITY_WEB: 'scripted',
+      },
+    });
+
+    const registered = await fetch(`${nexus.baseURL}/api/v1/agents`, {
+      method: 'POST',
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entity_id: RESEARCH_AGENT_ID,
+        name: 'Research E2E Analyst',
+        business_id: nexus.businessID,
+        capabilities: ['analysis'],
+        allowed_tools: ['web.search'],
+      }),
+    });
+    if (!registered.ok && registered.status !== 409) {
+      throw new Error(
+        `failed to register research agent: HTTP ${registered.status} ${await registered.text()}`
+      );
+    }
+
     frontend = new FrontendServer();
     frontendPort = await frontend.start(nexus.baseURL);
     frontendURL = `http://127.0.0.1:${frontendPort}`;
@@ -103,13 +133,16 @@ test.describe('Research Workspace E2E', () => {
     // Wait for Command Center page to load (authentication successful)
     await page.waitForSelector('text=Command Input', { timeout: 15000 });
 
-    // Navigate to Research workspace
-    await page.click('button:has-text("Research")', { timeout: 5000 });
+    // Navigate to Research workspace using the app's main navigation. The
+    // VirtualHQ zone rail also exposes a "Research" tab, so scope the click to
+    // the top-level tablist.
+    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
+    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
     await page.waitForSelector('text=Research Query', { timeout: 5000 });
 
-    // Submit a research objective using the form's submit button
-    // (use type="submit" to avoid matching the nav button which also says "Research")
-    await page.fill('textarea[placeholder*="research"]', 'Analyze the quarterly sales report and summarize key findings');
+    // Submit a research objective. The scripted provider deterministically
+    // calls web.search once, then completes.
+    await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
     await page.click('button[type="submit"]', { timeout: 5000 });
 
     // Wait for submission to be accepted (textarea cleared on success)
@@ -118,46 +151,59 @@ test.describe('Research Workspace E2E', () => {
       return textarea?.value === '';
     }, { timeout: 10000 });
 
-    // Wait for execution to reach a terminal state
-    let executionStatus = '';
-    let retries = 0;
-    const maxRetries = 60;
+    const output = page.locator('section[aria-labelledby="research-output-heading"]');
+    const evidence = page.locator('section[aria-labelledby="research-evidence-heading"]');
 
-    while (retries < maxRetries) {
-      const bodyText = await page.locator('body').textContent() || '';
+    // The real execution must complete and render the parsed result — not the
+    // raw summary string and not a fabricated evidence list.
+    await expect(
+      output.getByRole('heading', { name: 'Research result', exact: true })
+    ).toBeVisible({ timeout: 20000 });
+    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible();
+    await expect(output.getByText(RESEARCH_OBJECTIVE, { exact: true })).toBeVisible();
+    await expect(
+      output.locator('dt', { hasText: 'Tool calls' }).locator('..').locator('dd')
+    ).toHaveText('1');
 
-      // Terminal statuses
-      if (bodyText.includes('Research failed')) {
-        executionStatus = 'failed';
-        break;
-      }
-      if (bodyText.includes('Research cancelled')) {
-        executionStatus = 'cancelled';
-        break;
-      }
-      if (bodyText.includes('Research timed out')) {
-        executionStatus = 'timed_out';
-        break;
-      }
+    // The execution ran web.search but NEXUS does not expose the tool's
+    // source payload after execution. The UI must say so instead of inventing
+    // citations or claiming the search returned nothing.
+    await expect(evidence.getByText('No source records available')).toBeVisible();
+    await expect(evidence.getByText('web.search', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('not citations')).toBeVisible();
+    await expect(evidence.locator('a')).toHaveCount(0);
 
-      // Success: output content is displayed (not loading, not empty status)
-      const isLoading = await page.locator('text="Research in progress…"').count() > 0;
-      const paragraphs = await page.locator('p').allTextContents();
-      const hasSubstantialOutput = paragraphs.some(p => p.trim().length > 50);
-      if (!isLoading && hasSubstantialOutput) {
-        executionStatus = 'completed';
-        break;
-      }
+    // The trace overlay must not open automatically. Navigating away and back
+    // through the real app navigation would be blocked by the modal if it did.
+    await expect(page.getByRole('heading', { name: 'Execution Trace' })).toHaveCount(0);
+    await mainNav.getByRole('tab', { name: 'Command', exact: true }).click();
+    await page.waitForSelector('text=Command Input', { timeout: 10000 });
+    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible({
+      timeout: 15000,
+    });
 
-      await new Promise((r) => setTimeout(r, 1000));
-      retries++;
-    }
+    // The trace is available only on explicit request and can be closed.
+    await evidence.getByRole('button', { name: 'View Trace' }).click();
+    await expect(page.getByRole('heading', { name: /Execution Trace/ })).toBeVisible({
+      timeout: 10000,
+    });
+    await page.getByRole('button', { name: 'Close trace' }).click();
+    await expect(page.getByRole('heading', { name: /Execution Trace/ })).toHaveCount(0);
 
-    // Execution must reach a terminal state (completed, failed, cancelled, or timed_out)
-    expect(['completed', 'failed', 'cancelled', 'timed_out']).toContain(executionStatus);
-
-    // Verify some output or status message is displayed
-    const resultText = await page.locator('body').textContent() || '';
-    expect(resultText.length).toBeGreaterThan(0);
+    // Reload: the completed result must be recovered from the authoritative
+    // durable recovery read and remain readable.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible({
+      timeout: 20000,
+    });
+    await expect(evidence.getByText('No source records available')).toBeVisible();
+    await expect(output.getByText('Research failed')).toHaveCount(0);
   });
 });

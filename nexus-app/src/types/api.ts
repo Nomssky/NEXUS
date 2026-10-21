@@ -66,7 +66,8 @@ export interface ExecutionStatus {
   };
   output?: string;
   duration_ms?: number;
-  created_at: string;
+  /** Not exposed by the intelligence read; present only when supplied. */
+  created_at?: string;
   completed_at?: string;
 }
 
@@ -266,27 +267,93 @@ export interface ParsedWebSearchSource {
   url: string;
   source: string;
   snippet: string;
+  /**
+   * True only for absolute http(s) URLs with a host and no embedded
+   * credentials. Non-linkable records are still rendered, just without an
+   * anchor, so a malformed provider value can never become a clickable URI.
+   */
+  linkable: boolean;
 }
 
+/**
+ * Validate a URL before it is exposed as a link. Only http(s) is accepted;
+ * `javascript:`, `data:`, credentials-in-URL, and relative values are
+ * rejected. This is presentation safety, not an SSRF boundary.
+ */
+export function isSafeExternalUrl(value: string): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      url.hostname.length > 0 &&
+      url.username === '' &&
+      url.password === ''
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parse the documented web.search `sources` string:
+ *   "1. Title | URL | Source | Snippet\n..."
+ *
+ * Provider data is untrusted and may be malformed. Missing fields fall back
+ * deterministically, duplicates are dropped (first occurrence wins), and
+ * invalid URLs remain visible as records but are not linkable.
+ */
 export function parseWebSearchResult(result: WebSearchResult): ParsedWebSearchSource[] {
-  if (!result.sources) return [];
-  return result.sources.split('\n')
-    .filter(line => line.trim())
-    .map((line, index) => {
-      const parts = line.split(' | ');
-      if (parts.length < 4) return null;
-      const titlePart = parts[0].trim();
-      const match = titlePart.match(/^(\d+)\.\s*(.+)$/);
-      const title = match ? match[2] : titlePart;
-      return {
-        index: index + 1,
-        title,
-        url: parts[1].trim(),
-        source: parts[2].trim(),
-        snippet: parts[3].trim(),
-      };
-    })
-    .filter((item): item is ParsedWebSearchSource => item !== null);
+  if (!result || !result.sources) return [];
+
+  const parsed: ParsedWebSearchSource[] = [];
+  const seen = new Set<string>();
+
+  for (const rawLine of result.sources.split(/\r?\n/)) {
+    if (!rawLine.trim()) continue;
+
+    // Keep trailing whitespace until after the split so an empty final field
+    // (a source with no snippet) still produces the documented four parts.
+    const parts = rawLine.split(' | ');
+    // A usable record needs at least a title and a URL field. Missing source
+    // and snippet fields are allowed and rendered as empty.
+    if (parts.length < 2) continue;
+
+    const titlePart = parts[0].trim();
+    const titleMatch = /^\d+\.\s*(.*)$/.exec(titlePart);
+    const rawTitle = (titleMatch ? titleMatch[1] : titlePart).trim();
+    const url = (parts[1] ?? '').trim();
+    const source = (parts[2] ?? '').trim();
+    // Snippets may themselves contain " | "; the backend does not escape it.
+    const snippet = parts.slice(3).join(' | ').trim();
+
+    const linkable = isSafeExternalUrl(url);
+    let hostname = '';
+    if (linkable) {
+      try {
+        hostname = new URL(url).hostname;
+      } catch {
+        // isSafeExternalUrl already validated it; keep the fallback safe.
+      }
+    }
+
+    // Deduplicate by URL when present, otherwise by visible content. Keeping
+    // the first occurrence makes the order stable across renders.
+    const dedupeKey = url ? `url:${url}` : `text:${rawTitle}|${source}|${snippet}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+
+    parsed.push({
+      index: parsed.length + 1,
+      title: rawTitle || source || hostname || 'Untitled source',
+      url,
+      source: source || hostname,
+      snippet,
+      linkable,
+    });
+  }
+
+  return parsed;
 }
 
 // Git (read-only, sandboxed)

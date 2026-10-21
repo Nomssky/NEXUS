@@ -9,8 +9,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventStream, apiClient } from './client';
 
-const mockFetch = vi.fn() as unknown as typeof fetch;
-global.fetch = mockFetch;
+const mockFetch = vi.fn<typeof fetch>();
+globalThis.fetch = mockFetch;
 
 const encoder = new TextEncoder();
 
@@ -193,7 +193,7 @@ describe('EventStream reconnection', () => {
   it('aborts the in-flight fetch on close', async () => {
     vi.useFakeTimers();
     let abortSignal: AbortSignal | null = null;
-    mockFetch.mockImplementation((_url: string, init?: RequestInit) => {
+    mockFetch.mockImplementation((_input, init) => {
       abortSignal = init?.signal as AbortSignal;
       // Never resolve — simulates a hanging request.
       return new Promise(() => {});
@@ -256,8 +256,8 @@ describe('EventStream reconnection', () => {
   it('preserves auth headers and business scope across reconnects', async () => {
     vi.useFakeTimers();
     const seen: Array<{ url: string; headers: Record<string, string> }> = [];
-    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
-      seen.push({ url: String(url), headers: (init?.headers as Record<string, string>) ?? {} });
+    mockFetch.mockImplementation((input, init) => {
+      seen.push({ url: String(input), headers: (init?.headers as Record<string, string>) ?? {} });
       return Promise.resolve(sseResponse([frame('chain.started', { task_id: 't1' })]));
     });
 

@@ -7,11 +7,11 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { apiClient, createAPIClient, EventStream, createEventStream } from './client';
-import type { HealthResponse, StatusResponse, SubmitIntelligenceRequest } from './types/api';
+import type { HealthResponse, StatusResponse, SubmitIntelligenceRequest } from '../types/api';
 
 // Mock fetch globally
-const mockFetch = vi.fn() as unknown as typeof fetch;
-global.fetch = mockFetch;
+const mockFetch = vi.fn<typeof fetch>();
+globalThis.fetch = mockFetch;
 
 beforeEach(() => {
   mockFetch.mockClear();
@@ -99,10 +99,10 @@ describe('API client base URL', () => {
 
 describe('EventStream (fetch-based SSE)', () => {
   it('connects with auth headers and business_id', async () => {
-    let capturedInit: RequestInit | null = null;
+    let capturedInit: RequestInit | undefined;
     let capturedUrl: string | null = null;
-    mockFetch.mockImplementation((url: string, init?: RequestInit) => {
-      capturedUrl = String(url);
+    mockFetch.mockImplementation((input, init) => {
+      capturedUrl = String(input);
       capturedInit = init;
       return Promise.resolve(
         new Response('data: {"type":"test","data":"hello"}\n\n', {
@@ -142,10 +142,10 @@ describe('EventStream (fetch-based SSE)', () => {
   it('close() aborts the connection', async () => {
     let abortCalled = false;
     mockFetch.mockImplementation(() => {
-      return new Promise((resolve) => {
+      return new Promise<Response>((resolve) => {
         // Never resolve — simulates a hanging connection
         setTimeout(() => resolve(new Response('data: keepalive\n\n')), 10000);
-      }) as unknown as Response;
+      });
     });
 
     const stream = new EventStream(apiClient, 'biz-1');

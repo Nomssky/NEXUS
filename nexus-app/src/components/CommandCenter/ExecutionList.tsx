@@ -80,9 +80,13 @@ export const ExecutionList: React.FC<ExecutionListProps> = ({
               <div className={styles.itemInfo}>
                 <div className={styles.itemId}>{execId.slice(0, 12)}…</div>
                 <div className={styles.itemMeta}>
-                  <time dateTime={execution.created_at}>
-                    {new Date(execution.created_at).toLocaleString()}
-                  </time>
+                  {execution.created_at ? (
+                    <time dateTime={execution.created_at}>
+                      {new Date(execution.created_at).toLocaleString()}
+                    </time>
+                  ) : (
+                    <span>Time unavailable</span>
+                  )}
                   {execution.duration_ms && (
                     <>
                       <span className={styles.separator} aria-hidden="true">·</span>
