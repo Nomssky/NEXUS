@@ -6,10 +6,34 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as net from 'node:net';
 
-const FRONTEND_DIST = '/home/pc/NEXUS/nexus-app/dist';
 const RESEARCH_AGENT_ID = 'research-e2e-analyst';
 const RESEARCH_OBJECTIVE =
   'Search the web for NEXUS runtime capabilities and summarize the sources';
+
+/**
+ * Resolve the built frontend without assuming the checkout path. CI runs from
+ * `e2e/`, but local invocations may start at the repository root. Walk up
+ * until the built entry point is found; an explicit override is available for
+ * unusual layouts.
+ */
+function resolveFrontendDist(): string {
+  if (process.env.NEXUS_FRONTEND_DIST) {
+    return path.resolve(process.env.NEXUS_FRONTEND_DIST);
+  }
+
+  let dir = process.cwd();
+  for (;;) {
+    const candidate = path.join(dir, 'nexus-app', 'dist');
+    if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return path.resolve(process.cwd(), '..', 'nexus-app', 'dist');
+}
+
+const FRONTEND_DIST = resolveFrontendDist();
 
 class FrontendServer {
   private server: http.Server | null = null;
@@ -76,6 +100,12 @@ test.describe('Research Workspace E2E', () => {
   let frontendPort: number;
 
   test.beforeAll(async () => {
+    if (!fs.existsSync(path.join(FRONTEND_DIST, 'index.html'))) {
+      throw new Error(
+        `frontend build not found at ${FRONTEND_DIST}; run "npm run build" in nexus-app first`
+      );
+    }
+
     // Use the shipped deterministic provider and web capability so the E2E
     // exercises a real completed agent-intelligence execution through the
     // compiled Go binary. No API responses are mocked.

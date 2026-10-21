@@ -113,7 +113,17 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: e2e/package-lock.json
+          cache-dependency-path: |
+            e2e/package-lock.json
+            nexus-app/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: nexus-app
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: nexus-app
+        run: npm run build
 
       - name: Install e2e dependencies
         working-directory: e2e
