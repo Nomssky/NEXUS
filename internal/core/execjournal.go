@@ -58,9 +58,10 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 	}
 	state, class := journalState(result), journalErrorClass(result)
 	evidence := researchEvidenceOf(result)
+	evaluation := researchEvaluationOf(id, result)
 
 	if isApprovalWaiting(result) {
-		if terr := e.journal.TerminalWithEvidence(id, state, class, evidence); terr != nil {
+		if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation); terr != nil {
 			e.metrics.JournalWriteFailure()
 			return
 		}
@@ -75,13 +76,13 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 
 	// A real outcome. ErrNotApprovalPause only means this execution was not
 	// parked on a pause, which is the ordinary case.
-	if serr := e.journal.SupersedeApprovedPauseWithEvidence(id, state, class, evidence); serr == nil {
+	if serr := e.journal.SupersedeApprovedPauseWithResearch(id, state, class, evidence, evaluation); serr == nil {
 		return
 	} else if !errors.Is(serr, execjournal.ErrNotApprovalPause) {
 		e.metrics.JournalWriteFailure()
 		return
 	}
-	if terr := e.journal.TerminalWithEvidence(id, state, class, evidence); terr != nil {
+	if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation); terr != nil {
 		e.metrics.JournalWriteFailure()
 	}
 }
@@ -93,4 +94,26 @@ func researchEvidenceOf(result *Response) *execjournal.ResearchEvidence {
 		return nil
 	}
 	return result.Outcome.ResearchEvidence
+}
+
+// researchEvaluationOf returns the deterministic quality verdict carried by a
+// terminal response. The journal validates it against the evidence snapshot
+// again before writing.
+//
+// The evaluation is auxiliary: a defect in it must never block the durable
+// terminal record. An evaluation that does not bind to the exact evidence
+// snapshot is dropped instead of persisted, so the durable record can never
+// claim a verdict for evidence it did not evaluate.
+func researchEvaluationOf(id string, result *Response) *execjournal.ResearchEvaluation {
+	if result == nil || result.Outcome == nil {
+		return nil
+	}
+	evaluation := result.Outcome.ResearchEvaluation
+	if evaluation == nil {
+		return nil
+	}
+	if err := execjournal.ValidateResearchEvaluationForExecution(id, evaluation, result.Outcome.ResearchEvidence); err != nil {
+		return nil
+	}
+	return evaluation
 }

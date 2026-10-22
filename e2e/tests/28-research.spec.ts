@@ -216,6 +216,24 @@ test.describe('Research Workspace E2E', () => {
     // The model's free-form result prose is not rendered as a second answer.
     await expect(output.getByText('objective pursued deterministically')).toHaveCount(0);
 
+    // The deterministic quality evaluation is rendered next to the synthesis:
+    // dimension states, stable findings and the evaluator's own limitations.
+    // It never claims a trust score or a percentage.
+    const quality = output.locator('[aria-label="Research quality evaluation"]');
+    await expect(quality).toBeVisible({ timeout: 20000 });
+    await expect(quality.getByText('Quality checks', { exact: true })).toBeVisible();
+    await expect(quality.locator('[data-dimension="citation_integrity"]')).toBeVisible();
+    await expect(quality.locator('[data-dimension="plan_completeness"]')).toBeVisible();
+    await expect(quality.getByText('What these checks do not verify')).toBeVisible();
+    await expect(quality).not.toContainText('%');
+    // The scripted corpus contains one source with no lexical relation to the
+    // objective. The deterministic relevance check must say so instead of
+    // reporting a clean pass.
+    await expect(
+      quality.getByText('Source text has no meaningful lexical overlap with the objective.')
+    ).toBeVisible();
+    await expect(quality.getByText('Checks passed')).toHaveCount(0);
+
     // Durable evidence from the real web.search capture: two scripted
     // sources, provider-grounded titles and URLs, safe external links, and
     // nothing invented (no dates, no authors, no confidence).
@@ -332,6 +350,15 @@ test.describe('Research Workspace E2E', () => {
     await expect(output.locator('[data-synthesis-status]')).toHaveCount(0);
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
+
+    // The deterministic verdict IS durable: it survives the restart with its
+    // evidence binding, and the panel says that the synthesis it described is
+    // no longer available in this process.
+    const quality = output.locator('[aria-label="Research quality evaluation"]');
+    await expect(quality).toBeVisible({ timeout: 20000 });
+    await expect(quality.getByText('Recorded when this execution completed')).toBeVisible();
+    await expect(quality.locator('[data-dimension="citation_integrity"]')).toBeVisible();
+    await expect(quality).not.toContainText('%');
   });
 
   test('research workspace: multi-step research collects evidence and recovers after restart', async ({ page }) => {

@@ -71,6 +71,12 @@ export interface ExecutionStatus {
    * of the durable recovery read.
    */
   research_synthesis?: ResearchSynthesis;
+  /**
+   * Deterministic quality verdict. Present on a live research execution; the
+   * same persisted object is returned by the durable detail read after restart.
+   * It contains no model prose or source text.
+   */
+  research_evaluation?: ResearchEvaluation;
   duration_ms?: number;
   /** Not exposed by the intelligence read; present only when supplied. */
   created_at?: string;
@@ -100,6 +106,60 @@ export interface ResearchSynthesis {
   inferences: ResearchSynthesisInference[];
   conflicts: ResearchSynthesisStatement[];
   unresolved_questions: string[];
+}
+
+export type ResearchEvaluationStatus = 'passed' | 'warnings' | 'incomplete' | 'failed';
+
+export type ResearchEvaluationDimensionId =
+  | 'evidence_coverage'
+  | 'citation_integrity'
+  | 'relevance'
+  | 'source_quality'
+  | 'source_diversity'
+  | 'conflict_handling'
+  | 'uncertainty_handling'
+  | 'plan_completeness';
+
+export type ResearchEvaluationDimensionStatus =
+  | 'pass'
+  | 'warn'
+  | 'incomplete'
+  | 'fail'
+  | 'not_measurable'
+  | 'not_applicable';
+
+export interface ResearchEvaluationDimension {
+  id: ResearchEvaluationDimensionId;
+  status: ResearchEvaluationDimensionStatus;
+}
+
+export interface ResearchEvaluationFinding {
+  code: string;
+  dimension: ResearchEvaluationDimensionId;
+  severity: 'warning' | 'error';
+  message: string;
+  source_id?: string;
+  step_id?: string;
+}
+
+/**
+ * Deterministic, versioned quality verdict over one execution's synthesis and
+ * evidence. The backend evaluator never calls a model or fetches a page, and
+ * this object never contains model prose, titles, URLs, snippets or queries.
+ */
+export interface ResearchEvaluation {
+  version: 1;
+  method: 'deterministic_v1';
+  execution_id: string;
+  evidence_version: number;
+  evidence_count: number;
+  evidence_fingerprint: string;
+  synthesis_status?: ResearchSynthesisStatus;
+  synthesis_fingerprint?: string;
+  status: ResearchEvaluationStatus;
+  dimensions: ResearchEvaluationDimension[];
+  findings: ResearchEvaluationFinding[];
+  limitations: string[];
 }
 
 export type ExecutionStatusValue =
@@ -671,6 +731,11 @@ export interface DurableExecution {
    * detail read; the list stays bounded and never repeats it.
    */
   research_evidence?: DurableResearchEvidence;
+  /**
+   * Persisted deterministic quality verdict, returned only by the detail read
+   * alongside the evidence snapshot it evaluated.
+   */
+  research_evaluation?: ResearchEvaluation;
   recovery?: DurableRecoveryView;
   approvals?: DurableApprovalView[];
 }

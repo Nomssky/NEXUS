@@ -479,4 +479,68 @@ describe('ResearchOutput', () => {
       expect(markup).not.toContain('Evidence-backed findings');
     });
   });
+
+  describe('research quality evaluation', () => {
+    const evaluation = {
+      version: 1 as const,
+      method: 'deterministic_v1' as const,
+      execution_id: 'exec-1',
+      evidence_version: 2,
+      evidence_count: 1,
+      evidence_fingerprint: 'a'.repeat(64),
+      synthesis_status: 'complete' as const,
+      synthesis_fingerprint: 'b'.repeat(64),
+      status: 'warnings' as const,
+      dimensions: [
+        { id: 'evidence_coverage' as const, status: 'pass' as const },
+        { id: 'citation_integrity' as const, status: 'pass' as const },
+        { id: 'relevance' as const, status: 'warn' as const },
+        { id: 'source_quality' as const, status: 'pass' as const },
+        { id: 'source_diversity' as const, status: 'pass' as const },
+        { id: 'conflict_handling' as const, status: 'not_measurable' as const },
+        { id: 'uncertainty_handling' as const, status: 'pass' as const },
+        { id: 'plan_completeness' as const, status: 'pass' as const },
+      ],
+      findings: [
+        {
+          code: 'source_no_query_overlap',
+          dimension: 'relevance' as const,
+          severity: 'warning' as const,
+          message: 'Source text has no meaningful lexical overlap with the objective.',
+          source_id: 'src-1',
+        },
+      ],
+      limitations: ['Citation integrity proves reference resolution only.'],
+    };
+
+    it('renders the deterministic verdict next to a live result', () => {
+      const markup = render({
+        output: COMPLETED_SUMMARY,
+        status: 'completed',
+        evaluation,
+      });
+
+      expect(markup).toContain('aria-label="Research quality evaluation"');
+      expect(markup).toContain('data-evaluation-status="warnings"');
+      expect(markup).toContain('Quality checks');
+      expect(markup).toContain('data-dimension="relevance"');
+      expect(markup).toContain('Source text has no meaningful lexical overlap with the objective.');
+      expect(markup).not.toContain('Recorded when this execution completed');
+    });
+    it('renders the persisted verdict when the synthesis is gone after a restart', () => {
+      const markup = render({
+        output: undefined,
+        status: undefined,
+        durableState: 'completed',
+        createdAt: '2026-10-20T10:00:00Z',
+        completedAt: '2026-10-20T10:05:30Z',
+        evaluation,
+      });
+
+      expect(markup).toContain('aria-label="Research quality evaluation"');
+      expect(markup).toContain('Recorded when this execution completed');
+      expect(markup).toContain('Synthesis and result text unavailable');
+      expect(markup).not.toContain('Checks passed');
+    });
+  });
 });

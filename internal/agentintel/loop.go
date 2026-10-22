@@ -18,6 +18,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 	"github.com/Nomssky/NEXUS/internal/memory"
+	"github.com/Nomssky/NEXUS/internal/researchquality"
 )
 
 // Decision is the runtime's bounded adapter over the model provider: it is
@@ -174,6 +175,20 @@ type run struct {
 	// list as complete.
 	researchEvidence *execjournal.ResearchEvidence
 	evidenceOverflow bool
+	// question is the parsed objective description for this execution. It is
+	// used only for deterministic lexical relevance checks; it is never added
+	// to durable evidence or the evaluation record.
+	question string
+	// researchAttempted is true when this execution invoked web.search, even
+	// if every envelope was malformed or no complete snapshot was captured.
+	// It lets evaluation distinguish "not research" from "research input
+	// unavailable" without inventing a source list.
+	researchAttempted bool
+	// currentStepID is the step that was executing when the run settled. A
+	// completed run settles that step through the completion action, so its
+	// ledger status can still read "executing"; the evaluation excludes it
+	// from plan completeness exactly like the runtime's own completion gate.
+	currentStepID string
 	// synthesis is the validated typed completion answer for this execution.
 	// It is process-local (never journaled) and only attached to a completed
 	// outcome by the terminal defer.
@@ -322,6 +337,51 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 	}
 }
 
+// evaluateResearch builds the deterministic quality verdict from this run's
+// final plan, evidence and synthesis. The evaluator itself is pure; this method
+// only maps runtime-owned facts into its neutral input.
+func (rn *run) evaluateResearch(status string) *execjournal.ResearchEvaluation {
+	if rn == nil {
+		return nil
+	}
+	if !rn.researchAttempted && rn.researchEvidence == nil && rn.synthesis == nil {
+		return nil
+	}
+	steps := make([]researchquality.Step, 0)
+	if rn.plan != nil {
+		steps = make([]researchquality.Step, 0, len(rn.plan.Steps))
+		for _, step := range rn.plan.Steps {
+			stepStatus := ""
+			if rn.ledger != nil {
+				if rec := rn.ledger.get(step.StepID); rec != nil {
+					stepStatus = string(rec.Status)
+				}
+			}
+			steps = append(steps, researchquality.Step{
+				StepID:   step.StepID,
+				Intent:   step.Intent,
+				Status:   stepStatus,
+				Optional: step.Optional,
+			})
+		}
+	}
+	currentStepID := ""
+	if status == "completed" {
+		// A completed run settles the current step through the completion
+		// action, so its ledger status may still read "executing".
+		currentStepID = rn.currentStepID
+	}
+	return researchquality.Evaluate(researchquality.Input{
+		ExecutionID:   rn.execID,
+		Question:      rn.question,
+		Evidence:      rn.researchEvidence,
+		Synthesis:     rn.synthesis,
+		Plan:          steps,
+		CurrentStepID: currentStepID,
+		Attempted:     rn.researchAttempted || rn.researchEvidence != nil || rn.synthesis != nil,
+	})
+}
+
 // validateCompletionSynthesis enforces the completion gate for research
 // evidence. v2 evidence requires a typed synthesis; v1 evidence has no stable
 // source ids and must not be upgraded into one. The model's synthesis is only
@@ -431,7 +491,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	if execID == "" {
 		execID = req.TaskID
 	}
-	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag, planVersion: 1}
+	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag, planVersion: 1, question: obj.Description}
 	// Evidence is attached to every terminal outcome, including failure,
 	// cancellation, timeout and approval pause. It is a fact about a search
 	// that actually ran, not a success claim. The journal remains the only
@@ -444,6 +504,11 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		// Synthesis is never attached to a non-completed outcome or journaled.
 		if out != nil && rn.synthesis != nil && out.Status == "completed" {
 			out.ResearchSynthesis = rn.synthesis
+		}
+		// Evaluation is deterministic and safe on every terminal status. It is
+		// attached only when this execution actually attempted research.
+		if out != nil {
+			out.ResearchEvaluation = rn.evaluateResearch(out.Status)
 		}
 	}()
 
@@ -503,6 +568,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		rn.planVersion = snap.planVersion
 		rn.researchEvidence = snap.researchEvidence
 		rn.evidenceOverflow = snap.evidenceOverflow
+		rn.researchAttempted = snap.researchAttempted
 	} else {
 		// ---- planning (advisory) --------------------------------------------
 		rn.transition(StatePlanning, nil)
@@ -616,6 +682,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		if current != nil {
 			currentStepID = step.StepID
 		}
+		rn.currentStepID = currentStepID
 		rn.transition(StateExecuting, map[string]string{"step": step.StepID, "iteration": fmt.Sprint(usage.Iterations)})
 		rn.emit(event.EventTypeStepStarted, map[string]string{"step": step.StepID, "intent": step.Intent})
 		working.SetStep(step.StepID, step.Intent)
@@ -1065,6 +1132,12 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		return obs, usage, "", ""
 	case ActionToolCall:
 		usage.ToolCalls++
+		if a.Tool == execjournal.ResearchEvidenceCapability {
+			// An attempt is a runtime fact even when governance denies it or
+			// the result envelope is malformed. Evaluation reports incomplete
+			// input instead of pretending research never happened.
+			rn.researchAttempted = true
+		}
 		obs := &Observation{ObservationID: newID("obs"), Source: "tool:" + a.Tool, ActionType: ActionToolCall,
 			Status: "ok", Timestamp: r.now()}
 		// The correlation carried into the tool scope is this execution's resolved

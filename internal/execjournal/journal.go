@@ -152,6 +152,13 @@ type ExecutionRecord struct {
 	// snapshot was complete when captured; absence never implies the search
 	// returned nothing.
 	ResearchEvidence *ResearchEvidence `json:"research_evidence,omitempty"`
+	// ResearchEvaluation is the deterministic quality verdict computed over
+	// ResearchEvidence and the typed synthesis at the moment of terminal
+	// settlement. It is written in the same atomic update as evidence and is
+	// bound to the evidence fingerprint, so it can never be reused for a
+	// different snapshot. The synthesis itself remains process-local: only the
+	// verdict, stable codes and counts survive a restart.
+	ResearchEvaluation *ResearchEvaluation `json:"research_evaluation,omitempty"`
 }
 
 // InvocationRecord is the durable dispatch-intent/outcome evidence for one
@@ -257,6 +264,14 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 // remains nonterminal and no evidence is exposed, so the process-local result
 // can never claim durable evidence that was not stored.
 func (j *Journal) TerminalWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
+	return j.TerminalWithResearch(id, state, errClass, evidence, nil)
+}
+
+// TerminalWithResearch is TerminalWithEvidence with the deterministic quality
+// evaluation bound to that evidence. Evidence and evaluation are written in
+// one atomic update; the evaluation is validated against the exact evidence
+// snapshot (or absence) that will be persisted.
+func (j *Journal) TerminalWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation) error {
 	if j == nil {
 		return nil
 	}
@@ -285,12 +300,25 @@ func (j *Journal) TerminalWithEvidence(id string, state State, errClass string, 
 	if existing.State.Terminal() {
 		return nil // already terminal; terminal is final
 	}
+	finalEvidence := evidence
+	if finalEvidence == nil {
+		// A nonterminal record normally has no evidence. If a future path does
+		// persist it, keep the binding honest instead of validating against nil.
+		finalEvidence = existing.ResearchEvidence
+	}
+	evaluation = evaluationForEvidence(id, evaluation, existing.ResearchEvaluation, finalEvidence, evidence != nil)
+	if err := ValidateResearchEvaluationForExecution(id, evaluation, finalEvidence); err != nil {
+		return err
+	}
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
 	existing.CompletedAt = &now
 	existing.UpdatedAt = now
 	if evidence != nil {
 		existing.ResearchEvidence = evidence
+		existing.ResearchEvaluation = evaluation
+	} else if evaluation != nil {
+		existing.ResearchEvaluation = evaluation
 	}
 	return j.putExecution(existing, version)
 }
@@ -358,6 +386,14 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 // execution's complete capture. The final terminal time replaces the pause
 // time because the execution has now reached its real outcome.
 func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
+	return j.SupersedeApprovedPauseWithResearch(id, state, errClass, evidence, nil)
+}
+
+// SupersedeApprovedPauseWithResearch also replaces the deterministic quality
+// evaluation together with the evidence it evaluated. A nil evidence snapshot
+// preserves the pause's evidence and evaluation; a non-nil snapshot replaces
+// both, so an evaluation can never outlive the snapshot it described.
+func (j *Journal) SupersedeApprovedPauseWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation) error {
 	if j == nil {
 		return nil
 	}
@@ -380,6 +416,14 @@ func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, err
 		(existing.Recovery != nil && existing.Recovery.Recovered) {
 		return fmt.Errorf("%w: %s", ErrNotApprovalPause, id)
 	}
+	finalEvidence := evidence
+	if finalEvidence == nil {
+		finalEvidence = existing.ResearchEvidence
+	}
+	evaluation = evaluationForEvidence(id, evaluation, existing.ResearchEvaluation, finalEvidence, evidence != nil)
+	if err := ValidateResearchEvaluationForExecution(id, evaluation, finalEvidence); err != nil {
+		return err
+	}
 	now := j.now().UTC()
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
@@ -387,8 +431,38 @@ func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, err
 	existing.UpdatedAt = now
 	if evidence != nil {
 		existing.ResearchEvidence = evidence
+		existing.ResearchEvaluation = evaluation
+	} else if evaluation != nil {
+		existing.ResearchEvaluation = evaluation
 	}
 	return j.putExecution(existing, version)
+}
+
+// evaluationForEvidence keeps a persisted verdict and its evidence snapshot
+// bound to each other.
+//
+//   - A new evidence snapshot invalidates the previous verdict: the incoming
+//     evaluation must describe the new snapshot, or no verdict is persisted.
+//   - When the snapshot is preserved (a resumed run that captured no new
+//     evidence while the approval pause holds one), a verdict that describes
+//     the preserved snapshot is kept.
+//
+// The verdict is auxiliary data. It must never block a terminal lifecycle
+// write, so an unusable verdict is dropped instead of failing the write.
+func evaluationForEvidence(id string, incoming, preserved *ResearchEvaluation, finalEvidence *ResearchEvidence, replaced bool) *ResearchEvaluation {
+	if incoming == nil {
+		if replaced {
+			return nil
+		}
+		return preserved
+	}
+	if err := ValidateResearchEvaluationForExecution(id, incoming, finalEvidence); err == nil {
+		return incoming
+	}
+	if replaced {
+		return nil
+	}
+	return preserved
 }
 
 // RecordDispatchIntent durably records that a consequential invocation is about
@@ -701,6 +775,9 @@ func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
 		return er, err
 	}
 	if err := ValidateResearchEvidenceForExecution(er.ID, er.ResearchEvidence); err != nil {
+		return er, err
+	}
+	if err := ValidateResearchEvaluationForExecution(er.ID, er.ResearchEvaluation, er.ResearchEvidence); err != nil {
 		return er, err
 	}
 	return er, nil

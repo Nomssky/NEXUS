@@ -22,7 +22,7 @@ import {
   useRecoveryExecutions,
   useEventStream,
 } from '@/api/hooks';
-import type { DurableExecution, ExecutionStatus } from '@/types/api';
+import type { DurableExecution, ExecutionStatus, ResearchEvaluation } from '@/types/api';
 import {
   extractToolActivity,
   parseDurableResearchEvidence,
@@ -35,6 +35,7 @@ import {
   type ResearchStep,
   type ResearchToolActivity,
 } from '@/types/research';
+import { parseResearchEvaluation } from '@/types/researchEvaluation';
 import styles from './Research.module.css';
 
 interface ResearchPageProps {
@@ -166,6 +167,29 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     [parsedResult, durableEvidence, steps, execution?.research_synthesis]
   );
 
+  // Deterministic quality evaluation. Prefer the live object, then fall back to
+  // the persisted detail read (which is the only source after a restart). Both
+  // are bound to the active execution id and, when durable evidence is present,
+  // to its evidence version/count; a mismatch hides the panel.
+  const evaluation = useMemo(() => {
+    const live = parseResearchEvaluation(
+      execution?.research_evaluation,
+      activeExecutionId ?? undefined,
+      durableEvidence
+    );
+    if (live) return live;
+    return parseResearchEvaluation(
+      recoveryDetail?.research_evaluation,
+      activeExecutionId ?? undefined,
+      durableEvidence
+    );
+  }, [
+    execution?.research_evaluation,
+    recoveryDetail?.research_evaluation,
+    activeExecutionId,
+    durableEvidence,
+  ]);
+
   // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
     command: { executions: 0 },
@@ -244,6 +268,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               onViewTrace={handleViewTrace}
               onExecutionSelect={handleExecutionSelect}
               onCloseTrace={handleCloseTrace}
+              evaluation={evaluation}
             />
           )}
 
@@ -283,6 +308,7 @@ interface ResearchZoneProps {
   onViewTrace: (executionId: string) => void;
   onExecutionSelect: (executionId: string) => void;
   onCloseTrace: () => void;
+  evaluation?: ResearchEvaluation;
 }
 
 const ResearchZone: React.FC<ResearchZoneProps> = ({
@@ -304,6 +330,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   onViewTrace,
   onExecutionSelect,
   onCloseTrace,
+  evaluation,
 }) => {
   return (
     <div className={styles.zone}>
@@ -347,6 +374,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             findings={findings}
             durablePlan={durableEvidence.plan}
             durableSteps={durableEvidence.steps}
+            evaluation={evaluation}
           />
         </section>
 

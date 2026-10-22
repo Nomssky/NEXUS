@@ -26,6 +26,7 @@ import type {
   DurableResearchStepStatus,
   ExecutionStatus,
   ParsedWebSearchSource,
+  ResearchEvaluation,
 } from '../../types/api';
 import {
   parseResearchResult,
@@ -35,6 +36,7 @@ import {
   type ResearchStep,
   type ResearchFindings,
 } from '../../types/research';
+import { ResearchQuality } from './ResearchQuality';
 import styles from './ResearchOutput.module.css';
 
 interface ResearchOutputProps {
@@ -56,6 +58,11 @@ interface ResearchOutputProps {
   durablePlan?: DurableResearchPlan;
   /** Recovered durable steps in plan order. Distinct from process-local steps. */
   durableSteps?: ParsedDurableStep[];
+  /**
+   * Defensively parsed deterministic quality verdict. Persisted with the
+   * execution, so it may be present after the process-local synthesis is gone.
+   */
+  evaluation?: ResearchEvaluation;
 }
 
 const DURABLE_TERMINAL_STATES = new Set([
@@ -79,6 +86,7 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   findings,
   durablePlan,
   durableSteps,
+  evaluation,
 }) => {
   const parsed = useMemo(() => parseResearchResult(output), [output]);
 
@@ -112,6 +120,9 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
         <Card variant="outlined" padding="lg">
           {durablePlan && durableSteps && durableSteps.length > 0 && (
             <DurablePlanSection plan={durablePlan} steps={durableSteps} />
+          )}
+          {evaluation && (
+            <ResearchQuality evaluation={evaluation} recorded />
           )}
           <div className={styles.empty}>
             <div className={styles.resultHeader}>
@@ -229,6 +240,8 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
             </section>
           )
         )}
+
+        {evaluation && <ResearchQuality evaluation={evaluation} />}
 
         {findings?.typedSynthesis && (
           <TypedSynthesisBlock synthesis={findings.typedSynthesis} sources={findings.sources} />

@@ -100,8 +100,9 @@ type runSnapshot struct {
 	// researchEvidence carries source records captured before the pause, so a
 	// resumed run neither loses them nor re-runs the search. Overflow is
 	// latched too: once a capture was incomplete, it must stay absent.
-	researchEvidence *execjournal.ResearchEvidence
-	evidenceOverflow bool
+	researchEvidence  *execjournal.ResearchEvidence
+	evidenceOverflow  bool
+	researchAttempted bool
 }
 
 // snapshotRun stores the paused run's state for its resume. Only the
@@ -110,20 +111,21 @@ func (r *Runtime) snapshotRun(rn *run, id objectiveIdentity, plan *Plan, ledger 
 	observations []Observation, usage BudgetUsage, working *WorkingMemory, deadline time.Time) {
 	rn.finalizeResearchEvidence(plan, ledger)
 	snap := &runSnapshot{
-		identity:         id,
-		businessID:       rn.businessID,
-		divisionID:       rn.divisionID,
-		actorID:          rn.req.ActorID,
-		plan:             copyPlan(plan),
-		observations:     copyObservations(observations),
-		usage:            usage,
-		effects:          working.Effects(),
-		entries:          map[string]string{},
-		deadline:         deadline,
-		depth:            rn.depth,
-		planVersion:      rn.planVersion,
-		researchEvidence: copyResearchEvidence(rn.researchEvidence),
-		evidenceOverflow: rn.evidenceOverflow,
+		identity:          id,
+		businessID:        rn.businessID,
+		divisionID:        rn.divisionID,
+		actorID:           rn.req.ActorID,
+		plan:              copyPlan(plan),
+		observations:      copyObservations(observations),
+		usage:             usage,
+		effects:           working.Effects(),
+		entries:           map[string]string{},
+		deadline:          deadline,
+		depth:             rn.depth,
+		planVersion:       rn.planVersion,
+		researchEvidence:  copyResearchEvidence(rn.researchEvidence),
+		evidenceOverflow:  rn.evidenceOverflow,
+		researchAttempted: rn.researchAttempted,
 	}
 	for k, v := range working.Snapshot().Entries {
 		snap.entries[k] = v

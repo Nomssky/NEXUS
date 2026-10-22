@@ -123,6 +123,10 @@ type Outcome struct {
 	// the lifetime of this process, never journaled, and never regenerated from
 	// durable evidence after a restart.
 	ResearchSynthesis *ResearchSynthesis `json:"research_synthesis,omitempty"`
+	// ResearchEvaluation is the deterministic quality verdict for the captured
+	// evidence and synthesis. It contains only stable codes, dimension states,
+	// counts and fingerprints: never model prose or source content.
+	ResearchEvaluation *execjournal.ResearchEvaluation `json:"research_evaluation,omitempty"`
 	// Error is the error message if failed.
 	Error string `json:"error,omitempty"`
 	// Duration is total execution time.
@@ -679,6 +683,9 @@ func (e *Executor) executeWork(req *WorkRequest) {
 		if result.Status == "completed" {
 			outcome.ResearchSynthesis = result.ResearchSynthesis
 		}
+		// The deterministic quality evaluation is safe on any terminal status:
+		// it reports incomplete input honestly instead of inventing a result.
+		outcome.ResearchEvaluation = result.ResearchEvaluation
 		if result.Error != "" {
 			outcome.Error = result.Error
 		}

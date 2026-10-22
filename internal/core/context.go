@@ -212,6 +212,12 @@ type Outcome struct {
 	// live execution. It is never persisted, so after a restart the durable
 	// read proves the execution but the synthesis/result text is unavailable.
 	ResearchSynthesis *executor.ResearchSynthesis `json:"research_synthesis,omitempty"`
+
+	// ResearchEvaluation is the deterministic quality verdict. On a live
+	// response it is available immediately; after restart the same record is
+	// exposed by the durable recovery read. It is safe to serialize because it
+	// contains no model prose, source text, query or credential.
+	ResearchEvaluation *execjournal.ResearchEvaluation `json:"research_evaluation,omitempty"`
 }
 
 // ChainError represents an error that occurred in the execution chain.

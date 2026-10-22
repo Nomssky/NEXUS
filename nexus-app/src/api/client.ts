@@ -29,6 +29,7 @@ import type {
   DurableExecution,
   DurableExecutionList,
   ResearchSynthesis,
+  ResearchEvaluation,
 } from '../types/api';
 
 const DEFAULT_BASE_URL = '/api/v1';
@@ -182,6 +183,7 @@ class NexusAPIClient {
         artifacts?: string[];
         metrics?: Record<string, unknown>;
         research_synthesis?: ResearchSynthesis;
+        research_evaluation?: ResearchEvaluation;
       };
       error?: {
         code: string;
@@ -221,6 +223,7 @@ class NexusAPIClient {
       error: raw.error,
       output: raw.outcome?.summary,
       research_synthesis: raw.outcome?.research_synthesis,
+      research_evaluation: raw.outcome?.research_evaluation,
       duration_ms: durationMs,
     };
   }

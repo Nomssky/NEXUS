@@ -638,6 +638,12 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		execOutcome.Status == "completed" {
 		outcomeResult.ResearchSynthesis = execOutcome.ResearchSynthesis
 	}
+	// The deterministic quality verdict is copied on every terminal status. It
+	// is derived, bounded and contains no model text, so it does not change the
+	// completed-only synthesis rule.
+	if outcomeResult != nil && execOutcome != nil && execOutcome.ResearchEvaluation != nil {
+		outcomeResult.ResearchEvaluation = execOutcome.ResearchEvaluation
+	}
 
 	// Step 13: Store outcome in memory
 	e.chainMemoryWrite(ctx, req, status, outcomeResult)
