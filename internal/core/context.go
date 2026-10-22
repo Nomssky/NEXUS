@@ -207,6 +207,11 @@ type Outcome struct {
 	// only the durable recovery read may claim that a source snapshot survives
 	// a restart.
 	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
+
+	// ResearchSynthesis is the validated, process-local synthesis returned by a
+	// live execution. It is never persisted, so after a restart the durable
+	// read proves the execution but the synthesis/result text is unavailable.
+	ResearchSynthesis *executor.ResearchSynthesis `json:"research_synthesis,omitempty"`
 }
 
 // ChainError represents an error that occurred in the execution chain.

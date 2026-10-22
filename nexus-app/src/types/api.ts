@@ -65,10 +65,41 @@ export interface ExecutionStatus {
     details?: Record<string, unknown>;
   };
   output?: string;
+  /**
+   * Process-local typed synthesis for a research execution. Present only while
+   * the process that ran the execution still holds the result; it is never part
+   * of the durable recovery read.
+   */
+  research_synthesis?: ResearchSynthesis;
   duration_ms?: number;
   /** Not exposed by the intelligence read; present only when supplied. */
   created_at?: string;
   completed_at?: string;
+}
+
+export type ResearchSynthesisStatus = 'complete' | 'partial' | 'inconclusive';
+
+export interface ResearchSynthesisStatement {
+  statement: string;
+  source_ids: string[];
+}
+
+export interface ResearchSynthesisInference {
+  statement: string;
+}
+
+/**
+ * Backend-validated answer over one execution's evidence. The model supplies
+ * only source ids as citations; titles and URLs never appear in this object.
+ * The UI re-resolves every id against the authoritative durable evidence.
+ */
+export interface ResearchSynthesis {
+  status: ResearchSynthesisStatus;
+  summary: string;
+  evidence_backed: ResearchSynthesisStatement[];
+  inferences: ResearchSynthesisInference[];
+  conflicts: ResearchSynthesisStatement[];
+  unresolved_questions: string[];
 }
 
 export type ExecutionStatusValue =

@@ -151,10 +151,19 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     [recoveryDetail?.research_evidence]
   );
 
-  // Findings: agent-generated synthesis kept distinct from source records.
+  // Findings: the typed synthesis is resolved against the durable evidence and
+  // kept distinct from source records. It is process-local, so a recovered
+  // execution without it never gets a regenerated or prose-fallback synthesis.
   const findings = useMemo(
-    () => buildResearchFindings(parsedResult, durableEvidence, steps, durableEvidence.steps),
-    [parsedResult, durableEvidence, steps]
+    () =>
+      buildResearchFindings(
+        parsedResult,
+        durableEvidence,
+        steps,
+        durableEvidence.steps,
+        execution?.research_synthesis
+      ),
+    [parsedResult, durableEvidence, steps, execution?.research_synthesis]
   );
 
   // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.

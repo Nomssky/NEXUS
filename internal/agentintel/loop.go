@@ -64,7 +64,10 @@ func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, s
 		Messages:       toProviderMessages(msgs),
 		ResponseFormat: "json",
 		Structured:     structured,
-		MaxTokens:      512,
+		// Bounded, but large enough for a bounded plan with explicit operations
+		// and a synthesized answer with several citations. MaxDecisionBytes
+		// remains the hard wire-shape bound on what the runtime accepts.
+		MaxTokens: 2048,
 	}
 	resp, _, err := d.Router.Invoke(ctx, routeReq, gen)
 	if err != nil {
@@ -171,6 +174,10 @@ type run struct {
 	// list as complete.
 	researchEvidence *execjournal.ResearchEvidence
 	evidenceOverflow bool
+	// synthesis is the validated typed completion answer for this execution.
+	// It is process-local (never journaled) and only attached to a completed
+	// outcome by the terminal defer.
+	synthesis *executor.ResearchSynthesis
 }
 
 // captureResearchEvidence merges one complete web.search snapshot into this
@@ -300,10 +307,11 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 		}
 		ev.Operations = append(ev.Operations, op)
 	}
-	// Model-authored plan identifiers are validated only as non-empty by the
-	// plan validator. If the settled provenance cannot satisfy the durable
-	// evidence contract, drop the provenance rather than poisoning the
-	// terminal write; the source records remain honest but unattributed.
+	// Model-authored plan identifiers are validated as bounded, non-empty and
+	// schema-shaped by the plan validator. If the settled provenance still
+	// cannot satisfy the durable evidence contract, drop the provenance rather
+	// than poisoning the terminal write; the source records remain honest but
+	// unattributed.
 	if err := execjournal.ValidateResearchEvidenceForExecution(ev.Plan.PlanID, ev); err != nil {
 		ev.Plan, ev.Steps, ev.Operations = nil, nil, nil
 		if err := execjournal.ValidateResearchEvidence(ev); err != nil {
@@ -312,6 +320,49 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 			rn.researchEvidence = nil
 		}
 	}
+}
+
+// validateCompletionSynthesis enforces the completion gate for research
+// evidence. v2 evidence requires a typed synthesis; v1 evidence has no stable
+// source ids and must not be upgraded into one. The model's synthesis is only
+// a proposal until executor.ValidateResearchSynthesis resolves every citation
+// against this run's current evidence and checks status against the plan facts.
+func (rn *run) validateCompletionSynthesis(s *executor.ResearchSynthesis, plan *Plan, ledger *planLedger, currentStepID string) error {
+	ev := rn.researchEvidence
+	if s == nil {
+		if ev != nil && ev.Version == execjournal.ResearchEvidenceVersion {
+			return fmt.Errorf("evidence was captured but the complete action has no synthesis")
+		}
+		return nil
+	}
+	if ev == nil {
+		return fmt.Errorf("synthesis requires evidence captured by this execution")
+	}
+	if ev.Version != execjournal.ResearchEvidenceVersion {
+		return fmt.Errorf("synthesis requires v2 evidence with stable source ids")
+	}
+	return executor.ValidateResearchSynthesis(s, ev, completionIsPartial(plan, ledger, currentStepID))
+}
+
+// completionIsPartial is the runtime's verdict on the active plan at the
+// moment a complete action is validated. The currently executing step is
+// excluded: its completion is the action being validated. Any other step that
+// has not completed (including blocked/failed/dropped optional steps) makes a
+// `complete` synthesis status dishonest.
+func completionIsPartial(plan *Plan, ledger *planLedger, currentStepID string) bool {
+	if plan == nil || ledger == nil {
+		return false
+	}
+	for _, step := range plan.Steps {
+		if step.StepID == currentStepID {
+			continue
+		}
+		rec := ledger.get(step.StepID)
+		if rec == nil || rec.Status != StepCompleted {
+			return true
+		}
+	}
+	return false
 }
 
 func (rn *run) emit(ev event.EventType, extra map[string]string) {
@@ -390,6 +441,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		if out != nil && rn.researchEvidence != nil {
 			out.ResearchEvidence = rn.researchEvidence
 		}
+		// Synthesis is never attached to a non-completed outcome or journaled.
+		if out != nil && rn.synthesis != nil && out.Status == "completed" {
+			out.ResearchSynthesis = rn.synthesis
+		}
 	}()
 
 	// Approval resume: a waiting run left its authoritative snapshot behind
@@ -421,13 +476,20 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		memIdentity  memory.Identity
 		agentID      string
 	)
+	// The acting agent is resolved before planning so the planner receives the
+	// same bounded tool catalog a decision receives.
+	agentID = r.resolveAgent(obj, req)
+	planCaps := r.Caps
+	if budget.MaxSteps > 0 {
+		planCaps.MaxSteps = budget.MaxSteps
+	}
 	if resumed {
 		// Continue the waiting execution: re-validate the restored plan
 		// (the registry may have changed while waiting) and pick up
 		// exactly where the pause happened. No re-planning, no budget
 		// reset, no deadline extension.
 		plan = snap.plan
-		res := ValidatePlan(plan, r.scope(), r.Caps)
+		res := ValidatePlan(plan, r.scope(), planCaps)
 		rn.emit(event.EventTypePlanValidated, map[string]string{"valid": fmt.Sprint(res.Valid), "rejections": fmt.Sprint(len(res.Rejections))})
 		if !res.Valid {
 			rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
@@ -448,7 +510,12 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			rn.transition(StateCancelled, nil)
 			return cancelledOutcome(req, start, r.now()), nil
 		}
-		steps, planErr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
+		steps, planErr := r.planner().Plan(loopCtx, PlanPrompt{
+			Objective: obj.Description,
+			Context:   obj.Context,
+			Tools:     r.toolHints(req, agentID),
+			MaxSteps:  planCaps.MaxSteps,
+		})
 		if planErr != nil {
 			if ctx.Err() != nil {
 				rn.transition(StateCancelled, nil)
@@ -466,7 +533,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		rn.emit(event.EventTypePlanCreated, map[string]string{"plan_id": execID, "version": "1", "steps": fmt.Sprint(len(plan.Steps))})
 
 		// ---- validation (fail-closed before any action) ----------------------
-		res := ValidatePlan(plan, r.scope(), r.Caps)
+		res := ValidatePlan(plan, r.scope(), planCaps)
 		rn.emit(event.EventTypePlanValidated, map[string]string{"valid": fmt.Sprint(res.Valid), "rejections": fmt.Sprint(len(res.Rejections))})
 		if !res.Valid {
 			rn.transition(StateFailed, map[string]string{"reason": "plan rejected"})
@@ -479,7 +546,6 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	}
 	rn.plan, rn.ledger = plan, ledger
 
-	agentID = r.resolveAgent(obj, req)
 	if !resumed {
 		usage = BudgetUsage{}
 		// Working memory is process-local scratch state for THIS objective: bounded,
@@ -546,6 +612,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				return failedOutcome(req, start, r.now(), StateFailed, "step refused: "+err.Error()), nil
 			}
 		}
+		currentStepID := ""
+		if current != nil {
+			currentStepID = step.StepID
+		}
 		rn.transition(StateExecuting, map[string]string{"step": step.StepID, "iteration": fmt.Sprint(usage.Iterations)})
 		rn.emit(event.EventTypeStepStarted, map[string]string{"step": step.StepID, "intent": step.Intent})
 		working.SetStep(step.StepID, step.Intent)
@@ -580,9 +650,10 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		raw, derr := r.Decider.Decide(loopCtx, DecisionPrompt{
 			Objective: obj.Description, StepID: step.StepID, StepIntent: step.Intent,
 			Observations: observations, BudgetUsage: usage, Budget: budget,
-			Tools:   r.toolHints(req, agentID),
-			Memory:  assembledMemoryRecords(assembled),
-			Context: assembled.Text,
+			Tools:    r.toolHints(req, agentID),
+			Evidence: rn.researchEvidence,
+			Memory:   assembledMemoryRecords(assembled),
+			Context:  assembled.Text,
 			// Authoritative runtime state travels with every decision: the
 			// active plan version and the ledger's step facts (contract §12).
 			PlanVersion: plan.Version,
@@ -628,6 +699,25 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			rn.transition(StateFailed, map[string]string{"reason": "action rejected"})
 			return failedOutcome(req, start, r.now(), StateFailed, "action rejected: "+verr.Error()), nil
 		}
+		// Completion over captured v2 evidence is only meaningful as a typed,
+		// citation-resolved synthesis. Validate before any effect so an invalid
+		// citation can never be mistaken for a successful research result.
+		var validatedSynthesis *executor.ResearchSynthesis
+		if action.Synthesis != nil && action.Type != ActionComplete {
+			msg := "synthesis is only valid on a complete action"
+			rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": msg})
+			rn.transition(StateFailed, map[string]string{"reason": "invalid synthesis"})
+			return failedOutcome(req, start, r.now(), StateFailed, msg), nil
+		}
+		if action.Type == ActionComplete {
+			if serr := rn.validateCompletionSynthesis(action.Synthesis, plan, ledger, currentStepID); serr != nil {
+				msg := "invalid synthesis: " + serr.Error()
+				rn.emit(event.EventTypeActionRejected, map[string]string{"action": string(action.Type), "reason": msg})
+				rn.transition(StateFailed, map[string]string{"reason": "invalid synthesis"})
+				return failedOutcome(req, start, r.now(), StateFailed, msg), nil
+			}
+			validatedSynthesis = action.Synthesis
+		}
 		// A completed mutating effect is never silently repeated: the
 		// fingerprint of every consequential mutation this execution performed
 		// is recorded, and an identical proposal is rejected before anything
@@ -664,10 +754,6 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 		}
 		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
-		currentStepID := ""
-		if current != nil {
-			currentStepID = step.StepID
-		}
 		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, currentStepID, agentID, working, usage, budget)
 		usage = next
 		// Completion gate (contract §7). With criteria on the objective, a
@@ -753,6 +839,9 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		}
 		if termState != "" {
 			if termState == StateCompleted {
+				if validatedSynthesis != nil {
+					rn.synthesis = validatedSynthesis
+				}
 				rn.transition(StateCompleted, map[string]string{"iterations": fmt.Sprint(usage.Iterations)})
 				return completedOutcome(req, start, r.now(), obj, observations, usage, agentID, termMsg), nil
 			}
@@ -849,7 +938,16 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 				return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 			}
 			rn.transition(StateReplanning, map[string]string{"reason": reason, "version": fmt.Sprint(plan.Version + 1)})
-			newSteps, perr := r.planner().Plan(loopCtx, PlanPrompt{Objective: obj.Description, Context: obj.Context})
+			newSteps, perr := r.planner().Plan(loopCtx, PlanPrompt{
+				Objective:   obj.Description,
+				Context:     obj.Context,
+				Tools:       r.toolHints(req, agentID),
+				MaxSteps:    planCaps.MaxSteps,
+				PriorSteps:  plan.Steps,
+				PlanVersion: plan.Version,
+				StepStates:  ledger.describe(),
+				Reason:      reason,
+			})
 			if perr != nil {
 				if ctx.Err() != nil {
 					rn.transition(StateCancelled, nil)
@@ -865,7 +963,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			newPlan := &Plan{PlanID: execID, Version: plan.Version + 1, ParentVersion: plan.Version,
 				Reason: reason, Steps: newSteps, ObjectiveID: obj.ObjectiveID,
 				CorrelationID: execID, BusinessID: req.BusinessID, DivisionID: req.DivisionID, CreatedAt: r.now()}
-			nres := ValidatePlan(newPlan, r.scope(), r.Caps)
+			nres := ValidatePlan(newPlan, r.scope(), planCaps)
 			if !nres.Valid {
 				rn.transition(StateFailed, map[string]string{"reason": "replan rejected"})
 				return failedOutcome(req, start, r.now(), StateFailed, "replan rejected: "+rejectionSummary(nres)), nil
@@ -942,6 +1040,12 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		// of falsely completing it.
 		if len(observationsFor(working)) == 0 {
 			return nil, usage, StateFailed, "complete rejected: no runtime evidence of progress"
+		}
+		if a.Synthesis != nil {
+			// Typed synthesis is rendered from the structured outcome, not from
+			// free-form result prose. The runtime owns this summary fragment so
+			// two model-authored versions cannot disagree.
+			return nil, usage, StateCompleted, "source-grounded synthesis"
 		}
 		return nil, usage, StateCompleted, a.Result
 	case ActionFail:

@@ -21,7 +21,7 @@ func TestMultiStepLoopCapturesEvidenceFromBothSteps(t *testing.T) {
 		answers: []string{
 			`{"type":"tool_call","tool":"web.search","input":{"query":"nexus"}}`,
 			`{"type":"tool_call","tool":"web.search","input":{"query":"nexus capabilities"}}`,
-			`{"type":"complete","result":"done"}`,
+			groundedCompletion("src-1", "src-2", "src-3", "src-4"),
 		},
 	}
 

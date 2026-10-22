@@ -143,6 +143,35 @@ describe('submit → approve → resume → result journey', () => {
     }
   });
 
+  it('maps the process-local typed research synthesis without altering it', async () => {
+    const synthesis = {
+      status: 'partial' as const,
+      summary: 'Grounded in captured evidence.',
+      evidence_backed: [{ statement: 'A claim.', source_ids: ['src-1'] }],
+      inferences: [{ statement: 'An inference.' }],
+      conflicts: [],
+      unresolved_questions: ['What remains?'],
+    };
+    mockFetch.mockResolvedValueOnce(
+      mockJson(200, {
+        request_id: EXECUTION_ID,
+        business_id: BUSINESS_ID,
+        status: 'completed',
+        outcome: {
+          summary: 'source-grounded synthesis',
+          metrics: {},
+          research_synthesis: synthesis,
+        },
+        audit_trace: [],
+      })
+    );
+
+    const status = await apiClient.getIntelligence(EXECUTION_ID, BUSINESS_ID);
+
+    expect(status.research_synthesis).toEqual(synthesis);
+    expect(status.output).toBe('source-grounded synthesis');
+  });
+
   it('prefers outcome.metrics.duration_ms and converts Go nanoseconds otherwise', async () => {
     mockFetch.mockResolvedValueOnce(
       mockJson(200, {

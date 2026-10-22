@@ -118,6 +118,11 @@ type Outcome struct {
 	// only surface that exposes it, so a process-local result can never be
 	// mistaken for a durable snapshot.
 	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
+	// ResearchSynthesis is the validated typed answer for this execution. It is
+	// process-local only: it is carried to the live intelligence response for
+	// the lifetime of this process, never journaled, and never regenerated from
+	// durable evidence after a restart.
+	ResearchSynthesis *ResearchSynthesis `json:"research_synthesis,omitempty"`
 	// Error is the error message if failed.
 	Error string `json:"error,omitempty"`
 	// Duration is total execution time.
@@ -668,6 +673,12 @@ func (e *Executor) executeWork(req *WorkRequest) {
 		// Internal hand-off only: the durable journal writes this atomically
 		// with the terminal record. It is not serialized on public responses.
 		outcome.ResearchEvidence = result.ResearchEvidence
+		// Process-local synthesis is merged independently of evidence, but only
+		// for a completed handler outcome. A failure never exposes a model
+		// answer that was not accepted as the result.
+		if result.Status == "completed" {
+			outcome.ResearchSynthesis = result.ResearchSynthesis
+		}
 		if result.Error != "" {
 			outcome.Error = result.Error
 		}

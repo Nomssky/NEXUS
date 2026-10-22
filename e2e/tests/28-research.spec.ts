@@ -193,11 +193,28 @@ test.describe('Research Workspace E2E', () => {
     await expect(
       output.getByRole('heading', { name: 'Research result', exact: true })
     ).toBeVisible({ timeout: 20000 });
-    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible();
     await expect(output.getByText(RESEARCH_OBJECTIVE, { exact: true })).toBeVisible();
     await expect(
       output.locator('dt', { hasText: 'Tool calls' }).locator('..').locator('dd')
     ).toHaveText('1');
+
+    // The deterministic provider returns a typed, citation-resolved synthesis.
+    // Titles and URLs in it come from the durable source records.
+    const synthesis = output.locator('[aria-label="Typed research synthesis"]');
+    await expect(synthesis).toBeVisible();
+    await expect(synthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(synthesis.getByText('Synthesized from 2 captured source(s) in this execution.')).toBeVisible();
+    await expect(synthesis.getByText('Evidence-backed findings')).toBeVisible();
+    await expect(
+      synthesis.getByText('The captured source records (2) describe the requested subject.')
+    ).toBeVisible();
+    await expect(
+      synthesis.getByRole('link', { name: 'Nexus capability boundary' })
+    ).toHaveAttribute('href', 'https://docs.example/nexus');
+    await expect(synthesis.getByText('docs.example · src-1')).toBeVisible();
+    await expect(synthesis.getByText('not evidence')).toBeVisible();
+    // The model's free-form result prose is not rendered as a second answer.
+    await expect(output.getByText('objective pursued deterministically')).toHaveCount(0);
 
     // Durable evidence from the real web.search capture: two scripted
     // sources, provider-grounded titles and URLs, safe external links, and
@@ -237,9 +254,12 @@ test.describe('Research Workspace E2E', () => {
       .getByRole('tab', { name: 'Research', exact: true })
       .click();
     await page.waitForSelector('text=Research Query', { timeout: 5000 });
-    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible({
+    await expect(output.locator('[aria-label="Typed research synthesis"]')).toBeVisible({
       timeout: 20000,
     });
+    await expect(
+      output.locator('[aria-label="Typed research synthesis"]').getByText('Evidence-backed findings')
+    ).toBeVisible();
     await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
@@ -273,9 +293,12 @@ test.describe('Research Workspace E2E', () => {
     const output = page.locator('section[aria-labelledby="research-output-heading"]');
     const evidence = page.locator('section[aria-labelledby="research-evidence-heading"]');
 
-    await expect(output.getByText('objective pursued deterministically', { exact: true })).toBeVisible({
+    await expect(output.locator('[aria-label="Typed research synthesis"]')).toBeVisible({
       timeout: 20000,
     });
+    await expect(
+      output.locator('[aria-label="Typed research synthesis"]').getByText('Evidence-backed findings')
+    ).toBeVisible();
     await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
 
@@ -302,10 +325,11 @@ test.describe('Research Workspace E2E', () => {
     // Grounded terminal timestamp survives too.
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
 
-    // Honest post-restart state: the result text itself is not available
-    // after restart (process-local output is gone); the UI says so instead of
-    // fabricating text or claiming there was never a result.
-    await expect(output.getByText('Result text unavailable')).toBeVisible();
+    // Honest post-restart state: the typed synthesis and result text are
+    // process-local and are not regenerated from durable evidence. The UI says
+    // so instead of fabricating an answer or claiming there was never a result.
+    await expect(output.getByText('Synthesis and result text unavailable')).toBeVisible();
+    await expect(output.locator('[data-synthesis-status]')).toHaveCount(0);
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
@@ -354,6 +378,19 @@ test.describe('Research Workspace E2E', () => {
     await expect(
       output.locator('dt', { hasText: 'Tool calls' }).locator('..').locator('dd')
     ).toHaveText('2');
+
+    // The typed synthesis resolves all four citations against the merged
+    // durable snapshot; no title or URL is taken from the model.
+    const synthesis = output.locator('[aria-label="Typed research synthesis"]');
+    await expect(synthesis).toBeVisible();
+    await expect(synthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(synthesis.getByText('Synthesized from 4 captured source(s) in this execution.')).toBeVisible();
+    await expect(
+      synthesis.getByRole('link', { name: 'Nexus agent model' })
+    ).toHaveAttribute('href', 'https://docs.example/agents');
+    await expect(synthesis.getByText('docs.example · src-1')).toBeVisible();
+    await expect(synthesis.getByText('docs.example · src-4')).toBeVisible();
+    await expect(output.getByText('objective pursued deterministically')).toHaveCount(0);
 
     // Durable evidence merged from both searches: four provider-grounded
     // records, the two default sources plus the two capability sources. No
@@ -479,8 +516,10 @@ test.describe('Research Workspace E2E', () => {
     // Grounded terminal timestamp survives too.
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
 
-    // Honest post-restart state: result text unavailable, evidence intact.
-    await expect(output.getByText('Result text unavailable')).toBeVisible();
+    // Honest post-restart state: synthesis and result text unavailable,
+    // evidence and durable plan intact.
+    await expect(output.getByText('Synthesis and result text unavailable')).toBeVisible();
+    await expect(output.locator('[data-synthesis-status]')).toHaveCount(0);
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });

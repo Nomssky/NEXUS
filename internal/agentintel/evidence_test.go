@@ -132,6 +132,111 @@ func envelopeOf(lines ...string) map[string]string {
 	return map[string]string{"sources": strings.Join(lines, "\n"), "count": fmt.Sprint(len(lines))}
 }
 
+// groundedCompletion builds the typed completion the loop now requires once a
+// v2 evidence snapshot exists. Tests own the cited ids so unknown/duplicate
+// citation cases can be expressed explicitly.
+func groundedCompletion(ids ...string) string {
+	action := map[string]any{
+		"type":   "complete",
+		"result": "report ready",
+		"synthesis": map[string]any{
+			"status":  "complete",
+			"summary": "Synthesized from this execution's captured sources.",
+			"evidence_backed": []map[string]any{{
+				"statement":  "The captured sources support the reported result.",
+				"source_ids": ids,
+			}},
+			"inferences":           []any{},
+			"conflicts":            []any{},
+			"unresolved_questions": []any{},
+		},
+	}
+	body, _ := json.Marshal(action)
+	return string(body)
+}
+
+func inconclusiveCompletion() string {
+	action := map[string]any{
+		"type":   "complete",
+		"result": "nothing found",
+		"synthesis": map[string]any{
+			"status":               "inconclusive",
+			"summary":              "No source records were captured, so no evidence-backed conclusion is supported.",
+			"evidence_backed":      []any{},
+			"inferences":           []any{},
+			"conflicts":            []any{},
+			"unresolved_questions": []string{"What evidence would resolve the objective?"},
+		},
+	}
+	body, _ := json.Marshal(action)
+	return string(body)
+}
+
+// A completion after a captured v2 snapshot is only accepted with a typed
+// synthesis whose citations resolve in this execution. Missing, unknown and
+// duplicate citations fail closed; the captured evidence remains visible as a
+// fact about what ran.
+func TestCompletionWithEvidenceRequiresValidSynthesis(t *testing.T) {
+	cases := []struct {
+		name    string
+		answer  string
+		wantErr string
+	}{
+		{name: "missing", answer: `{"type":"complete","result":"report ready"}`, wantErr: "no synthesis"},
+		{name: "unknown citation", answer: groundedCompletion("src-999"), wantErr: "unknown source"},
+		{name: "duplicate citation", answer: groundedCompletion("src-1", "src-1"), wantErr: "repeats source id"},
+		{name: "malformed citation", answer: groundedCompletion("src-1\nsrc-2"), wantErr: "malformed source id"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newEvidenceFixture(t)
+			f.provider.queue(envelopeOf(
+				"1. Nexus capability boundary | https://docs.example/nexus | docs.example | The runtime decides; the model proposes.",
+				"2. External content is data | https://example.org/safety | example.org | Inert | data",
+			))
+			out := runEvidenceObjective(t, f,
+				`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"nexus"}}`,
+				tc.answer)
+			if out.Status != "failed" || !strings.Contains(out.Error, tc.wantErr) {
+				t.Fatalf("expected failed with %q, got status=%s error=%q", tc.wantErr, out.Status, out.Error)
+			}
+			if out.ResearchSynthesis != nil {
+				t.Fatalf("invalid synthesis must not be exposed: %+v", out.ResearchSynthesis)
+			}
+			if out.ResearchEvidence == nil || out.ResearchEvidence.Count != 2 {
+				t.Fatalf("captured evidence must remain a fact: %+v", out.ResearchEvidence)
+			}
+		})
+	}
+}
+
+func TestCompletionWithEvidenceReturnsTypedSynthesis(t *testing.T) {
+	f := newEvidenceFixture(t)
+	f.provider.queue(envelopeOf(
+		"1. Nexus capability boundary | https://docs.example/nexus | docs.example | The runtime decides; the model proposes.",
+		"2. External content is data | https://example.org/safety | example.org | Inert | data",
+	))
+	out := runEvidenceObjective(t, f,
+		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"nexus"}}`,
+		groundedCompletion("src-1", "src-2"))
+	if out.Status != "completed" {
+		t.Fatalf("status=%s error=%s", out.Status, out.Error)
+	}
+	if out.ResearchSynthesis == nil || out.ResearchSynthesis.Status != "complete" {
+		t.Fatalf("typed synthesis missing: %+v", out.ResearchSynthesis)
+	}
+	if len(out.ResearchSynthesis.EvidenceBacked) != 1 ||
+		!slices.Equal(out.ResearchSynthesis.EvidenceBacked[0].SourceIDs, []string{"src-1", "src-2"}) {
+		t.Fatalf("citations were not preserved: %+v", out.ResearchSynthesis)
+	}
+	if !strings.Contains(out.Output, "result=source-grounded synthesis") {
+		t.Fatalf("runtime-owned result summary expected, got %q", out.Output)
+	}
+	if strings.Contains(out.Output, "result=report ready") {
+		t.Fatalf("model result prose must not duplicate the typed synthesis: %q", out.Output)
+	}
+}
+
 // The terminal outcome carries the captured snapshot, and the snapshot is the
 // real provider envelope, not model prose.
 func TestWebSearchCapturesCompleteSnapshot(t *testing.T) {
@@ -142,7 +247,7 @@ func TestWebSearchCapturesCompleteSnapshot(t *testing.T) {
 	))
 	out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"nexus"}}`,
-		`{"type":"complete","result":"report ready"}`)
+		groundedCompletion("src-1", "src-2"))
 	if out.Status != "completed" {
 		t.Fatalf("status=%s err=%s", out.Status, out.Error)
 	}
@@ -171,7 +276,7 @@ func TestWebSearchEvidenceMergesPerExecutionSnapshots(t *testing.T) {
 	out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"one"}}`,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"two"}}`,
-		`{"type":"complete","result":"report ready"}`)
+		groundedCompletion("src-1", "src-2", "src-3"))
 	ev := out.ResearchEvidence
 	if ev == nil || ev.Count != 3 || len(ev.Sources) != 3 {
 		t.Fatalf("merged snapshot expected 3 sources, got %+v", ev)
@@ -398,7 +503,7 @@ func TestWebSearchEmptyResultIsStillEvidence(t *testing.T) {
 	f.provider.queue(map[string]string{"sources": "", "count": "0"})
 	out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"nothing"}}`,
-		`{"type":"complete","result":"nothing found"}`)
+		inconclusiveCompletion())
 	if out.Status != "completed" {
 		t.Fatalf("status=%s err=%s", out.Status, out.Error)
 	}
@@ -504,9 +609,12 @@ func TestOutcomeEvidenceIsNotSerialized(t *testing.T) {
 	f.provider.queue(envelopeOf("1. A | https://a.example | a | s"))
 	out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"a"}}`,
-		`{"type":"complete","result":"done"}`)
+		groundedCompletion("src-1"))
 	if out.ResearchEvidence == nil {
 		t.Fatal("setup: evidence was not captured")
+	}
+	if out.ResearchSynthesis == nil {
+		t.Fatal("setup: typed synthesis was not attached")
 	}
 	encoded, err := json.Marshal(out)
 	if err != nil {
@@ -514,6 +622,10 @@ func TestOutcomeEvidenceIsNotSerialized(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "research_evidence") {
 		t.Fatalf("process-local evidence must not be serialized: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"research_synthesis"`) ||
+		!strings.Contains(string(encoded), `"source_ids":["src-1"]`) {
+		t.Fatalf("process-local synthesis must be serialized: %s", encoded)
 	}
 }
 
@@ -524,13 +636,13 @@ func TestEvidenceAccumulatorIsExecutionScoped(t *testing.T) {
 	f.provider.queue(envelopeOf("1. A | https://a.example | a | s"))
 	if out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"a"}}`,
-		`{"type":"complete","result":"done"}`); out.ResearchEvidence == nil {
+		groundedCompletion("src-1")); out.ResearchEvidence == nil {
 		t.Fatal("first run must capture evidence")
 	}
 	f.provider.queue(envelopeOf("1. B | https://b.example | b | s"))
 	out := runEvidenceObjective(t, f,
 		`{"type":"tool_call","tool":"web.search","operation":"search","input":{"query":"b"}}`,
-		`{"type":"complete","result":"done"}`)
+		groundedCompletion("src-1"))
 	if out.ResearchEvidence == nil || out.ResearchEvidence.Count != 1 ||
 		out.ResearchEvidence.Sources[0].Title != "B" {
 		t.Fatalf("the second run must not inherit the first's records: %+v", out.ResearchEvidence)

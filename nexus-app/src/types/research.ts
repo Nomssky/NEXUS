@@ -44,6 +44,7 @@ import type {
   DurableResearchPlan,
   DurableResearchStepStatus,
   ParsedWebSearchSource,
+  ResearchSynthesis as APIResearchSynthesis,
   TraceEntry,
   WebSearchResult,
 } from './api';
@@ -321,6 +322,8 @@ export interface ParsedDurableEvidence {
    * zero sources.
    */
   present: boolean;
+  /** Evidence schema version (2 today; 1 is readable legacy evidence). */
+  version?: number;
   capability?: string;
   operation?: string;
   /** The count declared by the provider envelope; equals sources.length. */
@@ -453,6 +456,7 @@ export function parseDurableResearchEvidence(
     }
     return {
       present: true,
+      version: DURABLE_EVIDENCE_LEGACY_VERSION,
       capability: DURABLE_EVIDENCE_CAPABILITY,
       operation: DURABLE_EVIDENCE_OPERATION,
       count,
@@ -474,6 +478,7 @@ export function parseDurableResearchEvidence(
     if (hasSteps || hasOperations) return NO_DURABLE_EVIDENCE;
     return {
       present: true,
+      version: DURABLE_EVIDENCE_VERSION,
       capability: DURABLE_EVIDENCE_CAPABILITY,
       operation: DURABLE_EVIDENCE_OPERATION,
       count,
@@ -590,6 +595,7 @@ export function parseDurableResearchEvidence(
 
   return {
     present: true,
+    version: DURABLE_EVIDENCE_VERSION,
     capability: DURABLE_EVIDENCE_CAPABILITY,
     operation: DURABLE_EVIDENCE_OPERATION,
     count,
@@ -669,19 +675,225 @@ export interface ResearchStep {
 }
 
 /**
- * Reconstructed findings for one execution: the agent-generated synthesis
- * result text plus the durable source evidence, kept distinct so the UI never
- * presents a conclusion as a citation.
+ * Reconstructed findings for one execution: the validated typed synthesis,
+ * legacy agent prose, and the durable source evidence, kept distinct so the UI
+ * never presents a conclusion as a citation.
  */
 export interface ResearchFindings {
-  /** Agent-generated synthesis text (prose, never linkified as evidence). */
+  /** Legacy agent-generated synthesis prose (never linkified as evidence). */
   synthesis?: string;
+  /** Validated typed synthesis with citations resolved against durable evidence. */
+  typedSynthesis?: ParsedResearchSynthesis;
+  /**
+   * Set when the backend supplied a typed synthesis that the UI could not
+   * verify against this execution's durable evidence. The whole synthesis is
+   * withheld; no citation or prose fallback is rendered.
+   */
+  synthesisRejected?: ResearchSynthesisRejection;
   /** Durable source records captured at the capability boundary. */
   sources: ParsedWebSearchSource[];
   /** True when the durable evidence snapshot is present (even if empty). */
   evidencePresent: boolean;
-  /** True when any step failed or was blocked, so findings are partial. */
+  /** True when any step failed/was blocked or the synthesis declares partial. */
   partial: boolean;
+}
+
+export type ResearchSynthesisStatus = 'complete' | 'partial' | 'inconclusive';
+export type ResearchSynthesisRejection = 'invalid' | 'no_evidence';
+
+export interface ParsedSynthesisCitation {
+  sourceId: string;
+  /** The authoritative durable record. Titles/URLs never come from the model. */
+  source: ParsedWebSearchSource;
+}
+
+export interface ParsedSynthesisStatement {
+  statement: string;
+  citations: ParsedSynthesisCitation[];
+}
+
+export interface ParsedResearchSynthesis {
+  status: ResearchSynthesisStatus;
+  summary: string;
+  evidenceBacked: ParsedSynthesisStatement[];
+  inferences: string[];
+  conflicts: ParsedSynthesisStatement[];
+  unresolvedQuestions: string[];
+}
+
+export interface ResearchSynthesisParseResult {
+  synthesis?: ParsedResearchSynthesis;
+  rejection?: ResearchSynthesisRejection;
+}
+
+// Bounds mirror internal/executor/synthesis.go. A typed synthesis that exceeds
+// any bound, repeats a citation, or cites a source absent from this execution's
+// durable snapshot is rejected wholesale rather than partially rendered.
+const MAX_SYNTHESIS_SUMMARY = 4000;
+const MAX_SYNTHESIS_STATEMENTS = 12;
+const MAX_SYNTHESIS_INFERENCES = 12;
+const MAX_SYNTHESIS_CONFLICTS = 8;
+const MAX_SYNTHESIS_QUESTIONS = 8;
+const MAX_SYNTHESIS_STATEMENT = 2000;
+const MAX_SYNTHESIS_QUESTION = 1000;
+const MAX_SYNTHESIS_CITATIONS = 12;
+
+const SYNTHESIS_STATUSES = new Set<ResearchSynthesisStatus>([
+  'complete',
+  'partial',
+  'inconclusive',
+]);
+
+/**
+ * Validate a backend synthesis against the durable evidence snapshot this UI
+ * actually parsed. This is an independent display boundary, not a re-run of the
+ * backend validator: every source id must resolve in THIS execution's evidence,
+ * duplicates are rejected, and the model cannot supply titles or URLs.
+ */
+export function parseResearchSynthesis(
+  synthesis: APIResearchSynthesis | null | undefined,
+  durable: ParsedDurableEvidence
+): ResearchSynthesisParseResult {
+  if (synthesis === undefined || synthesis === null) return {};
+  if (!isRecord(synthesis)) return { rejection: 'invalid' };
+  if (!durable.present || durable.version !== DURABLE_EVIDENCE_VERSION) {
+    return { rejection: 'no_evidence' };
+  }
+
+  const status = synthesis.status;
+  if (typeof status !== 'string' || !SYNTHESIS_STATUSES.has(status as ResearchSynthesisStatus)) {
+    return { rejection: 'invalid' };
+  }
+  const summary = synthesis.summary;
+  if (
+    typeof summary !== 'string' ||
+    summary.trim() === '' ||
+    summary.length > MAX_SYNTHESIS_SUMMARY
+  ) {
+    return { rejection: 'invalid' };
+  }
+
+  const rawEvidence = synthesis.evidence_backed;
+  const rawInferences = synthesis.inferences;
+  const rawConflicts = synthesis.conflicts;
+  const rawQuestions = synthesis.unresolved_questions;
+  if (
+    !Array.isArray(rawEvidence) ||
+    !Array.isArray(rawInferences) ||
+    !Array.isArray(rawConflicts) ||
+    !Array.isArray(rawQuestions) ||
+    rawEvidence.length > MAX_SYNTHESIS_STATEMENTS ||
+    rawInferences.length > MAX_SYNTHESIS_INFERENCES ||
+    rawConflicts.length > MAX_SYNTHESIS_CONFLICTS ||
+    rawQuestions.length > MAX_SYNTHESIS_QUESTIONS
+  ) {
+    return { rejection: 'invalid' };
+  }
+
+  const sourceByID = new Map<string, ParsedWebSearchSource>();
+  for (const source of durable.sources) {
+    if (source.id) sourceByID.set(source.id, source);
+  }
+  const seenStatements = new Set<string>();
+  const parseStatements = (
+    rows: unknown[]
+  ): ParsedSynthesisStatement[] | undefined => {
+    const statements: ParsedSynthesisStatement[] = [];
+    for (const row of rows) {
+      if (!isRecord(row)) return undefined;
+      const statement = row.statement;
+      const sourceIDs = row.source_ids;
+      if (
+        typeof statement !== 'string' ||
+        statement.trim() === '' ||
+        statement.length > MAX_SYNTHESIS_STATEMENT ||
+        seenStatements.has(statement.trim())
+      ) {
+        return undefined;
+      }
+      if (
+        !Array.isArray(sourceIDs) ||
+        sourceIDs.length === 0 ||
+        sourceIDs.length > MAX_SYNTHESIS_CITATIONS
+      ) {
+        return undefined;
+      }
+      seenStatements.add(statement.trim());
+      const seenIDs = new Set<string>();
+      const citations: ParsedSynthesisCitation[] = [];
+      for (const sourceID of sourceIDs) {
+        if (
+          typeof sourceID !== 'string' ||
+          sourceID.length === 0 ||
+          sourceID.length > MAX_DURABLE_SOURCE_ID ||
+          sourceID.includes('\u0000') ||
+          sourceID.includes('\n') ||
+          sourceID.includes('\r') ||
+          seenIDs.has(sourceID) ||
+          !sourceByID.has(sourceID)
+        ) {
+          return undefined;
+        }
+        seenIDs.add(sourceID);
+        citations.push({
+          sourceId: sourceID,
+          source: sourceByID.get(sourceID) as ParsedWebSearchSource,
+        });
+      }
+      statements.push({ statement: statement.trim(), citations });
+    }
+    return statements;
+  };
+
+  const evidenceBacked = parseStatements(rawEvidence);
+  if (!evidenceBacked) return { rejection: 'invalid' };
+  const conflicts = parseStatements(rawConflicts);
+  if (!conflicts) return { rejection: 'invalid' };
+
+  const inferences: string[] = [];
+  for (const row of rawInferences) {
+    if (!isRecord(row)) return { rejection: 'invalid' };
+    const statement = row.statement;
+    if (
+      typeof statement !== 'string' ||
+      statement.trim() === '' ||
+      statement.length > MAX_SYNTHESIS_STATEMENT
+    ) {
+      return { rejection: 'invalid' };
+    }
+    inferences.push(statement.trim());
+  }
+
+  const unresolvedQuestions: string[] = [];
+  for (const question of rawQuestions) {
+    if (
+      typeof question !== 'string' ||
+      question.trim() === '' ||
+      question.length > MAX_SYNTHESIS_QUESTION
+    ) {
+      return { rejection: 'invalid' };
+    }
+    unresolvedQuestions.push(question.trim());
+  }
+
+  const grounded = evidenceBacked.length + conflicts.length;
+  if (status === 'inconclusive' && grounded !== 0) return { rejection: 'invalid' };
+  if (status === 'partial' && grounded === 0) return { rejection: 'invalid' };
+  if (status === 'complete' && evidenceBacked.length === 0) return { rejection: 'invalid' };
+  if (durable.sources.length === 0 && status !== 'inconclusive') {
+    return { rejection: 'invalid' };
+  }
+
+  return {
+    synthesis: {
+      status: status as ResearchSynthesisStatus,
+      summary: summary.trim(),
+      evidenceBacked,
+      inferences,
+      conflicts,
+      unresolvedQuestions,
+    },
+  };
 }
 
 /** Step lifecycle statuses emitted by the control loop (metadata only). */
@@ -757,25 +969,35 @@ export function buildResearchFindings(
   parsed: ReturnType<typeof parseResearchResult>,
   durable: ParsedDurableEvidence,
   steps: ResearchStep[],
-  durableSteps: ParsedDurableStep[] = []
+  durableSteps: ParsedDurableStep[] = [],
+  typedSynthesis?: APIResearchSynthesis | null
 ): ResearchFindings {
-  const partial =
+  const stepPartial =
     durableSteps.length > 0
       ? durableSteps.some(
           (step) =>
             step.status === 'failed' || step.status === 'blocked' || step.status === 'cancelled'
         )
       : steps.some((s) => s.status === 'failed' || s.status === 'blocked');
+  const hasTypedSynthesis = typedSynthesis !== undefined && typedSynthesis !== null;
+  const parsedSynthesis = parseResearchSynthesis(typedSynthesis, durable);
+  const typed = parsedSynthesis.synthesis;
+  const legacySynthesis =
+    parsed.kind === 'structured' || parsed.kind === 'summary'
+      ? parsed.resultText
+      : parsed.kind === 'text'
+        ? parsed.raw
+        : undefined;
 
   return {
-    synthesis:
-      parsed.kind === 'structured' || parsed.kind === 'summary'
-        ? parsed.resultText
-        : parsed.kind === 'text'
-          ? parsed.raw
-          : undefined,
+    // A typed result is authoritative for the synthesis surface. If it is
+    // rejected, do not fall back to model prose: that would silently convert an
+    // unverifiable citation claim into a conclusion.
+    synthesis: hasTypedSynthesis ? undefined : legacySynthesis,
+    typedSynthesis: typed,
+    synthesisRejected: hasTypedSynthesis ? parsedSynthesis.rejection : undefined,
     sources: durable.sources,
     evidencePresent: durable.present,
-    partial,
+    partial: stepPartial || typed?.status === 'partial',
   };
 }

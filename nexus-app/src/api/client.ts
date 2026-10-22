@@ -28,6 +28,7 @@ import type {
   APIError,
   DurableExecution,
   DurableExecutionList,
+  ResearchSynthesis,
 } from '../types/api';
 
 const DEFAULT_BASE_URL = '/api/v1';
@@ -180,6 +181,7 @@ class NexusAPIClient {
         summary?: string;
         artifacts?: string[];
         metrics?: Record<string, unknown>;
+        research_synthesis?: ResearchSynthesis;
       };
       error?: {
         code: string;
@@ -218,6 +220,7 @@ class NexusAPIClient {
       status: raw.status as ExecutionStatusValue,
       error: raw.error,
       output: raw.outcome?.summary,
+      research_synthesis: raw.outcome?.research_synthesis,
       duration_ms: durationMs,
     };
   }

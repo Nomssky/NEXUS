@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
+	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
@@ -81,6 +83,11 @@ type Action struct {
 	// complete / fail / replan
 	Result string `json:"result,omitempty"`
 	Reason string `json:"reason,omitempty"`
+	// Synthesis is the typed answer required when a completion follows captured
+	// v2 research evidence. It is untrusted model output until the loop resolves
+	// every source id against the current execution's evidence and validates the
+	// status against the plan's step states. It carries no source metadata.
+	Synthesis *executor.ResearchSynthesis `json:"synthesis,omitempty"`
 }
 
 // DelegateToolCall is one model-proposed tool call for a delegated child.
@@ -427,6 +434,11 @@ type DecisionPrompt struct {
 	// or authorization internals, and it grants nothing — every invocation is
 	// validated again by the capability platform.
 	Tools []ToolHint
+	// Evidence is the validated source snapshot captured by THIS execution. It
+	// is authoritative runtime data, not model output: the prompt renders only
+	// source ids and their captured metadata, and completion validation resolves
+	// citations against the same snapshot.
+	Evidence *execjournal.ResearchEvidence
 	// Memory is the bounded, ranked durable memory this decision may see. It is
 	// already scope-authorized and provenance-labelled by the memory platform
 	// (AGENT_MEMORY_CONTEXT_CONTRACTS §11).
@@ -465,6 +477,18 @@ type ToolHint struct {
 type PlanPrompt struct {
 	Objective string
 	Context   map[string]string
+	// Tools is the same bounded capability catalog the acting agent may use for
+	// a decision. It lets the model choose real tool ids/operations in a plan.
+	Tools []ToolHint
+	// MaxSteps is the effective runtime budget (already clamped to caps), not a
+	// suggestion the model may exceed.
+	MaxSteps int
+	// PriorSteps and StepStates describe the active plan on a replan. Completed
+	// steps are runtime facts the model must not rewrite; empty on first plan.
+	PriorSteps  []Step
+	PlanVersion int
+	StepStates  string
+	Reason      string
 }
 
 func contains(list []string, v string) bool {

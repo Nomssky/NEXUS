@@ -25,10 +25,13 @@ import type {
   DurableResearchPlan,
   DurableResearchStepStatus,
   ExecutionStatus,
+  ParsedWebSearchSource,
 } from '../../types/api';
 import {
   parseResearchResult,
   type ParsedDurableStep,
+  type ParsedResearchSynthesis,
+  type ParsedSynthesisStatement,
   type ResearchStep,
   type ResearchFindings,
 } from '../../types/research';
@@ -156,10 +159,13 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   const isFailure =
     runtimeStatus === 'failed' || runtimeStatus === 'cancelled' || runtimeStatus === 'timed_out';
   const details = buildDetails(parsed.objective, parsed.agent, parsed.metrics, durationMs, createdAt, completedAt);
-  // The synthesis block is the single place the agent-generated result prose is
-  // rendered; the fallback below is only for callers that do not supply
-  // findings.
-  const synthesisRendered = Boolean(findings?.synthesis);
+  // The synthesis block is the single place a conclusion is rendered; the
+  // fallback below is only for callers that do not supply findings. A rejected
+  // typed synthesis also suppresses result prose rather than silently turning
+  // an unverifiable answer into a conclusion.
+  const synthesisRendered = Boolean(
+    findings?.typedSynthesis || findings?.synthesis || findings?.synthesisRejected
+  );
 
   return (
     <Card variant={isFailure ? 'outlined' : 'default'} padding="lg">
@@ -224,6 +230,24 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
           )
         )}
 
+        {findings?.typedSynthesis && (
+          <TypedSynthesisBlock synthesis={findings.typedSynthesis} sources={findings.sources} />
+        )}
+
+        {findings?.synthesisRejected && (
+          <div className={styles.synthesisRejected} role="alert" aria-label="Synthesis withheld">
+            <h4 className={styles.synthesisTitle}>Synthesis withheld</h4>
+            <p>
+              {findings.synthesisRejected === 'no_evidence'
+                ? 'The synthesized answer could not be checked against a validated evidence snapshot from this execution, so it is not shown.'
+                : 'The synthesized answer did not pass this page’s citation checks against the captured evidence, so it is not shown.'}
+            </p>
+            <span>
+              No citation, source title or result prose is inferred from the withheld answer.
+            </span>
+          </div>
+        )}
+
         {findings?.synthesis && (
           <div className={styles.synthesisBlock} aria-label="Research synthesis">
             <h4 className={styles.synthesisTitle}>Synthesis</h4>
@@ -268,12 +292,14 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
           </dl>
         )}
 
-        {(parsed.kind === 'summary' || parsed.kind === 'structured') && (
-          <details className={styles.rawDetails}>
-            <summary>Execution summary</summary>
-            <pre className={styles.rawSummary}>{parsed.raw}</pre>
-          </details>
-        )}
+        {(parsed.kind === 'summary' || parsed.kind === 'structured') &&
+          !findings?.typedSynthesis &&
+          !findings?.synthesisRejected && (
+            <details className={styles.rawDetails}>
+              <summary>Execution summary</summary>
+              <pre className={styles.rawSummary}>{parsed.raw}</pre>
+            </details>
+          )}
       </div>
     </Card>
   );
@@ -328,6 +354,169 @@ const DurablePlanSection: React.FC<{
     </ul>
   </section>
 );
+
+/**
+ * Typed, evidence-grounded synthesis. Every citation link and visible title is
+ * looked up in the durable source record by id; the model's answer contributes
+ * only statement text and ids.
+ */
+const TypedSynthesisBlock: React.FC<{
+  synthesis: ParsedResearchSynthesis;
+  sources: ParsedWebSearchSource[];
+}> = ({ synthesis, sources }) => (
+  <div
+    className={styles.synthesisBlock}
+    aria-label="Typed research synthesis"
+    data-synthesis-status={synthesis.status}
+  >
+    <div className={styles.synthesisHeader}>
+      <div>
+        <h4 className={styles.synthesisTitle}>Synthesis</h4>
+        <p className={styles.provenance}>
+          Evidence-grounded answer with citations resolved against this execution.
+        </p>
+      </div>
+      <Badge variant={synthesisStatusVariant(synthesis.status)} size="sm">
+        {synthesisStatusLabel(synthesis.status)}
+      </Badge>
+    </div>
+
+    <p className={styles.synthesisText}>{synthesis.summary}</p>
+
+    {synthesis.status === 'partial' && (
+      <p className={styles.partialNotice} role="status">
+        This answer is partial: the run did not fully settle its planned research.
+        Unresolved questions are listed below.
+      </p>
+    )}
+    {synthesis.status === 'inconclusive' && (
+      <p className={styles.inconclusiveNotice} role="status">
+        No evidence-backed conclusion was reached. The run either captured no
+        supporting sources or could not settle the objective, so only unresolved
+        questions are reported.
+      </p>
+    )}
+
+    {synthesis.evidenceBacked.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Evidence-backed findings">
+        <h5 className={styles.synthesisSectionTitle}>Evidence-backed findings</h5>
+        <SynthesisClaims claims={synthesis.evidenceBacked} />
+      </section>
+    )}
+
+    {synthesis.inferences.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Inferences">
+        <h5 className={styles.synthesisSectionTitle}>
+          Inference <span className={styles.inferenceLabel}>not evidence</span>
+        </h5>
+        <ul className={styles.claimList}>
+          {synthesis.inferences.map((inference, index) => (
+            <li key={`inference-${index}`} className={styles.inferenceItem}>
+              {inference}
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {synthesis.conflicts.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Conflicting evidence">
+        <h5 className={styles.synthesisSectionTitle}>Conflicting evidence</h5>
+        <SynthesisClaims claims={synthesis.conflicts} conflict />
+      </section>
+    )}
+
+    {synthesis.unresolvedQuestions.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Unresolved questions">
+        <h5 className={styles.synthesisSectionTitle}>Unresolved questions</h5>
+        <ul className={styles.questionList}>
+          {synthesis.unresolvedQuestions.map((question, index) => (
+            <li key={`question-${index}`}>{question}</li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {sources.length > 0 && (
+      <p className={styles.sourcesNote}>
+        {sources.length} captured source record{sources.length === 1 ? '' : 's'}.
+        Citation titles and URLs come from Sources &amp; Evidence, never from the model.
+      </p>
+    )}
+    {sources.length === 0 && (
+      <p className={styles.sourcesNote}>
+        No source records were captured for this execution.
+      </p>
+    )}
+  </div>
+);
+
+const SynthesisClaims: React.FC<{ claims: ParsedSynthesisStatement[]; conflict?: boolean }> = ({
+  claims,
+  conflict = false,
+}) => (
+  <ul className={styles.claimList}>
+    {claims.map((claim, index) => (
+      <li
+        key={`claim-${index}`}
+        className={conflict ? styles.conflictItem : styles.claimItem}
+      >
+        <p>{claim.statement}</p>
+        <ul className={styles.citationList} aria-label="Citations">
+          {claim.citations.map((citation) => {
+            const label = citation.source.title.trim() || citation.source.url;
+            return (
+              <li key={citation.sourceId} data-source-id={citation.sourceId}>
+                {citation.source.linkable ? (
+                  <a
+                    className={styles.citationTitle}
+                    href={citation.source.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {label}
+                  </a>
+                ) : (
+                  <span className={styles.citationTitle}>{label}</span>
+                )}
+                <span className={styles.citationUrl}>{citation.source.url}</span>
+                <span className={styles.citationMeta}>
+                  {citation.source.source || 'captured source'} · {citation.sourceId}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      </li>
+    ))}
+  </ul>
+);
+
+function synthesisStatusVariant(
+  status: ParsedResearchSynthesis['status']
+): import('../primitives').BadgeVariant {
+  switch (status) {
+    case 'complete':
+      return 'success';
+    case 'partial':
+      return 'warning';
+    default:
+      return 'default';
+  }
+}
+
+function synthesisStatusLabel(status: ParsedResearchSynthesis['status']): string {
+  switch (status) {
+    case 'complete':
+      return 'Complete';
+    case 'partial':
+      return 'Partial';
+    case 'inconclusive':
+      return 'Inconclusive';
+    default:
+      return status;
+  }
+}
 
 function buildDetails(
   objective: string | undefined,
@@ -394,16 +583,16 @@ function durableUnavailableCopy(state: string): {
     'Persisted source records are listed separately when the execution captured them.';
   if (state === 'completed') {
     return {
-      title: 'Result text unavailable',
+      title: 'Synthesis and result text unavailable',
       description:
-        'This execution completed, but its result text is not available after a restart.',
+        'This execution completed, but its synthesized answer and result text are process-local and are not retained after a restart. The durable step states and captured source records remain available.',
       hint,
     };
   }
   return {
-    title: 'Result text unavailable',
+    title: 'Synthesis and result text unavailable',
     description:
-      'This execution is no longer running, and its result text is not available after a restart.',
+      'This execution is no longer running, and its synthesized answer and result text are not available after a restart.',
     hint,
   };
 }

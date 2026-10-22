@@ -13,13 +13,14 @@ import {
   parseDurableResearchEvidence,
   parseResearchResult,
   parseResearchSteps,
+  parseResearchSynthesis,
   buildResearchFindings,
   type ResearchFindings,
   type ResearchResult,
   type ResearchStep,
   type ResearchToolActivity,
 } from './research';
-import type { TraceEntry, DurableResearchEvidence } from './api';
+import type { TraceEntry, DurableResearchEvidence, ResearchSynthesis } from './api';
 
 describe('parseResearchResult', () => {
   it('returns empty for missing or blank output', () => {
@@ -792,5 +793,185 @@ describe('buildResearchFindings', () => {
     expect(findings.synthesis).toBeUndefined();
     expect(findings.evidencePresent).toBe(true);
     expect(findings.sources).toHaveLength(0);
+  });
+
+  const durableV2 = {
+    present: true,
+    version: 2,
+    capability: 'web.search',
+    operation: 'search',
+    count: 2,
+    sources: [
+      {
+        index: 1,
+        id: 'src-1',
+        title: 'Authoritative one',
+        url: 'https://one.example',
+        source: 'one',
+        snippet: 's',
+        linkable: true,
+      },
+      {
+        index: 2,
+        id: 'src-2',
+        title: 'Authoritative two',
+        url: 'https://two.example',
+        source: 'two',
+        snippet: 's',
+        linkable: true,
+      },
+    ],
+    steps: [],
+    unattributedSources: [],
+  };
+
+  const typedComplete: ResearchSynthesis = {
+    status: 'complete',
+    summary: 'A grounded summary.',
+    evidence_backed: [{ statement: 'Grounded claim.', source_ids: ['src-1'] }],
+    inferences: [{ statement: 'Model inference.' }],
+    conflicts: [],
+    unresolved_questions: [],
+  };
+
+  it('validates typed synthesis citations against authoritative durable sources', () => {
+    const result = parseResearchSynthesis(typedComplete, durableV2);
+
+    expect(result.rejection).toBeUndefined();
+    expect(result.synthesis?.status).toBe('complete');
+    expect(result.synthesis?.evidenceBacked[0].citations[0].source.title).toBe(
+      'Authoritative one'
+    );
+    expect(result.synthesis?.evidenceBacked[0].citations[0].source.url).toBe(
+      'https://one.example'
+    );
+    expect(result.synthesis?.evidenceBacked[0].citations[0].sourceId).toBe('src-1');
+  });
+
+  it('rejects a typed synthesis citing an unknown or cross-execution source', () => {
+    const result = parseResearchSynthesis(
+      {
+        ...typedComplete,
+        evidence_backed: [{ statement: 'Unknown claim.', source_ids: ['src-3'] }],
+      },
+      durableV2
+    );
+
+    expect(result.synthesis).toBeUndefined();
+    expect(result.rejection).toBe('invalid');
+  });
+
+  it('rejects duplicate citations and duplicate statements wholesale', () => {
+    const duplicateCitation = parseResearchSynthesis(
+      {
+        ...typedComplete,
+        evidence_backed: [{ statement: 'Claim.', source_ids: ['src-1', 'src-1'] }],
+      },
+      durableV2
+    );
+    expect(duplicateCitation.rejection).toBe('invalid');
+
+    const duplicateStatement = parseResearchSynthesis(
+      {
+        ...typedComplete,
+        evidence_backed: [
+          { statement: 'Same.', source_ids: ['src-1'] },
+          { statement: 'Same.', source_ids: ['src-2'] },
+        ],
+      },
+      durableV2
+    );
+    expect(duplicateStatement.rejection).toBe('invalid');
+  });
+
+  it('rejects a synthesis that cannot be checked against v2 evidence', () => {
+    expect(parseResearchSynthesis(typedComplete, durableAbsent).rejection).toBe('no_evidence');
+    expect(parseResearchSynthesis(typedComplete, durableEmpty).rejection).toBe('no_evidence');
+    expect(
+      parseResearchSynthesis(typedComplete, { ...durableV2, version: 1 }).rejection
+    ).toBe('no_evidence');
+  });
+
+  it('enforces typed synthesis status semantics', () => {
+    const inconclusive = parseResearchSynthesis(
+      { ...typedComplete, status: 'inconclusive' },
+      durableV2
+    );
+    expect(inconclusive.rejection).toBe('invalid');
+
+    const partialWithoutEvidence = parseResearchSynthesis(
+      {
+        ...typedComplete,
+        status: 'partial',
+        evidence_backed: [],
+        conflicts: [],
+      },
+      durableV2
+    );
+    expect(partialWithoutEvidence.rejection).toBe('invalid');
+
+    const groundedPartial = parseResearchSynthesis(
+      { ...typedComplete, status: 'partial' },
+      durableV2
+    );
+    expect(groundedPartial.synthesis?.status).toBe('partial');
+  });
+
+  it('never uses model-supplied metadata for citation titles or URLs', () => {
+    const result = parseResearchSynthesis(
+      {
+        ...typedComplete,
+        evidence_backed: [
+          {
+            statement: 'Claim.',
+            source_ids: ['src-2'],
+            title: 'Forged title',
+            url: 'https://evil.example',
+          },
+        ],
+      } as unknown as ResearchSynthesis,
+      durableV2
+    );
+
+    expect(result.synthesis?.evidenceBacked[0].citations[0].source.title).toBe(
+      'Authoritative two'
+    );
+    expect(result.synthesis?.evidenceBacked[0].citations[0].source.url).toBe(
+      'https://two.example'
+    );
+  });
+
+  it('suppresses legacy result prose when a typed synthesis is present or rejected', () => {
+    const accepted = buildResearchFindings(
+      parsedStructured,
+      durableV2,
+      [],
+      [],
+      typedComplete
+    );
+    expect(accepted.synthesis).toBeUndefined();
+    expect(accepted.typedSynthesis?.status).toBe('complete');
+
+    const rejected = buildResearchFindings(
+      parsedStructured,
+      durableV2,
+      [],
+      [],
+      {
+        ...typedComplete,
+        evidence_backed: [{ statement: 'Bad.', source_ids: ['src-999'] }],
+      }
+    );
+    expect(rejected.synthesis).toBeUndefined();
+    expect(rejected.typedSynthesis).toBeUndefined();
+    expect(rejected.synthesisRejected).toBe('invalid');
+  });
+
+  it('does not mark typed partial findings complete', () => {
+    const findings = buildResearchFindings(parsedStructured, durableV2, [], [], {
+      ...typedComplete,
+      status: 'partial',
+    });
+    expect(findings.partial).toBe(true);
   });
 });

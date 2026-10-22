@@ -152,6 +152,187 @@ describe('ResearchOutput', () => {
     expect(markup).toContain('1 source record');
   });
 
+  it('renders typed evidence-backed synthesis with authoritative citation titles and URLs', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      findings: {
+        typedSynthesis: {
+          status: 'complete',
+          summary: 'The captured sources support the answer.',
+          evidenceBacked: [
+            {
+              statement: 'The runtime decides and the model proposes.',
+              citations: [
+                {
+                  sourceId: 'src-1',
+                  source: {
+                    index: 1,
+                    id: 'src-1',
+                    title: 'Authoritative title',
+                    url: 'https://docs.example/nexus',
+                    source: 'docs.example',
+                    snippet: 'captured',
+                    linkable: true,
+                  },
+                },
+              ],
+            },
+          ],
+          inferences: ['An inference that is not evidence.'],
+          conflicts: [],
+          unresolvedQuestions: [],
+        },
+        sources: [
+          {
+            index: 1,
+            id: 'src-1',
+            title: 'Authoritative title',
+            url: 'https://docs.example/nexus',
+            source: 'docs.example',
+            snippet: 'captured',
+            linkable: true,
+          },
+        ],
+        evidencePresent: true,
+        partial: false,
+      },
+    });
+
+    expect(markup).toContain('Typed research synthesis');
+    expect(markup).toContain('data-synthesis-status="complete"');
+    expect(markup).toContain('Evidence-backed findings');
+    expect(markup).toContain('data-source-id="src-1"');
+    expect(markup).toContain('href="https://docs.example/nexus"');
+    expect(markup).toContain('Authoritative title');
+    expect(markup).toContain('https://docs.example/nexus');
+    expect(markup).toContain('not evidence');
+    // The typed answer suppresses the legacy result prose.
+    expect(markup).not.toContain('objective pursued deterministically');
+  });
+
+  it('renders partial and inconclusive typed synthesis honestly', () => {
+    const partial = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      findings: {
+        typedSynthesis: {
+          status: 'partial',
+          summary: 'Only one source was captured.',
+          evidenceBacked: [
+            {
+              statement: 'A grounded statement.',
+              citations: [
+                {
+                  sourceId: 'src-1',
+                  source: {
+                    index: 1,
+                    id: 'src-1',
+                    title: 'One',
+                    url: 'https://one.example',
+                    source: 'one',
+                    snippet: 's',
+                    linkable: true,
+                  },
+                },
+              ],
+            },
+          ],
+          inferences: [],
+          conflicts: [],
+          unresolvedQuestions: ['Which step did not complete?'],
+        },
+        sources: [],
+        evidencePresent: true,
+        partial: true,
+      },
+    });
+    expect(partial).toContain('data-synthesis-status="partial"');
+    expect(partial).toContain('This answer is partial');
+    expect(partial).toContain('Which step did not complete?');
+
+    const inconclusive = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      findings: {
+        typedSynthesis: {
+          status: 'inconclusive',
+          summary: 'No source records were captured.',
+          evidenceBacked: [],
+          inferences: [],
+          conflicts: [],
+          unresolvedQuestions: ['What evidence is missing?'],
+        },
+        sources: [],
+        evidencePresent: true,
+        partial: false,
+      },
+    });
+    expect(inconclusive).toContain('data-synthesis-status="inconclusive"');
+    expect(inconclusive).toContain('No evidence-backed conclusion was reached');
+    expect(inconclusive).toContain('What evidence is missing?');
+    expect(inconclusive).not.toContain('Evidence-backed findings');
+  });
+
+  it('withholds a rejected typed synthesis and does not fall back to prose', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      findings: {
+        synthesisRejected: 'invalid',
+        sources: [],
+        evidencePresent: true,
+        partial: false,
+      },
+    });
+
+    expect(markup).toContain('Synthesis withheld');
+    expect(markup).toContain('did not pass this page’s citation checks');
+    expect(markup).not.toContain('objective pursued deterministically');
+    expect(markup).not.toContain('Evidence-backed findings');
+  });
+
+  it('renders an unsafe citation URL as unlinked authoritative text', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      findings: {
+        typedSynthesis: {
+          status: 'complete',
+          summary: 'Grounded.',
+          evidenceBacked: [
+            {
+              statement: 'Claim.',
+              citations: [
+                {
+                  sourceId: 'src-1',
+                  source: {
+                    index: 1,
+                    id: 'src-1',
+                    title: 'Unsafe',
+                    url: 'javascript:alert(1)',
+                    source: 'unsafe',
+                    snippet: 's',
+                    linkable: false,
+                  },
+                },
+              ],
+            },
+          ],
+          inferences: [],
+          conflicts: [],
+          unresolvedQuestions: [],
+        },
+        sources: [],
+        evidencePresent: true,
+        partial: false,
+      },
+    });
+
+    expect(markup).toContain('javascript:alert(1)');
+    expect(markup).not.toContain('href="javascript');
+  });
+
   it('omits the step section when no plan steps were observed', () => {
     const markup = render({ output: COMPLETED_SUMMARY, status: 'completed', steps: [] });
 
@@ -250,8 +431,8 @@ describe('ResearchOutput', () => {
         completedAt: '2026-10-20T10:05:30Z',
       });
 
-      expect(markup).toContain('Result text unavailable');
-      expect(markup).toContain('not available after a restart');
+      expect(markup).toContain('Synthesis and result text unavailable');
+      expect(markup).toContain('not retained after a restart');
       expect(markup).toContain('Durable execution record.');
       expect(markup).toContain('2026-10-20 10:00 UTC');
       expect(markup).toContain('2026-10-20 10:05 UTC');
@@ -290,11 +471,12 @@ describe('ResearchOutput', () => {
         ],
       });
 
-      expect(markup).toContain('Result text unavailable');
+      expect(markup).toContain('Synthesis and result text unavailable');
       expect(markup).toContain('Research plan');
       expect(markup).toContain('data-step-id="s2"');
       expect(markup).toContain('2026-10-20 10:05 UTC');
-      expect(markup).not.toContain('Synthesis');
+      expect(markup).not.toContain('data-synthesis-status');
+      expect(markup).not.toContain('Evidence-backed findings');
     });
   });
 });

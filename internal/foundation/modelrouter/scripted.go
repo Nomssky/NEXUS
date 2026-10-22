@@ -11,6 +11,7 @@ package modelrouter
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -146,11 +147,11 @@ func scriptedAnswer(prompt string) string {
 	case strings.Contains(subject, "memory"):
 		switch {
 		case observed("memory_read"):
-			return `{"type":"complete","result":"memory consulted"}`
+			return scriptedCompletion(lower, "memory consulted")
 		case observed("memory_write"):
 			return `{"type":"memory_read","key":"notes"}`
 		case observed("memory_delete"):
-			return `{"type":"complete","result":"memory forgotten"}`
+			return scriptedCompletion(lower, "memory forgotten")
 		case forgetMemory(subject):
 			return `{"type":"memory_delete","key":"notes"}`
 		default:
@@ -194,6 +195,25 @@ func scriptedAnswer(prompt string) string {
 			query = "nexus capabilities"
 		}
 		return `{"type":"tool_call","tool":"web.search","input":{"query":"` + query + `"}}`
+	case strings.Contains(subject, "invalid citation"):
+		if ids, ok := scriptedEvidenceIDs(lower); ok && len(ids) > 0 {
+			// Deliberately cite a source that is not in this execution so the
+			// runtime must reject the whole synthesis.
+			return scriptedSynthesisAction([]string{"src-999"}, "complete")
+		}
+		return `{"type":"complete","result":"objective pursued deterministically"}`
+	case strings.Contains(subject, "missing synthesis"):
+		if _, ok := scriptedEvidenceIDs(lower); ok {
+			return `{"type":"complete","result":"completed without the required synthesis"}`
+		}
+		return `{"type":"complete","result":"objective pursued deterministically"}`
+	case strings.Contains(subject, "partial failure") && observedTool("web.search"):
+		return `{"type":"fail","reason":"the downstream analysis step failed after evidence was captured"}`
+	case strings.Contains(subject, "duplicate citation"):
+		if ids, ok := scriptedEvidenceIDs(lower); ok && len(ids) > 0 {
+			return scriptedSynthesisAction([]string{ids[0], ids[0]}, "complete")
+		}
+		return `{"type":"complete","result":"objective pursued deterministically"}`
 	case strings.Contains(subject, "filesystem") && strings.Contains(subject, "..") && !observedTool("filesystem"):
 		// Traversal attempt: the sandbox must reject it (black-box probe).
 		return `{"type":"tool_call","tool":"filesystem.read","operation":"read","input":{"path":"../../../etc/passwd"}}`
@@ -211,7 +231,7 @@ func scriptedAnswer(prompt string) string {
 		return `{"type":"tool_call","tool":"data","operation":"json.parse","input":{"payload":"{\"a\":1}"}}`
 	case strings.Contains(subject, "promote") && observed("memory_write"):
 		// The promotion already happened; finish deterministically.
-		return `{"type":"complete","result":"observation promoted"}`
+		return scriptedCompletion(lower, "observation promoted")
 	case strings.Contains(subject, "promote") && observationID(obsBlock) != "":
 		// Promotion names an observation the RUNTIME produced in this execution.
 		// The model supplies no content: the platform takes it from the
@@ -221,8 +241,176 @@ func scriptedAnswer(prompt string) string {
 	case strings.Contains(subject, "replan") && budgetUsed(budgetLine, "replans") == 0:
 		return `{"type":"replan","reason":"the first approach was not sufficient"}`
 	default:
+		if ids, ok := scriptedEvidenceIDs(lower); ok {
+			status := "complete"
+			if len(ids) == 0 {
+				status = "inconclusive"
+			} else if scriptedPlanHasIncompleteStep(lower) {
+				status = "partial"
+			}
+			return scriptedSynthesisAction(ids, status)
+		}
 		return `{"type":"complete","result":"objective pursued deterministically"}`
 	}
+}
+
+// scriptedEvidenceIDs reads only the runtime's current-execution EVIDENCE block
+// from the prompt. The second return value reports that a v2 evidence block is
+// present (even when it captured zero sources), so the simulation provider can
+// return an honest typed synthesis. Legacy v1 evidence is deliberately ignored.
+func scriptedEvidenceIDs(lower string) ([]string, bool) {
+	const marker = "evidence (validated, current execution only;"
+	i := strings.Index(lower, marker)
+	if i < 0 {
+		return nil, false
+	}
+	header := lower[i:]
+	if end := strings.Index(header, "\n"); end >= 0 {
+		header = header[:end]
+	}
+	if !strings.Contains(header, "version=2") {
+		return nil, false
+	}
+	ids := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(lower[i:], "\n") {
+		const idMarker = "- source_id="
+		j := strings.Index(line, idMarker)
+		if j < 0 {
+			continue
+		}
+		rest := line[j+len(idMarker):]
+		end := strings.IndexAny(rest, " \t")
+		if end < 0 {
+			end = len(rest)
+		}
+		id := strings.TrimSpace(rest[:end])
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		if len(ids) >= 4 {
+			break
+		}
+	}
+	return ids, true
+}
+
+// scriptedPlanHasIncompleteStep inspects the runtime's STEP_STATES line. The
+// currently executing step is excluded because its completion is the action
+// being decided. This is simulation context reading, never model authority.
+func scriptedPlanHasIncompleteStep(lower string) bool {
+	current := ""
+	if step := extractAfter(lower, "step: "); step != "" {
+		if fields := strings.Fields(step); len(fields) > 0 {
+			current = fields[0]
+		}
+	}
+	states := extractAfter(lower, "step_states (runtime facts, read-only): ")
+	if states == "" {
+		return false
+	}
+	for _, entry := range strings.Split(states, ",") {
+		entry = strings.TrimSpace(entry)
+		eq := strings.Index(entry, "=")
+		if eq <= 0 {
+			continue
+		}
+		id := entry[:eq]
+		state := entry[eq+1:]
+		if open := strings.IndexAny(state, "("); open >= 0 {
+			state = state[:open]
+		}
+		if id == current {
+			continue
+		}
+		if state != "completed" {
+			return true
+		}
+	}
+	return false
+}
+
+type scriptedSynthesisStatement struct {
+	Statement string   `json:"statement"`
+	SourceIDs []string `json:"source_ids"`
+}
+
+type scriptedSynthesisInference struct {
+	Statement string `json:"statement"`
+}
+
+type scriptedSynthesisPayload struct {
+	Status              string                       `json:"status"`
+	Summary             string                       `json:"summary"`
+	EvidenceBacked      []scriptedSynthesisStatement `json:"evidence_backed"`
+	Inferences          []scriptedSynthesisInference `json:"inferences"`
+	Conflicts           []scriptedSynthesisStatement `json:"conflicts"`
+	UnresolvedQuestions []string                     `json:"unresolved_questions"`
+}
+
+type scriptedSynthesisEnvelope struct {
+	Type      string                   `json:"type"`
+	Result    string                   `json:"result,omitempty"`
+	Synthesis scriptedSynthesisPayload `json:"synthesis"`
+}
+
+// scriptedCompletion emits a typed synthesis whenever the runtime has provided
+// a v2 EVIDENCE block. Deterministic branches that finish after a web.search
+// must still satisfy the completion gate; the plain result form is only for
+// objectives that never captured evidence.
+func scriptedCompletion(lower, result string) string {
+	if ids, ok := scriptedEvidenceIDs(lower); ok {
+		status := "complete"
+		if len(ids) == 0 {
+			status = "inconclusive"
+		} else if scriptedPlanHasIncompleteStep(lower) {
+			status = "partial"
+		}
+		return scriptedSynthesisAction(ids, status)
+	}
+	return fmt.Sprintf(`{"type":"complete","result":%q}`, result)
+}
+
+func scriptedSynthesisAction(ids []string, status string) string {
+	payload := scriptedSynthesisPayload{
+		Status:              status,
+		Summary:             "Synthesized from 0 captured sources in this execution.",
+		EvidenceBacked:      []scriptedSynthesisStatement{},
+		Inferences:          []scriptedSynthesisInference{},
+		Conflicts:           []scriptedSynthesisStatement{},
+		UnresolvedQuestions: []string{},
+	}
+	switch status {
+	case "inconclusive":
+		payload.Summary = "The search returned no source records, so no evidence-backed conclusion is supported."
+		payload.UnresolvedQuestions = []string{"What evidence would resolve the objective?"}
+	default:
+		cited := append([]string(nil), ids...)
+		if len(cited) > 4 {
+			cited = cited[:4]
+		}
+		payload.Summary = fmt.Sprintf("Synthesized from %d captured source(s) in this execution.", len(cited))
+		payload.EvidenceBacked = append(payload.EvidenceBacked, scriptedSynthesisStatement{
+			Statement: fmt.Sprintf("The captured source records (%d) describe the requested subject.", len(cited)),
+			SourceIDs: cited,
+		})
+		payload.Inferences = append(payload.Inferences, scriptedSynthesisInference{
+			Statement: "The runtime boundary between model proposals and authoritative execution appears deliberate.",
+		})
+		if status == "partial" {
+			payload.Summary = fmt.Sprintf("Synthesized from %d captured source(s); one or more plan steps did not complete.", len(cited))
+			payload.UnresolvedQuestions = append(payload.UnresolvedQuestions, "Which incomplete step is still required to settle the objective?")
+		}
+	}
+	body, _ := json.Marshal(scriptedSynthesisEnvelope{
+		Type: "complete", Result: "source-grounded synthesis", Synthesis: payload,
+	})
+	return string(body)
 }
 
 // forgetMemory selects the destructive memory branch: only an objective that

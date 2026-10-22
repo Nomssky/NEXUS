@@ -631,6 +631,13 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 	if outcomeResult != nil && execOutcome != nil && execOutcome.ResearchEvidence != nil {
 		outcomeResult.ResearchEvidence = execOutcome.ResearchEvidence
 	}
+	// Synthesis is process-local. Copy it independently of evidence so a
+	// terminal response can never claim a durable synthesis, and so an absent
+	// evidence hand-off cannot silently drop the typed result.
+	if outcomeResult != nil && execOutcome != nil && execOutcome.ResearchSynthesis != nil &&
+		execOutcome.Status == "completed" {
+		outcomeResult.ResearchSynthesis = execOutcome.ResearchSynthesis
+	}
 
 	// Step 13: Store outcome in memory
 	e.chainMemoryWrite(ctx, req, status, outcomeResult)

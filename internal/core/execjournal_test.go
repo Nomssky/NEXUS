@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -937,6 +938,65 @@ func TestEnginePersistsResearchEvidenceWithTerminalState(t *testing.T) {
 	}
 	if rec2.ResearchEvidence == nil || rec2.ResearchEvidence.Sources[0].URL != "https://docs.example/nexus" {
 		t.Fatalf("evidence did not survive restart: %+v", rec2.ResearchEvidence)
+	}
+}
+
+// Synthesis is a process-local hand-off: the live terminal response carries the
+// validated typed object, but the durable record never does. A restart may
+// prove the execution and its evidence; it cannot resurrect a synthesis.
+func TestEngineCarriesProcessLocalSynthesisWithoutJournaling(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	j := execjournal.New(st, nil)
+	e, err := NewEngine(nil, WithExecutionJournal(j))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+
+	evidence := coreSampleEvidence("Nexus capability boundary")
+	synthesis := &executor.ResearchSynthesis{
+		Status:  executor.ResearchSynthesisComplete,
+		Summary: "Synthesized from the captured source.",
+		EvidenceBacked: []executor.ResearchEvidenceStatement{{
+			Statement: "The runtime decides and the model proposes.", SourceIDs: []string{"src-1"},
+		}},
+		Inferences: []executor.ResearchInference{}, Conflicts: []executor.ResearchEvidenceStatement{},
+		UnresolvedQuestions: []string{},
+	}
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-core-synthesis", Context: NewRequestContext("exec-core-synthesis", "biz-1", "actor-1"),
+		Intent: "research", Handler: func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
+			return &executor.Outcome{
+				Status: "completed", Output: "done",
+				ResearchEvidence: evidence, ResearchSynthesis: synthesis,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	res := awaitResult(t, e, "exec-core-synthesis")
+	if res.Outcome == nil || res.Outcome.ResearchSynthesis == nil ||
+		res.Outcome.ResearchSynthesis.EvidenceBacked[0].SourceIDs[0] != "src-1" {
+		t.Fatalf("process-local synthesis missing from response: %+v", res.Outcome)
+	}
+	rec := waitForJournalState(t, j, "exec-core-synthesis", execjournal.StateCompleted)
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("research_synthesis")) || bytes.Contains(raw, []byte("Synthesized from")) {
+		t.Fatalf("synthesis must never be journaled: %s", raw)
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Count != 1 {
+		t.Fatalf("durable evidence missing: %+v", rec.ResearchEvidence)
 	}
 }
 
