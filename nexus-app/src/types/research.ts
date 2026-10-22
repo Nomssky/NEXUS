@@ -369,3 +369,125 @@ export function parseDurableResearchEvidence(
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
+
+// ---- Multi-step research (v53) ----
+
+/**
+ * One step of a multi-step research plan. Status is reconstructed from the
+ * execution trace (step.ready / step.started / step.completed / step.failed /
+ * step.blocked). Intent text is redacted at capture (EXECUTION_TRACE_CONTRACTS
+ * §9), so the trace carries step identity and status only.
+ */
+export interface ResearchStep {
+  stepId: string;
+  status: 'ready' | 'running' | 'completed' | 'failed' | 'blocked';
+  /** Observation id produced by the step, when the trace records one. */
+  observationId?: string;
+  /** Action type the model proposed for the step, when observed. */
+  actionType?: string;
+}
+
+/**
+ * Reconstructed findings for one execution: the agent-generated synthesis
+ * result text plus the durable source evidence, kept distinct so the UI never
+ * presents a conclusion as a citation.
+ */
+export interface ResearchFindings {
+  /** Agent-generated synthesis text (prose, never linkified as evidence). */
+  synthesis?: string;
+  /** Durable source records captured at the capability boundary. */
+  sources: ParsedWebSearchSource[];
+  /** True when the durable evidence snapshot is present (even if empty). */
+  evidencePresent: boolean;
+  /** True when any step failed or was blocked, so findings are partial. */
+  partial: boolean;
+}
+
+/** Step lifecycle statuses emitted by the control loop (metadata only). */
+const STEP_EVENT_STATUS: Record<string, ResearchStep['status']> = {
+  'step.ready': 'ready',
+  'step.started': 'running',
+  'step.completed': 'completed',
+  'step.failed': 'failed',
+  'step.blocked': 'blocked',
+};
+
+/** Action types that the model may propose for a step. */
+const STEP_ACTION_TYPES = new Set([
+  'tool_call',
+  'delegate',
+  'memory_write',
+  'memory_read',
+  'model_call',
+  'complete',
+  'fail',
+  'replan',
+  'continue',
+]);
+
+/**
+ * Rebuild per-step states from the execution trace. A step's latest
+ * step.* event wins; a step is considered running once started until a
+ * terminal step event arrives. Steps with no events are not reported.
+ */
+export function parseResearchSteps(
+  entries?: TraceEntry[] | null
+): ResearchStep[] {
+  const steps = new Map<string, ResearchStep>();
+  if (!entries) return [];
+
+  for (const entry of entries) {
+    const status = STEP_EVENT_STATUS[entry.type];
+    if (status) {
+      const stepId = entry.data?.step;
+      if (!stepId) continue;
+      const current = steps.get(stepId) ?? { stepId, status: 'ready' };
+      steps.set(stepId, {
+        stepId,
+        status,
+        observationId:
+          status === 'completed' ? entry.data?.observation : current.observationId,
+      });
+      continue;
+    }
+
+    if (entry.type === 'action.proposed') {
+      const stepId = entry.data?.step;
+      const actionType = entry.data?.action;
+      if (stepId && actionType && STEP_ACTION_TYPES.has(actionType)) {
+        const current = steps.get(stepId) ?? { stepId, status: 'ready' };
+        steps.set(stepId, { ...current, actionType, status: 'running' });
+      }
+    }
+  }
+
+  // Preserve trace order: it is the runtime's lifecycle order (plan order for
+  // planned steps, followed by the loop's finalize step). Sorting by id would
+  // reorder steps the model happened to name non-lexicographically.
+  return Array.from(steps.values());
+}
+
+/**
+ * Build research findings from a parsed result plus durable evidence. The
+ * synthesis (result text) and the sources are kept distinct: the UI renders
+ * the synthesis as prose and the sources as separately-verifiable records.
+ */
+export function buildResearchFindings(
+  parsed: ReturnType<typeof parseResearchResult>,
+  durable: ParsedDurableEvidence,
+  steps: ResearchStep[]
+): ResearchFindings {
+  const partial = steps.some((s) => s.status === 'failed' || s.status === 'blocked');
+
+  return {
+    synthesis:
+      parsed.kind === 'structured' || parsed.kind === 'summary'
+        ? parsed.resultText
+        : parsed.kind === 'text'
+          ? parsed.raw
+          : undefined,
+    sources: durable.sources,
+    evidencePresent: durable.present,
+    partial,
+  };
+}

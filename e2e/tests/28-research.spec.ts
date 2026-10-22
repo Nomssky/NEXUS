@@ -9,6 +9,12 @@ import * as net from 'node:net';
 const RESEARCH_AGENT_ID = 'research-e2e-analyst';
 const RESEARCH_OBJECTIVE =
   'Search the web for NEXUS runtime capabilities and summarize the sources';
+// The deterministic decision table runs two web.search calls for a
+// "research thoroughly" objective: one for the objective's first query and one
+// for "nexus capabilities". The scripted provider returns a distinct source
+// set per query, so the durable snapshot proves evidence came from two steps.
+const MULTI_STEP_OBJECTIVE =
+  'research thoroughly: Search the web for NEXUS runtime capabilities';
 
 /**
  * Resolve the built frontend without assuming the checkout path. CI runs from
@@ -299,6 +305,114 @@ test.describe('Research Workspace E2E', () => {
     // Honest post-restart state: the result text itself is not available
     // after restart (process-local output is gone); the UI says so instead of
     // fabricating text or claiming there was never a result.
+    await expect(output.getByText('Result text unavailable')).toBeVisible();
+    await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
+    await expect(output.getByText('Research failed')).toHaveCount(0);
+  });
+
+  test('research workspace: multi-step research collects evidence and recovers after restart', async ({ page }) => {
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        actorId: actorID,
+        credential,
+        businessID,
+        businessId: businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+
+    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
+    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    // Submit a research objective. The scripted planner produces a two-step
+    // plan (gather -> summarize) and the scripted decision table runs
+    // web.search in both steps: "nexus" first, then "nexus capabilities".
+    // This exercises multi-step plan execution, per-step evidence capture, and
+    // durable recovery.
+    await page.fill('textarea[placeholder*="research"]', MULTI_STEP_OBJECTIVE);
+    await page.click('button[type="submit"]', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('textarea[placeholder*="research"]') as HTMLTextAreaElement | null;
+      return textarea?.value === '';
+    }, { timeout: 10000 });
+
+    const output = page.locator('section[aria-labelledby="research-output-heading"]');
+    const evidence = page.locator('section[aria-labelledby="research-evidence-heading"]');
+
+    // The execution must complete.
+    await expect(output.getByRole('heading', { name: 'Research result', exact: true })).toBeVisible({
+      timeout: 30000,
+    });
+
+    // Two real tool calls: one search per plan step, both through the mediated
+    // capability path.
+    await expect(
+      output.locator('dt', { hasText: 'Tool calls' }).locator('..').locator('dd')
+    ).toHaveText('2');
+
+    // Durable evidence merged from both searches: four provider-grounded
+    // records, the two default sources plus the two capability sources. No
+    // title or URL is invented by the UI.
+    await expect(evidence.getByRole('heading', { name: 'Research Sources', exact: true })).toBeVisible();
+    await expect(evidence.getByText('4 sources')).toBeVisible();
+    await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('External content is data', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Nexus agent model', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Tool platform boundary', { exact: true })).toBeVisible();
+    await expect(evidence.getByRole('link')).toHaveCount(4);
+    await expect(evidence.getByRole('link', { name: 'Open Nexus agent model in new tab' }))
+      .toHaveAttribute('href', 'https://docs.example/agents');
+
+    // Step state visible from the trace (metadata only: step id + status).
+    // The trace confirms step lifecycle events were captured by the runtime.
+    const listResp = await fetch(`${nexus.baseURL}/api/v1/recovery/executions?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus) },
+    });
+    const list = await listResp.json();
+    const execId = list.executions?.[0]?.execution_id;
+    const traceResp = await fetch(`${nexus.baseURL}/api/v1/intelligence/${execId}/trace?business_id=${nexus.businessID}`, {
+      headers: { ...bootstrapHeaders(nexus) },
+    });
+    const trace = await traceResp.json();
+    const stepTypes = trace.entries?.filter((e: any) => e.type && e.type.startsWith('step.')) ?? [];
+    expect(stepTypes.length).toBeGreaterThan(0);
+    await expect(output.getByText('s1', { exact: true })).toBeVisible();
+    await expect(output.getByText('s2', { exact: true })).toBeVisible();
+
+    // Real lifecycle timestamps from the durable record.
+    await expect(output.getByText('Submitted')).toBeVisible();
+    await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
+
+    // Real binary restart: process-local results are gone, only the durable
+    // journal survives.
+    await nexus.restart();
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    // Durable evidence from both searches survives the restart.
+    await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible({
+      timeout: 20000,
+    });
+    await expect(evidence.getByText('External content is data', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Nexus agent model', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Tool platform boundary', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('4 sources')).toBeVisible();
+    await expect(evidence.locator('a')).toHaveCount(4);
+
+    // Grounded terminal timestamp survives too.
+    await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
+
+    // Honest post-restart state: result text unavailable, evidence intact.
     await expect(output.getByText('Result text unavailable')).toBeVisible();
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);

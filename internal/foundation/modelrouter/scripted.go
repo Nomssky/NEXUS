@@ -184,6 +184,16 @@ func scriptedAnswer(prompt string) string {
 			method, url, body)
 	case (strings.Contains(subject, "search the web") || strings.Contains(subject, "web research") || strings.Contains(subject, "web.search")) && !observedTool("web.search"):
 		return `{"type":"tool_call","tool":"web.search","input":{"query":"nexus"}}`
+	case strings.Contains(subject, "research thoroughly") && webSearchCount(obsBlock) < 2:
+		// Deterministic multi-step research: two web.search steps collect
+		// distinct evidence (query-keyed by the scripted provider) before the
+		// loop completes. This is simulation behavior only — live providers
+		// are not represented by this table.
+		query := "nexus"
+		if webSearchCount(obsBlock) == 1 {
+			query = "nexus capabilities"
+		}
+		return `{"type":"tool_call","tool":"web.search","input":{"query":"` + query + `"}}`
 	case strings.Contains(subject, "filesystem") && strings.Contains(subject, "..") && !observedTool("filesystem"):
 		// Traversal attempt: the sandbox must reject it (black-box probe).
 		return `{"type":"tool_call","tool":"filesystem.read","operation":"read","input":{"path":"../../../etc/passwd"}}`
@@ -275,6 +285,47 @@ func toolExecuted(obsBlock, name string) bool {
 		}
 	}
 	return false
+}
+
+// webSearchCount reports how many DISTINCT web.search observations completed
+// with an ok status in the runtime's observation data, so the decision table
+// can bound multi-step research to a fixed number of search steps. The same
+// observation can appear more than once in the prompt (the context assembler
+// echoes observations alongside the direct observation block), so identity is
+// the observation id, never the line count.
+func webSearchCount(obsBlock string) int {
+	seen := map[string]struct{}{}
+	const src = "] source=tool:web.search "
+	for _, line := range strings.Split(obsBlock, "\n") {
+		i := strings.Index(line, src)
+		if i < 0 {
+			continue
+		}
+		if !strings.HasSuffix(line[:i+1], " ok]") {
+			continue
+		}
+		id := observationIDFromLine(line[:i])
+		if id == "" {
+			id = line[:i+1]
+		}
+		seen[id] = struct{}{}
+	}
+	return len(seen)
+}
+
+// observationIDFromLine extracts the [obs-...] token from the metadata prefix
+// of one prompt observation line.
+func observationIDFromLine(prefix string) string {
+	start := strings.Index(prefix, "[obs-")
+	if start < 0 {
+		return ""
+	}
+	rest := prefix[start+1:]
+	end := strings.IndexAny(rest, " ]")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // budgetUsed reads "<name>=used/total" from the prompt's budget line.

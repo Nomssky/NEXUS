@@ -25,8 +25,13 @@ import {
 import type { DurableExecution, ExecutionStatus } from '@/types/api';
 import {
   extractToolActivity,
+  parseDurableResearchEvidence,
   parseResearchResult,
+  parseResearchSteps,
+  buildResearchFindings,
   type ResearchResult,
+  type ResearchFindings,
+  type ResearchStep,
   type ResearchToolActivity,
 } from '@/types/research';
 import styles from './Research.module.css';
@@ -132,6 +137,25 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     [trace?.entries]
   );
 
+  // Step states reconstructed from the execution trace (metadata only — step
+  // ids, statuses, observation refs; intent text is redacted at capture).
+  const steps: ResearchStep[] = useMemo(
+    () => parseResearchSteps(trace?.entries),
+    [trace?.entries]
+  );
+
+  // Durable evidence from the recovery detail read, parsed defensively.
+  const durableEvidence = useMemo(
+    () => parseDurableResearchEvidence(recoveryDetail?.research_evidence ?? null),
+    [recoveryDetail?.research_evidence]
+  );
+
+  // Findings: agent-generated synthesis kept distinct from source records.
+  const findings = useMemo(
+    () => buildResearchFindings(parsedResult, durableEvidence, steps),
+    [parsedResult, durableEvidence, steps]
+  );
+
   // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
     command: { executions: 0 },
@@ -200,6 +224,8 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               execution={execution}
               parsedResult={parsedResult}
               toolActivity={toolActivity}
+              steps={steps}
+              findings={findings}
               isLoading={isLoading}
               recoveryError={recoveryError}
               recoveryDetail={recoveryDetail}
@@ -236,6 +262,8 @@ interface ResearchZoneProps {
   execution: ExecutionStatus | undefined;
   parsedResult: ResearchResult;
   toolActivity: ResearchToolActivity[];
+  steps: ResearchStep[];
+  findings: ResearchFindings;
   isLoading: boolean;
   recoveryError: boolean;
   recoveryDetail: DurableExecution | undefined;
@@ -254,6 +282,8 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   execution,
   parsedResult,
   toolActivity,
+  steps,
+  findings,
   isLoading,
   recoveryError,
   recoveryDetail,
@@ -300,6 +330,8 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             durableState={recoveryDetail?.state}
             createdAt={recoveryDetail?.created_at}
             completedAt={recoveryDetail?.completed_at}
+            steps={steps}
+            findings={findings}
           />
         </section>
 

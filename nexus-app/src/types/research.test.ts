@@ -12,6 +12,12 @@ import {
   extractToolActivity,
   parseDurableResearchEvidence,
   parseResearchResult,
+  parseResearchSteps,
+  buildResearchFindings,
+  type ResearchFindings,
+  type ResearchResult,
+  type ResearchStep,
+  type ResearchToolActivity,
 } from './research';
 import type { TraceEntry, DurableResearchEvidence } from './api';
 
@@ -370,5 +376,173 @@ describe('parseDurableResearchEvidence', () => {
     expect(parsed.present).toBe(true);
     expect(parsed.count).toBe(0);
     expect(parsed.sources).toHaveLength(0);
+  });
+});
+
+describe('parseResearchSteps', () => {
+  function entry(
+    type: string,
+    data: Record<string, string>,
+    seq = 1
+  ): TraceEntry {
+    return {
+      seq,
+      event_id: `e-${seq}`,
+      type,
+      source: 'test',
+      timestamp: '2026-01-01T00:00:00Z',
+      data,
+    };
+  }
+
+  it('returns an empty list for missing or empty entries', () => {
+    expect(parseResearchSteps(undefined)).toEqual([]);
+    expect(parseResearchSteps([])).toEqual([]);
+  });
+
+  it('reconstructs step states from step.* events', () => {
+    const entries = [
+      entry('step.ready', { step: 's1' }, 1),
+      entry('step.started', { step: 's1' }, 2),
+      entry('step.completed', { step: 's1', observation: 'obs-1' }, 3),
+      entry('step.ready', { step: 's2' }, 4),
+      entry('step.started', { step: 's2' }, 5),
+      entry('step.failed', { step: 's2' }, 6),
+    ];
+
+    const steps = parseResearchSteps(entries);
+
+    expect(steps).toEqual([
+      { stepId: 's1', status: 'completed', observationId: 'obs-1' },
+      { stepId: 's2', status: 'failed' },
+    ]);
+  });
+
+  it('marks a step as running when started but not yet terminal', () => {
+    const entries = [
+      entry('step.ready', { step: 's1' }, 1),
+      entry('step.started', { step: 's1' }, 2),
+    ];
+
+    const steps = parseResearchSteps(entries);
+
+    expect(steps).toEqual([{ stepId: 's1', status: 'running' }]);
+  });
+
+  it('ignores events without a step id', () => {
+    const entries = [
+      entry('step.ready', {}, 1),
+      entry('step.started', { step: 's1' }, 2),
+    ];
+
+    const steps = parseResearchSteps(entries);
+
+    expect(steps).toEqual([{ stepId: 's1', status: 'running' }]);
+  });
+
+  it('lets later step events override earlier ones', () => {
+    const entries = [
+      entry('step.started', { step: 's1' }, 1),
+      entry('step.completed', { step: 's1' }, 2),
+      entry('step.failed', { step: 's1' }, 3),
+    ];
+
+    const steps = parseResearchSteps(entries);
+
+    expect(steps).toEqual([{ stepId: 's1', status: 'failed' }]);
+  });
+
+  it('preserves trace order instead of sorting by step id', () => {
+    const entries = [
+      entry('step.ready', { step: 's2' }, 1),
+      entry('step.ready', { step: 's10' }, 2),
+      entry('step.ready', { step: 's1' }, 3),
+    ];
+
+    const steps = parseResearchSteps(entries);
+
+    expect(steps.map((step) => step.stepId)).toEqual(['s2', 's10', 's1']);
+  });
+});
+
+describe('buildResearchFindings', () => {
+  const parsedStructured = {
+    kind: 'structured' as const,
+    raw: '{"sources":"...","count":"2"}',
+    resultText: 'The research found two key sources.',
+    metrics: {},
+  };
+
+  const durableWithSources = {
+    present: true,
+    sources: [
+      { index: 1, title: 'A', url: 'https://a.example', source: 'a', snippet: 's', linkable: true },
+      { index: 2, title: 'B', url: 'https://b.example', source: 'b', snippet: 's', linkable: true },
+    ],
+  };
+
+  const durableEmpty = { present: true, sources: [] };
+  const durableAbsent = { present: false, sources: [] };
+
+  it('keeps synthesis and sources distinct', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableWithSources,
+      [{ stepId: 's1', status: 'completed' }]
+    );
+
+    expect(findings.synthesis).toBe('The research found two key sources.');
+    expect(findings.sources).toHaveLength(2);
+    expect(findings.evidencePresent).toBe(true);
+    expect(findings.partial).toBe(false);
+  });
+
+  it('marks findings partial when a step failed', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableWithSources,
+      [
+        { stepId: 's1', status: 'completed' },
+        { stepId: 's2', status: 'failed' },
+      ]
+    );
+
+    expect(findings.partial).toBe(true);
+  });
+
+  it('marks findings partial when a downstream step is blocked', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableWithSources,
+      [
+        { stepId: 's1', status: 'failed' },
+        { stepId: 's2', status: 'blocked' },
+      ]
+    );
+
+    expect(findings.partial).toBe(true);
+  });
+
+  it('represents absent durable evidence honestly', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableAbsent,
+      [{ stepId: 's1', status: 'completed' }]
+    );
+
+    expect(findings.evidencePresent).toBe(false);
+    expect(findings.sources).toHaveLength(0);
+  });
+
+  it('returns empty synthesis for empty output', () => {
+    const findings = buildResearchFindings(
+      { kind: 'empty' as const, raw: '', metrics: {} },
+      durableEmpty,
+      []
+    );
+
+    expect(findings.synthesis).toBeUndefined();
+    expect(findings.evidencePresent).toBe(true);
+    expect(findings.sources).toHaveLength(0);
   });
 });

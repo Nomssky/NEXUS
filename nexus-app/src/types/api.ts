@@ -134,7 +134,18 @@ export type TraceEventType =
   | 'approval.requested'
   | 'approval.approved'
   | 'approval.denied'
-  | 'agent.delegated';
+  | 'agent.delegated'
+  // Agent intelligence control-loop step lifecycle (metadata only: step id,
+  // plan version, status, observation ref — intent text is redacted at capture).
+  | 'plan.created'
+  | 'plan.validated'
+  | 'plan.replanned'
+  | 'step.ready'
+  | 'step.started'
+  | 'step.observing'
+  | 'step.completed'
+  | 'step.failed'
+  | 'step.blocked';
 
 // Alias for backward compatibility
 export type ExecutionTraceEntry = TraceEntry;

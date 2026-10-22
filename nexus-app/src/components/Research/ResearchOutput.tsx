@@ -19,7 +19,11 @@
 import React, { useMemo } from 'react';
 import { Card, Badge, getStatusVariant } from '../primitives';
 import type { ExecutionStatus } from '../../types/api';
-import { parseResearchResult } from '../../types/research';
+import {
+  parseResearchResult,
+  type ResearchStep,
+  type ResearchFindings,
+} from '../../types/research';
 import styles from './ResearchOutput.module.css';
 
 interface ResearchOutputProps {
@@ -33,6 +37,9 @@ interface ResearchOutputProps {
   /** Real lifecycle timestamps from the durable record. Undefined means unavailable. */
   createdAt?: string | null;
   completedAt?: string | null;
+  /** Findings: synthesis kept distinct from source records. */
+  steps?: ResearchStep[];
+  findings?: ResearchFindings;
 }
 
 const DURABLE_TERMINAL_STATES = new Set([
@@ -52,6 +59,8 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   durableState,
   createdAt,
   completedAt,
+  steps,
+  findings,
 }) => {
   const parsed = useMemo(() => parseResearchResult(output), [output]);
 
@@ -129,6 +138,10 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   const isFailure =
     runtimeStatus === 'failed' || runtimeStatus === 'cancelled' || runtimeStatus === 'timed_out';
   const details = buildDetails(parsed.objective, parsed.agent, parsed.metrics, durationMs, createdAt, completedAt);
+  // The synthesis block is the single place the agent-generated result prose is
+  // rendered; the fallback below is only for callers that do not supply
+  // findings.
+  const synthesisRendered = Boolean(findings?.synthesis);
 
   return (
     <Card variant={isFailure ? 'outlined' : 'default'} padding="lg">
@@ -158,9 +171,50 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
           </div>
         )}
 
+        {steps && steps.length > 0 && (
+          <section className={styles.stepStates} aria-label="Research steps">
+            <h4 className={styles.stepStatesTitle}>Research steps</h4>
+            <ul className={styles.stepStatesList}>
+              {steps.map((step) => (
+                <li
+                  key={step.stepId}
+                  className={`${styles.stepItem} ${styles['step-' + step.status]}`}
+                >
+                  <span className={styles.stepId}>{step.stepId}</span>
+                  <Badge variant={stepStatusVariant(step.status)} size="sm">
+                    {stepStatusLabel(step.status)}
+                  </Badge>
+                  {step.actionType && (
+                    <span className={styles.stepAction}>{step.actionType}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {findings?.synthesis && (
+          <div className={styles.synthesisBlock} aria-label="Research synthesis">
+            <h4 className={styles.synthesisTitle}>Synthesis</h4>
+            <p className={styles.synthesisText}>{findings.synthesis}</p>
+            {findings.partial && (
+              <p className={styles.partialNotice}>
+                Some research steps did not complete. Findings are partial and
+                reflect only the steps that finished.
+              </p>
+            )}
+            {findings.evidencePresent && findings.sources.length > 0 && (
+              <p className={styles.sourcesNote}>
+                {findings.sources.length} source record{findings.sources.length !== 1 ? 's' : ''}
+                captured from tool output and listed in Sources &amp; Evidence.
+              </p>
+            )}
+          </div>
+        )}
+
         {parsed.webSearch ? (
           <p className={styles.structuredResult}>{structuredSummary(parsed.webSearch.count)}</p>
-        ) : parsed.resultText ? (
+        ) : synthesisRendered ? null : parsed.resultText ? (
           <div className={styles.outputContent}>{formatOutput(parsed.resultText)}</div>
         ) : parsed.kind === 'text' ? (
           <div className={styles.outputContent}>{formatOutput(parsed.raw)}</div>
@@ -276,6 +330,40 @@ function durableUnavailableCopy(state: string): {
       'This execution is no longer running, and its result text is not available after a restart.',
     hint,
   };
+}
+
+function stepStatusVariant(status: ResearchStep['status']): import('../primitives').BadgeVariant {
+  switch (status) {
+    case 'completed':
+      return 'success';
+    case 'running':
+      return 'info';
+    case 'ready':
+      return 'warning';
+    case 'blocked':
+      return 'warning';
+    case 'failed':
+      return 'error';
+    default:
+      return 'error';
+  }
+}
+
+function stepStatusLabel(status: ResearchStep['status']): string {
+  switch (status) {
+    case 'completed':
+      return 'Completed';
+    case 'running':
+      return 'Running';
+    case 'ready':
+      return 'Ready';
+    case 'blocked':
+      return 'Blocked';
+    case 'failed':
+      return 'Failed';
+    default:
+      return status;
+  }
 }
 
 function emptyState(

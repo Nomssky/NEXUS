@@ -114,6 +114,50 @@ describe('ResearchOutput', () => {
     expect(markup).toContain('second item');
   });
 
+  it('renders planned steps and keeps the synthesis distinct from source records', () => {
+    const synthesis = 'objective pursued deterministically';
+    const markup = render({
+      output: synthesis,
+      status: 'completed',
+      steps: [
+        { stepId: 's1', status: 'completed', actionType: 'tool_call' },
+        { stepId: 's2', status: 'failed' },
+      ],
+      findings: {
+        synthesis,
+        sources: [
+          {
+            index: 1,
+            title: 'A',
+            url: 'https://a.example',
+            source: 'a.example',
+            snippet: 's',
+            linkable: true,
+          },
+        ],
+        evidencePresent: true,
+        partial: true,
+      },
+    });
+
+    expect(markup).toContain('Research steps');
+    expect(markup).toContain('s1');
+    expect(markup).toContain('tool_call');
+    expect(markup).toContain('Failed');
+    expect(markup).toContain('Synthesis');
+    // The agent result prose is rendered once, not once as synthesis and
+    // again as the legacy result block.
+    expect(markup.match(/objective pursued deterministically/g)).toHaveLength(1);
+    expect(markup).toContain('Findings are partial');
+    expect(markup).toContain('1 source record');
+  });
+
+  it('omits the step section when no plan steps were observed', () => {
+    const markup = render({ output: COMPLETED_SUMMARY, status: 'completed', steps: [] });
+
+    expect(markup).not.toContain('Research steps');
+  });
+
   describe('durable lifecycle timestamps (recovery detail read)', () => {
     const rendered = render({
       output: 'state=completed | objective=Search the web for nexus runtime capabilities | agent=analyst | tool_calls=1',
