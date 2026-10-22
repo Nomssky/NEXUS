@@ -11,7 +11,9 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -32,19 +34,28 @@ type Source struct {
 	PublishedAt string `json:"published_at,omitempty"`
 }
 
-// ResearchProvider is the pluggable search backend. v1 ships a deterministic
-// scripted provider; a real provider plugs in behind this interface.
+// ResearchProvider is the pluggable search backend. The deterministic scripted
+// provider remains for tests; the real external provider is
+// WikipediaSearchProvider (websearch_provider.go). Both plug in behind this
+// interface and therefore behind the same mediated capability path.
 type ResearchProvider interface {
 	Identify() string
 	Search(ctx context.Context, query string, limit int) ([]Source, error)
 }
 
-// WebSearchTool is the mediated research adapter.
+// WebSearchTool is the mediated research adapter. It is the boundary that
+// turns provider records into the documented web.search envelope; provider
+// data is untrusted and every accepted record is normalized, bounded and
+// URL-validated here.
 type WebSearchTool struct {
 	Provider   ResearchProvider
 	MaxSnippet int
 	MaxResults int
 	Timeout    time.Duration
+	// MaxPayload bounds the complete envelope below the platform/manifest
+	// output limit so a large provider response is trimmed record-by-record
+	// (with an honest count) instead of being truncated mid-envelope.
+	MaxPayload int
 }
 
 // Operations implements tool.Adapter.
@@ -59,33 +70,95 @@ func (t *WebSearchTool) Invoke(ctx context.Context, inv tool.Invocation) (tool.R
 		return tool.RawResult{}, fmt.Errorf("%w: no research provider configured", ErrValidation)
 	}
 	query := strings.TrimSpace(inv.Input["query"])
-	if query == "" {
-		return tool.RawResult{}, fmt.Errorf("%w: query is required", ErrValidation)
+	if err := validateSearchQuery(query); err != nil {
+		return tool.RawResult{}, err
 	}
 	limit := boundedInt(inv.Input["limit"], 5, 1, t.maxResults())
 	ctxRun, cancel := context.WithTimeout(ctx, t.timeout())
 	defer cancel()
+	provider := t.Provider.Identify()
 	sources, err := t.Provider.Search(ctxRun, query, limit)
 	if err != nil {
-		return tool.RawResult{}, fmt.Errorf("%w: research failed: %v", ErrExternal, err)
+		// Preserve the provider's already-classified kind (timeout, validation,
+		// resource limit, external). Unknown errors become a generic external
+		// error: a provider implementation must never be able to leak a raw
+		// transport/secret string through the adapter.
+		switch {
+		case errors.Is(err, ErrValidation), errors.Is(err, ErrTimeout),
+			errors.Is(err, ErrResourceLimit), errors.Is(err, ErrExternal),
+			errors.Is(err, ErrNetworkBlocked), errors.Is(err, ErrCredential):
+			return tool.RawResult{}, err
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return tool.RawResult{}, err
+		default:
+			return tool.RawResult{}, fmt.Errorf("%w: research provider %q failed", ErrExternal, provider)
+		}
 	}
 	if len(sources) > limit {
 		sources = sources[:limit]
 	}
 	parts := make([]string, 0, len(sources))
-	for i, s := range sources {
-		snippet := s.Snippet
-		if len(snippet) > t.maxSnippet() {
-			snippet = snippet[:t.maxSnippet()]
+	payload := 0
+	for _, s := range sources {
+		normalized, ok := t.normalizeSource(s)
+		if !ok {
+			// One unusable provider record must not discard the safe records
+			// around it. It is simply not evidence.
+			continue
 		}
-		// Research text is DATA: it is returned verbatim (bounded) and tagged
-		// as external content by the observation layer.
-		parts = append(parts, fmt.Sprintf("%d. %s | %s | %s | %s", i+1, s.Title, s.URL, s.Source, snippet))
+		line := fmt.Sprintf("%d. %s | %s | %s | %s",
+			len(parts)+1, normalized.Title, normalized.URL, normalized.Source, normalized.Snippet)
+		if payload+len(line)+1 > t.maxPayload() {
+			break
+		}
+		payload += len(line) + 1
+		// Research text is DATA: it is returned bounded and tagged as external
+		// content by the observation layer. A snippet is an excerpt, never a
+		// claim that the page was fetched or read.
+		parts = append(parts, line)
 	}
 	return tool.RawResult{Result: map[string]string{
 		"sources": strings.Join(parts, "\n"),
-		"count":   strconv.Itoa(len(sources)),
+		"count":   strconv.Itoa(len(parts)),
 	}}, nil
+}
+
+// normalizeSource applies the documented field bounds and rejects records that
+// cannot be presented safely (no title, unsafe URL, control characters). It
+// never invents metadata: source identity comes from the provider or from the
+// validated result URL's host.
+func (t *WebSearchTool) normalizeSource(s Source) (Source, bool) {
+	title := truncateUTF8Bytes(envelopeField(s.Title), MaxSearchResultTitle)
+	if title == "" {
+		return Source{}, false
+	}
+	rawURL, ok := normalizedSearchURL(s.URL)
+	if !ok {
+		return Source{}, false
+	}
+	source := truncateUTF8Bytes(envelopeField(s.Source), MaxSearchResultSource)
+	if source == "" {
+		if u, err := url.Parse(rawURL); err == nil {
+			source = truncateUTF8Bytes(u.Hostname(), MaxSearchResultSource)
+		}
+	}
+	snippet := truncateUTF8Bytes(snippetField(s.Snippet), t.maxSnippet())
+	return Source{Title: title, URL: rawURL, Source: source, Snippet: snippet}, true
+}
+
+// envelopeField keeps a title/source on one line and removes the envelope's
+// field separator so one provider value cannot forge another column.
+func envelopeField(value string) string {
+	value = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ", "\x00", " ").Replace(value)
+	value = strings.ReplaceAll(value, "|", "/")
+	return strings.Join(strings.Fields(value), " ")
+}
+
+// snippetField keeps a snippet on one line. The documented envelope permits
+// " | " inside the snippet (it is the final field), so pipes are preserved.
+func snippetField(value string) string {
+	value = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ", "\x00", " ").Replace(value)
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func (t *WebSearchTool) maxSnippet() int {
@@ -105,6 +178,14 @@ func (t *WebSearchTool) timeout() time.Duration {
 		return t.Timeout
 	}
 	return 5 * time.Second
+}
+func (t *WebSearchTool) maxPayload() int {
+	if t.MaxPayload > 0 {
+		return t.MaxPayload
+	}
+	// Below both the manifest output bound (32768) and the platform default,
+	// leaving room for the JSON envelope and the count field.
+	return 30 * 1024
 }
 
 // ScriptedResearchProvider is the deterministic provider used by tests and by
@@ -179,7 +260,7 @@ func (p *ScriptedResearchProvider) Search(ctx context.Context, query string, lim
 func WebSearchManifest() tool.ToolManifest {
 	return tool.ToolManifest{
 		ID: "web.search", Version: "1.0.0", Name: "Web Research",
-		Description: "Normalized web research through a provider interface. Results are external, untrusted data (operation: search).",
+		Description: "Normalized external web search through a mediated provider. Results are excerpts, external untrusted data (operation: search).",
 		Category:    tool.ToolCategoryNetwork,
 		InputSchema: tool.Schema{Fields: []tool.SchemaField{
 			{Name: "query", Type: tool.FieldString, Required: true, MaxLength: 512},
@@ -190,7 +271,7 @@ func WebSearchManifest() tool.ToolManifest {
 			{Name: "count", Type: tool.FieldString},
 		}},
 		SideEffectClass:    tool.SideEffectRead,
-		NetworkRequirement: tool.NetworkNone, // provider owns its own egress
+		NetworkRequirement: tool.NetworkOutboundHTTP, // real provider egress behind the adapter
 		ScopeRequirement:   tool.ScopeBusiness,
 		SecurityClass:      tool.SecuritySandboxed,
 		Operations:         []string{"search"},

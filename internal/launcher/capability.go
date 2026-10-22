@@ -71,12 +71,20 @@ func capabilityPlatform(
 	production := strings.EqualFold(env("NEXUS_ENVIRONMENT"), "production")
 
 	// Capability catalogue knobs (boot-time configuration, never model input):
-	//   NEXUS_CAPABILITY_WEB=scripted     -> register web.search with the
-	//                                        deterministic scripted provider
-	//   NEXUS_CAPABILITY_GITHUB_REF=x     -> register the GitHub capability
+	//   NEXUS_CAPABILITY_WEB=scripted  -> deterministic test provider
+	//   NEXUS_CAPABILITY_WEB=wikipedia -> real external MediaWiki search
+	//   NEXUS_CAPABILITY_WEB_ENDPOINT / _LANGUAGE / _USER_AGENT -> provider config
+	//   NEXUS_CAPABILITY_GITHUB_REF=x  -> register the GitHub capability
 	//   NEXUS_CAPABILITY_GITHUB_BUSINESS=b -> its business scope
-	if env("NEXUS_CAPABILITY_WEB") == "scripted" && opts.ResearchProvider == nil {
-		opts.ResearchProvider = capability.ScriptedResearch()
+	//
+	// An unknown non-empty provider selection fails boot: a typo must never
+	// silently disable search or fall back to scripted retrieval.
+	if opts.ResearchProvider == nil {
+		provider, err := researchProviderFromEnv(env)
+		if err != nil {
+			return nil, fmt.Errorf("capability platform: %w", err)
+		}
+		opts.ResearchProvider = provider
 	}
 	if ref := env("NEXUS_CAPABILITY_GITHUB_REF"); ref != "" && opts.GitHubCredentialRef == "" {
 		opts.GitHubCredentialRef = ref
@@ -118,6 +126,29 @@ func capabilityPlatform(
 		}
 	}
 	return platform, nil
+}
+
+func researchProviderFromEnv(env func(string) string) (capability.ResearchProvider, error) {
+	switch strings.ToLower(strings.TrimSpace(env("NEXUS_CAPABILITY_WEB"))) {
+	case "":
+		return nil, nil
+	case "scripted":
+		return capability.ScriptedResearch(), nil
+	case "wikipedia":
+		provider, err := capability.NewWikipediaSearchProvider(capability.WikipediaProviderConfig{
+			Endpoint:          env("NEXUS_CAPABILITY_WEB_ENDPOINT"),
+			Language:          env("NEXUS_CAPABILITY_WEB_LANGUAGE"),
+			UserAgent:         env("NEXUS_CAPABILITY_WEB_USER_AGENT"),
+			AllowInsecureHTTP: strings.EqualFold(env("NEXUS_CAPABILITY_WEB_ALLOW_INSECURE"), "true"),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("web search provider: %w", err)
+		}
+		return provider, nil
+	default:
+		return nil, fmt.Errorf("%w: NEXUS_CAPABILITY_WEB must be empty, %q, or %q",
+			capability.ErrValidation, "scripted", "wikipedia")
+	}
 }
 
 func firstNonEmpty(values ...string) string {

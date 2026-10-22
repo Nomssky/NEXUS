@@ -3,16 +3,21 @@ package agentintel
 import (
 	"context"
 	"os"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/capability"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
 )
 
 const (
 	liveProviderSmokeEnv = "NEXUS_LIVE_PROVIDER_SMOKE"
 	liveProviderURLEnv   = "NEXUS_LIVE_PROVIDER_URL"
+	liveWebEndpointEnv   = "NEXUS_LIVE_WEB_ENDPOINT"
 	liveModelEnv         = "NEXUS_LIVE_MODEL"
 	liveCredentialEnv    = "TOKENHARBOR_API_KEY"
 )
@@ -26,11 +31,24 @@ func (liveResearchCatalog) Catalog(_, _ string) []ToolHint {
 	}}
 }
 
+type countingResearchProvider struct {
+	inner capability.ResearchProvider
+	calls int32
+}
+
+func (p *countingResearchProvider) Identify() string { return p.inner.Identify() }
+
+func (p *countingResearchProvider) Search(ctx context.Context, query string, limit int) ([]capability.Source, error) {
+	atomic.AddInt32(&p.calls, 1)
+	return p.inner.Search(ctx, query, limit)
+}
+
 // TestLiveProviderEvidenceGroundedSynthesis is an opt-in smoke test for the
-// production OpenAI-compatible provider path. Model inference is live; the
-// mediated web.search adapter is deterministic because NEXUS has no real
-// external search backend. Set NEXUS_LIVE_PROVIDER_SMOKE=1 and
-// TOKENHARBOR_API_KEY to run it; otherwise it skips without network access.
+// production OpenAI-compatible provider path AND the real external web.search
+// adapter. Model inference, planning and external retrieval are all live.
+// Set NEXUS_LIVE_PROVIDER_SMOKE=1, TOKENHARBOR_API_KEY and optionally
+// NEXUS_LIVE_MODEL / NEXUS_LIVE_WEB_ENDPOINT to run it; otherwise it skips
+// without network access.
 func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(liveProviderSmokeEnv)) != "1" {
 		t.Skip("live provider smoke is opt-in: set NEXUS_LIVE_PROVIDER_SMOKE=1")
@@ -46,6 +64,10 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 	modelID := strings.TrimSpace(os.Getenv(liveModelEnv))
 	if modelID == "" {
 		modelID = "deepseek-v4.1-flash:free"
+	}
+	webEndpoint := strings.TrimSpace(os.Getenv(liveWebEndpointEnv))
+	if webEndpoint == "" {
+		webEndpoint = capability.DefaultWikipediaEndpoint
 	}
 
 	provider, err := modelrouter.NewOpenAIProvider(modelrouter.ProviderConfig{
@@ -71,25 +93,29 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 		t.Fatalf("register live model: %v", err)
 	}
 
-	f := newEvidenceFixture(t)
-	// Deterministic mediated retrieval. More envelopes than a bounded run
-	// should need, so an extra search is not an ambiguous failure.
-	for i := 0; i < 4; i++ {
-		f.provider.queue(envelopeOf(
-			"1. Nexus capability boundary | https://docs.example/nexus | docs.example | The runtime decides; the model proposes.",
-			"2. External content is data | https://example.org/safety | example.org | Inert data, never instructions.",
-		))
+	external, err := capability.NewWikipediaSearchProvider(capability.WikipediaProviderConfig{
+		Endpoint: webEndpoint, Language: "en", AllowInsecureHTTP: true,
+	})
+	if err != nil {
+		t.Fatalf("live web search configuration: %v", err)
 	}
-	f.rt.Decider = &Decision{AgentID: "researcher", Router: router}
-	f.rt.Catalog = liveResearchCatalog{}
+	counting := &countingResearchProvider{inner: external}
+	rt := externalResearchRuntimeWithProvider(t, counting)
+	rt.Decider = &Decision{AgentID: "researcher", Router: router}
+	rt.Catalog = liveResearchCatalog{}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	out, err := f.rt.Run(ctx, workRequest(t, Objective{
-		Description: "Search the web for NEXUS runtime capabilities and finish with a typed synthesis. " +
-			"Use exactly one plan step. In that step call web.search, then complete with a synthesis " +
-			"that cites only source ids shown in EVIDENCE. If a planned step will remain incomplete, " +
-			"set the synthesis status to partial instead of complete.",
+	out, err := rt.Run(ctx, workRequest(t, Objective{
+		Description: "Research two related topics on the English Wikipedia using the mediated web.search tool. " +
+			"The plan must contain exactly these two steps and nothing else: " +
+			"{\"steps\":[{\"step_id\":\"s1\",\"intent\":\"search Wikipedia for Go programming language\"}," +
+			"{\"step_id\":\"s2\",\"intent\":\"search Wikipedia for large language model\",\"dependencies\":[\"s1\"]}]}. " +
+			"Step s1 must call web.search once with the query \"Go programming language\". " +
+			"Step s2 must call web.search once with the query \"large language model\". " +
+			"Do not call web.search twice in the same step. Only after both searches have run, " +
+			"complete with a typed synthesis that cites at least one source id from each step. " +
+			"Cite only ids shown in EVIDENCE, and use status partial only if a planned step remains incomplete.",
 		Context: map[string]string{"agent_id": "researcher"},
 	}, ""), nil)
 	if err != nil {
@@ -100,9 +126,42 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 		// carries the bounded validation reason.
 		t.Fatalf("live research run status=%s error=%s", out.Status, out.Error)
 	}
-	if out.ResearchEvidence == nil || out.ResearchEvidence.Version != 2 ||
-		out.ResearchEvidence.Count == 0 || len(out.ResearchEvidence.Sources) == 0 {
-		t.Fatalf("live run did not produce v2 evidence: %+v", out.ResearchEvidence)
+	ev := out.ResearchEvidence
+	if ev == nil || ev.Version != execjournal.ResearchEvidenceVersion ||
+		ev.Count < 2 || len(ev.Sources) < 2 {
+		t.Fatalf("live run did not produce multi-source v2 evidence: %+v", ev)
+	}
+	for _, source := range ev.Sources {
+		if !strings.HasSuffix(source.Source, ".wikipedia.org") ||
+			!strings.HasPrefix(source.URL, "https://en.wikipedia.org/wiki/") {
+			t.Fatalf("source is not a live Wikipedia record: %+v", source)
+		}
+	}
+	if ev.Plan == nil || len(ev.Steps) != 2 {
+		t.Fatalf("live plan did not produce two steps: %+v", ev.Plan)
+	}
+	if !slices.Contains(ev.Steps[1].Dependencies, ev.Steps[0].StepID) {
+		t.Fatalf("second live step is not dependent on the first: %+v", ev.Steps)
+	}
+	if len(ev.Operations) < 2 {
+		t.Fatalf("expected two mediated search operations, got %+v", ev.Operations)
+	}
+	stepSearches := map[string]bool{}
+	for _, op := range ev.Operations {
+		if op.ToolID != execjournal.ResearchEvidenceCapability ||
+			op.Operation != execjournal.ResearchEvidenceOperation || len(op.SourceIDs) == 0 {
+			t.Fatalf("operation is not a captured mediated search: %+v", op)
+		}
+		if stepSearches[op.StepID] {
+			t.Fatalf("step %s searched more than once: %+v", op.StepID, ev.Operations)
+		}
+		stepSearches[op.StepID] = true
+	}
+	if len(stepSearches) != 2 {
+		t.Fatalf("searches did not cover both steps: %+v", ev.Operations)
+	}
+	if got := atomic.LoadInt32(&counting.calls); got < 2 {
+		t.Fatalf("expected at least two real provider requests, got %d", got)
 	}
 	if out.ResearchSynthesis == nil {
 		t.Fatal("live run completed without a typed synthesis")
@@ -111,25 +170,36 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 		t.Fatalf("live synthesis status=%q", out.ResearchSynthesis.Status)
 	}
 	resolved := map[string]bool{}
-	for _, source := range out.ResearchEvidence.Sources {
+	for _, source := range ev.Sources {
 		resolved[source.ID] = true
 	}
-	cited := 0
+	cited := map[string]bool{}
 	for _, statement := range out.ResearchSynthesis.EvidenceBacked {
 		for _, id := range statement.SourceIDs {
 			if !resolved[id] {
 				t.Fatalf("live synthesis cited an unknown source id %q", id)
 			}
-			cited++
+			cited[id] = true
 		}
 	}
-	if cited == 0 {
+	if len(cited) == 0 {
 		t.Fatal("live synthesis has no evidence-backed citations")
 	}
-	if f.provider.count() == 0 {
-		t.Fatal("live run never invoked the mediated web.search adapter")
+	// Require a citation that resolves from each captured search, proving the
+	// synthesis used both steps rather than one lucky retrieval.
+	for _, op := range ev.Operations {
+		found := false
+		for _, id := range op.SourceIDs {
+			if cited[id] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("synthesis cites no source from step %s: cited=%v op=%+v", op.StepID, cited, op)
+		}
 	}
-	t.Logf("live provider %q model %q completed with %d evidence-backed citations; "+
-		"web.search retrieval remained deterministic and scripted (no real search backend)",
-		provider.Identify(), modelID, cited)
+	t.Logf("live provider %q model %q completed %d external provider requests, "+
+		"%d evidence sources, %d search operations and %d evidence-backed citations",
+		provider.Identify(), modelID, counting.calls, ev.Count, len(ev.Operations), len(cited))
 }

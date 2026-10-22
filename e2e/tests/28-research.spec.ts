@@ -524,3 +524,144 @@ test.describe('Research Workspace E2E', () => {
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
 });
+
+// The production adapter (not the scripted envelope provider) is booted through
+// the compiled binary against a local MediaWiki-shaped fixture. The model stays
+// deterministic, while the real HTTP provider code path, launcher configuration,
+// normalization, durable evidence and UI rendering are all exercised.
+test.describe('Research Workspace real web provider', () => {
+  let nexus: NexusHandle;
+  let frontend: FrontendServer;
+  let frontendURL: string;
+  let wiki: http.Server;
+  let wikiURL: string;
+  const searches: string[] = [];
+
+  test.beforeAll(async () => {
+    if (!fs.existsSync(path.join(FRONTEND_DIST, 'index.html'))) {
+      throw new Error(
+        `frontend build not found at ${FRONTEND_DIST}; run "npm run build" in nexus-app first`
+      );
+    }
+
+    wiki = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (url.pathname !== '/w/api.php' || url.searchParams.get('action') !== 'query' ||
+          url.searchParams.get('list') !== 'search') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end('{"error":{"code":"not_found"}}');
+        return;
+      }
+      searches.push(url.searchParams.get('srsearch') ?? '');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        batchcomplete: true,
+        query: {
+          search: [
+            {
+              title: 'Nexus runtime capabilities',
+              pageid: 101,
+              snippet: 'The <span class="searchmatch">Nexus</span> runtime mediates every capability call.',
+            },
+            {
+              title: 'Nexus evidence boundary',
+              pageid: 102,
+              snippet: 'Only <span class="searchmatch">captured</span> provider records become evidence.',
+            },
+          ],
+        },
+      }));
+    });
+    await new Promise<void>((resolve) => wiki.listen(0, '127.0.0.1', resolve));
+    const address = wiki.address() as net.AddressInfo;
+    wikiURL = `http://127.0.0.1:${address.port}/w/api.php`;
+
+    nexus = await startNexus({
+      extraEnv: {
+        NEXUS_SEEDED_PROVIDER_MODE: 'scripted',
+        NEXUS_CAPABILITY_WEB: 'wikipedia',
+        NEXUS_CAPABILITY_WEB_ENDPOINT: wikiURL,
+        NEXUS_CAPABILITY_WEB_ALLOW_INSECURE: 'true',
+        NEXUS_CAPABILITY_WEB_LANGUAGE: 'en',
+      },
+    });
+
+    const registered = await fetch(`${nexus.baseURL}/api/v1/agents`, {
+      method: 'POST',
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entity_id: RESEARCH_AGENT_ID,
+        name: 'Research E2E Analyst',
+        business_id: nexus.businessID,
+        capabilities: ['analysis'],
+        allowed_tools: ['web.search'],
+      }),
+    });
+    if (!registered.ok && registered.status !== 409) {
+      throw new Error(
+        `failed to register research agent: HTTP ${registered.status} ${await registered.text()}`
+      );
+    }
+
+    frontend = new FrontendServer();
+    frontendURL = `http://127.0.0.1:${await frontend.start(nexus.baseURL)}`;
+  });
+
+  test.afterAll(async () => {
+    await frontend?.stop();
+    await nexus?.dispose();
+    if (wiki) {
+      await new Promise<void>((resolve) => wiki.close(() => resolve()));
+    }
+  });
+
+  test('research workspace: the real adapter retrieves and renders provider records', async ({ page }) => {
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        actorId: actorID,
+        credential,
+        businessID,
+        businessId: businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
+    await page.click('button[type="submit"]', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('textarea[placeholder*="research"]') as HTMLTextAreaElement | null;
+      return textarea?.value === '';
+    }, { timeout: 10000 });
+
+    const output = page.locator('section[aria-labelledby="research-output-heading"]');
+    const evidence = page.locator('section[aria-labelledby="research-evidence-heading"]');
+
+    await expect(output.locator('[aria-label="Typed research synthesis"]')).toBeVisible({
+      timeout: 20000,
+    });
+    await expect(evidence.getByText('2 sources')).toBeVisible();
+    await expect(evidence.getByText('Nexus runtime capabilities', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Nexus evidence boundary', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('en.wikipedia.org', { exact: true }).first()).toBeVisible();
+    await expect(evidence.getByText('The Nexus runtime mediates every capability call.')).toBeVisible();
+    await expect(evidence.getByRole('link', { name: 'Open Nexus runtime capabilities in new tab' }))
+      .toHaveAttribute('href', 'https://en.wikipedia.org/wiki/Nexus_runtime_capabilities');
+    await expect(evidence.getByText('docs.example')).toHaveCount(0);
+
+    const synthesis = output.locator('[aria-label="Typed research synthesis"]');
+    await expect(synthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(synthesis.getByText('Evidence-backed findings')).toBeVisible();
+    await expect(synthesis.getByRole('link', { name: 'Nexus runtime capabilities' }))
+      .toHaveAttribute('href', 'https://en.wikipedia.org/wiki/Nexus_runtime_capabilities');
+
+    expect(searches).toEqual(['nexus']);
+  });
+});
