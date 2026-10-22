@@ -208,9 +208,10 @@ type Outcome struct {
 	// a restart.
 	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
 
-	// ResearchSynthesis is the validated, process-local synthesis returned by a
-	// live execution. It is never persisted, so after a restart the durable
-	// read proves the execution but the synthesis/result text is unavailable.
+	// ResearchSynthesis is the validated synthesis returned by a live
+	// execution. The journal also persists a durable snapshot of it (v59), so
+	// the conclusion survives a restart; the durable read proves the execution
+	// and returns that snapshot. The raw result text stays process-local.
 	ResearchSynthesis *executor.ResearchSynthesis `json:"research_synthesis,omitempty"`
 
 	// ResearchEvaluation is the deterministic quality verdict. On a live

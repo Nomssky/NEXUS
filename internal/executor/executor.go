@@ -119,9 +119,10 @@ type Outcome struct {
 	// mistaken for a durable snapshot.
 	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
 	// ResearchSynthesis is the validated typed answer for this execution. It is
-	// process-local only: it is carried to the live intelligence response for
-	// the lifetime of this process, never journaled, and never regenerated from
-	// durable evidence after a restart.
+	// carried to the live intelligence response for the lifetime of this
+	// process and is never regenerated from durable evidence. The journal
+	// persists a durable snapshot of it (v59) so the conclusion survives a
+	// restart; that copy is bound to the evidence it was validated against.
 	ResearchSynthesis *ResearchSynthesis `json:"research_synthesis,omitempty"`
 	// ResearchEvaluation is the deterministic quality verdict for the captured
 	// evidence and synthesis. It contains only stable codes, dimension states,

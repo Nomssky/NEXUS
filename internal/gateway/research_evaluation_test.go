@@ -48,7 +48,7 @@ func TestRecoveryDetailExposesResearchEvaluation(t *testing.T) {
 	if err := j.Accepted("exec-evi", recBiz, "", "user-wide"); err != nil {
 		t.Fatalf("seed accepted: %v", err)
 	}
-	if err := j.TerminalWithResearch("exec-evi", execjournal.StateCompleted, "", evidence, evaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-evi", execjournal.StateCompleted, "", evidence, evaluation, nil); err != nil {
 		t.Fatalf("seed terminal: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestRecoveryListOmitsResearchEvaluation(t *testing.T) {
 	if err := j.Accepted("exec-evi", recBiz, "", "user-wide"); err != nil {
 		t.Fatalf("seed accepted: %v", err)
 	}
-	if err := j.TerminalWithResearch("exec-evi", execjournal.StateCompleted, "", evidence, evaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-evi", execjournal.StateCompleted, "", evidence, evaluation, nil); err != nil {
 		t.Fatalf("seed terminal: %v", err)
 	}
 	w := evidenceGet(t, srv, "/api/v1/recovery/executions?business_id="+recBiz, wideHeaders())

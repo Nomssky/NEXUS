@@ -26,10 +26,12 @@ import type { DurableExecution, ExecutionStatus, ResearchEvaluation } from '@/ty
 import {
   extractToolActivity,
   parseDurableResearchEvidence,
+  parseDurableResearchSynthesis,
   parseResearchResult,
   parseResearchSteps,
   buildResearchFindings,
   type ParsedDurableEvidence,
+  type DurableParsedSynthesis,
   type ResearchResult,
   type ResearchFindings,
   type ResearchStep,
@@ -190,6 +192,19 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     durableEvidence,
   ]);
 
+  // Durable synthesis parsed from the recovery detail read. It survives a
+  // restart alongside the evidence and evaluation it describes. Re-validate
+  // against the active execution id and the parsed durable evidence; a
+  // mismatch hides it rather than rendering a stale synthesis.
+  const durableSynthesis = useMemo(() => {
+    const parsed = parseDurableResearchSynthesis(
+      recoveryDetail?.research_synthesis,
+      durableEvidence,
+      activeExecutionId ?? undefined
+    );
+    return parsed.synthesis;
+  }, [recoveryDetail?.research_synthesis, durableEvidence, activeExecutionId]);
+
   // Zone stats for VirtualHQ. Counts come from the authoritative recovery list.
   const zoneStats = {
     command: { executions: 0 },
@@ -269,6 +284,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               onExecutionSelect={handleExecutionSelect}
               onCloseTrace={handleCloseTrace}
               evaluation={evaluation}
+              durableSynthesis={durableSynthesis}
             />
           )}
 
@@ -309,6 +325,8 @@ interface ResearchZoneProps {
   onExecutionSelect: (executionId: string) => void;
   onCloseTrace: () => void;
   evaluation?: ResearchEvaluation;
+  /** Durable, persisted synthesis resolved against durable evidence. */
+  durableSynthesis?: DurableParsedSynthesis;
 }
 
 const ResearchZone: React.FC<ResearchZoneProps> = ({
@@ -331,6 +349,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   onExecutionSelect,
   onCloseTrace,
   evaluation,
+  durableSynthesis,
 }) => {
   return (
     <div className={styles.zone}>
@@ -375,6 +394,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             durablePlan={durableEvidence.plan}
             durableSteps={durableEvidence.steps}
             evaluation={evaluation}
+            durableSynthesis={durableSynthesis}
           />
         </section>
 

@@ -30,6 +30,7 @@ import type {
 } from '../../types/api';
 import {
   parseResearchResult,
+  type DurableParsedSynthesis,
   type ParsedDurableStep,
   type ParsedResearchSynthesis,
   type ParsedSynthesisStatement,
@@ -63,6 +64,12 @@ interface ResearchOutputProps {
    * execution, so it may be present after the process-local synthesis is gone.
    */
   evaluation?: ResearchEvaluation;
+  /**
+   * Durable, validated synthesis resolved against durable evidence. Persisted
+   * alongside evidence and evaluation; survives a restart. Rendered distinctly
+   * from the process-local live synthesis.
+   */
+  durableSynthesis?: DurableParsedSynthesis;
 }
 
 const DURABLE_TERMINAL_STATES = new Set([
@@ -87,6 +94,7 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   durablePlan,
   durableSteps,
   evaluation,
+  durableSynthesis,
 }) => {
   const parsed = useMemo(() => parseResearchResult(output), [output]);
 
@@ -114,7 +122,7 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
     const durableTerminal =
       status === undefined && durableState !== undefined && DURABLE_TERMINAL_STATES.has(durableState);
     if (durableTerminal) {
-      const copy = durableUnavailableCopy(durableState);
+      const copy = durableUnavailableCopy(durableState, Boolean(durableSynthesis));
       const details = lifecycleDetails(createdAt, completedAt);
       return (
         <Card variant="outlined" padding="lg">
@@ -122,7 +130,17 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
             <DurablePlanSection plan={durablePlan} steps={durableSteps} />
           )}
           {evaluation && (
-            <ResearchQuality evaluation={evaluation} recorded />
+            <ResearchQuality
+              evaluation={evaluation}
+              recorded
+              synthesisAvailable={Boolean(durableSynthesis)}
+            />
+          )}
+          {durableSynthesis && (
+            <DurableSynthesisBlock
+              synthesis={durableSynthesis}
+              sources={findings?.sources ?? []}
+            />
           )}
           <div className={styles.empty}>
             <div className={styles.resultHeader}>
@@ -242,6 +260,20 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
         )}
 
         {evaluation && <ResearchQuality evaluation={evaluation} />}
+
+        {/*
+          The live typed synthesis wins when the process still holds it: it is
+          the same validated answer the durable record carries, so rendering
+          both would duplicate identical text. The durable synthesis is the
+          recovery path — shown when the live one is gone (e.g. after a
+          restart) — and is always labeled as a durable record.
+        */}
+        {durableSynthesis && !findings?.typedSynthesis && (
+          <DurableSynthesisBlock
+            synthesis={durableSynthesis}
+            sources={findings?.sources ?? []}
+          />
+        )}
 
         {findings?.typedSynthesis && (
           <TypedSynthesisBlock synthesis={findings.typedSynthesis} sources={findings.sources} />
@@ -366,6 +398,110 @@ const DurablePlanSection: React.FC<{
       ))}
     </ul>
   </section>
+);
+
+/**
+ * Durable, validated synthesis persisted through the execution journal.
+ * Rendered distinctly from the process-local live synthesis: every citation
+ * link and visible title is looked up in the durable source record by id.
+ * Labeled as a durable record so users can tell a persisted conclusion from
+ * live, in-memory state.
+ */
+const DurableSynthesisBlock: React.FC<{
+  synthesis: DurableParsedSynthesis;
+  sources: ParsedWebSearchSource[];
+}> = ({ synthesis, sources }) => (
+  <div
+    className={styles.synthesisBlock}
+    aria-label="Durable research synthesis"
+    data-synthesis-status={synthesis.status}
+    data-provenance="durable"
+  >
+    <div className={styles.synthesisHeader}>
+      <div>
+        <h4 className={styles.synthesisTitle}>Durable synthesis</h4>
+        <p className={styles.provenance}>
+          Persisted validated answer, recovered from the execution journal.
+          Citation titles and URLs come from Sources &amp; Evidence, never from
+          the model.
+        </p>
+      </div>
+      <Badge variant="info" size="sm">
+        Durable record
+      </Badge>
+      <Badge variant={synthesisStatusVariant(synthesis.status)} size="sm">
+        {synthesisStatusLabel(synthesis.status)}
+      </Badge>
+    </div>
+
+    <p className={styles.synthesisText}>{synthesis.summary}</p>
+
+    {synthesis.status === 'partial' && (
+      <p className={styles.partialNotice} role="status">
+        This answer is partial: the run did not fully settle its planned research.
+        Unresolved questions are listed below.
+      </p>
+    )}
+    {synthesis.status === 'inconclusive' && (
+      <p className={styles.inconclusiveNotice} role="status">
+        No evidence-backed conclusion was reached. The run either captured no
+        supporting sources or could not settle the objective, so only unresolved
+        questions are reported.
+      </p>
+    )}
+
+    {synthesis.evidenceBacked.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Evidence-backed findings">
+        <h5 className={styles.synthesisSectionTitle}>Evidence-backed findings</h5>
+        <SynthesisClaims claims={synthesis.evidenceBacked} />
+      </section>
+    )}
+
+    {synthesis.inferences.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Inferences">
+        <h5 className={styles.synthesisSectionTitle}>
+          Inference <span className={styles.inferenceLabel}>not evidence</span>
+        </h5>
+        <ul className={styles.claimList}>
+          {synthesis.inferences.map((inference, index) => (
+            <li key={`inference-${index}`} className={styles.inferenceItem}>
+              {inference}
+            </li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {synthesis.conflicts.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Conflicting evidence">
+        <h5 className={styles.synthesisSectionTitle}>Conflicting evidence</h5>
+        <SynthesisClaims claims={synthesis.conflicts} conflict />
+      </section>
+    )}
+
+    {synthesis.unresolvedQuestions.length > 0 && (
+      <section className={styles.synthesisSection} aria-label="Unresolved questions">
+        <h5 className={styles.synthesisSectionTitle}>Unresolved questions</h5>
+        <ul className={styles.questionList}>
+          {synthesis.unresolvedQuestions.map((question, index) => (
+            <li key={`question-${index}`}>{question}</li>
+          ))}
+        </ul>
+      </section>
+    )}
+
+    {sources.length > 0 && (
+      <p className={styles.sourcesNote}>
+        {sources.length} captured source record{sources.length === 1 ? '' : 's'}.
+        Citation titles and URLs come from Sources &amp; Evidence, never from the model.
+      </p>
+    )}
+    {sources.length === 0 && (
+      <p className={styles.sourcesNote}>
+        No source records were captured for this execution.
+      </p>
+    )}
+  </div>
 );
 
 /**
@@ -587,7 +723,7 @@ function formatTimestamp(value: string | null | undefined): string | undefined {
   return `${date.toISOString().replace('T', ' ').slice(0, 16)} UTC`;
 }
 
-function durableUnavailableCopy(state: string): {
+function durableUnavailableCopy(state: string, hasDurableSynthesis: boolean): {
   title: string;
   description: string;
   hint: string;
@@ -595,17 +731,33 @@ function durableUnavailableCopy(state: string): {
   const hint =
     'Persisted source records are listed separately when the execution captured them.';
   if (state === 'completed') {
+    if (hasDurableSynthesis) {
+      return {
+        title: 'Execution result text unavailable',
+        description:
+          'This execution completed. Its validated synthesis, captured source records and quality verdict are retained in the durable execution record. Only the raw execution result text is process-local and is not retained after a restart.',
+        hint,
+      };
+    }
     return {
       title: 'Synthesis and result text unavailable',
       description:
-        'This execution completed, but its synthesized answer and result text are process-local and are not retained after a restart. The durable step states and captured source records remain available.',
+        'This execution completed, but no validated synthesis was persisted for it. The durable step states and captured source records remain available.',
+      hint,
+    };
+  }
+  if (hasDurableSynthesis) {
+    return {
+      title: 'Execution result text unavailable',
+      description:
+        'This execution is no longer running. Its validated synthesis, captured source records and quality verdict are retained in the durable execution record; only the raw result text is process-local.',
       hint,
     };
   }
   return {
     title: 'Synthesis and result text unavailable',
     description:
-      'This execution is no longer running, and its synthesized answer and result text are not available after a restart.',
+      'This execution is no longer running, and no validated synthesis was persisted for it.',
     hint,
   };
 }

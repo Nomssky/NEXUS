@@ -107,16 +107,28 @@ describe('ResearchQuality', () => {
     expect(markup).not.toContain('Checks passed');
   });
 
-  it('states that a recorded verdict outlived the process-local synthesis', () => {
+  it('states that a recorded verdict was read back from the durable record', () => {
     const markup = render({ evaluation: evaluation(), recorded: true });
 
     expect(markup).toContain('Recorded when this execution completed');
-    expect(markup).toContain('no longer available in this process');
+    expect(markup).toContain('The typed synthesis is not available for this record');
+  });
+
+  it('states that the shown synthesis is the same persisted snapshot', () => {
+    const markup = render({
+      evaluation: evaluation(),
+      recorded: true,
+      synthesisAvailable: true,
+    });
+
+    expect(markup).toContain('Recorded when this execution completed');
+    expect(markup).toContain('the same persisted snapshot');
+    expect(markup).toContain('it is not regenerated');
   });
 
   it('does not claim a synthesis is missing while the verdict is still live', () => {
     const markup = render({ evaluation: evaluation() });
 
-    expect(markup).not.toContain('no longer available in this process');
+    expect(markup).not.toContain('Recorded when this execution completed');
   });
 });

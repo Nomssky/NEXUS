@@ -941,10 +941,11 @@ func TestEnginePersistsResearchEvidenceWithTerminalState(t *testing.T) {
 	}
 }
 
-// Synthesis is a process-local hand-off: the live terminal response carries the
-// validated typed object, but the durable record never does. A restart may
-// prove the execution and its evidence; it cannot resurrect a synthesis.
-func TestEngineCarriesProcessLocalSynthesisWithoutJournaling(t *testing.T) {
+// Synthesis is now a durable artifact: the live terminal response carries the
+// validated typed object, and the durable record persists it atomically with
+// the evidence and evaluation it describes. A restart can resurrect the
+// synthesis because it is bound to the exact evidence snapshot.
+func TestEnginePersistsResearchSynthesisDurably(t *testing.T) {
 	dir := t.TempDir()
 	st, err := store.NewFileStore(dir)
 	if err != nil {
@@ -968,7 +969,8 @@ func TestEngineCarriesProcessLocalSynthesisWithoutJournaling(t *testing.T) {
 		EvidenceBacked: []executor.ResearchEvidenceStatement{{
 			Statement: "The runtime decides and the model proposes.", SourceIDs: []string{"src-1"},
 		}},
-		Inferences: []executor.ResearchInference{}, Conflicts: []executor.ResearchEvidenceStatement{},
+		Inferences:          []executor.ResearchInference{},
+		Conflicts:           []executor.ResearchEvidenceStatement{},
 		UnresolvedQuestions: []string{},
 	}
 	if err := e.SubmitRequest(&Request{
@@ -988,15 +990,62 @@ func TestEngineCarriesProcessLocalSynthesisWithoutJournaling(t *testing.T) {
 		t.Fatalf("process-local synthesis missing from response: %+v", res.Outcome)
 	}
 	rec := waitForJournalState(t, j, "exec-core-synthesis", execjournal.StateCompleted)
+	if rec.ResearchSynthesis == nil {
+		t.Fatalf("durable synthesis missing: %+v", rec.ResearchSynthesis)
+	}
+	if rec.ResearchSynthesis.Status != executor.ResearchSynthesisComplete {
+		t.Fatalf("durable synthesis status = %q", rec.ResearchSynthesis.Status)
+	}
+	if len(rec.ResearchSynthesis.EvidenceBacked) != 1 ||
+		rec.ResearchSynthesis.EvidenceBacked[0].Statement != "The runtime decides and the model proposes." ||
+		len(rec.ResearchSynthesis.EvidenceBacked[0].SourceIDs) != 1 ||
+		rec.ResearchSynthesis.EvidenceBacked[0].SourceIDs[0] != "src-1" {
+		t.Fatalf("durable synthesis statements/citations mismatch: %+v", rec.ResearchSynthesis.EvidenceBacked)
+	}
+	if rec.ResearchSynthesis.EvidenceFingerprint != execjournal.ResearchEvidenceFingerprint(rec.ResearchEvidence) {
+		t.Fatal("durable synthesis must stay bound to the persisted evidence")
+	}
 	raw, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(raw, []byte("research_synthesis")) || bytes.Contains(raw, []byte("Synthesized from")) {
-		t.Fatalf("synthesis must never be journaled: %s", raw)
+	if !bytes.Contains(raw, []byte("research_synthesis")) {
+		t.Fatalf("durable record must carry research_synthesis: %s", raw)
 	}
 	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Count != 1 {
 		t.Fatalf("durable evidence missing: %+v", rec.ResearchEvidence)
+	}
+
+	// A fresh process over the same durable directory must expose exactly the
+	// same synthesis, evidence and terminal timestamp.
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	st2, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	j2 := execjournal.New(st2, nil)
+	if _, err := j2.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	rec2, ok, err := j2.Get("exec-core-synthesis")
+	if err != nil || !ok {
+		t.Fatalf("reopened get: ok=%v err=%v", ok, err)
+	}
+	if rec2.ResearchSynthesis == nil {
+		t.Fatal("durable synthesis did not survive restart")
+	}
+	if rec2.ResearchSynthesis.Status != executor.ResearchSynthesisComplete ||
+		len(rec2.ResearchSynthesis.EvidenceBacked) != 1 ||
+		rec2.ResearchSynthesis.EvidenceBacked[0].SourceIDs[0] != "src-1" {
+		t.Fatalf("durable synthesis changed across restart: %+v", rec2.ResearchSynthesis)
+	}
+	if rec2.ResearchSynthesis.EvidenceFingerprint != execjournal.ResearchEvidenceFingerprint(rec2.ResearchEvidence) {
+		t.Fatal("durable synthesis evidence binding changed across restart")
+	}
+	if !rec2.CompletedAt.Equal(*rec.CompletedAt) {
+		t.Fatalf("completed_at changed across restart: %v -> %v", rec.CompletedAt, rec2.CompletedAt)
 	}
 }
 

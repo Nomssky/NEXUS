@@ -17,8 +17,12 @@ import (
 // the evidence snapshot it evaluated. Its evidence fingerprint is recomputed on
 // every durable read, so an evaluation can never be reused for different
 // evidence under the same execution id. A superseding terminal write (the
-// single, narrow approval-resume path) replaces evidence and evaluation
-// together.
+// single, narrow approval-resume path) replaces evidence, evaluation and
+// synthesis together.
+//
+// The evaluation stores only the verdict's reference to the synthesis (its
+// status and fingerprint). The synthesis itself is a separate durable
+// artifact (v59), written in the same atomic update.
 const (
 	// ResearchEvaluationVersion is the evaluation schema version written today.
 	// It is independent of SchemaVersion and ResearchEvidenceVersion.
@@ -109,7 +113,8 @@ type ResearchEvaluation struct {
 	EvidenceFingerprint string `json:"evidence_fingerprint"`
 	// SynthesisStatus and SynthesisFingerprint bind the verdict to the typed
 	// synthesis that was evaluated. They are absent when no synthesis existed.
-	// The synthesis itself remains process-local and is never stored here.
+	// The synthesis itself is not stored here: this record carries only the
+	// verdict's reference to it, never its text.
 	SynthesisStatus      string                        `json:"synthesis_status,omitempty"`
 	SynthesisFingerprint string                        `json:"synthesis_fingerprint,omitempty"`
 	Status               string                        `json:"status"`

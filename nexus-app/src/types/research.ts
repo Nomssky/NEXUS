@@ -43,6 +43,7 @@ import type {
   DurableResearchEvidence,
   DurableResearchPlan,
   DurableResearchStepStatus,
+  DurableResearchSynthesis,
   ParsedWebSearchSource,
   ResearchSynthesis as APIResearchSynthesis,
   TraceEntry,
@@ -737,6 +738,223 @@ const MAX_SYNTHESIS_QUESTIONS = 8;
 const MAX_SYNTHESIS_STATEMENT = 2000;
 const MAX_SYNTHESIS_QUESTION = 1000;
 const MAX_SYNTHESIS_CITATIONS = 12;
+
+// Durable synthesis bounds mirror internal/execjournal/research_synthesis.go.
+const MAX_DURABLE_SYNTHESIS_SUMMARY = MAX_SYNTHESIS_SUMMARY;
+const MAX_DURABLE_SYNTHESIS_STATEMENTS = MAX_SYNTHESIS_STATEMENTS;
+const MAX_DURABLE_SYNTHESIS_INFERENCES = MAX_SYNTHESIS_INFERENCES;
+const MAX_DURABLE_SYNTHESIS_CONFLICTS = MAX_SYNTHESIS_CONFLICTS;
+const MAX_DURABLE_SYNTHESIS_QUESTIONS = MAX_SYNTHESIS_QUESTIONS;
+const MAX_DURABLE_SYNTHESIS_STATEMENT = MAX_SYNTHESIS_STATEMENT;
+const MAX_DURABLE_SYNTHESIS_QUESTION = MAX_SYNTHESIS_QUESTION;
+const MAX_DURABLE_SYNTHESIS_CITATIONS = MAX_SYNTHESIS_CITATIONS;
+
+// Durable synthesis fingerprint format: lowercase hex SHA-256 digest.
+const DURABLE_SYNTHESIS_FINGERPRINT = /^[0-9a-f]{64}$/;
+
+/**
+ * One durable, evidence-resolved citation. The title and URL come from the
+ * authoritative durable source record, never from the persisted synthesis.
+ */
+export interface DurableParsedSynthesisCitation {
+  sourceId: string;
+  source: ParsedWebSearchSource;
+}
+
+/**
+ * One durable evidence-backed statement with its resolved citations.
+ */
+export interface DurableParsedSynthesisStatement {
+  statement: string;
+  citations: DurableParsedSynthesisCitation[];
+}
+
+/**
+ * Durable, validated parsed synthesis resolved against the durable evidence
+ * snapshot. Distinct from the process-local ParsedResearchSynthesis: this is
+ * read from the durable journal and survives restarts.
+ */
+export interface DurableParsedSynthesis {
+  status: ResearchSynthesisStatus;
+  summary: string;
+  evidenceBacked: DurableParsedSynthesisStatement[];
+  inferences: string[];
+  conflicts: DurableParsedSynthesisStatement[];
+  unresolvedQuestions: string[];
+}
+
+/**
+ * Validate a durable synthesis against the durable evidence snapshot the UI
+ * actually parsed. Every source id must resolve in THIS execution's evidence,
+ * duplicates are rejected, and the model cannot supply titles or URLs. The
+ * execution_id must match the active execution and the evidence_fingerprint
+ * must be well-formed (binding to the exact evidence snapshot is enforced by
+ * the backend).
+ */
+export function parseDurableResearchSynthesis(
+  synthesis: DurableResearchSynthesis | null | undefined,
+  durable: ParsedDurableEvidence,
+  expectedExecutionId?: string
+): { synthesis?: DurableParsedSynthesis; rejection?: 'invalid' } {
+  if (synthesis === undefined || synthesis === null) return {};
+  if (!isRecord(synthesis)) return { rejection: 'invalid' };
+  if (!durable.present || durable.version !== DURABLE_EVIDENCE_VERSION) {
+    return { rejection: 'invalid' };
+  }
+
+  if (synthesis.version !== 1 || synthesis.method !== 'deterministic_v1') {
+    return { rejection: 'invalid' };
+  }
+  if (
+    typeof synthesis.execution_id !== 'string' ||
+    synthesis.execution_id.length === 0 ||
+    synthesis.execution_id.length > MAX_DURABLE_PLAN_ID
+  ) {
+    return { rejection: 'invalid' };
+  }
+  if (expectedExecutionId && synthesis.execution_id !== expectedExecutionId) {
+    return { rejection: 'invalid' };
+  }
+  if (
+    typeof synthesis.evidence_fingerprint !== 'string' ||
+    !DURABLE_SYNTHESIS_FINGERPRINT.test(synthesis.evidence_fingerprint)
+  ) {
+    return { rejection: 'invalid' };
+  }
+
+  const status = synthesis.status;
+  if (typeof status !== 'string' || !SYNTHESIS_STATUSES.has(status as ResearchSynthesisStatus)) {
+    return { rejection: 'invalid' };
+  }
+  const summary = synthesis.summary;
+  if (
+    typeof summary !== 'string' ||
+    summary.trim() === '' ||
+    summary.length > MAX_DURABLE_SYNTHESIS_SUMMARY
+  ) {
+    return { rejection: 'invalid' };
+  }
+
+  const rawEvidence = synthesis.evidence_backed;
+  const rawInferences = synthesis.inferences;
+  const rawConflicts = synthesis.conflicts;
+  const rawQuestions = synthesis.unresolved_questions;
+  if (
+    !Array.isArray(rawEvidence) ||
+    !Array.isArray(rawInferences) ||
+    !Array.isArray(rawConflicts) ||
+    !Array.isArray(rawQuestions) ||
+    rawEvidence.length > MAX_DURABLE_SYNTHESIS_STATEMENTS ||
+    rawInferences.length > MAX_DURABLE_SYNTHESIS_INFERENCES ||
+    rawConflicts.length > MAX_DURABLE_SYNTHESIS_CONFLICTS ||
+    rawQuestions.length > MAX_DURABLE_SYNTHESIS_QUESTIONS
+  ) {
+    return { rejection: 'invalid' };
+  }
+
+  const sourceByID = new Map<string, ParsedWebSearchSource>();
+  for (const source of durable.sources) {
+    if (source.id) sourceByID.set(source.id, source);
+  }
+  const seenStatements = new Set<string>();
+  const parseStatements = (rows: unknown[]): DurableParsedSynthesisStatement[] | undefined => {
+    const statements: DurableParsedSynthesisStatement[] = [];
+    for (const row of rows) {
+      if (!isRecord(row)) return undefined;
+      const statement = row.statement;
+      const sourceIDs = row.source_ids;
+      if (
+        typeof statement !== 'string' ||
+        statement.trim() === '' ||
+        statement.length > MAX_DURABLE_SYNTHESIS_STATEMENT ||
+        seenStatements.has(statement.trim())
+      ) {
+        return undefined;
+      }
+      if (
+        !Array.isArray(sourceIDs) ||
+        sourceIDs.length === 0 ||
+        sourceIDs.length > MAX_DURABLE_SYNTHESIS_CITATIONS
+      ) {
+        return undefined;
+      }
+      seenStatements.add(statement.trim());
+      const seenIDs = new Set<string>();
+      const citations: DurableParsedSynthesisCitation[] = [];
+      for (const sourceID of sourceIDs) {
+        if (
+          typeof sourceID !== 'string' ||
+          sourceID.length === 0 ||
+          sourceID.length > MAX_DURABLE_SOURCE_ID ||
+          sourceID.includes('\u0000') ||
+          sourceID.includes('\n') ||
+          sourceID.includes('\r') ||
+          seenIDs.has(sourceID) ||
+          !sourceByID.has(sourceID)
+        ) {
+          return undefined;
+        }
+        seenIDs.add(sourceID);
+        citations.push({
+          sourceId: sourceID,
+          source: sourceByID.get(sourceID) as ParsedWebSearchSource,
+        });
+      }
+      statements.push({ statement: statement.trim(), citations });
+    }
+    return statements;
+  };
+
+  const evidenceBacked = parseStatements(rawEvidence);
+  if (!evidenceBacked) return { rejection: 'invalid' };
+  const conflicts = parseStatements(rawConflicts);
+  if (!conflicts) return { rejection: 'invalid' };
+
+  const inferences: string[] = [];
+  for (const row of rawInferences) {
+    if (!isRecord(row)) return { rejection: 'invalid' };
+    const statement = row.statement;
+    if (
+      typeof statement !== 'string' ||
+      statement.trim() === '' ||
+      statement.length > MAX_DURABLE_SYNTHESIS_STATEMENT
+    ) {
+      return { rejection: 'invalid' };
+    }
+    inferences.push(statement.trim());
+  }
+
+  const unresolvedQuestions: string[] = [];
+  for (const question of rawQuestions) {
+    if (
+      typeof question !== 'string' ||
+      question.trim() === '' ||
+      question.length > MAX_DURABLE_SYNTHESIS_QUESTION
+    ) {
+      return { rejection: 'invalid' };
+    }
+    unresolvedQuestions.push(question.trim());
+  }
+
+  const grounded = evidenceBacked.length + conflicts.length;
+  if (status === 'inconclusive' && grounded !== 0) return { rejection: 'invalid' };
+  if (status === 'partial' && grounded === 0) return { rejection: 'invalid' };
+  if (status === 'complete' && evidenceBacked.length === 0) return { rejection: 'invalid' };
+  if (durable.sources.length === 0 && status !== 'inconclusive') {
+    return { rejection: 'invalid' };
+  }
+
+  return {
+    synthesis: {
+      status: status as ResearchSynthesisStatus,
+      summary: summary.trim(),
+      evidenceBacked,
+      inferences,
+      conflicts,
+      unresolvedQuestions,
+    },
+  };
+}
 
 const SYNTHESIS_STATUSES = new Set<ResearchSynthesisStatus>([
   'complete',

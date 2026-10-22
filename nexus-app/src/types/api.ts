@@ -108,6 +108,46 @@ export interface ResearchSynthesis {
   unresolved_questions: string[];
 }
 
+/**
+ * Durable, versioned representation of a validated typed synthesis, persisted
+ * through the execution journal (v59). Mirrors backend
+ * internal/execjournal.ResearchSynthesis. Like the live ResearchSynthesis it
+ * carries only source ids as citations; titles and URLs never appear here and
+ * are re-resolved against the durable evidence snapshot.
+ *
+ * The synthesis is bound to exactly one execution id and one evidence snapshot
+ * (via evidence_fingerprint). The backend validates this binding at write and
+ * decode time; the client re-validates structure defensively before rendering.
+ */
+export interface DurableResearchSynthesisStatement {
+  statement: string;
+  source_ids: string[];
+}
+
+export interface DurableResearchSynthesisInference {
+  statement: string;
+}
+
+export interface DurableResearchSynthesis {
+  version: 1;
+  method: 'deterministic_v1';
+  /** The execution this synthesis belongs to; never another. */
+  execution_id: string;
+  status: ResearchSynthesisStatus;
+  /** Bounded model-authored overview, rendered as text only. */
+  summary: string;
+  /** Evidence-backed statements; every citation resolves in this execution's evidence. */
+  evidence_backed: DurableResearchSynthesisStatement[];
+  /** Model conclusions that are not themselves source claims. */
+  inferences: DurableResearchSynthesisInference[];
+  /** Disagreements the captured sources support. */
+  conflicts: DurableResearchSynthesisStatement[];
+  /** Gaps the execution could not settle. */
+  unresolved_questions: string[];
+  /** SHA-256 over the normalized evidence snapshot this synthesis was validated against. */
+  evidence_fingerprint: string;
+}
+
 export type ResearchEvaluationStatus = 'passed' | 'warnings' | 'incomplete' | 'failed';
 
 export type ResearchEvaluationDimensionId =
@@ -736,6 +776,12 @@ export interface DurableExecution {
    * alongside the evidence snapshot it evaluated.
    */
   research_evaluation?: ResearchEvaluation;
+  /**
+   * Persisted validated typed synthesis, returned only by the detail read
+   * alongside the evidence and evaluation it describes. Present only for
+   * executions written by v59 or later; legacy records omit it.
+   */
+  research_synthesis?: DurableResearchSynthesis;
   recovery?: DurableRecoveryView;
   approvals?: DurableApprovalView[];
 }

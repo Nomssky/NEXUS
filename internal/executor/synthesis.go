@@ -14,10 +14,15 @@ import (
 // UI resolves those ids against the authoritative source records; a model can
 // never alter what a source is.
 //
-// The contract is process-local. It is attached to the terminal executor
-// outcome and the process-local execution response; it is NOT a durable journal
-// field, so after a restart the UI reports synthesis as unavailable rather than
-// regenerating it.
+// The contract is process-local on the live path: it is attached to the
+// terminal executor outcome and the process-local execution response.
+//
+// The validated synthesis is ALSO persisted, as a durable snapshot, through the
+// execution journal (v59). The durable copy is written atomically with the
+// evidence snapshot and the quality verdict it describes, and is bound to that
+// exact evidence by fingerprint. After a restart the UI reads the persisted
+// synthesis back from the durable record; it is never regenerated from
+// evidence or prose, and a record without one says so.
 type ResearchSynthesis struct {
 	Status string `json:"status"`
 	// Summary is the bounded model-authored overview. It is rendered as text,
@@ -210,4 +215,48 @@ func ValidateResearchSynthesis(s *ResearchSynthesis, ev *execjournal.ResearchEvi
 func validSynthesisID(value string) bool {
 	return value != "" && len(value) <= 64 &&
 		!strings.ContainsAny(value, "\x00\n\r")
+}
+
+// DurableResearchSynthesis converts a validated, process-local synthesis into
+// its durable journal representation, bound to the exact evidence snapshot it
+// was validated against.
+//
+// The conversion is a snapshot, not a regeneration: it copies only the fields
+// the backend validator already accepted. The evidence fingerprint is computed
+// from the same snapshot the journal persists, so the durable synthesis and
+// the durable evidence can never describe different captures.
+//
+// The result is nil when the synthesis is nil. Callers validate the result
+// with execjournal.ValidateResearchSynthesisForExecution before persisting it.
+func DurableResearchSynthesis(s *ResearchSynthesis, executionID string, evidence *execjournal.ResearchEvidence) *execjournal.ResearchSynthesis {
+	if s == nil {
+		return nil
+	}
+	durable := &execjournal.ResearchSynthesis{
+		Version:             execjournal.ResearchSynthesisVersion,
+		Method:              execjournal.ResearchSynthesisMethod,
+		ExecutionID:         executionID,
+		Status:              s.Status,
+		Summary:             s.Summary,
+		EvidenceFingerprint: execjournal.ResearchEvidenceFingerprint(evidence),
+	}
+	for _, statement := range s.EvidenceBacked {
+		durable.EvidenceBacked = append(durable.EvidenceBacked, execjournal.ResearchSynthesisStatement{
+			Statement: statement.Statement,
+			SourceIDs: append([]string(nil), statement.SourceIDs...),
+		})
+	}
+	for _, inference := range s.Inferences {
+		durable.Inferences = append(durable.Inferences, execjournal.ResearchSynthesisInference{
+			Statement: inference.Statement,
+		})
+	}
+	for _, conflict := range s.Conflicts {
+		durable.Conflicts = append(durable.Conflicts, execjournal.ResearchSynthesisStatement{
+			Statement: conflict.Statement,
+			SourceIDs: append([]string(nil), conflict.SourceIDs...),
+		})
+	}
+	durable.UnresolvedQuestions = append([]string(nil), s.UnresolvedQuestions...)
+	return durable
 }

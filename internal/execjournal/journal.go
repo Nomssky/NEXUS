@@ -156,9 +156,16 @@ type ExecutionRecord struct {
 	// ResearchEvidence and the typed synthesis at the moment of terminal
 	// settlement. It is written in the same atomic update as evidence and is
 	// bound to the evidence fingerprint, so it can never be reused for a
-	// different snapshot. The synthesis itself remains process-local: only the
-	// verdict, stable codes and counts survive a restart.
+	// different snapshot. The verdict itself carries only stable codes,
+	// dimension states and counts — never model prose or source content.
 	ResearchEvaluation *ResearchEvaluation `json:"research_evaluation,omitempty"`
+	// ResearchSynthesis is the durable, validated typed synthesis, persisted
+	// atomically with ResearchEvidence and ResearchEvaluation. It is bound to
+	// the exact evidence snapshot and execution id it describes. Absence means
+	// no synthesis was captured or validated for this execution (including all
+	// records written before this milestone); it never implies the search
+	// returned nothing.
+	ResearchSynthesis *ResearchSynthesis `json:"research_synthesis,omitempty"`
 }
 
 // InvocationRecord is the durable dispatch-intent/outcome evidence for one
@@ -264,14 +271,14 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 // remains nonterminal and no evidence is exposed, so the process-local result
 // can never claim durable evidence that was not stored.
 func (j *Journal) TerminalWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
-	return j.TerminalWithResearch(id, state, errClass, evidence, nil)
+	return j.TerminalWithResearch(id, state, errClass, evidence, nil, nil)
 }
 
 // TerminalWithResearch is TerminalWithEvidence with the deterministic quality
-// evaluation bound to that evidence. Evidence and evaluation are written in
-// one atomic update; the evaluation is validated against the exact evidence
-// snapshot (or absence) that will be persisted.
-func (j *Journal) TerminalWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation) error {
+// evaluation and the validated typed synthesis, both bound to that evidence.
+// Evidence, evaluation and synthesis are written in one atomic update; none of
+// them can be read against a different snapshot or execution id.
+func (j *Journal) TerminalWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation, synthesis *ResearchSynthesis) error {
 	if j == nil {
 		return nil
 	}
@@ -307,7 +314,11 @@ func (j *Journal) TerminalWithResearch(id string, state State, errClass string, 
 		finalEvidence = existing.ResearchEvidence
 	}
 	evaluation = evaluationForEvidence(id, evaluation, existing.ResearchEvaluation, finalEvidence, evidence != nil)
+	synthesis = synthesisForEvidence(id, synthesis, existing.ResearchSynthesis, finalEvidence, evidence != nil)
 	if err := ValidateResearchEvaluationForExecution(id, evaluation, finalEvidence); err != nil {
+		return err
+	}
+	if err := ValidateResearchSynthesisForExecution(id, synthesis, finalEvidence); err != nil {
 		return err
 	}
 	existing.State = state
@@ -317,8 +328,10 @@ func (j *Journal) TerminalWithResearch(id string, state State, errClass string, 
 	if evidence != nil {
 		existing.ResearchEvidence = evidence
 		existing.ResearchEvaluation = evaluation
-	} else if evaluation != nil {
+		existing.ResearchSynthesis = synthesis
+	} else if evaluation != nil || synthesis != nil {
 		existing.ResearchEvaluation = evaluation
+		existing.ResearchSynthesis = synthesis
 	}
 	return j.putExecution(existing, version)
 }
@@ -386,14 +399,15 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 // execution's complete capture. The final terminal time replaces the pause
 // time because the execution has now reached its real outcome.
 func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
-	return j.SupersedeApprovedPauseWithResearch(id, state, errClass, evidence, nil)
+	return j.SupersedeApprovedPauseWithResearch(id, state, errClass, evidence, nil, nil)
 }
 
 // SupersedeApprovedPauseWithResearch also replaces the deterministic quality
-// evaluation together with the evidence it evaluated. A nil evidence snapshot
-// preserves the pause's evidence and evaluation; a non-nil snapshot replaces
-// both, so an evaluation can never outlive the snapshot it described.
-func (j *Journal) SupersedeApprovedPauseWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation) error {
+// evaluation and the validated typed synthesis together with the evidence they
+// describe. A nil evidence snapshot preserves the pause's evidence,
+// evaluation and synthesis; a non-nil snapshot replaces all three, so an
+// evaluation or synthesis can never outlive the snapshot it described.
+func (j *Journal) SupersedeApprovedPauseWithResearch(id string, state State, errClass string, evidence *ResearchEvidence, evaluation *ResearchEvaluation, synthesis *ResearchSynthesis) error {
 	if j == nil {
 		return nil
 	}
@@ -421,7 +435,11 @@ func (j *Journal) SupersedeApprovedPauseWithResearch(id string, state State, err
 		finalEvidence = existing.ResearchEvidence
 	}
 	evaluation = evaluationForEvidence(id, evaluation, existing.ResearchEvaluation, finalEvidence, evidence != nil)
+	synthesis = synthesisForEvidence(id, synthesis, existing.ResearchSynthesis, finalEvidence, evidence != nil)
 	if err := ValidateResearchEvaluationForExecution(id, evaluation, finalEvidence); err != nil {
+		return err
+	}
+	if err := ValidateResearchSynthesisForExecution(id, synthesis, finalEvidence); err != nil {
 		return err
 	}
 	now := j.now().UTC()
@@ -432,8 +450,10 @@ func (j *Journal) SupersedeApprovedPauseWithResearch(id string, state State, err
 	if evidence != nil {
 		existing.ResearchEvidence = evidence
 		existing.ResearchEvaluation = evaluation
-	} else if evaluation != nil {
+		existing.ResearchSynthesis = synthesis
+	} else if evaluation != nil || synthesis != nil {
 		existing.ResearchEvaluation = evaluation
+		existing.ResearchSynthesis = synthesis
 	}
 	return j.putExecution(existing, version)
 }
@@ -457,6 +477,33 @@ func evaluationForEvidence(id string, incoming, preserved *ResearchEvaluation, f
 		return preserved
 	}
 	if err := ValidateResearchEvaluationForExecution(id, incoming, finalEvidence); err == nil {
+		return incoming
+	}
+	if replaced {
+		return nil
+	}
+	return preserved
+}
+
+// synthesisForEvidence keeps a persisted synthesis and its evidence snapshot
+// bound to each other.
+//
+//   - A new evidence snapshot invalidates the previous synthesis: the incoming
+//     synthesis must describe the new snapshot, or no synthesis is persisted.
+//   - When the snapshot is preserved (a resumed run that captured no new
+//     evidence while the approval pause holds one), a synthesis that describes
+//     the preserved snapshot is kept.
+//
+// The synthesis is auxiliary data. It must never block a terminal lifecycle
+// write, so an unusable synthesis is dropped instead of failing the write.
+func synthesisForEvidence(id string, incoming, preserved *ResearchSynthesis, finalEvidence *ResearchEvidence, replaced bool) *ResearchSynthesis {
+	if incoming == nil {
+		if replaced {
+			return nil
+		}
+		return preserved
+	}
+	if err := ValidateResearchSynthesisForExecution(id, incoming, finalEvidence); err == nil {
 		return incoming
 	}
 	if replaced {
@@ -778,6 +825,9 @@ func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
 		return er, err
 	}
 	if err := ValidateResearchEvaluationForExecution(er.ID, er.ResearchEvaluation, er.ResearchEvidence); err != nil {
+		return er, err
+	}
+	if err := ValidateResearchSynthesisForExecution(er.ID, er.ResearchSynthesis, er.ResearchEvidence); err != nil {
 		return er, err
 	}
 	return er, nil

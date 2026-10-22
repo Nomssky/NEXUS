@@ -432,7 +432,7 @@ describe('ResearchOutput', () => {
       });
 
       expect(markup).toContain('Synthesis and result text unavailable');
-      expect(markup).toContain('not retained after a restart');
+      expect(markup).toContain('no validated synthesis was persisted for it');
       expect(markup).toContain('Durable execution record.');
       expect(markup).toContain('2026-10-20 10:00 UTC');
       expect(markup).toContain('2026-10-20 10:05 UTC');
@@ -541,6 +541,125 @@ describe('ResearchOutput', () => {
       expect(markup).toContain('Recorded when this execution completed');
       expect(markup).toContain('Synthesis and result text unavailable');
       expect(markup).not.toContain('Checks passed');
+    });
+  });
+
+  describe('durable research synthesis', () => {
+    const durableSynthesis = {
+      status: 'complete' as const,
+      summary: 'Synthesized from the captured source.',
+      evidenceBacked: [
+        {
+          statement: 'The runtime decides and the model proposes.',
+          citations: [
+            {
+              sourceId: 'src-1',
+              source: {
+                index: 1,
+                id: 'src-1',
+                title: 'Nexus capability boundary',
+                url: 'https://docs.example/nexus',
+                source: 'docs.example',
+                snippet: 'The runtime decides; the model proposes.',
+                linkable: true,
+              },
+            },
+          ],
+        },
+      ],
+      inferences: [],
+      conflicts: [],
+      unresolvedQuestions: [],
+    };
+
+    it('renders persisted durable synthesis distinctly from live synthesis', () => {
+      const markup = render({
+        output: undefined,
+        status: undefined,
+        durableState: 'completed',
+        createdAt: '2026-10-20T10:00:00Z',
+        completedAt: '2026-10-20T10:05:30Z',
+        durableSynthesis,
+      });
+
+      expect(markup).toContain('aria-label="Durable research synthesis"');
+      expect(markup).toContain('data-provenance="durable"');
+      expect(markup).toContain('Durable synthesis');
+      expect(markup).toContain('Durable record');
+      expect(markup).toContain('Synthesized from the captured source.');
+      expect(markup).toContain('The runtime decides and the model proposes.');
+      expect(markup).toContain('docs.example/nexus');
+      expect(markup).toContain('Nexus capability boundary');
+      expect(markup).toContain('docs.example · src-1');
+      expect(markup).not.toContain('objective pursued deterministically');
+    });
+
+    it('renders durable synthesis alongside live output', () => {
+      const markup = render({
+        output: COMPLETED_SUMMARY,
+        status: 'completed',
+        durableSynthesis,
+      });
+
+      expect(markup).toContain('aria-label="Durable research synthesis"');
+      expect(markup).toContain('Synthesized from the captured source.');
+      expect(markup).toContain('objective pursued deterministically');
+    });
+
+    it('does not duplicate the answer when the live typed synthesis is present', () => {
+      const markup = render({
+        output: COMPLETED_SUMMARY,
+        status: 'completed',
+        durableSynthesis,
+        findings: {
+          sources: durableSynthesis.evidenceBacked[0].citations.map((c) => c.source),
+          evidencePresent: true,
+          partial: false,
+          typedSynthesis: {
+            status: 'complete',
+            summary: 'Live typed synthesis summary.',
+            evidenceBacked: [
+              {
+                statement: 'Live typed statement.',
+                citations: [
+                  {
+                    sourceId: 'src-1',
+                    source: durableSynthesis.evidenceBacked[0].citations[0].source,
+                  },
+                ],
+              },
+            ],
+            inferences: [],
+            conflicts: [],
+            unresolvedQuestions: [],
+          },
+        },
+      });
+
+      expect(markup).toContain('aria-label="Typed research synthesis"');
+      expect(markup).toContain('Live typed statement.');
+      // The durable copy is the recovery path, not a second rendering of the
+      // same answer while the live one is on screen.
+      expect(markup).not.toContain('aria-label="Durable research synthesis"');
+      expect(markup).not.toContain('Durable record');
+    });
+
+    it('renders partial durable synthesis with unresolved questions', () => {
+      const markup = render({
+        output: undefined,
+        status: undefined,
+        durableState: 'completed',
+        createdAt: '2026-10-20T10:00:00Z',
+        completedAt: '2026-10-20T10:05:30Z',
+        durableSynthesis: {
+          ...durableSynthesis,
+          status: 'partial' as const,
+          unresolvedQuestions: ['Why did step s2 fail?'],
+        },
+      });
+
+      expect(markup).toContain('This answer is partial');
+      expect(markup).toContain('Why did step s2 fail?');
     });
   });
 });

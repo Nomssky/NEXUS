@@ -151,7 +151,7 @@ func TestTerminalWithResearchPersistsEvaluationAtomically(t *testing.T) {
 	}
 	evidence := evaluationEvidence("exec-1")
 	evaluation := evaluationFor("exec-1", evidence)
-	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation, nil); err != nil {
 		t.Fatalf("terminal: %v", err)
 	}
 
@@ -190,7 +190,7 @@ func TestTerminalDropsEvaluationThatDoesNotMatchEvidence(t *testing.T) {
 	evidence := evaluationEvidence("exec-1")
 	evaluation := evaluationFor("exec-1", evidence)
 	evaluation.EvidenceFingerprint = strings.Repeat("a", 64)
-	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation, nil); err != nil {
 		t.Fatalf("terminal: %v", err)
 	}
 	rec, ok, err := j.Get("exec-1")
@@ -218,7 +218,7 @@ func TestTerminalDropsForeignEvaluation(t *testing.T) {
 	evidence := evaluationEvidence("exec-1")
 	evaluation := evaluationFor("exec-1", evidence)
 	evaluation.ExecutionID = "exec-2"
-	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation, nil); err != nil {
 		t.Fatalf("terminal: %v", err)
 	}
 	rec, _, err := j.Get("exec-1")
@@ -237,14 +237,14 @@ func TestSupersedeReplacesEvidenceAndEvaluationTogether(t *testing.T) {
 	}
 	pauseEvidence := evaluationEvidence("exec-1")
 	pauseEvaluation := evaluationFor("exec-1", pauseEvidence)
-	if err := j.TerminalWithResearch("exec-1", StateFailed, ApprovalRequiredClass, pauseEvidence, pauseEvaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-1", StateFailed, ApprovalRequiredClass, pauseEvidence, pauseEvaluation, nil); err != nil {
 		t.Fatalf("pause terminal: %v", err)
 	}
 
 	finalEvidence := evaluationEvidence("exec-1")
 	finalEvidence.Sources[0].Title = "Final title"
 	finalEvaluation := evaluationFor("exec-1", finalEvidence)
-	if err := j.SupersedeApprovedPauseWithResearch("exec-1", StateCompleted, "", finalEvidence, finalEvaluation); err != nil {
+	if err := j.SupersedeApprovedPauseWithResearch("exec-1", StateCompleted, "", finalEvidence, finalEvaluation, nil); err != nil {
 		t.Fatalf("supersede: %v", err)
 	}
 	rec, _, err := j.Get("exec-1")
@@ -267,7 +267,7 @@ func TestSupersedeKeepsPauseEvaluationWhenResumedRunHasNoEvidence(t *testing.T) 
 	}
 	pauseEvidence := evaluationEvidence("exec-1")
 	pauseEvaluation := evaluationFor("exec-1", pauseEvidence)
-	if err := j.TerminalWithResearch("exec-1", StateFailed, ApprovalRequiredClass, pauseEvidence, pauseEvaluation); err != nil {
+	if err := j.TerminalWithResearch("exec-1", StateFailed, ApprovalRequiredClass, pauseEvidence, pauseEvaluation, nil); err != nil {
 		t.Fatalf("pause terminal: %v", err)
 	}
 
@@ -276,7 +276,7 @@ func TestSupersedeKeepsPauseEvaluationWhenResumedRunHasNoEvidence(t *testing.T) 
 	// snapshot. The pause's evidence-bound evaluation is kept, and the
 	// terminal write still succeeds.
 	resumedEvaluation := evaluationWithoutEvidence("exec-1")
-	if err := j.SupersedeApprovedPauseWithResearch("exec-1", StateCompleted, "", nil, resumedEvaluation); err != nil {
+	if err := j.SupersedeApprovedPauseWithResearch("exec-1", StateCompleted, "", nil, resumedEvaluation, nil); err != nil {
 		t.Fatalf("supersede: %v", err)
 	}
 	rec, _, err := j.Get("exec-1")
@@ -308,7 +308,7 @@ func TestTerminalResearchIsFirstWinsUnderConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation)
+			_ = j.TerminalWithResearch("exec-1", StateCompleted, "", evidence, evaluation, nil)
 		}()
 	}
 	wg.Wait()

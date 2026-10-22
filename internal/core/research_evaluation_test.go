@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
@@ -38,6 +39,68 @@ func coreSampleEvaluation(executionID string, evidence *execjournal.ResearchEvid
 			SourceID: "src-1",
 		}},
 		Limitations: []string{"Citation integrity proves reference resolution only."},
+	}
+}
+
+// A failed durable write must not yield a success response that falsely
+// implies the synthesis is durable. The process-local result still carries the
+// live synthesis, but the journal record must not claim completion, evidence
+// or synthesis.
+func TestEngineSynthesisWriteFailureNeverClaimsDurableSynthesis(t *testing.T) {
+	dir := t.TempDir()
+	base, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	failing := failOnPutStore{Store: base, marker: `"research_synthesis"`}
+	j := execjournal.New(failing, nil)
+	e, err := NewEngine(nil, WithExecutionJournal(j))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+
+	evidence := coreSampleEvidence("Not durable")
+	synthesis := &executor.ResearchSynthesis{
+		Status:  executor.ResearchSynthesisComplete,
+		Summary: "Synthesized from the captured source.",
+		EvidenceBacked: []executor.ResearchEvidenceStatement{{
+			Statement: "The runtime decides and the model proposes.", SourceIDs: []string{"src-1"},
+		}},
+	}
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-core-synthesis-fail", Context: NewRequestContext("exec-core-synthesis-fail", "biz-1", "actor-1"),
+		Intent: "research", Handler: func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
+			return &executor.Outcome{
+				Status: "completed", Output: "done",
+				ResearchEvidence: evidence, ResearchSynthesis: synthesis,
+			}, nil
+		},
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	res := awaitResult(t, e, "exec-core-synthesis-fail")
+	if res.Status != "completed" {
+		t.Fatalf("process-local result: %+v", res)
+	}
+	// Give journalFinalize time to fail and leave the record untouched.
+	time.Sleep(20 * time.Millisecond)
+	rec, ok, err := j.Get("exec-core-synthesis-fail")
+	if err != nil || !ok {
+		t.Fatalf("journal get: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Terminal() || rec.CompletedAt != nil {
+		t.Fatalf("failed atomic write must not claim completion: %+v", rec)
+	}
+	if rec.ResearchSynthesis != nil {
+		t.Fatalf("failed atomic write must not claim a durable synthesis: %+v", rec.ResearchSynthesis)
+	}
+	if rec.ResearchEvidence != nil {
+		t.Fatalf("failed atomic write must not claim durable evidence: %+v", rec.ResearchEvidence)
 	}
 }
 

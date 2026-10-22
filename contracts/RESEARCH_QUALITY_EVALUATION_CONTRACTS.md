@@ -53,7 +53,7 @@ never as a failure of the research itself.
 | `execution_id` | the execution this verdict belongs to; never another |
 | `evidence_version` / `evidence_count` | the evidence snapshot that was evaluated (`0`/`0` when no snapshot existed) |
 | `evidence_fingerprint` | SHA-256 over the normalized evidence JSON; binds the verdict to that exact snapshot |
-| `synthesis_status` / `synthesis_fingerprint` | the synthesis that was evaluated. The synthesis itself stays process-local; only its status and fingerprint survive |
+| `synthesis_status` / `synthesis_fingerprint` | the synthesis that was evaluated. Since v59 the validated synthesis itself is also persisted (see `RESEARCH_SYNTHESIS_DURABLE_CONTRACTS.md`); this verdict still records only its status and fingerprint |
 | `status` | overall verdict (§2) |
 | `dimensions` | exactly eight dimension results (§3) |
 | `findings` | stable machine-readable findings (§4) |

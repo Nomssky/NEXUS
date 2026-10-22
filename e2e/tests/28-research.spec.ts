@@ -343,20 +343,39 @@ test.describe('Research Workspace E2E', () => {
     // Grounded terminal timestamp survives too.
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
 
-    // Honest post-restart state: the typed synthesis and result text are
-    // process-local and are not regenerated from durable evidence. The UI says
+    // The validated synthesis IS durable: it survives the restart alongside the
+    // evidence it was validated against, and it is rendered as a durable record
+    // (not regenerated, not re-derived from prose).
+    const durableSynthesis = output.locator('[aria-label="Durable research synthesis"]');
+    await expect(durableSynthesis).toBeVisible({ timeout: 20000 });
+    await expect(durableSynthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(durableSynthesis.getByText('Durable record')).toBeVisible();
+    await expect(
+      durableSynthesis.getByText('Synthesized from 2 captured source(s) in this execution.')
+    ).toBeVisible();
+    await expect(
+      durableSynthesis.getByText('The captured source records (2) describe the requested subject.')
+    ).toBeVisible();
+    // Citations resolve against the durable source records, never from the model.
+    await expect(
+      durableSynthesis.getByRole('link', { name: 'Nexus capability boundary' })
+    ).toHaveAttribute('href', 'https://docs.example/nexus');
+    await expect(durableSynthesis.getByText('docs.example · src-1')).toBeVisible();
+
+    // Honest post-restart state: the raw execution result text is still
+    // process-local and is not regenerated from durable evidence. The UI says
     // so instead of fabricating an answer or claiming there was never a result.
-    await expect(output.getByText('Synthesis and result text unavailable')).toBeVisible();
-    await expect(output.locator('[data-synthesis-status]')).toHaveCount(0);
+    await expect(output.getByText('Execution result text unavailable')).toBeVisible();
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
 
     // The deterministic verdict IS durable: it survives the restart with its
-    // evidence binding, and the panel says that the synthesis it described is
-    // no longer available in this process.
+    // evidence binding, and the panel states that the synthesis shown next to
+    // it is the same persisted snapshot.
     const quality = output.locator('[aria-label="Research quality evaluation"]');
     await expect(quality).toBeVisible({ timeout: 20000 });
     await expect(quality.getByText('Recorded when this execution completed')).toBeVisible();
+    await expect(quality.getByText('the same persisted snapshot')).toBeVisible();
     await expect(quality.locator('[data-dimension="citation_integrity"]')).toBeVisible();
     await expect(quality).not.toContainText('%');
   });
@@ -543,10 +562,21 @@ test.describe('Research Workspace E2E', () => {
     // Grounded terminal timestamp survives too.
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });
 
-    // Honest post-restart state: synthesis and result text unavailable,
-    // evidence and durable plan intact.
-    await expect(output.getByText('Synthesis and result text unavailable')).toBeVisible();
-    await expect(output.locator('[data-synthesis-status]')).toHaveCount(0);
+    // The validated synthesis IS durable: it survives the restart with the
+    // evidence and evaluation it was validated against.
+    const durableSynthesis = output.locator('[aria-label="Durable research synthesis"]');
+    await expect(durableSynthesis).toBeVisible({ timeout: 20000 });
+    await expect(durableSynthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(
+      durableSynthesis.getByText('Synthesized from 4 captured source(s) in this execution.')
+    ).toBeVisible();
+    await expect(
+      durableSynthesis.getByRole('link', { name: 'Nexus agent model' })
+    ).toHaveAttribute('href', 'https://docs.example/agents');
+
+    // Honest post-restart state: the raw result text is unavailable, the
+    // durable synthesis, evidence and plan are intact.
+    await expect(output.getByText('Execution result text unavailable')).toBeVisible();
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });

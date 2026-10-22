@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/Nomssky/NEXUS/internal/execjournal"
+	"github.com/Nomssky/NEXUS/internal/executor"
 )
 
 // journalState maps an engine terminal Response status to the durable journal
@@ -59,9 +60,10 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 	state, class := journalState(result), journalErrorClass(result)
 	evidence := researchEvidenceOf(result)
 	evaluation := researchEvaluationOf(id, result)
+	synthesis := researchSynthesisOf(id, result)
 
 	if isApprovalWaiting(result) {
-		if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation); terr != nil {
+		if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation, synthesis); terr != nil {
 			e.metrics.JournalWriteFailure()
 			return
 		}
@@ -76,13 +78,13 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 
 	// A real outcome. ErrNotApprovalPause only means this execution was not
 	// parked on a pause, which is the ordinary case.
-	if serr := e.journal.SupersedeApprovedPauseWithResearch(id, state, class, evidence, evaluation); serr == nil {
+	if serr := e.journal.SupersedeApprovedPauseWithResearch(id, state, class, evidence, evaluation, synthesis); serr == nil {
 		return
 	} else if !errors.Is(serr, execjournal.ErrNotApprovalPause) {
 		e.metrics.JournalWriteFailure()
 		return
 	}
-	if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation); terr != nil {
+	if terr := e.journal.TerminalWithResearch(id, state, class, evidence, evaluation, synthesis); terr != nil {
 		e.metrics.JournalWriteFailure()
 	}
 }
@@ -116,4 +118,27 @@ func researchEvaluationOf(id string, result *Response) *execjournal.ResearchEval
 		return nil
 	}
 	return evaluation
+}
+
+// researchSynthesisOf returns the validated typed synthesis carried by a
+// terminal response. The journal validates it against the evidence snapshot
+// again before writing.
+//
+// The synthesis is auxiliary: a defect in it must never block the durable
+// terminal record. A synthesis that does not bind to the exact evidence
+// snapshot is dropped instead of persisted, so the durable record can never
+// claim a synthesis for evidence it did not describe.
+func researchSynthesisOf(id string, result *Response) *execjournal.ResearchSynthesis {
+	if result == nil || result.Outcome == nil {
+		return nil
+	}
+	synthesis := result.Outcome.ResearchSynthesis
+	if synthesis == nil {
+		return nil
+	}
+	durable := executor.DurableResearchSynthesis(synthesis, id, result.Outcome.ResearchEvidence)
+	if err := execjournal.ValidateResearchSynthesisForExecution(id, durable, result.Outcome.ResearchEvidence); err != nil {
+		return nil
+	}
+	return durable
 }

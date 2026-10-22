@@ -44,7 +44,11 @@ type durableExecutionView struct {
 	// ResearchEvaluation is the persisted deterministic quality verdict,
 	// returned only by the single-execution detail read alongside its evidence.
 	ResearchEvaluation *execjournal.ResearchEvaluation `json:"research_evaluation,omitempty"`
-	Recovery           *durableRecoveryView            `json:"recovery,omitempty"`
+	// ResearchSynthesis is the persisted validated typed synthesis, returned
+	// only by the single-execution detail read alongside the evidence and
+	// evaluation it describes.
+	ResearchSynthesis *execjournal.ResearchSynthesis `json:"research_synthesis,omitempty"`
+	Recovery          *durableRecoveryView           `json:"recovery,omitempty"`
 	// Approvals is the durable approval history for THIS execution, in the
 	// order it was recorded. It is omitted entirely when the execution never
 	// went through an approval gate, so an unapproved execution's response is
@@ -114,6 +118,7 @@ func durableDetailView(er execjournal.ExecutionRecord) durableExecutionView {
 	v := durableView(er)
 	v.ResearchEvidence = er.ResearchEvidence
 	v.ResearchEvaluation = er.ResearchEvaluation
+	v.ResearchSynthesis = er.ResearchSynthesis
 	return v
 }
 

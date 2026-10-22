@@ -21,12 +21,17 @@ import styles from './ResearchQuality.module.css';
 interface ResearchQualityProps {
   evaluation: ResearchEvaluation;
   /**
-   * True when the verdict was recorded at completion and the typed synthesis
-   * it described is no longer available in this process (e.g. after a
-   * restart). The panel then says so instead of implying the answer is still
-   * on screen.
+   * True when the verdict was recorded at completion and is now being read back
+   * from the durable record (e.g. after a restart). The panel then says so
+   * instead of implying the verdict is live state.
    */
   recorded?: boolean;
+  /**
+   * True when the persisted synthesis this verdict describes is also available
+   * and rendered. The panel then notes that the synthesis shown alongside it is
+   * the same persisted snapshot, not a regenerated answer.
+   */
+  synthesisAvailable?: boolean;
 }
 
 const DIMENSION_LABELS: Record<ResearchEvaluationDimensionId, string> = {
@@ -70,6 +75,7 @@ const DIMENSION_STATUS_LABELS: Record<ResearchEvaluationDimensionStatus, string>
 export const ResearchQuality: React.FC<ResearchQualityProps> = ({
   evaluation,
   recorded = false,
+  synthesisAvailable = false,
 }) => {
   const failed = evaluation.status === 'failed';
   const synthesisStatus = evaluation.synthesis_status;
@@ -105,9 +111,9 @@ export const ResearchQuality: React.FC<ResearchQualityProps> = ({
 
       {showSynthesisNote && (
         <p className={styles.recordedNote}>
-          Recorded when this execution completed. The typed synthesis is no longer
-          available in this process, so statement and citation text cannot be
-          re-displayed; only this deterministic verdict survived.
+          {synthesisAvailable
+            ? 'Recorded when this execution completed. The synthesis shown alongside is the same persisted snapshot, read back from the durable execution record — it is not regenerated.'
+            : 'Recorded when this execution completed. The typed synthesis is not available for this record, so only this deterministic verdict is shown.'}
         </p>
       )}
 
