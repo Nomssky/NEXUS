@@ -6,7 +6,7 @@
  * with SSE providing real-time hints that are reconciled on reconnect.
  */
 
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { VirtualHQ, type ZoneId } from '../components/VirtualHQ/VirtualHQ';
 import { Badge } from '../components/primitives';
@@ -14,7 +14,14 @@ import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
 import { ResearchInput } from '../components/Research/ResearchInput';
 import { ResearchOutput } from '../components/Research/ResearchOutput';
 import { ResearchEvidence } from '../components/Research/ResearchEvidence';
-import { useIntelligence, useIntelligenceTrace, useRecoveryExecutions, useEventStream } from '@/api/hooks';
+import {
+  queryKeys,
+  useIntelligence,
+  useIntelligenceTrace,
+  useRecoveryExecution,
+  useRecoveryExecutions,
+  useEventStream,
+} from '@/api/hooks';
 import type { DurableExecution, ExecutionStatus } from '@/types/api';
 import {
   extractToolActivity,
@@ -75,12 +82,34 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
     }
   );
 
+  // Durable execution detail for the active execution: the only read that
+  // exposes the persisted research evidence and the real terminal timestamp.
+  // A failed read (e.g. a 404 from an older backend) is tolerated silently —
+  // the components then fall back to the process-local execution output.
+  const { data: recoveryDetail } = useRecoveryExecution(activeExecutionId, businessId);
+
   const { data: trace } = useIntelligenceTrace(
     activeExecutionId || '',
     businessId,
     { limit: 100 },
     { enabled: !!activeExecutionId }
   );
+
+  // Refresh durable reads when the execution reaches a terminal state: that is
+  // the moment the journal writes completed_at and the evidence snapshot, and
+  // neither should wait for the next poll to appear.
+  useEffect(() => {
+    const status = execution?.status;
+    const terminal =
+      status === 'completed' ||
+      status === 'failed' ||
+      status === 'cancelled' ||
+      status === 'timed_out' ||
+      status === 'unknown';
+    if (!terminal) return;
+    queryClient.invalidateQueries({ queryKey: queryKeys.recoveryExecution(activeExecutionId || '', businessId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.recoveryExecutions(businessId) });
+  }, [execution?.status, activeExecutionId, businessId, queryClient]);
 
   // SSE: reconcile authoritative state on reconnect; SSE is a hint, never truth.
   const { connectionState, retryDelayMs } = useEventStream(businessId, {
@@ -173,6 +202,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               toolActivity={toolActivity}
               isLoading={isLoading}
               recoveryError={recoveryError}
+              recoveryDetail={recoveryDetail}
               traceExecutionId={selectedExecution}
               onViewTrace={handleViewTrace}
               onExecutionSelect={handleExecutionSelect}
@@ -208,6 +238,7 @@ interface ResearchZoneProps {
   toolActivity: ResearchToolActivity[];
   isLoading: boolean;
   recoveryError: boolean;
+  recoveryDetail: DurableExecution | undefined;
   traceExecutionId: string | null;
   onViewTrace: (executionId: string) => void;
   onExecutionSelect: (executionId: string) => void;
@@ -225,6 +256,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   toolActivity,
   isLoading,
   recoveryError,
+  recoveryDetail,
   traceExecutionId,
   onViewTrace,
   onExecutionSelect,
@@ -265,6 +297,9 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             error={execution?.error}
             durationMs={execution?.duration_ms}
             isLoading={isLoading}
+            durableState={recoveryDetail?.state}
+            createdAt={recoveryDetail?.created_at}
+            completedAt={recoveryDetail?.completed_at}
           />
         </section>
 
@@ -274,8 +309,9 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
           </h2>
           <ResearchEvidence
             result={parsedResult.webSearch}
+            durableEvidence={recoveryDetail?.research_evidence}
             toolActivity={toolActivity}
-            status={execution?.status}
+            status={execution?.status ?? recoveryDetail?.state}
             executionId={activeExecutionId ?? undefined}
             onViewTrace={onViewTrace}
           />

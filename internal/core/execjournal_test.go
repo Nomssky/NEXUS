@@ -842,3 +842,174 @@ func TestCompletedAndDeniedIDsCannotBeReAdmitted(t *testing.T) {
 		}
 	}
 }
+
+// ---- v52: research evidence is atomic with the terminal record -----------
+
+func coreSampleEvidence(title string) *execjournal.ResearchEvidence {
+	return &execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+		Sources: []execjournal.ResearchSource{{
+			Title: title, URL: "https://docs.example/nexus", Source: "docs.example",
+			Snippet: "The runtime decides; the model proposes.",
+		}},
+	}
+}
+
+func waitForJournalState(t *testing.T, j *execjournal.Journal, id string, want execjournal.State) execjournal.ExecutionRecord {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, ok, err := j.Get(id)
+		if err != nil {
+			t.Fatalf("journal get: %v", err)
+		}
+		if ok && rec.State == want {
+			return rec
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	rec, _, _ := j.Get(id)
+	t.Fatalf("timed out waiting for journal state %q, got %+v", want, rec)
+	return execjournal.ExecutionRecord{}
+}
+
+// The engine writes the agent's validated source snapshot in the same durable
+// update as the terminal state, and the terminal timestamp is a real lifecycle
+// fact that survives a restart.
+func TestEnginePersistsResearchEvidenceWithTerminalState(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	j := execjournal.New(st, nil)
+	e, err := NewEngine(nil, WithExecutionJournal(j))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = e.Stop(ctx) })
+
+	evidence := coreSampleEvidence("Nexus capability boundary")
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-core-evidence", Context: NewRequestContext("exec-core-evidence", "biz-1", "actor-1"),
+		Intent: "research", Handler: func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
+			return &executor.Outcome{Status: "completed", Output: "done", ResearchEvidence: evidence}, nil
+		},
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if res := awaitResult(t, e, "exec-core-evidence"); res.Status != "completed" {
+		t.Fatalf("process-local result: %+v", res)
+	}
+	rec := waitForJournalState(t, j, "exec-core-evidence", execjournal.StateCompleted)
+	if rec.CompletedAt == nil {
+		t.Fatal("a terminal record must carry completed_at")
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Count != 1 ||
+		rec.ResearchEvidence.Sources[0].Title != "Nexus capability boundary" {
+		t.Fatalf("terminal evidence missing: %+v", rec.ResearchEvidence)
+	}
+
+	// A fresh process over the same durable directory must expose exactly the
+	// same evidence and terminal timestamp.
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	st2, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	j2 := execjournal.New(st2, nil)
+	if _, err := j2.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	rec2, ok, err := j2.Get("exec-core-evidence")
+	if err != nil || !ok {
+		t.Fatalf("reopened get: ok=%v err=%v", ok, err)
+	}
+	if rec2.CompletedAt == nil || !rec2.CompletedAt.Equal(*rec.CompletedAt) {
+		t.Fatalf("completed_at changed across restart: %v -> %v", rec.CompletedAt, rec2.CompletedAt)
+	}
+	if rec2.ResearchEvidence == nil || rec2.ResearchEvidence.Sources[0].URL != "https://docs.example/nexus" {
+		t.Fatalf("evidence did not survive restart: %+v", rec2.ResearchEvidence)
+	}
+}
+
+// If the atomic terminal-with-evidence write fails, the execution is NOT
+// durably completed and exposes no evidence. Recovery classifies the interrupted
+// record unknown and does not re-run the handler. A process-local result cannot
+// be promoted to durable evidence by a later write.
+func TestEngineEvidenceWriteFailureNeverClaimsDurableEvidenceOrReplays(t *testing.T) {
+	dir := t.TempDir()
+	base, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	failing := failOnPutStore{Store: base, marker: `"research_evidence"`}
+	j := execjournal.New(failing, nil)
+	e, err := NewEngine(nil, WithExecutionJournal(j))
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	ctx := context.Background()
+	if err := e.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	var ran int
+	if err := e.SubmitRequest(&Request{
+		ID: "exec-core-evidence-fail", Context: NewRequestContext("exec-core-evidence-fail", "biz-1", "actor-1"),
+		Intent: "research", Handler: func(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
+			ran++
+			return &executor.Outcome{Status: "completed", Output: "done",
+				ResearchEvidence: coreSampleEvidence("Not durable")}, nil
+		},
+	}); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	res := awaitResult(t, e, "exec-core-evidence-fail")
+	if res.Status != "completed" {
+		t.Fatalf("process-local result: %+v", res)
+	}
+	// Give journalFinalize time to fail and leave the record untouched.
+	time.Sleep(20 * time.Millisecond)
+	rec, ok, err := j.Get("exec-core-evidence-fail")
+	if err != nil || !ok {
+		t.Fatalf("journal get: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Terminal() || rec.CompletedAt != nil || rec.ResearchEvidence != nil {
+		t.Fatalf("failed atomic write must not claim completion/evidence: %+v", rec)
+	}
+	if err := e.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// Restart: recovery must classify the interrupted record unknown, not
+	// completed, and it must not silently re-run the handler.
+	st2, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	j2 := execjournal.New(st2, nil)
+	if _, err := j2.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	rec2, ok, err := j2.Get("exec-core-evidence-fail")
+	if err != nil || !ok {
+		t.Fatalf("reopened get: ok=%v err=%v", ok, err)
+	}
+	if rec2.State != execjournal.StateUnknown {
+		t.Fatalf("interrupted record must be unknown, got %q", rec2.State)
+	}
+	if rec2.CompletedAt != nil || rec2.ResearchEvidence != nil {
+		t.Fatalf("recovered record must not fabricate completion/evidence: %+v", rec2)
+	}
+	if ran != 1 {
+		t.Fatalf("the handler must not be replayed, ran %d times", ran)
+	}
+}

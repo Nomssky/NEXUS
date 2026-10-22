@@ -613,8 +613,41 @@ export interface DurableExecution {
   error_class?: string;
   created_at: string;
   updated_at: string;
+  /**
+   * The real terminal transition time. Omitted for records written before
+   * v52 and for executions that never reached a terminal transition, so the
+   * UI can never pass `updated_at` off as a completion time.
+   */
+  completed_at?: string;
+  /**
+   * Durable web.search source snapshot. Returned only by the single-execution
+   * detail read; the list stays bounded and never repeats it.
+   */
+  research_evidence?: DurableResearchEvidence;
   recovery?: DurableRecoveryView;
   approvals?: DurableApprovalView[];
+}
+
+// ---- Durable research evidence (v52) ----
+// Mirrors internal/execjournal.ResearchEvidence: one normalized provider
+// record per web.search call, bounded, and validated wholesale at write time.
+// Dates and authors are deliberately absent — the provider envelope has no
+// grounded value for them, so none is exposed.
+
+export interface DurableResearchSource {
+  title: string;
+  url: string;
+  source: string;
+  snippet: string;
+}
+
+export interface DurableResearchEvidence {
+  version: number;
+  capability: string;
+  operation: string;
+  /** The count declared by the provider envelope; equals sources.length. */
+  count: number;
+  sources: DurableResearchSource[];
 }
 
 export interface DurableExecutionList {

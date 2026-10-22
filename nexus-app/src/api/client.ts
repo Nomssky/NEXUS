@@ -26,6 +26,7 @@ import type {
   StatusResponse,
   PaginationParams,
   APIError,
+  DurableExecution,
   DurableExecutionList,
 } from '../types/api';
 
@@ -247,6 +248,17 @@ class NexusAPIClient {
     if (params?.offset) searchParams.set('offset', params.offset.toString());
     if (params?.divisionId) searchParams.set('division_id', params.divisionId);
     return this.request<DurableExecutionList>('GET', `/recovery/executions?${searchParams}`);
+  }
+
+  // Single-execution recovery detail. This is the only read that exposes the
+  // durable research_evidence snapshot and the real completed_at timestamp.
+  // A 404 on an older backend is a normal "not exposed" signal: callers fall
+  // back to the process-local execution read instead of treating it as fatal.
+  async getRecoveryExecution(id: string, businessId: string): Promise<DurableExecution> {
+    return this.request<DurableExecution>(
+      'GET',
+      `/recovery/executions/${encodeURIComponent(id)}?business_id=${businessId}`
+    );
   }
 
   // Approvals

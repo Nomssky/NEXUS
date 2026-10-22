@@ -7,6 +7,13 @@
  * - Structured output is recognized only when parseResearchResult finds the
  *   documented web.search envelope; sources are rendered by ResearchEvidence.
  * - Malformed or unrecognized output is shown verbatim as text.
+ * - Timestamps shown here come only from the durable recovery read's real
+ *   lifecycle fields (created_at / completed_at). They are never inferred from
+ *   updated_at or client-side time, and are omitted entirely when the durable
+ *   record cannot provide them.
+ * - When the process-local execution read is unavailable but the durable read
+ *   proves a terminal state (e.g. after a restart), the panel reports the
+ *   result text as unavailable instead of pretending there is no result.
  */
 
 import React, { useMemo } from 'react';
@@ -21,7 +28,20 @@ interface ResearchOutputProps {
   error?: ExecutionStatus['error'];
   durationMs?: number;
   isLoading?: boolean;
+  /** Durable state from the recovery detail read, when that read is available. */
+  durableState?: string;
+  /** Real lifecycle timestamps from the durable record. Undefined means unavailable. */
+  createdAt?: string | null;
+  completedAt?: string | null;
 }
+
+const DURABLE_TERMINAL_STATES = new Set([
+  'completed',
+  'failed',
+  'cancelled',
+  'timed_out',
+  'unknown',
+]);
 
 export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   output,
@@ -29,6 +49,9 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   error,
   durationMs,
   isLoading = false,
+  durableState,
+  createdAt,
+  completedAt,
 }) => {
   const parsed = useMemo(() => parseResearchResult(output), [output]);
 
@@ -49,6 +72,44 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   }
 
   if (parsed.kind === 'empty') {
+    // No process-local status means the execution read provided nothing (e.g.
+    // the result is gone after a backend restart). The durable read is then
+    // the honest source: show the persisted state and say plainly that the
+    // result text itself is unavailable.
+    const durableTerminal =
+      status === undefined && durableState !== undefined && DURABLE_TERMINAL_STATES.has(durableState);
+    if (durableTerminal) {
+      const copy = durableUnavailableCopy(durableState);
+      const details = lifecycleDetails(createdAt, completedAt);
+      return (
+        <Card variant="outlined" padding="lg">
+          <div className={styles.empty}>
+            <div className={styles.resultHeader}>
+              <div className={styles.resultHeading}>
+                <h3 className={styles.title}>{copy.title}</h3>
+                <p className={styles.provenance}>Durable execution record.</p>
+              </div>
+              <Badge variant={getStatusVariant(durableState)} size="sm">
+                {statusLabel(durableState)}
+              </Badge>
+            </div>
+            <p>{copy.description}</p>
+            <span>{copy.hint}</span>
+            {details.length > 0 && (
+              <dl className={styles.metaGrid} aria-label="Execution details">
+                {details.map((detail) => (
+                  <div key={detail.label} className={styles.metaItem}>
+                    <dt>{detail.label}</dt>
+                    <dd>{detail.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+          </div>
+        </Card>
+      );
+    }
+
     const empty = emptyState(status, error?.message);
     return (
       <Card variant="outlined" padding="lg">
@@ -67,7 +128,7 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   const runtimeStatus = status || parsed.runtimeState || 'unknown';
   const isFailure =
     runtimeStatus === 'failed' || runtimeStatus === 'cancelled' || runtimeStatus === 'timed_out';
-  const details = buildDetails(parsed.objective, parsed.agent, parsed.metrics, durationMs);
+  const details = buildDetails(parsed.objective, parsed.agent, parsed.metrics, durationMs, createdAt, completedAt);
 
   return (
     <Card variant={isFailure ? 'outlined' : 'default'} padding="lg">
@@ -142,7 +203,9 @@ function buildDetails(
   objective: string | undefined,
   agent: string | undefined,
   metrics: ReturnType<typeof parseResearchResult>['metrics'],
-  durationMs: number | undefined
+  durationMs: number | undefined,
+  createdAt?: string | null,
+  completedAt?: string | null
 ): DetailItem[] {
   const details: DetailItem[] = [];
   if (objective) details.push({ label: 'Objective', value: objective });
@@ -166,7 +229,53 @@ function buildDetails(
   if (metrics.replans !== undefined && metrics.replans > 0) {
     details.push({ label: 'Replans', value: String(metrics.replans) });
   }
+  details.push(...lifecycleDetails(createdAt, completedAt));
   return details;
+}
+
+/**
+ * Lifecycle timestamps from the durable record only. A record written before
+ * v52 — or a non-terminal execution — has no completed_at, and the UI must
+ * omit it instead of substituting updated_at or the current clock.
+ */
+function lifecycleDetails(createdAt?: string | null, completedAt?: string | null): DetailItem[] {
+  const details: DetailItem[] = [];
+  const submitted = formatTimestamp(createdAt);
+  if (submitted) details.push({ label: 'Submitted', value: submitted });
+  const finished = formatTimestamp(completedAt);
+  if (finished) details.push({ label: 'Finished', value: finished });
+  return details;
+}
+
+function formatTimestamp(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  // Deterministic UTC rendering of the stored value; no local timezone shift.
+  return `${date.toISOString().replace('T', ' ').slice(0, 16)} UTC`;
+}
+
+function durableUnavailableCopy(state: string): {
+  title: string;
+  description: string;
+  hint: string;
+} {
+  const hint =
+    'Persisted source records are listed separately when the execution captured them.';
+  if (state === 'completed') {
+    return {
+      title: 'Result text unavailable',
+      description:
+        'This execution completed, but its result text is not available after a restart.',
+      hint,
+    };
+  }
+  return {
+    title: 'Result text unavailable',
+    description:
+      'This execution is no longer running, and its result text is not available after a restart.',
+    hint,
+  };
 }
 
 function emptyState(

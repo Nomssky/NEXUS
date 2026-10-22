@@ -2,11 +2,24 @@ package execjournal
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
+
+type evidenceWriteFailStore struct {
+	store.Store
+	marker string
+}
+
+func (s evidenceWriteFailStore) Put(r *store.Record) error {
+	if r != nil && r.Type == recordTypeExecution && strings.Contains(string(r.Data), s.marker) {
+		return errors.New("injected evidence write failure")
+	}
+	return s.Store.Put(r)
+}
 
 func fixedClock() func() time.Time {
 	return func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }
@@ -904,5 +917,172 @@ func TestCorruptRecordIsNotMistakenForAbsence(t *testing.T) {
 	// An unrelated missing record is still plain absence, never a failure.
 	if _, _, err := j.Get("never-existed"); err != nil {
 		t.Fatalf("absence must not be reported as an error, got %v", err)
+	}
+}
+
+func sampleEvidence(title string) *ResearchEvidence {
+	return &ResearchEvidence{
+		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 1,
+		Sources: []ResearchSource{{Title: title, URL: "https://example.test/source", Source: "example.test", Snippet: "bounded snippet"}},
+	}
+}
+
+// Evidence is written atomically with the terminal state, carries the real
+// terminal timestamp, and survives reopening the durable store.
+func TestTerminalWithEvidenceSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStoreWithClock(dir, fixedClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := New(st, fixedClock())
+	if err := j.Accepted("exec-evidence", "biz-1", "div-1", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.TerminalWithEvidence("exec-evidence", StateCompleted, "", sampleEvidence("Nexus")); err != nil {
+		t.Fatalf("terminal with evidence: %v", err)
+	}
+	rec, ok, err := j.Get("exec-evidence")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if rec.State != StateCompleted || rec.CompletedAt == nil {
+		t.Fatalf("terminal state/timestamp missing: %+v", rec)
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Count != 1 ||
+		rec.ResearchEvidence.Sources[0].Title != "Nexus" {
+		t.Fatalf("evidence not recorded: %+v", rec.ResearchEvidence)
+	}
+	if rec.CompletedAt.Before(rec.CreatedAt) {
+		t.Fatalf("completed_at must not precede created_at: %v < %v", rec.CompletedAt, rec.CreatedAt)
+	}
+
+	// Restart: reopen the same durable directory with a fresh journal.
+	st2, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j2 := New(st2, nil)
+	rec2, ok, err := j2.Get("exec-evidence")
+	if err != nil || !ok {
+		t.Fatalf("reopen get: ok=%v err=%v", ok, err)
+	}
+	if rec2.CompletedAt == nil || !rec2.CompletedAt.Equal(*rec.CompletedAt) {
+		t.Fatalf("completed_at changed across restart: %v -> %v", rec.CompletedAt, rec2.CompletedAt)
+	}
+	if rec2.ResearchEvidence == nil || rec2.ResearchEvidence.Sources[0].URL != "https://example.test/source" {
+		t.Fatalf("evidence did not survive restart: %+v", rec2.ResearchEvidence)
+	}
+}
+
+// An approval pause is provisionally terminal. Its pause timestamp and evidence
+// are replaced by the real final outcome when the pause is superseded.
+func TestSupersedeApprovedPauseUpdatesTimestampsAndEvidence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	clock := func() time.Time { return now }
+	j := New(store.NewMemStore(), clock)
+	if err := j.Accepted("exec-pause", "biz-1", "", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.TerminalWithEvidence("exec-pause", StateFailed, ApprovalRequiredClass, sampleEvidence("Before pause")); err != nil {
+		t.Fatal(err)
+	}
+	paused, _, _ := j.Get("exec-pause")
+	if paused.CompletedAt == nil {
+		t.Fatal("the provisional pause must carry its transition time")
+	}
+	pauseTime := *paused.CompletedAt
+
+	now = now.Add(5 * time.Minute)
+	if err := j.SupersedeApprovedPauseWithEvidence("exec-pause", StateCompleted, "", sampleEvidence("After resume")); err != nil {
+		t.Fatal(err)
+	}
+	final, _, _ := j.Get("exec-pause")
+	if final.State != StateCompleted || final.CompletedAt == nil {
+		t.Fatalf("final state missing: %+v", final)
+	}
+	if !final.CompletedAt.After(pauseTime) {
+		t.Fatalf("final completed_at must replace the pause time: %v -> %v", pauseTime, final.CompletedAt)
+	}
+	if final.ResearchEvidence == nil || final.ResearchEvidence.Sources[0].Title != "After resume" {
+		t.Fatalf("final evidence was not replaced: %+v", final.ResearchEvidence)
+	}
+}
+
+// A resumed run that captured no new evidence must not erase evidence captured
+// before the pause.
+func TestSupersedeApprovedPausePreservesPauseEvidenceWhenFinalIsNil(t *testing.T) {
+	j := New(store.NewMemStore(), fixedClock())
+	if err := j.Accepted("exec-pause-keep", "biz-1", "", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.TerminalWithEvidence("exec-pause-keep", StateFailed, ApprovalRequiredClass, sampleEvidence("Kept")); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.SupersedeApprovedPauseWithEvidence("exec-pause-keep", StateCompleted, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	rec, _, _ := j.Get("exec-pause-keep")
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Sources[0].Title != "Kept" {
+		t.Fatalf("pause evidence must survive a nil final capture: %+v", rec.ResearchEvidence)
+	}
+}
+
+// Older records have neither field. They decode as unavailable, never as a
+// zero timestamp or an empty-but-present source list.
+func TestLegacyExecutionRecordHasNoFabricatedTimestampsOrEvidence(t *testing.T) {
+	st := store.NewMemStore()
+	raw := []byte(`{"version":1,"id":"legacy","business_id":"biz-1","state":"completed",` +
+		`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:01:00Z"}`)
+	if err := st.Put(&store.Record{ID: execKey("legacy"), Type: recordTypeExecution, Data: raw}); err != nil {
+		t.Fatal(err)
+	}
+	rec, ok, err := New(st, fixedClock()).Get("legacy")
+	if err != nil || !ok {
+		t.Fatalf("legacy get: ok=%v err=%v", ok, err)
+	}
+	if rec.CompletedAt != nil {
+		t.Fatalf("legacy completed_at must be unavailable, got %v", rec.CompletedAt)
+	}
+	if rec.ResearchEvidence != nil {
+		t.Fatalf("legacy evidence must be absent, got %+v", rec.ResearchEvidence)
+	}
+}
+
+// If the atomic terminal write fails, the record remains nonterminal and no
+// evidence is exposed. A process-local result cannot become durable evidence
+// through a later partial write.
+func TestEvidenceWriteFailureLeavesRecordNonterminalWithoutEvidence(t *testing.T) {
+	base := store.NewMemStore()
+	failing := evidenceWriteFailStore{Store: base, marker: `"research_evidence"`}
+	j := New(failing, fixedClock())
+	if err := j.Accepted("exec-fail", "biz-1", "", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.TerminalWithEvidence("exec-fail", StateCompleted, "", sampleEvidence("Never durable")); err == nil {
+		t.Fatal("the injected terminal write must fail")
+	}
+	rec, ok, err := j.Get("exec-fail")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Terminal() || rec.CompletedAt != nil || rec.ResearchEvidence != nil {
+		t.Fatalf("failed write must leave no terminal/evidence claim: %+v", rec)
+	}
+}
+
+// Corrupt or unsupported evidence fails closed at decode rather than serving a
+// possibly partial snapshot.
+func TestUnsupportedEvidenceVersionFailsClosed(t *testing.T) {
+	st := store.NewMemStore()
+	raw := []byte(`{"version":1,"id":"bad-evidence","business_id":"biz-1","state":"completed",` +
+		`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:01:00Z",` +
+		`"research_evidence":{"version":99,"capability":"web.search","operation":"search","count":0,"sources":[]}}`)
+	if err := st.Put(&store.Record{ID: execKey("bad-evidence"), Type: recordTypeExecution, Data: raw}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := New(st, fixedClock()).Get("bad-evidence"); err == nil {
+		t.Fatal("unsupported evidence version must fail closed")
 	}
 }

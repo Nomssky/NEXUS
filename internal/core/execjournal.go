@@ -57,9 +57,10 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 		return
 	}
 	state, class := journalState(result), journalErrorClass(result)
+	evidence := researchEvidenceOf(result)
 
 	if isApprovalWaiting(result) {
-		if terr := e.journal.Terminal(id, state, class); terr != nil {
+		if terr := e.journal.TerminalWithEvidence(id, state, class, evidence); terr != nil {
 			e.metrics.JournalWriteFailure()
 			return
 		}
@@ -74,13 +75,22 @@ func (e *Engine) journalFinalize(id string, result *Response) {
 
 	// A real outcome. ErrNotApprovalPause only means this execution was not
 	// parked on a pause, which is the ordinary case.
-	if serr := e.journal.SupersedeApprovedPause(id, state, class); serr == nil {
+	if serr := e.journal.SupersedeApprovedPauseWithEvidence(id, state, class, evidence); serr == nil {
 		return
 	} else if !errors.Is(serr, execjournal.ErrNotApprovalPause) {
 		e.metrics.JournalWriteFailure()
 		return
 	}
-	if terr := e.journal.Terminal(id, state, class); terr != nil {
+	if terr := e.journal.TerminalWithEvidence(id, state, class, evidence); terr != nil {
 		e.metrics.JournalWriteFailure()
 	}
+}
+
+// researchEvidenceOf returns the validated source snapshot carried by a
+// terminal response. The journal validates it again before writing.
+func researchEvidenceOf(result *Response) *execjournal.ResearchEvidence {
+	if result == nil || result.Outcome == nil {
+		return nil
+	}
+	return result.Outcome.ResearchEvidence
 }

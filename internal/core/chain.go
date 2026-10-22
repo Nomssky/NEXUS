@@ -624,6 +624,14 @@ func (e *Engine) executeChain(ctx context.Context, req *Request) *Response {
 		respErr.Timestamp = e.now()
 	}
 
+	// Carry the agent's validated web.search snapshot into the terminal
+	// response so journalFinalize can write it atomically with the durable
+	// lifecycle transition. It is internal hand-off state and is not encoded
+	// on the process-local intelligence read.
+	if outcomeResult != nil && execOutcome != nil && execOutcome.ResearchEvidence != nil {
+		outcomeResult.ResearchEvidence = execOutcome.ResearchEvidence
+	}
+
 	// Step 13: Store outcome in memory
 	e.chainMemoryWrite(ctx, req, status, outcomeResult)
 	audit = append(audit, AuditEntry{

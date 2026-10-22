@@ -7,7 +7,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { apiClient, createAPIClient, EventStream, createEventStream } from './client';
-import type { HealthResponse, StatusResponse, SubmitIntelligenceRequest } from '../types/api';
+import type {
+  DurableExecution,
+  HealthResponse,
+  StatusResponse,
+  SubmitIntelligenceRequest,
+} from '../types/api';
 
 // Mock fetch globally
 const mockFetch = vi.fn<typeof fetch>();
@@ -232,6 +237,44 @@ describe('recovery executions (authoritative activity)', () => {
     await apiClient.listRecoveryExecutions('biz-1', { divisionId: 'div-1' });
     expect(mockFetch).toHaveBeenCalledWith(
       expect.stringContaining('division_id=div-1'),
+      expect.anything()
+    );
+  });
+
+  it('calls the recovery detail endpoint with business scope', async () => {
+    const execution: DurableExecution = {
+      source: 'durable_journal',
+      execution_id: 'exec-1',
+      business_id: 'biz-1',
+      state: 'completed',
+      created_at: '2026-10-20T10:00:00Z',
+      updated_at: '2026-10-20T10:05:30Z',
+      completed_at: '2026-10-20T10:05:30Z',
+      research_evidence: {
+        version: 1,
+        capability: 'web.search',
+        operation: 'search',
+        count: 1,
+        sources: [{ title: 'Nexus', url: 'https://example.com/n', source: 'example.com', snippet: 's' }],
+      },
+    };
+
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify(execution), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    );
+
+    const result = await apiClient.getRecoveryExecution('exec-1', 'biz-1');
+
+    expect(result.execution_id).toBe('exec-1');
+    expect(result.state).toBe('completed');
+    expect(result.completed_at).toBe('2026-10-20T10:05:30Z');
+    expect(result.research_evidence?.count).toBe(1);
+    expect(result.research_evidence?.sources[0].title).toBe('Nexus');
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/recovery/executions/exec-1?business_id=biz-1'),
       expect.anything()
     );
   });

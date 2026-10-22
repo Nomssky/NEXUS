@@ -11,6 +11,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/control"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
@@ -158,6 +159,37 @@ type run struct {
 	// planVersion is the active plan version, maintained by the loop across
 	// replans. Event metadata reads it; the model never sets it.
 	planVersion int
+	// researchEvidence accumulates only complete, validated web.search
+	// snapshots from THIS execution. evidenceOverflow latches when the bound is
+	// exceeded; the snapshot is then dropped rather than exposing a partial
+	// list as complete.
+	researchEvidence *execjournal.ResearchEvidence
+	evidenceOverflow bool
+}
+
+// captureResearchEvidence merges one complete web.search snapshot into this
+// execution's evidence. It never mixes records across executions: the run
+// object — and therefore the accumulator — belongs to exactly one execution.
+// If the combined list would exceed the durable bound, the whole snapshot is
+// dropped and no later capture can resurrect a partial list.
+func (rn *run) captureResearchEvidence(ev *execjournal.ResearchEvidence) {
+	if rn == nil || ev == nil || rn.evidenceOverflow {
+		return
+	}
+	if rn.researchEvidence == nil {
+		copy := *ev
+		copy.Sources = append([]execjournal.ResearchSource(nil), ev.Sources...)
+		rn.researchEvidence = &copy
+		return
+	}
+	combined := len(rn.researchEvidence.Sources) + len(ev.Sources)
+	if combined > execjournal.MaxResearchEvidenceSources {
+		rn.researchEvidence = nil
+		rn.evidenceOverflow = true
+		return
+	}
+	rn.researchEvidence.Sources = append(rn.researchEvidence.Sources, ev.Sources...)
+	rn.researchEvidence.Count = len(rn.researchEvidence.Sources)
 }
 
 func (rn *run) emit(ev event.EventType, extra map[string]string) {
@@ -201,7 +233,7 @@ func (r *Runtime) Handler() executor.TaskHandler {
 // canonical executor outcome. Failure never becomes success: every terminal
 // state other than completed/cancelled is a failed outcome whose message
 // names the terminal state, and the state itself is echoed in the summary.
-func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (*executor.Outcome, error) {
+func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.Agent) (out *executor.Outcome, err error) {
 	start := r.now()
 	obj, budget, err := parseObjective(req.Input["agent_objective"], r.Caps)
 	if err != nil {
@@ -227,6 +259,15 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		execID = req.TaskID
 	}
 	rn := &run{rt: r, req: req, execID: execID, businessID: req.BusinessID, divisionID: req.DivisionID, ag: ag, planVersion: 1}
+	// Evidence is attached to every terminal outcome, including failure,
+	// cancellation, timeout and approval pause. It is a fact about a search
+	// that actually ran, not a success claim. The journal remains the only
+	// durable exposure; this hand-off is internal.
+	defer func() {
+		if out != nil && rn.researchEvidence != nil {
+			out.ResearchEvidence = rn.researchEvidence
+		}
+	}()
 
 	// Approval resume: a waiting run left its authoritative snapshot behind
 	// under this execution id. The re-submitted request continues it —
@@ -275,6 +316,8 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		observations = snap.observations
 		rn.depth = snap.depth
 		rn.planVersion = snap.planVersion
+		rn.researchEvidence = snap.researchEvidence
+		rn.evidenceOverflow = snap.evidenceOverflow
 	} else {
 		// ---- planning (advisory) --------------------------------------------
 		rn.transition(StatePlanning, nil)
@@ -800,10 +843,11 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		// execution would present a different dedupe token and a remote system
 		// could not recognise a replay. This is the same identity events, memory
 		// writes and delegation already carry.
-		out, err := r.Exec.InvokeToolScoped(ctx, agentexec.ToolScope{
+		res, err := r.Exec.InvokeToolScopedResult(ctx, agentexec.ToolScope{
 			ActorID: rn.req.ActorID, BusinessID: rn.businessID, DivisionID: rn.divisionID,
 			AgentTools: r.agentTools(agentID), CorrelationID: rn.execID,
 		}, agentID, agentexec.ToolCallSpec{ToolID: a.Tool, Operation: a.Operation, Input: a.Input})
+		out := res.Result
 		rn.emit(event.EventTypeToolRequested, map[string]string{"tool_id": a.Tool, "agent_id": agentID})
 		if err != nil {
 			// A governance refusal is NOT a tool failure. It reports its own
@@ -853,6 +897,12 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 				obs.ReconciliationRequired = oe.Outcome == "unknown"
 			}
 			return obs, usage, StateFailed, "tool failed: " + err.Error()
+		}
+		// Only a successful, untruncated web.search result can become durable
+		// evidence. ParseWebSearchEvidence rejects the whole snapshot on a
+		// count/format/size mismatch, so a partial source list is never stored.
+		if ev, ok := execjournal.ParseWebSearchEvidence(a.Tool, res.Operation, out, res.Truncated); ok {
+			rn.captureResearchEvidence(ev)
 		}
 		obs.Result = out
 		obs.Text = kvString(out)

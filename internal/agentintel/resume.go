@@ -5,6 +5,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 )
 
@@ -96,6 +97,11 @@ type runSnapshot struct {
 	// depth and planVersion continue the execution's position.
 	depth       int
 	planVersion int
+	// researchEvidence carries source records captured before the pause, so a
+	// resumed run neither loses them nor re-runs the search. Overflow is
+	// latched too: once a capture was incomplete, it must stay absent.
+	researchEvidence *execjournal.ResearchEvidence
+	evidenceOverflow bool
 }
 
 // snapshotRun stores the paused run's state for its resume. Only the
@@ -103,18 +109,20 @@ type runSnapshot struct {
 func (r *Runtime) snapshotRun(rn *run, id objectiveIdentity, plan *Plan, ledger *planLedger,
 	observations []Observation, usage BudgetUsage, working *WorkingMemory, deadline time.Time) {
 	snap := &runSnapshot{
-		identity:     id,
-		businessID:   rn.businessID,
-		divisionID:   rn.divisionID,
-		actorID:      rn.req.ActorID,
-		plan:         copyPlan(plan),
-		observations: copyObservations(observations),
-		usage:        usage,
-		effects:      working.Effects(),
-		entries:      map[string]string{},
-		deadline:     deadline,
-		depth:        rn.depth,
-		planVersion:  rn.planVersion,
+		identity:         id,
+		businessID:       rn.businessID,
+		divisionID:       rn.divisionID,
+		actorID:          rn.req.ActorID,
+		plan:             copyPlan(plan),
+		observations:     copyObservations(observations),
+		usage:            usage,
+		effects:          working.Effects(),
+		entries:          map[string]string{},
+		deadline:         deadline,
+		depth:            rn.depth,
+		planVersion:      rn.planVersion,
+		researchEvidence: copyResearchEvidence(rn.researchEvidence),
+		evidenceOverflow: rn.evidenceOverflow,
 	}
 	for k, v := range working.Snapshot().Entries {
 		snap.entries[k] = v
@@ -237,6 +245,16 @@ func copyObservations(in []Observation) []Observation {
 		}
 	}
 	return out
+}
+
+// copyResearchEvidence removes aliasing between a paused run and its resume.
+func copyResearchEvidence(in *execjournal.ResearchEvidence) *execjournal.ResearchEvidence {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Sources = append([]execjournal.ResearchSource(nil), in.Sources...)
+	return &out
 }
 
 // obsSummary renders one line per observation for failure messages. It is

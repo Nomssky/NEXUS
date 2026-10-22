@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 )
 
@@ -200,6 +201,12 @@ type Outcome struct {
 
 	// Metrics captures performance metrics.
 	Metrics map[string]interface{} `json:"metrics,omitempty"`
+
+	// ResearchEvidence is internal hand-off state for the durable journal. It
+	// is deliberately not serialized on the process-local intelligence read:
+	// only the durable recovery read may claim that a source snapshot survives
+	// a restart.
+	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
 }
 
 // ChainError represents an error that occurred in the execution chain.

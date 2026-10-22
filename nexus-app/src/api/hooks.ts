@@ -24,6 +24,7 @@ import type {
   ApproveRequest,
   CreateAgentRequest,
   PaginationParams,
+  DurableExecution,
   DurableExecutionList,
 } from '../types/api';
 
@@ -44,6 +45,8 @@ export const queryKeys = {
   capabilities: ['capabilities'] as const,
   memory: (params: MemoryQueryRequest) => ['memory', params] as const,
   recoveryExecutions: (businessId: string) => ['recoveryExecutions', businessId] as const,
+  recoveryExecution: (id: string, businessId: string) =>
+    ['recoveryExecution', businessId, id] as const,
 };
 
 // Health & Status
@@ -234,6 +237,37 @@ export function useRecoveryExecutions(
     queryFn: () => apiClient.listRecoveryExecutions(businessId, { limit: 50 }),
     enabled: !!businessId,
     refetchInterval: 5000,
+    ...options,
+  });
+}
+
+// Single-execution recovery detail — the only read exposing the durable
+// research evidence snapshot and the real completed_at timestamp. Polled while
+// the execution is not yet terminal so evidence appears as soon as the
+// terminal journal write lands; a terminal state stops polling because the
+// durable record cannot change again. Rejected queries (e.g. a 404 from an
+// older backend that does not expose the detail read) surface as an error, and
+// callers fall back to the process-local execution read.
+export function useRecoveryExecution(
+  id: string | null | undefined,
+  businessId: string,
+  options?: QueryOptions<DurableExecution>
+) {
+  return useQuery({
+    queryKey: queryKeys.recoveryExecution(id || '', businessId),
+    queryFn: () => apiClient.getRecoveryExecution(id as string, businessId),
+    enabled: !!id && !!businessId,
+    retry: false,
+    refetchInterval: (query) => {
+      const state = query.state.data?.state;
+      const terminal =
+        state === 'completed' ||
+        state === 'failed' ||
+        state === 'cancelled' ||
+        state === 'timed_out' ||
+        state === 'unknown';
+      return terminal ? false : 5000;
+    },
     ...options,
   });
 }

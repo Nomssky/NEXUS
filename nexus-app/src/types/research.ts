@@ -24,9 +24,22 @@
  * It is recognized only when the whole execution output is that JSON object.
  * Any other JSON (malformed, partial, or a different shape) is rendered as
  * plain text. Unknown JSON is not pretty-printed into an implied structure.
+ *
+ * v52 adds the durable evidence read: the recovery detail endpoint can return
+ * a persisted web.search source snapshot (`research_evidence`) and the real
+ * terminal timestamp. That snapshot is provider-grounded data captured at the
+ * capability boundary, and it survives restarts. It is parsed defensively with
+ * the same wholesale-rejection rules the journal writer applies, and rendered
+ * through the same ParsedWebSearchSource shape as the process-local envelope.
  */
 
-import type { TraceEntry, WebSearchResult } from './api';
+import type {
+  DurableResearchEvidence,
+  ParsedWebSearchSource,
+  TraceEntry,
+  WebSearchResult,
+} from './api';
+import { isSafeExternalUrl } from './api';
 
 export interface ResearchSummaryMetrics {
   iterations?: number;
@@ -247,6 +260,110 @@ function parseNonNegativeInt(value: string | undefined): number | undefined {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) return undefined;
   return parsed;
+}
+
+// ---- Durable research evidence (v52) ----
+
+/** Per-field bounds mirror internal/execjournal/evidence.go. */
+const MAX_DURABLE_TITLE = 512;
+const MAX_DURABLE_URL = 2048;
+const MAX_DURABLE_SOURCE = 256;
+const MAX_DURABLE_SNIPPET = 1024;
+
+/** Schema version the journal writes today; unknown versions are not rendered. */
+const DURABLE_EVIDENCE_VERSION = 1;
+const DURABLE_EVIDENCE_CAPABILITY = 'web.search';
+const DURABLE_EVIDENCE_OPERATION = 'search';
+
+export interface ParsedDurableEvidence {
+  /**
+   * True only when the recovery detail read returned a structurally valid
+   * web.search evidence snapshot. Presence means the execution journal holds a
+   * complete capture; absence means no valid capture was persisted — never
+   * "the search returned nothing". An empty search is present evidence with
+   * zero sources.
+   */
+  present: boolean;
+  capability?: string;
+  operation?: string;
+  /** The count declared by the provider envelope; equals sources.length. */
+  count?: number;
+  sources: ParsedWebSearchSource[];
+}
+
+const NO_DURABLE_EVIDENCE: ParsedDurableEvidence = { present: false, sources: [] };
+
+/**
+ * Parse the durable research_evidence field from the recovery detail read.
+ * Like the journal writer, validation is wholesale: one malformed row, a
+ * count mismatch, an unsupported capability, or an over-bound value rejects
+ * the whole snapshot instead of rendering a partial record as evidence.
+ */
+export function parseDurableResearchEvidence(
+  evidence?: DurableResearchEvidence | null
+): ParsedDurableEvidence {
+  if (!isRecord(evidence)) return NO_DURABLE_EVIDENCE;
+  if (evidence.capability !== DURABLE_EVIDENCE_CAPABILITY) return NO_DURABLE_EVIDENCE;
+  if (evidence.version !== DURABLE_EVIDENCE_VERSION) return NO_DURABLE_EVIDENCE;
+
+  const operation = evidence.operation;
+  if (
+    operation !== undefined &&
+    operation !== '' &&
+    operation !== DURABLE_EVIDENCE_OPERATION
+  ) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
+  const count = evidence.count;
+  if (
+    typeof count !== 'number' ||
+    !Number.isInteger(count) ||
+    count < 0 ||
+    count > 50
+  ) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
+  if (!Array.isArray(evidence.sources) || evidence.sources.length !== count) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
+  const sources: ParsedWebSearchSource[] = [];
+  for (let i = 0; i < evidence.sources.length; i++) {
+    const row = evidence.sources[i];
+    if (!isRecord(row)) return NO_DURABLE_EVIDENCE;
+    const { title, url, source, snippet } = row;
+    if (
+      typeof title !== 'string' ||
+      typeof url !== 'string' ||
+      typeof source !== 'string' ||
+      typeof snippet !== 'string' ||
+      title.length > MAX_DURABLE_TITLE ||
+      url.length > MAX_DURABLE_URL ||
+      source.length > MAX_DURABLE_SOURCE ||
+      snippet.length > MAX_DURABLE_SNIPPET
+    ) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    sources.push({
+      index: i + 1,
+      title,
+      url,
+      source,
+      snippet,
+      // The same http(s)-only link rule used for the process-local envelope.
+      linkable: isSafeExternalUrl(url),
+    });
+  }
+
+  return {
+    present: true,
+    capability: DURABLE_EVIDENCE_CAPABILITY,
+    operation: DURABLE_EVIDENCE_OPERATION,
+    count,
+    sources,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -141,6 +141,17 @@ type ExecutionRecord struct {
 	// is additive and optional: a record written before this field existed
 	// decodes with no history, and nothing is ever fabricated to fill it.
 	Approvals []ApprovalDecision `json:"approvals,omitempty"`
+	// CompletedAt is the real terminal transition time, set exactly once on the
+	// ordinary terminal path and replaced only by the narrow approval-pause
+	// supersede. It is a pointer so an older record (or an interrupted record
+	// that has no terminal event) reports "unavailable" instead of a fabricated
+	// zero timestamp.
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// ResearchEvidence is the optional, validated web.search source snapshot.
+	// It is written atomically with the terminal transition. Presence means the
+	// snapshot was complete when captured; absence never implies the search
+	// returned nothing.
+	ResearchEvidence *ResearchEvidence `json:"research_evidence,omitempty"`
 }
 
 // InvocationRecord is the durable dispatch-intent/outcome evidence for one
@@ -237,6 +248,15 @@ func (j *Journal) Accepted(id, businessID, divisionID, actorID string) error {
 // Terminal durably records a terminal lifecycle state. `errClass` is a coarse
 // classification only (e.g. an error code), never a raw message.
 func (j *Journal) Terminal(id string, state State, errClass string) error {
+	return j.TerminalWithEvidence(id, state, errClass, nil)
+}
+
+// TerminalWithEvidence is Terminal with an optional, validated research source
+// snapshot written in the SAME atomic record update. Callers must not write
+// evidence in a separate later step: if the terminal write fails, the record
+// remains nonterminal and no evidence is exposed, so the process-local result
+// can never claim durable evidence that was not stored.
+func (j *Journal) TerminalWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
 	if j == nil {
 		return nil
 	}
@@ -246,16 +266,20 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
 	}
+	if err := ValidateResearchEvidence(evidence); err != nil {
+		return err
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	existing, version, ok, err := j.getExecution(id)
 	if err != nil {
 		return err
 	}
+	now := j.now().UTC()
 	if !ok {
 		// A terminal transition without a prior accepted record still records
 		// the fact; the id is authoritative.
-		existing = ExecutionRecord{Version: SchemaVersion, ID: id, CreatedAt: j.now().UTC()}
+		existing = ExecutionRecord{Version: SchemaVersion, ID: id, CreatedAt: now}
 		version = 0
 	}
 	if existing.State.Terminal() {
@@ -263,7 +287,11 @@ func (j *Journal) Terminal(id string, state State, errClass string) error {
 	}
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
-	existing.UpdatedAt = j.now().UTC()
+	existing.CompletedAt = &now
+	existing.UpdatedAt = now
+	if evidence != nil {
+		existing.ResearchEvidence = evidence
+	}
 	return j.putExecution(existing, version)
 }
 
@@ -320,6 +348,16 @@ func (j *Journal) RecordApproval(id, approvalID, outcome, decidedBy string) erro
 // ordinary terminal write is still final. ErrNotApprovalPause is returned when
 // there is simply no pause to supersede; the caller then uses Terminal().
 func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string) error {
+	return j.SupersedeApprovedPauseWithEvidence(id, state, errClass, nil)
+}
+
+// SupersedeApprovedPauseWithEvidence is SupersedeApprovedPause with an
+// optional final research source snapshot. A nil snapshot preserves the
+// provisional pause's evidence (it is still evidence of a real search that
+// occurred before the pause). A non-nil snapshot replaces it with the resumed
+// execution's complete capture. The final terminal time replaces the pause
+// time because the execution has now reached its real outcome.
+func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, errClass string, evidence *ResearchEvidence) error {
 	if j == nil {
 		return nil
 	}
@@ -328,6 +366,9 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 	}
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
+	}
+	if err := ValidateResearchEvidence(evidence); err != nil {
+		return err
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -339,9 +380,14 @@ func (j *Journal) SupersedeApprovedPause(id string, state State, errClass string
 		(existing.Recovery != nil && existing.Recovery.Recovered) {
 		return fmt.Errorf("%w: %s", ErrNotApprovalPause, id)
 	}
+	now := j.now().UTC()
 	existing.State = state
 	existing.ErrorClass = errClass // coarse class only; never a raw message
-	existing.UpdatedAt = j.now().UTC()
+	existing.CompletedAt = &now
+	existing.UpdatedAt = now
+	if evidence != nil {
+		existing.ResearchEvidence = evidence
+	}
 	return j.putExecution(existing, version)
 }
 
@@ -652,6 +698,9 @@ func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
 		return er, fmt.Errorf("execjournal: execution record %s has invalid state %q", er.ID, er.State)
 	}
 	if err := validateApprovals(er); err != nil {
+		return er, err
+	}
+	if err := ValidateResearchEvidence(er.ResearchEvidence); err != nil {
 		return er, err
 	}
 	return er, nil

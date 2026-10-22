@@ -1,10 +1,19 @@
 /**
  * ResearchEvidence - Displays source records and search metadata.
  *
- * Sources are rendered only from the documented web.search output envelope
- * (`{ sources, count }`). The execution trace contributes tool-invocation
- * metadata only: the trace allowlist drops tool results, prompts, and model
- * output, so a trace entry can never be turned into a citation.
+ * Sources are rendered from two grounded inputs, in priority order:
+ *
+ * 1. The durable research evidence snapshot from the recovery detail read
+ *    (v52). It is a capture taken at the capability boundary, so it survives
+ *    restarts and is authoritative; presence with zero sources means the
+ *    search really ran and returned nothing.
+ * 2. The documented web.search output envelope (`{ sources, count }`) parsed
+ *    from the process-local execution output, used only while the durable
+ *    read is unavailable (e.g. an older backend).
+ *
+ * The execution trace contributes tool-invocation metadata only: the trace
+ * allowlist drops tool results, prompts, and model output, so a trace entry
+ * can never be turned into a citation.
  *
  * The empty state is deliberately explicit. "No source records available" is
  * different from "the search found nothing", and the UI must not imply either
@@ -13,13 +22,19 @@
 
 import React, { useMemo } from 'react';
 import { Card, Badge, Button, type BadgeVariant } from '../primitives';
-import type { WebSearchResult } from '../../types/api';
+import type { DurableResearchEvidence, ParsedWebSearchSource, WebSearchResult } from '../../types/api';
 import { parseWebSearchResult } from '../../types/api';
-import type { ResearchToolActivity } from '../../types/research';
+import {
+  parseDurableResearchEvidence,
+  type ResearchToolActivity,
+} from '../../types/research';
 import styles from './ResearchEvidence.module.css';
 
 interface ResearchEvidenceProps {
+  /** Process-local web.search envelope from the execution output (fallback). */
   result?: WebSearchResult;
+  /** Durable source snapshot from the recovery detail read. Preferred. */
+  durableEvidence?: DurableResearchEvidence | null;
   /** Terminal tool events from the execution trace. Metadata only. */
   toolActivity?: ResearchToolActivity[];
   status?: string;
@@ -29,13 +44,56 @@ interface ResearchEvidenceProps {
 
 export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
   result,
+  durableEvidence,
   toolActivity = [],
   status,
   executionId,
   onViewTrace,
 }) => {
-  const sources = useMemo(() => (result ? parseWebSearchResult(result) : []), [result]);
-  const declaredCount = useMemo(() => declaredSourceCount(result), [result]);
+  const durable = useMemo(
+    () => parseDurableResearchEvidence(durableEvidence),
+    [durableEvidence]
+  );
+  const localSources = useMemo(() => (result ? parseWebSearchResult(result) : []), [result]);
+
+  // Durable evidence wins when present: it is the persisted capability-boundary
+  // capture and it survives restarts. The process-local envelope is only a
+  // fallback for backends that do not expose the durable read.
+  if (durable.present) {
+    if (durable.sources.length > 0) {
+      return (
+        <SourcesPanel
+          sources={durable.sources}
+          executionId={executionId}
+          onViewTrace={onViewTrace}
+        />
+      );
+    }
+    return (
+      <Card variant="outlined" padding="md">
+        <div className={styles.empty}>
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+            <circle cx="24" cy="24" r="20" stroke="var(--color-surface-border)" strokeWidth="2" />
+            <path d="M24 16v16M16 24h16" stroke="var(--color-text-muted)" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+          <p>The search returned no source records</p>
+          <span>
+            The durable research record shows the search ran and returned zero
+            results. Nothing was invented to fill this panel.
+          </span>
+          {executionId && (
+            <Button variant="ghost" size="sm" onClick={() => onViewTrace?.(executionId)}>
+              View Trace
+            </Button>
+          )}
+        </div>
+        {toolActivity.length > 0 && <ToolActivity activity={toolActivity} />}
+      </Card>
+    );
+  }
+
+  const sources = localSources;
+  const declaredCount = declaredSourceCount(result);
   const missingCount =
     declaredCount !== undefined && declaredCount > sources.length
       ? declaredCount - sources.length
@@ -64,6 +122,33 @@ export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
   }
 
   return (
+    <SourcesPanel
+      sources={sources}
+      executionId={executionId}
+      onViewTrace={onViewTrace}
+      declaredCount={declaredCount}
+      missingCount={missingCount}
+    />
+  );
+};
+
+interface SourcesPanelProps {
+  sources: ParsedWebSearchSource[];
+  executionId?: string;
+  onViewTrace?: (executionId: string) => void;
+  /** Declared count from a process-local envelope, when known. */
+  declaredCount?: number;
+  missingCount?: number;
+}
+
+const SourcesPanel: React.FC<SourcesPanelProps> = ({
+  sources,
+  executionId,
+  onViewTrace,
+  declaredCount,
+  missingCount = 0,
+}) => {
+  return (
     <div className={styles.evidenceContainer}>
       <div className={styles.header}>
         <h3 className={styles.title}>Research Sources</h3>
@@ -79,7 +164,7 @@ export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
         </div>
       </div>
 
-      {missingCount > 0 && (
+      {declaredCount !== undefined && missingCount > 0 && (
         <p className={styles.partialNote}>
           The execution reported {declaredCount} source records; {missingCount} could not be
           displayed (duplicate or malformed).

@@ -644,11 +644,26 @@ func (e *OutcomeError) Unwrap() error { return e.Cause }
 
 // InvokeToolScoped is the mediated invocation with the full runtime scope
 // (identity, business, division, allowlist, correlation). It is the same
-// boundary as InvokeTool; only the scope is richer.
+// boundary as InvokeTool; only the scope is richer. It returns the result map
+// for callers that do not need the canonical result envelope.
 func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID string, call ToolCallSpec) (map[string]string, error) {
+	res, err := r.InvokeToolScopedResult(ctx, scope, agentID, call)
+	if err != nil {
+		return nil, err
+	}
+	return res.Result, nil
+}
+
+// InvokeToolScopedResult is InvokeToolScoped with the canonical, bounded
+// tool.Result envelope. It exists so evidence-aware callers can inspect
+// runtime facts that the result map intentionally does not carry — most
+// importantly Truncated, which makes a provider payload unfit for a complete
+// durable snapshot. Admission, governance, journaling, dispatch evidence and
+// error semantics are identical to InvokeToolScoped.
+func (r *Runtime) InvokeToolScopedResult(ctx context.Context, scope ToolScope, agentID string, call ToolCallSpec) (tool.Result, error) {
 	allowedTools, businessID := scope.AgentTools, scope.BusinessID
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return tool.Result{}, err
 	}
 	if r.Platform != nil {
 		corr := scope.CorrelationID
@@ -660,7 +675,7 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 		// reaches Platform.Invoke, and an allowing decision may tighten the call.
 		effective, aerr := r.Admit(call, scope, corr, agentID, Limits{MaxDuration: capabilityMaxDuration})
 		if aerr != nil {
-			return nil, aerr
+			return tool.Result{}, aerr
 		}
 		// v10 durable dispatch evidence: for a CONSEQUENTIAL effect, persist the
 		// dispatch intent BEFORE the effect can occur, then the outcome AFTER.
@@ -675,7 +690,7 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 				id, jerr := r.Journal.RecordDispatchIntent(corr, corr, call.ToolID, call.Operation, string(m.SideEffectClass))
 				if jerr != nil {
 					r.Metrics.JournalWriteFailure()
-					return nil, fmt.Errorf("durable dispatch intent failed for %s (refusing consequential effect): %w", call.ToolID, jerr)
+					return tool.Result{}, fmt.Errorf("durable dispatch intent failed for %s (refusing consequential effect): %w", call.ToolID, jerr)
 				}
 				invID = id
 			}
@@ -697,7 +712,7 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 			}
 		}
 		if res.Status != tool.StatusSuccess {
-			return nil, &OutcomeError{
+			return res, &OutcomeError{
 				Outcome:                 res.Outcome,
 				Attempts:                res.Attempts,
 				RetryRecommended:        res.RetryRecommended,
@@ -705,16 +720,16 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 				Cause:                   errors.New(res.Error),
 			}
 		}
-		return res.Result, nil
+		return res, nil
 	}
 	if strings.TrimSpace(call.ToolID) == "" {
-		return nil, fmt.Errorf("tool id is required")
+		return tool.Result{}, fmt.Errorf("tool id is required")
 	}
 	if r.Tools == nil {
-		return nil, fmt.Errorf("tool %q is not registered", call.ToolID)
+		return tool.Result{}, fmt.Errorf("tool %q is not registered", call.ToolID)
 	}
 	if _, ok := r.Tools.GetTool(call.ToolID); !ok {
-		return nil, fmt.Errorf("tool %q is not registered", call.ToolID)
+		return tool.Result{}, fmt.Errorf("tool %q is not registered", call.ToolID)
 	}
 	// The pre-platform builtin path is still an execution path, so it is still
 	// admitted. Without a platform this is the only gate an action gets, and a
@@ -724,14 +739,14 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 		corr = correlationOf(ctx)
 	}
 	if _, aerr := r.Admit(call, scope, corr, agentID, Limits{}); aerr != nil {
-		return nil, aerr
+		return tool.Result{}, aerr
 	}
 	if agentID != "" && len(allowedTools) > 0 && !stringIn(allowedTools, call.ToolID) {
-		return nil, fmt.Errorf("tool %q is not in the agent allowlist", call.ToolID)
+		return tool.Result{}, fmt.Errorf("tool %q is not in the agent allowlist", call.ToolID)
 	}
 	execFn, ok := r.ToolExec[call.ToolID]
 	if !ok || execFn == nil {
-		return nil, fmt.Errorf("tool %q has no executor", call.ToolID)
+		return tool.Result{}, fmt.Errorf("tool %q has no executor", call.ToolID)
 	}
 	// v8 dispatch evidence (CANONICAL_TOOL_DISPATCH_CONTRACTS §4.2): the
 	// invocation boundary is real, so invocation-started and one terminal
@@ -755,7 +770,7 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 				"outcome":     "failed",
 				"duration_ms": fmt.Sprint(elapsed.Milliseconds()),
 			})
-		return nil, execErr
+		return tool.Result{}, execErr
 	}
 	r.publishInvocation(event.EventTypeToolInvocationCompleted, corr, businessID,
 		call.ToolID, call.Operation, agentID, sideEffect, map[string]string{
@@ -763,7 +778,10 @@ func (r *Runtime) InvokeToolScoped(ctx context.Context, scope ToolScope, agentID
 			"outcome":     "completed",
 			"duration_ms": fmt.Sprint(elapsed.Milliseconds()),
 		})
-	return out, nil
+	return tool.Result{
+		ToolID: call.ToolID, Operation: call.Operation, Status: tool.StatusSuccess,
+		Result: out, Outcome: "completed", Attempts: 1, Duration: elapsed,
+	}, nil
 }
 
 // DelegateChild runs one child execution through the existing delegation

@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
@@ -111,6 +112,12 @@ type Outcome struct {
 	Output string `json:"output,omitempty"`
 	// Evidence is the evidence for verification.
 	Evidence []string `json:"evidence,omitempty"`
+	// ResearchEvidence is the validated web.search source snapshot captured by
+	// the intelligence loop. It is internal hand-off state for the durable
+	// journal, not a public response field: the durable recovery read is the
+	// only surface that exposes it, so a process-local result can never be
+	// mistaken for a durable snapshot.
+	ResearchEvidence *execjournal.ResearchEvidence `json:"-"`
 	// Error is the error message if failed.
 	Error string `json:"error,omitempty"`
 	// Duration is total execution time.
@@ -658,6 +665,9 @@ func (e *Executor) executeWork(req *WorkRequest) {
 		outcome.Status = result.Status
 		outcome.Output = result.Output
 		outcome.Evidence = result.Evidence
+		// Internal hand-off only: the durable journal writes this atomically
+		// with the terminal record. It is not serialized on public responses.
+		outcome.ResearchEvidence = result.ResearchEvidence
 		if result.Error != "" {
 			outcome.Error = result.Error
 		}

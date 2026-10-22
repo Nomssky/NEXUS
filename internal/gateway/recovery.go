@@ -25,15 +25,23 @@ const (
 // record. It never includes actor_id, the internal recovery reason, store keys,
 // or raw durable bytes.
 type durableExecutionView struct {
-	Source      string               `json:"source"`
-	ExecutionID string               `json:"execution_id"`
-	BusinessID  string               `json:"business_id"`
-	DivisionID  string               `json:"division_id,omitempty"`
-	State       string               `json:"state"`
-	ErrorClass  string               `json:"error_class,omitempty"`
-	CreatedAt   time.Time            `json:"created_at"`
-	UpdatedAt   time.Time            `json:"updated_at"`
-	Recovery    *durableRecoveryView `json:"recovery,omitempty"`
+	Source      string    `json:"source"`
+	ExecutionID string    `json:"execution_id"`
+	BusinessID  string    `json:"business_id"`
+	DivisionID  string    `json:"division_id,omitempty"`
+	State       string    `json:"state"`
+	ErrorClass  string    `json:"error_class,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	// CompletedAt is the real terminal transition time. It is absent for an
+	// older record or an execution that never reached a terminal transition
+	// (e.g. recovery classified it unknown).
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// ResearchEvidence is returned only by the single-execution detail read.
+	// The list stays bounded and does not repeat source snapshots for every
+	// history row.
+	ResearchEvidence *execjournal.ResearchEvidence `json:"research_evidence,omitempty"`
+	Recovery         *durableRecoveryView          `json:"recovery,omitempty"`
 	// Approvals is the durable approval history for THIS execution, in the
 	// order it was recorded. It is omitted entirely when the execution never
 	// went through an approval gate, so an unapproved execution's response is
@@ -70,6 +78,7 @@ func durableView(er execjournal.ExecutionRecord) durableExecutionView {
 		ErrorClass:  er.ErrorClass,
 		CreatedAt:   er.CreatedAt,
 		UpdatedAt:   er.UpdatedAt,
+		CompletedAt: er.CompletedAt,
 	}
 	if er.Recovery != nil && er.Recovery.Recovered {
 		v.Recovery = &durableRecoveryView{
@@ -93,6 +102,14 @@ func durableView(er execjournal.ExecutionRecord) durableExecutionView {
 			})
 		}
 	}
+	return v
+}
+
+// durableDetailView adds the fields that are useful only when reading one
+// execution. The source snapshot is not repeated in every list row.
+func durableDetailView(er execjournal.ExecutionRecord) durableExecutionView {
+	v := durableView(er)
+	v.ResearchEvidence = er.ResearchEvidence
 	return v
 }
 
@@ -148,7 +165,7 @@ func (s *Server) handleGetRecoveryExecution(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(durableView(rec))
+	_ = json.NewEncoder(w).Encode(durableDetailView(rec))
 }
 
 // handleListRecoveryExecutions returns a bounded, newest-first page of durable
