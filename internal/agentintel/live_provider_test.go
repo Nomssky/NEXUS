@@ -2,6 +2,8 @@ package agentintel
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -18,8 +20,10 @@ const (
 	liveProviderSmokeEnv = "NEXUS_LIVE_PROVIDER_SMOKE"
 	liveProviderURLEnv   = "NEXUS_LIVE_PROVIDER_URL"
 	liveWebEndpointEnv   = "NEXUS_LIVE_WEB_ENDPOINT"
+	liveWebProviderEnv   = "NEXUS_LIVE_WEB_PROVIDER"
 	liveModelEnv         = "NEXUS_LIVE_MODEL"
 	liveCredentialEnv    = "TOKENHARBOR_API_KEY"
+	liveBraveCredential  = "BRAVE_API_KEY"
 )
 
 type liveResearchCatalog struct{}
@@ -47,7 +51,8 @@ func (p *countingResearchProvider) Search(ctx context.Context, query string, lim
 // production OpenAI-compatible provider path AND the real external web.search
 // adapter. Model inference, planning and external retrieval are all live.
 // Set NEXUS_LIVE_PROVIDER_SMOKE=1, TOKENHARBOR_API_KEY and optionally
-// NEXUS_LIVE_MODEL / NEXUS_LIVE_WEB_ENDPOINT to run it; otherwise it skips
+// NEXUS_LIVE_MODEL / NEXUS_LIVE_WEB_ENDPOINT (Wikipedia) or
+// NEXUS_LIVE_WEB_PROVIDER=brave + BRAVE_API_KEY to run it; otherwise it skips
 // without network access.
 func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 	if strings.TrimSpace(os.Getenv(liveProviderSmokeEnv)) != "1" {
@@ -93,9 +98,7 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 		t.Fatalf("register live model: %v", err)
 	}
 
-	external, err := capability.NewWikipediaSearchProvider(capability.WikipediaProviderConfig{
-		Endpoint: webEndpoint, Language: "en", AllowInsecureHTTP: true,
-	})
+	external, providerLabel, err := liveWebResearchProvider(webEndpoint)
 	if err != nil {
 		t.Fatalf("live web search configuration: %v", err)
 	}
@@ -107,10 +110,10 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	out, err := rt.Run(ctx, workRequest(t, Objective{
-		Description: "Research two related topics on the English Wikipedia using the mediated web.search tool. " +
+		Description: "Research two related topics using the mediated web.search tool on " + providerLabel + ". " +
 			"The plan must contain exactly these two steps and nothing else: " +
-			"{\"steps\":[{\"step_id\":\"s1\",\"intent\":\"search Wikipedia for Go programming language\"}," +
-			"{\"step_id\":\"s2\",\"intent\":\"search Wikipedia for large language model\",\"dependencies\":[\"s1\"]}]}. " +
+			"{\"steps\":[{\"step_id\":\"s1\",\"intent\":\"search for Go programming language\"}," +
+			"{\"step_id\":\"s2\",\"intent\":\"search for large language model\",\"dependencies\":[\"s1\"]}]}. " +
 			"Step s1 must call web.search once with the query \"Go programming language\". " +
 			"Step s2 must call web.search once with the query \"large language model\". " +
 			"Do not call web.search twice in the same step. Only after both searches have run, " +
@@ -132,9 +135,18 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 		t.Fatalf("live run did not produce multi-source v2 evidence: %+v", ev)
 	}
 	for _, source := range ev.Sources {
-		if !strings.HasSuffix(source.Source, ".wikipedia.org") ||
-			!strings.HasPrefix(source.URL, "https://en.wikipedia.org/wiki/") {
-			t.Fatalf("source is not a live Wikipedia record: %+v", source)
+		if external.Identify() == "wikipedia" {
+			if !strings.HasSuffix(source.Source, ".wikipedia.org") ||
+				!strings.HasPrefix(source.URL, "https://en.wikipedia.org/wiki/") {
+				t.Fatalf("source is not a live Wikipedia record: %+v", source)
+			}
+			continue
+		}
+		parsed, err := url.Parse(source.URL)
+		if err != nil || parsed.Host == "" ||
+			(parsed.Scheme != "https" && parsed.Scheme != "http") ||
+			source.Source != strings.ToLower(parsed.Hostname()) {
+			t.Fatalf("source is not a normalized live provider record: %+v", source)
 		}
 	}
 	if ev.Plan == nil || len(ev.Steps) != 2 {
@@ -202,4 +214,24 @@ func TestLiveProviderEvidenceGroundedSynthesis(t *testing.T) {
 	t.Logf("live provider %q model %q completed %d external provider requests, "+
 		"%d evidence sources, %d search operations and %d evidence-backed citations",
 		provider.Identify(), modelID, counting.calls, ev.Count, len(ev.Operations), len(cited))
+}
+
+// liveWebResearchProvider resolves the explicitly selected live web-search
+// backend. There is no fallback: an unknown selection fails the opt-in test,
+// and Brave requires its own credential.
+func liveWebResearchProvider(wikipediaEndpoint string) (capability.ResearchProvider, string, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(liveWebProviderEnv))) {
+	case "", "wikipedia":
+		provider, err := capability.NewWikipediaSearchProvider(capability.WikipediaProviderConfig{
+			Endpoint: wikipediaEndpoint, Language: "en", AllowInsecureHTTP: true,
+		})
+		return provider, "the English Wikipedia", err
+	case "brave":
+		provider, err := capability.NewBraveSearchProvider(capability.BraveProviderConfig{
+			APIKey: os.Getenv(liveBraveCredential), Timeout: 15 * time.Second,
+		})
+		return provider, "the general web", err
+	default:
+		return nil, "", fmt.Errorf("NEXUS_LIVE_WEB_PROVIDER must be empty, \"wikipedia\", or \"brave\"")
+	}
 }

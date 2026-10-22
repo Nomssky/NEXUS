@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,41 @@ func testConfig() config.Config {
 		Lifecycle: config.LifecycleConfig{
 			ShutdownTimeoutSeconds: 5,
 		},
+	}
+}
+
+// A selected but invalid web-search provider is a startup failure, not a
+// silent degraded boot with a different research backend.
+func TestLauncherStartFailsOnInvalidWebProviderConfiguration(t *testing.T) {
+	const secret = "launcher-bad-brave-key"
+	cases := []struct {
+		name       string
+		selection  string
+		credential string
+	}{
+		{name: "unknown selection", selection: "not-a-provider"},
+		{name: "missing Brave credential", selection: "brave"},
+		{name: "malformed Brave credential", selection: "brave", credential: secret + "\x01"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NEXUS_CAPABILITY_WEB", tc.selection)
+			t.Setenv("BRAVE_API_KEY", tc.credential)
+			l := New(Options{
+				Config:    testConfig(),
+				Logger:    logging.New(logging.Options{}),
+				Health:    health.NewServer(),
+				Lifecycle: lifecycle.New(lifecycle.Options{}),
+				Addr:      ":0",
+			})
+			err := l.Start(context.Background())
+			if err == nil || !strings.Contains(err.Error(), "web search provider") {
+				t.Fatalf("invalid web provider must fail startup, got %v", err)
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("startup error leaked the credential: %v", err)
+			}
+		})
 	}
 }
 

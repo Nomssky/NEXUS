@@ -10,6 +10,8 @@ package launcher
 // registered with a permissive default.
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -22,6 +24,12 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 )
+
+// errResearchProviderConfig marks a web-search provider selection or credential
+// error. Unlike an unusable optional capability policy, an explicitly selected
+// provider with bad configuration is a startup error: booting without the
+// selected provider would silently change the operator's research backend.
+var errResearchProviderConfig = errors.New("web search provider configuration")
 
 // CapabilityOptions configures the shipped capability catalogue.
 type CapabilityOptions struct {
@@ -73,7 +81,9 @@ func capabilityPlatform(
 	// Capability catalogue knobs (boot-time configuration, never model input):
 	//   NEXUS_CAPABILITY_WEB=scripted  -> deterministic test provider
 	//   NEXUS_CAPABILITY_WEB=wikipedia -> real external MediaWiki search
+	//   NEXUS_CAPABILITY_WEB=brave     -> real external general web search
 	//   NEXUS_CAPABILITY_WEB_ENDPOINT / _LANGUAGE / _USER_AGENT -> provider config
+	//   BRAVE_API_KEY -> Brave Search credential (never logged or persisted)
 	//   NEXUS_CAPABILITY_GITHUB_REF=x  -> register the GitHub capability
 	//   NEXUS_CAPABILITY_GITHUB_BUSINESS=b -> its business scope
 	//
@@ -82,7 +92,7 @@ func capabilityPlatform(
 	if opts.ResearchProvider == nil {
 		provider, err := researchProviderFromEnv(env)
 		if err != nil {
-			return nil, fmt.Errorf("capability platform: %w", err)
+			return nil, fmt.Errorf("capability platform: %w: %w", errResearchProviderConfig, err)
 		}
 		opts.ResearchProvider = provider
 	}
@@ -115,13 +125,24 @@ func capabilityPlatform(
 	}
 	if bus != nil {
 		for _, m := range tools.ListManifests() {
+			diagnostic := map[string]string{
+				"tool_id":           m.ID,
+				"version":           m.Version,
+				"side_effect_class": string(m.SideEffectClass),
+				"security_class":    string(m.SecurityClass),
+			}
+			// Provider selection is safe boot-time diagnostics: it names the
+			// backend, never a credential or endpoint.
+			if m.ID == "web.search" && opts.ResearchProvider != nil {
+				diagnostic["provider"] = opts.ResearchProvider.Identify()
+			}
+			data, _ := json.Marshal(diagnostic)
 			_ = bus.Publish(&event.Event{
 				Type:       event.EventTypeToolRegistered,
 				Source:     "capability",
 				Timestamp:  time.Now(),
 				BusinessID: opts.GitHubBusinessID,
-				Data: []byte(fmt.Sprintf(`{"tool_id":%q,"version":%q,"side_effect_class":%q,"security_class":%q}`,
-					m.ID, m.Version, m.SideEffectClass, m.SecurityClass)),
+				Data:       data,
 			})
 		}
 	}
@@ -145,9 +166,20 @@ func researchProviderFromEnv(env func(string) string) (capability.ResearchProvid
 			return nil, fmt.Errorf("web search provider: %w", err)
 		}
 		return provider, nil
+	case "brave":
+		provider, err := capability.NewBraveSearchProvider(capability.BraveProviderConfig{
+			APIKey:            env("BRAVE_API_KEY"),
+			Endpoint:          env("NEXUS_CAPABILITY_WEB_ENDPOINT"),
+			UserAgent:         env("NEXUS_CAPABILITY_WEB_USER_AGENT"),
+			AllowInsecureHTTP: strings.EqualFold(env("NEXUS_CAPABILITY_WEB_ALLOW_INSECURE"), "true"),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("web search provider: %w", err)
+		}
+		return provider, nil
 	default:
-		return nil, fmt.Errorf("%w: NEXUS_CAPABILITY_WEB must be empty, %q, or %q",
-			capability.ErrValidation, "scripted", "wikipedia")
+		return nil, fmt.Errorf("%w: NEXUS_CAPABILITY_WEB must be empty, %q, %q, or %q",
+			capability.ErrValidation, "scripted", "wikipedia", "brave")
 	}
 }
 

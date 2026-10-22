@@ -9,6 +9,7 @@ package launcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -356,6 +357,15 @@ func New(opts Options) *Launcher {
 			opts.Logger.Error("capability platform not registered", logging.Fields{
 				Context: map[string]any{"err": capErr.Error()},
 			})
+		}
+		// An explicitly selected but unusable web-search provider fails
+		// startup. Other optional capability policy failures retain the
+		// established fail-closed degraded boot path.
+		if errors.Is(capErr, errResearchProviderConfig) {
+			return &Launcher{
+				cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				metrics: m, initErr: capErr,
+			}
 		}
 	} else {
 		agentRt.Platform = platform

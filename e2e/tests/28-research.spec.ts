@@ -665,3 +665,165 @@ test.describe('Research Workspace real web provider', () => {
     expect(searches).toEqual(['nexus']);
   });
 });
+
+// The general web-search adapter is booted through the compiled binary against
+// a local Brave-shaped fixture. The model remains deterministic; the real
+// HTTP adapter, credential header, launcher selection, result validation,
+// durable evidence and UI rendering are all exercised without external network
+// access.
+test.describe('Research Workspace Brave web provider', () => {
+  const BRAVE_TEST_KEY = 'brave-e2e-fixture-key-0123456789';
+  let nexus: NexusHandle;
+  let frontend: FrontendServer;
+  let frontendURL: string;
+  let brave: http.Server;
+  let braveURL: string;
+  const searches: string[] = [];
+  const keys: string[] = [];
+
+  test.beforeAll(async () => {
+    if (!fs.existsSync(path.join(FRONTEND_DIST, 'index.html'))) {
+      throw new Error(
+        `frontend build not found at ${FRONTEND_DIST}; run "npm run build" in nexus-app first`
+      );
+    }
+
+    brave = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (url.pathname !== '/res/v1/web/search') {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end('{"error":{"code":"not_found"}}');
+        return;
+      }
+      searches.push(url.searchParams.get('q') ?? '');
+      keys.push(req.headers['x-subscription-token'] as string);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'search',
+        query: { original: url.searchParams.get('q') ?? '' },
+        web: {
+          type: 'search',
+          results: [
+            {
+              title: 'Nexus general web result',
+              url: 'https://general.example/nexus-runtime',
+              description: 'A <strong>general web</strong> excerpt from the Brave-shaped fixture.',
+              page_age: '2 days ago',
+            },
+            {
+              title: 'Nexus evidence boundary',
+              url: 'https://evidence.example/capture',
+              description: 'Only validated provider records become evidence.',
+            },
+            {
+              title: 'Unsafe result',
+              url: 'javascript:alert(1)',
+              description: 'must never render',
+            },
+            {
+              title: 'Malformed result',
+              url: '/relative',
+              description: 'must never render',
+            },
+          ],
+        },
+      }));
+    });
+    await new Promise<void>((resolve) => brave.listen(0, '127.0.0.1', resolve));
+    const address = brave.address() as net.AddressInfo;
+    braveURL = `http://127.0.0.1:${address.port}/res/v1/web/search`;
+
+    nexus = await startNexus({
+      extraEnv: {
+        NEXUS_SEEDED_PROVIDER_MODE: 'scripted',
+        NEXUS_CAPABILITY_WEB: 'brave',
+        BRAVE_API_KEY: BRAVE_TEST_KEY,
+        NEXUS_CAPABILITY_WEB_ENDPOINT: braveURL,
+        NEXUS_CAPABILITY_WEB_ALLOW_INSECURE: 'true',
+      },
+    });
+
+    const registered = await fetch(`${nexus.baseURL}/api/v1/agents`, {
+      method: 'POST',
+      headers: { ...bootstrapHeaders(nexus), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entity_id: RESEARCH_AGENT_ID,
+        name: 'Research E2E Analyst',
+        business_id: nexus.businessID,
+        capabilities: ['analysis'],
+        allowed_tools: ['web.search'],
+      }),
+    });
+    if (!registered.ok && registered.status !== 409) {
+      throw new Error(
+        `failed to register research agent: HTTP ${registered.status} ${await registered.text()}`
+      );
+    }
+
+    frontend = new FrontendServer();
+    frontendURL = `http://127.0.0.1:${await frontend.start(nexus.baseURL)}`;
+  });
+
+  test.afterAll(async () => {
+    await frontend?.stop();
+    await nexus?.dispose();
+    if (brave) {
+      await new Promise<void>((resolve) => brave.close(() => resolve()));
+    }
+  });
+
+  test('research workspace: the Brave adapter retrieves and renders general web records', async ({ page }) => {
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        actorId: actorID,
+        credential,
+        businessID,
+        businessId: businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
+    await page.click('button[type="submit"]', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('textarea[placeholder*="research"]') as HTMLTextAreaElement | null;
+      return textarea?.value === '';
+    }, { timeout: 10000 });
+
+    const output = page.locator('section[aria-labelledby="research-output-heading"]');
+    const evidence = page.locator('section[aria-labelledby="research-evidence-heading"]');
+
+    await expect(output.locator('[aria-label="Typed research synthesis"]')).toBeVisible({
+      timeout: 20000,
+    });
+    await expect(evidence.getByText('2 sources')).toBeVisible();
+    await expect(evidence.getByText('Nexus general web result', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('Nexus evidence boundary', { exact: true })).toBeVisible();
+    await expect(evidence.getByText('general.example', { exact: true }).first()).toBeVisible();
+    await expect(evidence.getByText('A general web excerpt from the Brave-shaped fixture.')).toBeVisible();
+    await expect(evidence.getByText('Unsafe result')).toHaveCount(0);
+    await expect(evidence.getByText('Malformed result')).toHaveCount(0);
+    await expect(evidence.getByText('docs.example')).toHaveCount(0);
+    await expect(evidence.getByRole('link', { name: 'Open Nexus general web result in new tab' }))
+      .toHaveAttribute('href', 'https://general.example/nexus-runtime');
+
+    const synthesis = output.locator('[aria-label="Typed research synthesis"]');
+    await expect(synthesis).toHaveAttribute('data-synthesis-status', 'complete');
+    await expect(synthesis.getByText('Evidence-backed findings')).toBeVisible();
+    await expect(synthesis.getByRole('link', { name: 'Nexus general web result' }))
+      .toHaveAttribute('href', 'https://general.example/nexus-runtime');
+
+    expect(searches).toEqual(['nexus']);
+    expect(keys).toEqual([BRAVE_TEST_KEY]);
+    expect(nexus.stdout()).not.toContain(BRAVE_TEST_KEY);
+    expect(nexus.stderr()).not.toContain(BRAVE_TEST_KEY);
+  });
+});

@@ -11,14 +11,45 @@ type ResearchProvider interface {
 }
 ```
 
-## Real provider
+## Real providers
 
-`WikipediaSearchProvider` is the shipped real external backend. It calls the
-documented MediaWiki Action API (`action=query&list=search`) and maps only the
-search-result title, canonical Wikipedia page URL, host label and search
-excerpt into `Source`. It does not fetch result pages, follow redirects, accept
-model-supplied endpoints, or invent publication dates (the provider timestamp
-is a last-edit time, not a publication date).
+`WikipediaSearchProvider` and `BraveSearchProvider` are the shipped real
+external backends. Each implements the same `ResearchProvider` seam and is
+selected explicitly at boot; provider-specific parsing never leaks into the
+capability platform, evidence schema or synthesis code.
+
+### Brave general web search
+
+`BraveSearchProvider` calls the documented Brave Search Web Search API
+(`GET https://api.search.brave.com/res/v1/web/search`, authenticated with the
+`X-Subscription-Token` header). It maps only the provider's web-result `title`,
+`url` and `description` into `Source`, derives the source label from the result
+URL host, and stops there. It never fetches result pages, follows redirects,
+uses Brave's rich/local enrichment endpoints, or maps `page_age` (a relative
+freshness label) onto the publication-date field.
+
+```sh
+NEXUS_CAPABILITY_WEB=brave
+BRAVE_API_KEY=...                                                 # required
+NEXUS_CAPABILITY_WEB_USER_AGENT='NEXUS-research/1.0'             # optional
+```
+
+The API key is read only from `BRAVE_API_KEY`. It is sent only in the provider
+request header; it is never logged, persisted, included in errors or exposed in
+result metadata. Startup fails with a credential error when the key is missing
+or malformed. The endpoint defaults to the fixed documented Brave endpoint; an
+endpoint override is accepted only as loopback HTTP with
+`NEXUS_CAPABILITY_WEB_ALLOW_INSECURE=true` for deterministic tests, so a
+credential-bearing request cannot be redirected to an arbitrary host.
+
+### Wikipedia
+
+`WikipediaSearchProvider` calls the documented MediaWiki Action API
+(`action=query&list=search`) and maps only the search-result title, canonical
+Wikipedia page URL, host label and search excerpt into `Source`. It does not
+fetch result pages, follow redirects, accept model-supplied endpoints, or
+invent publication dates (the provider timestamp is a last-edit time, not a
+publication date).
 
 Boot-time configuration:
 
@@ -30,24 +61,30 @@ NEXUS_CAPABILITY_WEB_USER_AGENT='NEXUS-research/1.0'             # optional
 ```
 
 An empty `NEXUS_CAPABILITY_WEB` disables `web.search`; `scripted` selects the
-test provider; any other value fails boot. The endpoint must be HTTPS unless it
-is loopback HTTP with `NEXUS_CAPABILITY_WEB_ALLOW_INSECURE=true` (test-only).
-Provider failures are returned as classified errors and never fall back to the
-scripted provider or synthetic evidence.
+test provider; `wikipedia` and `brave` select the real external providers. Any
+other non-empty value fails boot. The Wikipedia endpoint must be HTTPS unless
+it is loopback HTTP with `NEXUS_CAPABILITY_WEB_ALLOW_INSECURE=true` (test-only).
+Provider failures are returned as classified errors and never fall back to
+another provider, the scripted provider, or synthetic evidence. The safe
+`tool.registered` diagnostic names the selected provider for `web.search`
+without exposing credentials or endpoints.
 
-The adapter bounds queries to 512 bytes and accepts at most 10 provider
-records. It rejects control characters and URL-shaped queries, validates every
+The adapters bound queries to 512 bytes and accept at most 10 provider
+records. They reject control characters and URL-shaped queries, validate every
 result URL as absolute HTTP(S) with a public host and no embedded credentials,
-drops unusable records individually, and bounds title, URL, source and snippet
-fields plus the complete envelope. Errors omit the provider response body and
-transport details, so credentials or internal endpoints cannot leak through a
-failure.
+drop unusable records individually, and bound title, URL, source and snippet
+fields plus the complete envelope. HTTP 401/403 is reported as a credential
+failure, 429 as a rate limit, 5xx as provider unavailability, and malformed
+JSON or record envelopes as external errors. Errors omit the provider response
+body and transport details, so credentials or internal endpoints cannot leak
+through a failure.
 
 The deterministic Research E2E boots the compiled binary with
-`NEXUS_CAPABILITY_WEB=wikipedia` against a local MediaWiki-shaped HTTP fixture,
-so the real provider, launcher wiring, normalization, durable evidence and UI
-are exercised without external network access. Live retrieval is covered by
-the opt-in smoke test described below.
+`NEXUS_CAPABILITY_WEB=wikipedia` against a local MediaWiki-shaped HTTP fixture
+and with `NEXUS_CAPABILITY_WEB=brave` against a local Brave-shaped HTTP
+fixture, so both real adapters, launcher wiring, normalization, durable
+evidence and UI are exercised without external network access. Live retrieval
+is covered by the opt-in smoke tests described below.
 
 ## Scripted provider
 
@@ -84,17 +121,37 @@ Foundational tests to preserve around this boundary:
 
 ## Live smoke (opt-in)
 
-The live smoke runs a real OpenAI-compatible model and the real Wikipedia
-provider through the same mediated platform and intelligence loop:
+The provider-only smoke verifies the Brave adapter against the real documented
+endpoint without invoking a model:
+
+```sh
+NEXUS_LIVE_WEB_SMOKE=1 \
+NEXUS_LIVE_WEB_PROVIDER=brave \
+BRAVE_API_KEY=... \
+go test ./internal/capability -run TestLiveBraveProviderSmoke -count=1 -v
+```
+
+It reports provider identity and test mode, distinguishes a reached-but-empty
+result from returned evidence, and sends records through the production
+`WebSearchTool` normalization path. It never substitutes a local fixture for
+live validation.
+
+The full live smoke runs a real OpenAI-compatible model and the explicitly
+selected real provider through the same mediated platform and intelligence
+loop:
 
 ```sh
 NEXUS_LIVE_PROVIDER_SMOKE=1 \
 TOKENHARBOR_API_KEY=... \
+NEXUS_LIVE_WEB_PROVIDER=brave \
+BRAVE_API_KEY=... \
 go test ./internal/agentintel -run TestLiveProviderEvidenceGroundedSynthesis -count=1 -v
 ```
 
-Optional overrides are `NEXUS_LIVE_PROVIDER_URL`, `NEXUS_LIVE_MODEL` and
-`NEXUS_LIVE_WEB_ENDPOINT`. The test requires a two-step dependent plan, two
-real provider searches, v2 evidence from canonical Wikipedia URLs, and a typed
-synthesis citing sources from both steps. It is skipped unless explicitly
-enabled.
+With `NEXUS_LIVE_WEB_PROVIDER` empty or set to `wikipedia` (the
+backward-compatible default), the test uses Wikipedia and the optional
+`NEXUS_LIVE_WEB_ENDPOINT` override. With `brave`, it requires `BRAVE_API_KEY`
+and uses the fixed documented Brave endpoint; there is no provider fallback.
+The test requires a two-step dependent plan, two real provider searches, v2
+evidence, and a typed synthesis citing sources from both steps. Both live
+tests are skipped unless explicitly enabled and make bounded external requests.
