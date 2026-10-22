@@ -104,7 +104,7 @@ func TestObservationMarksCompletedToolCall(t *testing.T) {
 	rn := ledgerRun(t, rt)
 	obs, usage, state, _ := rt.perform(rn, context.Background(), Objective{Description: "post"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "commit", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if state != "" {
 		t.Fatalf("a completed tool call must not end the loop, state=%q", state)
 	}
@@ -125,7 +125,7 @@ func TestObservationSurfacesUnknownOutcomeWithoutRetry(t *testing.T) {
 	rn := ledgerRun(t, rt)
 	obs, _, state, msg := rt.perform(rn, context.Background(), Objective{Description: "post"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "commit", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if state != StateFailed {
 		t.Fatalf("an indeterminate mutation must not be treated as success: %q", state)
 	}
@@ -152,7 +152,7 @@ func TestObservationSurfacesTimeoutDistinctly(t *testing.T) {
 	rn := ledgerRun(t, rt)
 	obs, _, _, _ := rt.perform(rn, context.Background(), Objective{Description: "read"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "execute", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if obs.Outcome != "timed_out" {
 		t.Fatalf("a deadline expiry must not be reported as a plain failure, got %q", obs.Outcome)
 	}
@@ -167,7 +167,7 @@ func TestObservationCarriesRetryPostureForRead(t *testing.T) {
 	rn := ledgerRun(t, rt)
 	obs, _, _, _ := rt.perform(rn, context.Background(), Objective{Description: "read"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "execute", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if obs.Outcome != "failed" {
 		t.Fatalf("a classified external failure is failed, got %q", obs.Outcome)
 	}
@@ -309,7 +309,7 @@ func TestNotSentAndUnknownCarryDifferentRecoveryPosture(t *testing.T) {
 	rn := ledgerRun(t, rt)
 	obs, _, state, _ := rt.perform(rn, context.Background(), Objective{Description: "read"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "execute", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if state != "" && state != StateFailed {
 		t.Fatalf("unexpected terminal state %s", state)
 	}
@@ -327,7 +327,7 @@ func TestNotSentAndUnknownCarryDifferentRecoveryPosture(t *testing.T) {
 	rn2 := ledgerRun(t, rt2)
 	obs2, _, state2, _ := rt2.perform(rn2, context.Background(), Objective{Description: "commit"},
 		Action{Type: ActionToolCall, Tool: "ledger", Operation: "commit", Input: map[string]string{"amount": "10"}},
-		"bookkeeper", nil, BudgetUsage{}, Budget{})
+		"", "bookkeeper", nil, BudgetUsage{}, Budget{})
 	if state2 != StateFailed {
 		t.Fatalf("an unknown outcome must be terminal, got %s", state2)
 	}

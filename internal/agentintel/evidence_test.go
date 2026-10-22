@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
 	"github.com/Nomssky/NEXUS/internal/capability"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
@@ -182,6 +184,213 @@ func TestWebSearchEvidenceMergesPerExecutionSnapshots(t *testing.T) {
 	}
 }
 
+// Repeated delivery of the same mediated operation id never duplicates source
+// records or associations. Distinct operations in different steps stay
+// distinct and keep their stable source ids.
+func TestCaptureResearchEvidenceIsIdempotentPerOperation(t *testing.T) {
+	rn := &run{}
+	first := &execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+		Sources: []execjournal.ResearchSource{{ID: "local-1", Title: "One", URL: "https://one.example"}},
+	}
+	rn.captureResearchEvidence(first, "s1", "obs-1")
+	rn.captureResearchEvidence(first, "s1", "obs-1")
+	if rn.researchEvidence == nil || rn.researchEvidence.Count != 1 ||
+		len(rn.researchEvidence.Sources) != 1 || len(rn.researchEvidence.Operations) != 1 {
+		t.Fatalf("repeated delivery duplicated evidence: %+v", rn.researchEvidence)
+	}
+	if rn.researchEvidence.Sources[0].ID != "src-1" ||
+		!slices.Equal(rn.researchEvidence.Operations[0].SourceIDs, []string{"src-1"}) {
+		t.Fatalf("execution-scoped source id/association wrong: %+v", rn.researchEvidence)
+	}
+
+	second := &execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+		Sources: []execjournal.ResearchSource{{ID: "local-1", Title: "Two", URL: "https://two.example"}},
+	}
+	rn.captureResearchEvidence(second, "s2", "obs-2")
+	if rn.researchEvidence.Count != 2 || len(rn.researchEvidence.Operations) != 2 {
+		t.Fatalf("second operation not captured: %+v", rn.researchEvidence)
+	}
+	if rn.researchEvidence.Sources[1].ID != "src-2" {
+		t.Fatalf("source ids must stay execution-scoped: %+v", rn.researchEvidence.Sources)
+	}
+	if rn.researchEvidence.Operations[1].StepID != "s2" ||
+		!slices.Equal(rn.researchEvidence.Operations[1].SourceIDs, []string{"src-2"}) {
+		t.Fatalf("second step association wrong: %+v", rn.researchEvidence.Operations[1])
+	}
+}
+
+// A resumed run can carry a v52/v53 evidence snapshot. Legacy rows have no
+// ids, so merging v2 rows or operations would invent identity and produce an
+// invalid record. The persisted legacy snapshot stays readable unchanged.
+func TestCaptureResearchEvidenceDoesNotUpgradeLegacySnapshot(t *testing.T) {
+	rn := &run{researchEvidence: &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceLegacyVersion,
+		Capability: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+		Count: 1, Sources: []execjournal.ResearchSource{
+			{Title: "Legacy", URL: "https://legacy.example"},
+		},
+	}}
+	incoming := &execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+		Sources: []execjournal.ResearchSource{{ID: "src-1", Title: "New", URL: "https://new.example"}},
+	}
+	rn.captureResearchEvidence(incoming, "s1", "obs-1")
+	ev := rn.researchEvidence
+	if ev.Version != execjournal.ResearchEvidenceLegacyVersion || ev.Count != 1 ||
+		len(ev.Sources) != 1 || ev.Sources[0].ID != "" || ev.Sources[0].Title != "Legacy" ||
+		len(ev.Operations) != 0 || ev.Plan != nil || len(ev.Steps) != 0 {
+		t.Fatalf("legacy evidence must not be upgraded or mixed: %+v", ev)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("legacy evidence must remain readable: %v", err)
+	}
+}
+
+// The terminal snapshot attaches only steps that exist in the final plan. A
+// source whose step was dropped by a replan stays present but unattributed.
+func TestFinalizeResearchEvidenceDropsOnlyUnprovableStepReferences(t *testing.T) {
+	rn := &run{
+		plan: &Plan{PlanID: "exec-1", Version: 2, Steps: []Step{
+			{StepID: "s1", Intent: "gather", Dependencies: nil},
+			{StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
+		}},
+		ledger: &planLedger{
+			planID: "exec-1", version: 2,
+			order: []string{"s1", "s2"},
+			steps: map[string]*Step{
+				"s1": {StepID: "s1", Intent: "gather"},
+				"s2": {StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
+			},
+			records: map[string]*StepRecord{
+				"s1": {StepID: "s1", Status: StepCompleted, PlanVersion: 1, ObservationID: "obs-1"},
+				"s2": {StepID: "s2", Status: StepReady, PlanVersion: 2},
+			},
+		},
+		researchEvidence: &execjournal.ResearchEvidence{
+			Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+			Operation: execjournal.ResearchEvidenceOperation, Count: 2,
+			Sources: []execjournal.ResearchSource{
+				{ID: "src-1", Title: "One", URL: "https://one.example"},
+				{ID: "src-2", Title: "Dropped", URL: "https://dropped.example"},
+			},
+			Operations: []execjournal.ResearchOperationEvidence{
+				{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"}},
+				{OperationID: "obs-9", StepID: "s9", ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-2"}},
+			},
+		},
+	}
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	ev := rn.researchEvidence
+	if ev.Plan == nil || ev.Plan.PlanID != "exec-1" || ev.Plan.Version != 2 ||
+		len(ev.Steps) != 2 || len(ev.Operations) != 1 {
+		t.Fatalf("unexpected finalized provenance: %+v", ev)
+	}
+	if ev.Operations[0].StepID != "s1" || !slices.Equal(ev.Operations[0].SourceIDs, []string{"src-1"}) {
+		t.Fatalf("dropped-step operation must not be reassigned: %+v", ev.Operations[0])
+	}
+	if err := execjournal.ValidateResearchEvidence(ev); err != nil {
+		t.Fatalf("finalized provenance must validate: %v", err)
+	}
+}
+
+// A plan step without a ledger record has no provable lifecycle fact. It is
+// omitted with its operation instead of being assigned an invented status;
+// the source stays present and unattributed.
+func TestFinalizeResearchEvidenceOmitsUnprovenStep(t *testing.T) {
+	rn := &run{
+		plan: &Plan{PlanID: "exec-1", Version: 1, Steps: []Step{
+			{StepID: "s1", Intent: "gather"},
+			{StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
+		}},
+		ledger: &planLedger{
+			planID: "exec-1", version: 1,
+			order: []string{"s1", "s2"},
+			steps: map[string]*Step{
+				"s1": {StepID: "s1", Intent: "gather"},
+				"s2": {StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
+			},
+			records: map[string]*StepRecord{
+				"s1": {StepID: "s1", Status: StepCompleted, PlanVersion: 1, ObservationID: "obs-1"},
+			},
+		},
+		researchEvidence: &execjournal.ResearchEvidence{
+			Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+			Operation: execjournal.ResearchEvidenceOperation, Count: 2,
+			Sources: []execjournal.ResearchSource{
+				{ID: "src-1", Title: "One", URL: "https://one.example"},
+				{ID: "src-2", Title: "Unproven", URL: "https://unproven.example"},
+			},
+			Operations: []execjournal.ResearchOperationEvidence{
+				{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"}},
+				{OperationID: "obs-2", StepID: "s2", ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-2"}},
+			},
+		},
+	}
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	ev := rn.researchEvidence
+	if ev.Plan == nil || ev.Plan.PlanID != "exec-1" || len(ev.Steps) != 1 || len(ev.Operations) != 1 {
+		t.Fatalf("unproven step must be omitted: %+v", ev)
+	}
+	if ev.Steps[0].StepID != "s1" || ev.Operations[0].StepID != "s1" {
+		t.Fatalf("proven step must survive: %+v", ev)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("finalized provenance must validate: %v", err)
+	}
+}
+
+// If the settled plan cannot satisfy the evidence contract (for example a
+// model-authored step id beyond the durable bound), provenance is dropped
+// rather than turning the terminal write into a failure. Sources stay present
+// but unattributed.
+func TestFinalizeResearchEvidenceDropsInvalidProvenance(t *testing.T) {
+	longStepID := strings.Repeat("s", execjournal.MaxResearchStepID+1)
+	rn := &run{
+		plan: &Plan{PlanID: "exec-1", Version: 1, Steps: []Step{
+			{StepID: longStepID, Intent: "gather"},
+		}},
+		ledger: &planLedger{
+			planID: "exec-1", version: 1,
+			order: []string{longStepID},
+			steps: map[string]*Step{
+				longStepID: {StepID: longStepID, Intent: "gather"},
+			},
+			records: map[string]*StepRecord{
+				longStepID: {StepID: longStepID, Status: StepCompleted, PlanVersion: 1, ObservationID: "obs-1"},
+			},
+		},
+		researchEvidence: &execjournal.ResearchEvidence{
+			Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+			Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+			Sources: []execjournal.ResearchSource{{ID: "src-1", Title: "One", URL: "https://one.example"}},
+			Operations: []execjournal.ResearchOperationEvidence{
+				{OperationID: "obs-1", StepID: longStepID, ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"}},
+			},
+		},
+	}
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	ev := rn.researchEvidence
+	if ev.Plan != nil || len(ev.Steps) != 0 || len(ev.Operations) != 0 {
+		t.Fatalf("invalid provenance must be dropped: %+v", ev)
+	}
+	if ev.Count != 1 || len(ev.Sources) != 1 || ev.Sources[0].ID != "src-1" {
+		t.Fatalf("source records must remain: %+v", ev)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("dropped provenance must still validate: %v", err)
+	}
+}
+
 // An empty complete result is evidence that the search returned nothing, not
 // evidence of nothing.
 func TestWebSearchEmptyResultIsStillEvidence(t *testing.T) {
@@ -198,6 +407,21 @@ func TestWebSearchEmptyResultIsStillEvidence(t *testing.T) {
 	}
 	if out.ResearchEvidence.Count != 0 || len(out.ResearchEvidence.Sources) != 0 {
 		t.Fatalf("empty snapshot must stay empty: %+v", out.ResearchEvidence)
+	}
+	if out.ResearchEvidence.Sources == nil {
+		t.Fatal("empty sources must stay a JSON array, not null")
+	}
+	raw, err := json.Marshal(out.ResearchEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"sources":[]`) {
+		t.Fatalf("present empty evidence must serialize sources as []: %s", raw)
+	}
+	if len(out.ResearchEvidence.Operations) != 1 ||
+		out.ResearchEvidence.Operations[0].SourceIDs == nil ||
+		!strings.Contains(string(raw), `"source_ids":[]`) {
+		t.Fatalf("empty operation must serialize source_ids as []: %s", raw)
 	}
 }
 

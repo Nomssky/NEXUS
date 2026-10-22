@@ -272,6 +272,29 @@
   letter-spacing: var(--letter-spacing-wide);
 }
 
+.stepStatesHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.stepStatesHeader .stepStatesTitle {
+  margin-bottom: 0;
+}
+
+.stepStatesNote {
+  margin: var(--space-2) 0 var(--space-3);
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-normal);
+  color: var(--color-text-muted);
+}
+
+.planIdentity {
+  font-family: var(--font-family-mono);
+  overflow-wrap: anywhere;
+}
+
 .stepStatesList {
   display: flex;
   flex-direction: column;
@@ -304,6 +327,18 @@
   font-family: var(--font-family-mono);
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
+}
+
+.stepDependencies {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+
+.stepSources {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  white-space: nowrap;
 }
 
 .step-completed {

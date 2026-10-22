@@ -29,6 +29,7 @@ import {
   parseResearchResult,
   parseResearchSteps,
   buildResearchFindings,
+  type ParsedDurableEvidence,
   type ResearchResult,
   type ResearchFindings,
   type ResearchStep,
@@ -152,7 +153,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
 
   // Findings: agent-generated synthesis kept distinct from source records.
   const findings = useMemo(
-    () => buildResearchFindings(parsedResult, durableEvidence, steps),
+    () => buildResearchFindings(parsedResult, durableEvidence, steps, durableEvidence.steps),
     [parsedResult, durableEvidence, steps]
   );
 
@@ -226,6 +227,7 @@ export const Research: React.FC<ResearchPageProps> = ({ businessId, actorId }) =
               toolActivity={toolActivity}
               steps={steps}
               findings={findings}
+              durableEvidence={durableEvidence}
               isLoading={isLoading}
               recoveryError={recoveryError}
               recoveryDetail={recoveryDetail}
@@ -264,6 +266,7 @@ interface ResearchZoneProps {
   toolActivity: ResearchToolActivity[];
   steps: ResearchStep[];
   findings: ResearchFindings;
+  durableEvidence: ParsedDurableEvidence;
   isLoading: boolean;
   recoveryError: boolean;
   recoveryDetail: DurableExecution | undefined;
@@ -284,6 +287,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
   toolActivity,
   steps,
   findings,
+  durableEvidence,
   isLoading,
   recoveryError,
   recoveryDetail,
@@ -332,6 +336,8 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
             completedAt={recoveryDetail?.completed_at}
             steps={steps}
             findings={findings}
+            durablePlan={durableEvidence.plan}
+            durableSteps={durableEvidence.steps}
           />
         </section>
 
@@ -342,6 +348,7 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
           <ResearchEvidence
             result={parsedResult.webSearch}
             durableEvidence={recoveryDetail?.research_evidence}
+            parsedEvidence={durableEvidence}
             toolActivity={toolActivity}
             status={execution?.status ?? recoveryDetail?.state}
             executionId={activeExecutionId ?? undefined}

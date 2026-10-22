@@ -14,13 +14,21 @@
  * - When the process-local execution read is unavailable but the durable read
  *   proves a terminal state (e.g. after a restart), the panel reports the
  *   result text as unavailable instead of pretending there is no result.
+ * - A recovered plan is rendered with its durable plan identity, ordered steps,
+ *   dependencies and ledger statuses. It is visually and textually distinct
+ *   from the process-local trace, which is labeled as live, non-durable state.
  */
 
 import React, { useMemo } from 'react';
 import { Card, Badge, getStatusVariant } from '../primitives';
-import type { ExecutionStatus } from '../../types/api';
+import type {
+  DurableResearchPlan,
+  DurableResearchStepStatus,
+  ExecutionStatus,
+} from '../../types/api';
 import {
   parseResearchResult,
+  type ParsedDurableStep,
   type ResearchStep,
   type ResearchFindings,
 } from '../../types/research';
@@ -37,9 +45,14 @@ interface ResearchOutputProps {
   /** Real lifecycle timestamps from the durable record. Undefined means unavailable. */
   createdAt?: string | null;
   completedAt?: string | null;
-  /** Findings: synthesis kept distinct from source records. */
+  /** Process-local step states from the execution trace. */
   steps?: ResearchStep[];
+  /** Findings: synthesis kept distinct from source records. */
   findings?: ResearchFindings;
+  /** Durable plan identity; present only when the journal persisted it. */
+  durablePlan?: DurableResearchPlan;
+  /** Recovered durable steps in plan order. Distinct from process-local steps. */
+  durableSteps?: ParsedDurableStep[];
 }
 
 const DURABLE_TERMINAL_STATES = new Set([
@@ -61,6 +74,8 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   completedAt,
   steps,
   findings,
+  durablePlan,
+  durableSteps,
 }) => {
   const parsed = useMemo(() => parseResearchResult(output), [output]);
 
@@ -92,6 +107,9 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
       const details = lifecycleDetails(createdAt, completedAt);
       return (
         <Card variant="outlined" padding="lg">
+          {durablePlan && durableSteps && durableSteps.length > 0 && (
+            <DurablePlanSection plan={durablePlan} steps={durableSteps} />
+          )}
           <div className={styles.empty}>
             <div className={styles.resultHeader}>
               <div className={styles.resultHeading}>
@@ -171,26 +189,39 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
           </div>
         )}
 
-        {steps && steps.length > 0 && (
-          <section className={styles.stepStates} aria-label="Research steps">
-            <h4 className={styles.stepStatesTitle}>Research steps</h4>
-            <ul className={styles.stepStatesList}>
-              {steps.map((step) => (
-                <li
-                  key={step.stepId}
-                  className={`${styles.stepItem} ${styles['step-' + step.status]}`}
-                >
-                  <span className={styles.stepId}>{step.stepId}</span>
-                  <Badge variant={stepStatusVariant(step.status)} size="sm">
-                    {stepStatusLabel(step.status)}
-                  </Badge>
-                  {step.actionType && (
-                    <span className={styles.stepAction}>{step.actionType}</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </section>
+        {durablePlan && durableSteps && durableSteps.length > 0 ? (
+          <DurablePlanSection plan={durablePlan} steps={durableSteps} />
+        ) : (
+          steps &&
+          steps.length > 0 && (
+            <section className={styles.stepStates} aria-label="Process-local research steps">
+              <div className={styles.stepStatesHeader}>
+                <h4 className={styles.stepStatesTitle}>Research steps</h4>
+                <Badge variant="default" size="sm">
+                  Live trace
+                </Badge>
+              </div>
+              <p className={styles.stepStatesNote}>
+                Process-local lifecycle events from this running instance. Not durably persisted.
+              </p>
+              <ul className={styles.stepStatesList}>
+                {steps.map((step) => (
+                  <li
+                    key={step.stepId}
+                    className={`${styles.stepItem} ${styles['step-' + step.status]}`}
+                  >
+                    <span className={styles.stepId}>{step.stepId}</span>
+                    <Badge variant={stepStatusVariant(step.status)} size="sm">
+                      {stepStatusLabel(step.status)}
+                    </Badge>
+                    {step.actionType && (
+                      <span className={styles.stepAction}>{step.actionType}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )
         )}
 
         {findings?.synthesis && (
@@ -252,6 +283,51 @@ interface DetailItem {
   label: string;
   value: string;
 }
+
+const DurablePlanSection: React.FC<{
+  plan: DurableResearchPlan;
+  steps: ParsedDurableStep[];
+}> = ({ plan, steps }) => (
+  <section
+    className={styles.stepStates}
+    aria-label="Durable research plan"
+    data-provenance="durable"
+  >
+    <div className={styles.stepStatesHeader}>
+      <h4 className={styles.stepStatesTitle}>Research plan</h4>
+      <Badge variant="info" size="sm">
+        Durable record
+      </Badge>
+    </div>
+    <p className={styles.stepStatesNote}>
+      Recovered from the execution journal and persisted across restarts. Plan{' '}
+      <span className={styles.planIdentity}>{plan.plan_id}</span>, version {plan.version}.
+    </p>
+    <ul className={styles.stepStatesList}>
+      {steps.map((step) => (
+        <li
+          key={step.stepId}
+          className={`${styles.stepItem} ${styles[durableStepClassName(step.status)]}`}
+          data-step-id={step.stepId}
+          data-step-status={step.status}
+        >
+          <span className={styles.stepId}>{step.stepId}</span>
+          <Badge variant={durableStepStatusVariant(step.status)} size="sm">
+            {durableStepStatusLabel(step.status)}
+          </Badge>
+          {step.dependencies.length > 0 && (
+            <span className={styles.stepDependencies}>
+              after {step.dependencies.join(', ')}
+            </span>
+          )}
+          <span className={styles.stepSources}>
+            {step.sources.length} source{step.sources.length === 1 ? '' : 's'}
+          </span>
+        </li>
+      ))}
+    </ul>
+  </section>
+);
 
 function buildDetails(
   objective: string | undefined,
@@ -361,6 +437,66 @@ function stepStatusLabel(status: ResearchStep['status']): string {
       return 'Blocked';
     case 'failed':
       return 'Failed';
+    default:
+      return status;
+  }
+}
+
+/** CSS class for a durable ledger state, including states the trace omits. */
+function durableStepClassName(status: DurableResearchStepStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'step-completed';
+    case 'executing':
+    case 'observing':
+      return 'step-running';
+    case 'failed':
+    case 'cancelled':
+      return 'step-failed';
+    default:
+      return 'step-ready';
+  }
+}
+
+function durableStepStatusVariant(
+  status: DurableResearchStepStatus
+): import('../primitives').BadgeVariant {
+  switch (status) {
+    case 'completed':
+      return 'success';
+    case 'executing':
+    case 'observing':
+      return 'info';
+    case 'blocked':
+    case 'pending':
+    case 'ready':
+      return 'warning';
+    case 'failed':
+    case 'cancelled':
+      return 'error';
+    default:
+      return 'default';
+  }
+}
+
+function durableStepStatusLabel(status: DurableResearchStepStatus): string {
+  switch (status) {
+    case 'pending':
+      return 'Pending';
+    case 'ready':
+      return 'Ready';
+    case 'executing':
+      return 'Executing';
+    case 'observing':
+      return 'Observing';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    case 'blocked':
+      return 'Blocked';
+    case 'cancelled':
+      return 'Cancelled';
     default:
       return status;
   }

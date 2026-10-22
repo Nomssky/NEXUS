@@ -31,10 +31,18 @@
  * capability boundary, and it survives restarts. It is parsed defensively with
  * the same wholesale-rejection rules the journal writer applies, and rendered
  * through the same ParsedWebSearchSource shape as the process-local envelope.
+ *
+ * v54 extends that snapshot (schema v2) with runtime-owned plan identity,
+ * ordered step evidence and operation-to-source associations. Attribution is
+ * read only from those persisted operation records; it is never inferred from
+ * source order, titles, URLs or timestamps. Legacy v1 evidence remains
+ * readable without invented ids or provenance.
  */
 
 import type {
   DurableResearchEvidence,
+  DurableResearchPlan,
+  DurableResearchStepStatus,
   ParsedWebSearchSource,
   TraceEntry,
   WebSearchResult,
@@ -262,18 +270,47 @@ function parseNonNegativeInt(value: string | undefined): number | undefined {
   return parsed;
 }
 
-// ---- Durable research evidence (v52) ----
+// ---- Durable research evidence (v52, extended by v54) ----
 
-/** Per-field bounds mirror internal/execjournal/evidence.go. */
+/**
+ * Bounds mirror internal/execjournal/evidence.go. A durable snapshot that
+ * exceeds any bound is rejected wholesale; the UI never renders a partial or
+ * silently truncated provenance record.
+ */
 const MAX_DURABLE_TITLE = 512;
 const MAX_DURABLE_URL = 2048;
 const MAX_DURABLE_SOURCE = 256;
 const MAX_DURABLE_SNIPPET = 1024;
+const MAX_DURABLE_SOURCES = 50;
+const MAX_DURABLE_PLAN_STEPS = 64;
+const MAX_DURABLE_STEP_DEPENDENCIES = 32;
+const MAX_DURABLE_OPERATIONS = 64;
+const MAX_DURABLE_OPERATION_SOURCE_REFS = 50;
+const MAX_DURABLE_PLAN_ID = 128;
+const MAX_DURABLE_STEP_ID = 128;
+const MAX_DURABLE_OBSERVATION_ID = 128;
+const MAX_DURABLE_OPERATION_ID = 128;
+const MAX_DURABLE_SOURCE_ID = 64;
+const MAX_DURABLE_PLAN_VERSION = 1_000_000;
 
-/** Schema version the journal writes today; unknown versions are not rendered. */
-const DURABLE_EVIDENCE_VERSION = 1;
+/** Schema version the journal writes today; v1 is readable legacy evidence. */
+const DURABLE_EVIDENCE_VERSION = 2;
+const DURABLE_EVIDENCE_LEGACY_VERSION = 1;
 const DURABLE_EVIDENCE_CAPABILITY = 'web.search';
 const DURABLE_EVIDENCE_OPERATION = 'search';
+
+/**
+ * One recovered plan step. Order is the durable plan order, not source order
+ * or URL order. Sources are attached only through operation records the
+ * runtime wrote at tool-mediation time.
+ */
+export interface ParsedDurableStep {
+  stepId: string;
+  status: DurableResearchStepStatus;
+  dependencies: string[];
+  observationId?: string;
+  sources: ParsedWebSearchSource[];
+}
 
 export interface ParsedDurableEvidence {
   /**
@@ -289,22 +326,58 @@ export interface ParsedDurableEvidence {
   /** The count declared by the provider envelope; equals sources.length. */
   count?: number;
   sources: ParsedWebSearchSource[];
+  /**
+   * Plan identity from the durable record. Absent on legacy v1 evidence and on
+   * v2 source-only captures that were never associated with a plan.
+   */
+  plan?: DurableResearchPlan;
+  /** Ordered durable steps. Empty for legacy or source-only evidence. */
+  steps: ParsedDurableStep[];
+  /**
+   * Sources that no operation references. Kept explicit instead of guessing a
+   * step association; legacy v1 evidence places every source here.
+   */
+  unattributedSources: ParsedWebSearchSource[];
 }
 
-const NO_DURABLE_EVIDENCE: ParsedDurableEvidence = { present: false, sources: [] };
+const NO_DURABLE_EVIDENCE: ParsedDurableEvidence = {
+  present: false,
+  sources: [],
+  steps: [],
+  unattributedSources: [],
+};
+
+const DURABLE_STEP_STATUSES = new Set<DurableResearchStepStatus>([
+  'pending',
+  'ready',
+  'executing',
+  'observing',
+  'completed',
+  'failed',
+  'blocked',
+  'cancelled',
+]);
 
 /**
  * Parse the durable research_evidence field from the recovery detail read.
  * Like the journal writer, validation is wholesale: one malformed row, a
- * count mismatch, an unsupported capability, or an over-bound value rejects
- * the whole snapshot instead of rendering a partial record as evidence.
+ * count mismatch, an unsupported version, an over-bound value, or provenance
+ * that references an unknown step/source rejects the whole snapshot instead
+ * of rendering a partial record as evidence.
+ *
+ * v1 legacy evidence remains readable exactly as written: no plan, steps,
+ * operations, source ids, or timestamps are invented for it.
  */
 export function parseDurableResearchEvidence(
   evidence?: DurableResearchEvidence | null
 ): ParsedDurableEvidence {
   if (!isRecord(evidence)) return NO_DURABLE_EVIDENCE;
   if (evidence.capability !== DURABLE_EVIDENCE_CAPABILITY) return NO_DURABLE_EVIDENCE;
-  if (evidence.version !== DURABLE_EVIDENCE_VERSION) return NO_DURABLE_EVIDENCE;
+
+  const version = evidence.version;
+  if (version !== DURABLE_EVIDENCE_VERSION && version !== DURABLE_EVIDENCE_LEGACY_VERSION) {
+    return NO_DURABLE_EVIDENCE;
+  }
 
   const operation = evidence.operation;
   if (
@@ -320,7 +393,7 @@ export function parseDurableResearchEvidence(
     typeof count !== 'number' ||
     !Number.isInteger(count) ||
     count < 0 ||
-    count > 50
+    count > MAX_DURABLE_SOURCES
   ) {
     return NO_DURABLE_EVIDENCE;
   }
@@ -330,10 +403,12 @@ export function parseDurableResearchEvidence(
   }
 
   const sources: ParsedWebSearchSource[] = [];
+  const sourceIDs = new Set<string>();
+  const v2 = version === DURABLE_EVIDENCE_VERSION;
   for (let i = 0; i < evidence.sources.length; i++) {
     const row = evidence.sources[i];
     if (!isRecord(row)) return NO_DURABLE_EVIDENCE;
-    const { title, url, source, snippet } = row;
+    const { id, title, url, source, snippet } = row;
     if (
       typeof title !== 'string' ||
       typeof url !== 'string' ||
@@ -342,12 +417,27 @@ export function parseDurableResearchEvidence(
       title.length > MAX_DURABLE_TITLE ||
       url.length > MAX_DURABLE_URL ||
       source.length > MAX_DURABLE_SOURCE ||
-      snippet.length > MAX_DURABLE_SNIPPET
+      snippet.length > MAX_DURABLE_SNIPPET ||
+      containsLineBreak(title) ||
+      containsLineBreak(url) ||
+      containsLineBreak(source) ||
+      containsLineBreak(snippet)
     ) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    if (v2) {
+      if (!isDurableID(id, MAX_DURABLE_SOURCE_ID) || sourceIDs.has(id)) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      sourceIDs.add(id);
+    } else if (id !== undefined) {
+      // Legacy evidence never carried ids; accepting one would invent
+      // execution-scoped identity that was not persisted.
       return NO_DURABLE_EVIDENCE;
     }
     sources.push({
       index: i + 1,
+      id: v2 ? (id as string) : undefined,
       title,
       url,
       source,
@@ -357,13 +447,204 @@ export function parseDurableResearchEvidence(
     });
   }
 
+  if (!v2) {
+    if (evidence.plan !== undefined || evidence.steps !== undefined || evidence.operations !== undefined) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    return {
+      present: true,
+      capability: DURABLE_EVIDENCE_CAPABILITY,
+      operation: DURABLE_EVIDENCE_OPERATION,
+      count,
+      sources,
+      steps: [],
+      unattributedSources: sources,
+    };
+  }
+
+  const rawPlan = evidence.plan;
+  const rawSteps = evidence.steps;
+  const rawOperations = evidence.operations;
+  const hasSteps = rawSteps !== undefined && rawSteps !== null;
+  const hasOperations = rawOperations !== undefined && rawOperations !== null;
+
+  if (rawPlan === undefined || rawPlan === null) {
+    // Source-only v2 evidence is valid, but it cannot smuggle in provenance
+    // without the plan identity it belongs to.
+    if (hasSteps || hasOperations) return NO_DURABLE_EVIDENCE;
+    return {
+      present: true,
+      capability: DURABLE_EVIDENCE_CAPABILITY,
+      operation: DURABLE_EVIDENCE_OPERATION,
+      count,
+      sources,
+      steps: [],
+      unattributedSources: sources,
+    };
+  }
+
+  if (!isRecord(rawPlan)) return NO_DURABLE_EVIDENCE;
+  const planId = rawPlan.plan_id;
+  const planVersion = rawPlan.version;
+  if (
+    !isDurableID(planId, MAX_DURABLE_PLAN_ID) ||
+    typeof planVersion !== 'number' ||
+    !Number.isInteger(planVersion) ||
+    planVersion < 1 ||
+    planVersion > MAX_DURABLE_PLAN_VERSION
+  ) {
+    return NO_DURABLE_EVIDENCE;
+  }
+  if (!Array.isArray(rawSteps) || rawSteps.length < 1 || rawSteps.length > MAX_DURABLE_PLAN_STEPS) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
+  const stepIndex = new Set<string>();
+  const steps: ParsedDurableStep[] = [];
+  for (const rawStep of rawSteps) {
+    if (!isRecord(rawStep)) return NO_DURABLE_EVIDENCE;
+    const stepId = rawStep.step_id;
+    const status = rawStep.status;
+    if (!isDurableID(stepId, MAX_DURABLE_STEP_ID) || stepIndex.has(stepId)) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    if (typeof status !== 'string' || !DURABLE_STEP_STATUSES.has(status as DurableResearchStepStatus)) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    const dependencies = parseDurableDependencies(rawStep.dependencies);
+    if (dependencies === undefined) return NO_DURABLE_EVIDENCE;
+    if (
+      rawStep.observation_id !== undefined &&
+      rawStep.observation_id !== null &&
+      rawStep.observation_id !== '' &&
+      !isDurableID(rawStep.observation_id, MAX_DURABLE_OBSERVATION_ID)
+    ) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    stepIndex.add(stepId);
+    steps.push({
+      stepId,
+      status: status as DurableResearchStepStatus,
+      dependencies,
+      observationId:
+        typeof rawStep.observation_id === 'string' && rawStep.observation_id !== ''
+          ? rawStep.observation_id
+          : undefined,
+      sources: [],
+    });
+  }
+  for (const step of steps) {
+    for (const dep of step.dependencies) {
+      if (!stepIndex.has(dep)) return NO_DURABLE_EVIDENCE;
+    }
+  }
+  if (durableStepsHaveCycle(steps)) return NO_DURABLE_EVIDENCE;
+
+  const sourcesByID = new Map<string, ParsedWebSearchSource>();
+  for (const source of sources) {
+    if (source.id) sourcesByID.set(source.id, source);
+  }
+  const stepByID = new Map(steps.map((step) => [step.stepId, step]));
+  const operations = rawOperations ?? [];
+  if (!Array.isArray(operations) || operations.length > MAX_DURABLE_OPERATIONS) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
+  const operationIDs = new Set<string>();
+  const referencedSources = new Set<string>();
+  for (const rawOperation of operations) {
+    if (!isRecord(rawOperation)) return NO_DURABLE_EVIDENCE;
+    const operationId = rawOperation.operation_id;
+    const stepId = rawOperation.step_id;
+    const toolId = rawOperation.tool_id;
+    const operationName = rawOperation.operation;
+    const refs = rawOperation.source_ids;
+    if (!isDurableID(operationId, MAX_DURABLE_OPERATION_ID) || operationIDs.has(operationId)) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    if (!isDurableID(stepId, MAX_DURABLE_STEP_ID) || !stepByID.has(stepId)) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    if (toolId !== DURABLE_EVIDENCE_CAPABILITY || operationName !== DURABLE_EVIDENCE_OPERATION) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    if (!Array.isArray(refs) || refs.length > MAX_DURABLE_OPERATION_SOURCE_REFS) {
+      return NO_DURABLE_EVIDENCE;
+    }
+    operationIDs.add(operationId);
+    const operationSourceIDs = new Set<string>();
+    for (const sourceId of refs) {
+      if (
+        !isDurableID(sourceId, MAX_DURABLE_SOURCE_ID) ||
+        !sourcesByID.has(sourceId) ||
+        operationSourceIDs.has(sourceId) ||
+        referencedSources.has(sourceId)
+      ) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      operationSourceIDs.add(sourceId);
+      referencedSources.add(sourceId);
+      stepByID.get(stepId)?.sources.push(sourcesByID.get(sourceId) as ParsedWebSearchSource);
+    }
+  }
+
   return {
     present: true,
     capability: DURABLE_EVIDENCE_CAPABILITY,
     operation: DURABLE_EVIDENCE_OPERATION,
     count,
     sources,
+    plan: { plan_id: planId, version: planVersion },
+    steps,
+    unattributedSources: sources.filter(
+      (source) => !source.id || !referencedSources.has(source.id)
+    ),
   };
+}
+
+function parseDurableDependencies(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > MAX_DURABLE_STEP_DEPENDENCIES) return undefined;
+  const deps: string[] = [];
+  const seen = new Set<string>();
+  for (const dep of value) {
+    if (!isDurableID(dep, MAX_DURABLE_STEP_ID) || seen.has(dep)) return undefined;
+    seen.add(dep);
+    deps.push(dep);
+  }
+  return deps;
+}
+
+function durableStepsHaveCycle(steps: ParsedDurableStep[]): boolean {
+  const deps = new Map(steps.map((step) => [step.stepId, step.dependencies]));
+  const state = new Map<string, 'visiting' | 'done'>();
+  const visit = (id: string): boolean => {
+    const current = state.get(id);
+    if (current === 'visiting') return true;
+    if (current === 'done') return false;
+    state.set(id, 'visiting');
+    for (const dep of deps.get(id) ?? []) {
+      if (visit(dep)) return true;
+    }
+    state.set(id, 'done');
+    return false;
+  };
+  return steps.some((step) => visit(step.stepId));
+}
+
+function isDurableID(value: unknown, max: number): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= max &&
+    !value.includes('\u0000') &&
+    !value.includes('\n') &&
+    !value.includes('\r')
+  );
+}
+
+function containsLineBreak(value: string): boolean {
+  return value.includes('\u0000') || value.includes('\n') || value.includes('\r');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -475,9 +756,16 @@ export function parseResearchSteps(
 export function buildResearchFindings(
   parsed: ReturnType<typeof parseResearchResult>,
   durable: ParsedDurableEvidence,
-  steps: ResearchStep[]
+  steps: ResearchStep[],
+  durableSteps: ParsedDurableStep[] = []
 ): ResearchFindings {
-  const partial = steps.some((s) => s.status === 'failed' || s.status === 'blocked');
+  const partial =
+    durableSteps.length > 0
+      ? durableSteps.some(
+          (step) =>
+            step.status === 'failed' || step.status === 'blocked' || step.status === 'cancelled'
+        )
+      : steps.some((s) => s.status === 'failed' || s.status === 'blocked');
 
   return {
     synthesis:

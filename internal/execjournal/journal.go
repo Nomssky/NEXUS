@@ -266,7 +266,7 @@ func (j *Journal) TerminalWithEvidence(id string, state State, errClass string, 
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
 	}
-	if err := ValidateResearchEvidence(evidence); err != nil {
+	if err := ValidateResearchEvidenceForExecution(id, evidence); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -367,7 +367,7 @@ func (j *Journal) SupersedeApprovedPauseWithEvidence(id string, state State, err
 	if !state.Terminal() {
 		return fmt.Errorf("execjournal: %q is not a terminal state", state)
 	}
-	if err := ValidateResearchEvidence(evidence); err != nil {
+	if err := ValidateResearchEvidenceForExecution(id, evidence); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -700,7 +700,7 @@ func unmarshalExecution(r *store.Record) (ExecutionRecord, error) {
 	if err := validateApprovals(er); err != nil {
 		return er, err
 	}
-	if err := ValidateResearchEvidence(er.ResearchEvidence); err != nil {
+	if err := ValidateResearchEvidenceForExecution(er.ID, er.ResearchEvidence); err != nil {
 		return er, err
 	}
 	return er, nil

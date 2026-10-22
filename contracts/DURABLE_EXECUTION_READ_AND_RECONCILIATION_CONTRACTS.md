@@ -223,3 +223,57 @@ label can falsely claim external success.
   unaffected.
 - The new contract does not contradict the v10 recovery contract; it reads the
   same records and adds no writes.
+
+## 11. Optional research evidence (v52, extended by v54)
+
+The detail read may carry an additive `research_evidence` object for executions
+that captured a complete, validated `web.search` result. Its absence means no
+valid capture was persisted; it never means "the search returned nothing".
+An empty capture is present evidence with `count = 0`. The list read never
+carries this object.
+
+### 11.1 Versioned contract
+
+- **v1 (legacy):** `{version, capability, operation, count, sources}`. Source
+  rows have no ids, and there are no plan/step/operation fields. It is readable
+  exactly as written; no identity, attribution, plan or timestamp is invented.
+- **v2 (current):** the same fields, each source with an execution-scoped
+  `id` (`src-1`, `src-2`, ...), plus optional:
+  - `plan: {plan_id, version}` — the active plan version at the terminal
+    transition. `plan_id` is execution-scoped and must equal the durable
+    execution id.
+  - ordered `steps: [{step_id, status, dependencies?, observation_id?}]` in
+    plan order. Status is the runtime ledger state, not a success claim.
+  - `operations: [{operation_id, step_id, tool_id, operation, source_ids}]` —
+    one record per mediated successful `web.search` invocation, written when
+    the runtime knew the executing step and observation id. `source_ids` refer
+    to source ids in the same object.
+
+Attribution is derived only from these runtime records. It is never inferred
+from source order, titles, URLs, timestamps, or the order of the provider's
+result rows. Sources without an operation remain explicitly unattributed.
+Operations whose step is absent from the final plan are dropped; their sources
+remain present but unattributed rather than being reassigned.
+
+### 11.2 Bounds and failure behavior
+
+The snapshot is atomic with the terminal/supersede write. It is validated
+wholesale on write and read: unknown versions, missing v2 source ids, count
+mismatch, missing/duplicate/cyclic step references, unknown operation
+step/source ids, a source referenced by more than one operation, invalid status
+values, control characters, and the documented bounds fail closed. Bounds are
+50 sources, 64 plan steps, 32 dependencies per step, 64 operations, 50 source
+references per operation, 64-byte source ids, and 128-byte
+plan/step/observation/operation ids.
+
+A repeated delivery of the same mediated operation id does not duplicate source
+or operation records. Legacy evidence cannot carry v2 ids or provenance.
+
+### 11.3 What recovery may render
+
+Recovery may render the durable plan identity, step order and dependencies,
+step lifecycle statuses, operation-to-step source associations, source records,
+and the execution record's real lifecycle timestamps. It may not render the
+agent's synthesis text after restart: that text is process-local and is not
+durable. It may not fabricate step timestamps, source attribution, or a plan for
+legacy v1 evidence.

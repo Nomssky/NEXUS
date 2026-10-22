@@ -108,6 +108,7 @@ type runSnapshot struct {
 // pending_approval path calls this, right before returning.
 func (r *Runtime) snapshotRun(rn *run, id objectiveIdentity, plan *Plan, ledger *planLedger,
 	observations []Observation, usage BudgetUsage, working *WorkingMemory, deadline time.Time) {
+	rn.finalizeResearchEvidence(plan, ledger)
 	snap := &runSnapshot{
 		identity:         id,
 		businessID:       rn.businessID,
@@ -253,7 +254,24 @@ func copyResearchEvidence(in *execjournal.ResearchEvidence) *execjournal.Researc
 		return nil
 	}
 	out := *in
-	out.Sources = append([]execjournal.ResearchSource(nil), in.Sources...)
+	// Sources is a required JSON array. Copying into a nil slice would turn a
+	// present empty capture into null after an approval resume.
+	out.Sources = append([]execjournal.ResearchSource{}, in.Sources...)
+	if in.Plan != nil {
+		plan := *in.Plan
+		out.Plan = &plan
+	}
+	out.Steps = append([]execjournal.ResearchStepEvidence(nil), in.Steps...)
+	for i := range out.Steps {
+		out.Steps[i].Dependencies = append([]string(nil), in.Steps[i].Dependencies...)
+	}
+	out.Operations = append([]execjournal.ResearchOperationEvidence(nil), in.Operations...)
+	for i := range out.Operations {
+		// SourceIDs is a required JSON array even for a complete search that
+		// returned zero sources; null would be indistinguishable from a
+		// malformed association on the read side.
+		out.Operations[i].SourceIDs = append([]string{}, in.Operations[i].SourceIDs...)
+	}
 	return &out
 }
 

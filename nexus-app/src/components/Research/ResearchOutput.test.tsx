@@ -158,6 +158,42 @@ describe('ResearchOutput', () => {
     expect(markup).not.toContain('Research steps');
   });
 
+  it('renders a recovered durable plan distinctly from process-local trace steps', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      steps: [{ stepId: 'trace-s1', status: 'running', actionType: 'tool_call' }],
+      durablePlan: { plan_id: 'exec-1', version: 2 },
+      durableSteps: [
+        {
+          stepId: 's1',
+          status: 'completed',
+          dependencies: [],
+          observationId: 'obs-1',
+          sources: [],
+        },
+        {
+          stepId: 's2',
+          status: 'completed',
+          dependencies: ['s1'],
+          observationId: 'obs-2',
+          sources: [],
+        },
+      ],
+    });
+
+    expect(markup).toContain('Research plan');
+    expect(markup).toContain('Durable record');
+    expect(markup).toContain('exec-1');
+    expect(markup).toContain('version 2');
+    expect(markup).toContain('data-step-id="s1"');
+    expect(markup).toContain('after s1');
+    // The live trace is not presented as durable plan state.
+    expect(markup).not.toContain('Research steps');
+    expect(markup).not.toContain('Live trace');
+    expect(markup).not.toContain('trace-s1');
+  });
+
   describe('durable lifecycle timestamps (recovery detail read)', () => {
     const rendered = render({
       output: 'state=completed | objective=Search the web for nexus runtime capabilities | agent=analyst | tool_calls=1',
@@ -233,6 +269,32 @@ describe('ResearchOutput', () => {
       });
 
       expect(markup).toContain('Persisted source records are listed separately');
+    });
+
+    it('renders the recovered durable plan while result text remains unavailable', () => {
+      const markup = render({
+        output: undefined,
+        status: undefined,
+        durableState: 'completed',
+        createdAt: '2026-10-20T10:00:00Z',
+        completedAt: '2026-10-20T10:05:30Z',
+        durablePlan: { plan_id: 'exec-1', version: 1 },
+        durableSteps: [
+          { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
+          {
+            stepId: 's2',
+            status: 'completed',
+            dependencies: ['s1'],
+            sources: [],
+          },
+        ],
+      });
+
+      expect(markup).toContain('Result text unavailable');
+      expect(markup).toContain('Research plan');
+      expect(markup).toContain('data-step-id="s2"');
+      expect(markup).toContain('2026-10-20 10:05 UTC');
+      expect(markup).not.toContain('Synthesis');
     });
   });
 });

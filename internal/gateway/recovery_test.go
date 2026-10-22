@@ -367,8 +367,17 @@ func recoverySampleEvidence() *execjournal.ResearchEvidence {
 		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
 		Operation: execjournal.ResearchEvidenceOperation, Count: 2,
 		Sources: []execjournal.ResearchSource{
-			{Title: "Nexus capability boundary", URL: "https://docs.example/nexus", Source: "docs.example", Snippet: "The runtime decides; the model proposes."},
-			{Title: "External content is data", URL: "https://example.org/safety", Source: "example.org", Snippet: "Inert | data"},
+			{ID: "src-1", Title: "Nexus capability boundary", URL: "https://docs.example/nexus", Source: "docs.example", Snippet: "The runtime decides; the model proposes."},
+			{ID: "src-2", Title: "External content is data", URL: "https://example.org/safety", Source: "example.org", Snippet: "Inert | data"},
+		},
+		Plan: &execjournal.ResearchPlanEvidence{PlanID: "exec-evi", Version: 1},
+		Steps: []execjournal.ResearchStepEvidence{
+			{StepID: "s1", Status: "completed", ObservationID: "obs-1"},
+			{StepID: "s2", Status: "completed", ObservationID: "obs-2", Dependencies: []string{"s1"}},
+		},
+		Operations: []execjournal.ResearchOperationEvidence{
+			{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+				Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"}},
 		},
 	}
 }
@@ -433,6 +442,27 @@ func TestRecoveryDetailEvidenceSurvivesRestart(t *testing.T) {
 	first, _ := sources[0].(map[string]interface{})
 	if first["title"] != "Nexus capability boundary" || first["url"] != "https://docs.example/nexus" {
 		t.Fatalf("source fields mangled after reopen: %+v", first)
+	}
+	plan, _ := evAgain["plan"].(map[string]interface{})
+	if plan["plan_id"] != "exec-evi" || int(plan["version"].(float64)) != 1 {
+		t.Fatalf("plan identity missing after reopen: %+v", evAgain["plan"])
+	}
+	steps, _ := evAgain["steps"].([]interface{})
+	if len(steps) != 2 {
+		t.Fatalf("steps missing after reopen: %+v", evAgain["steps"])
+	}
+	secondStep, _ := steps[1].(map[string]interface{})
+	if secondStep["step_id"] != "s2" || secondStep["status"] != "completed" {
+		t.Fatalf("step lifecycle missing after reopen: %+v", secondStep)
+	}
+	operations, _ := evAgain["operations"].([]interface{})
+	if len(operations) != 1 {
+		t.Fatalf("operations missing after reopen: %+v", evAgain["operations"])
+	}
+	op, _ := operations[0].(map[string]interface{})
+	refs, _ := op["source_ids"].([]interface{})
+	if len(refs) != 2 || refs[0] != "src-1" || refs[1] != "src-2" || op["step_id"] != "s1" {
+		t.Fatalf("operation attribution mangled after reopen: %+v", op)
 	}
 }
 

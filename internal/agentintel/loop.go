@@ -159,6 +159,12 @@ type run struct {
 	// planVersion is the active plan version, maintained by the loop across
 	// replans. Event metadata reads it; the model never sets it.
 	planVersion int
+	// plan and ledger are the active runtime-owned plan snapshot. They are
+	// attached to the durable evidence only at terminal/pause time; evidence
+	// capture itself carries the step/operation attribution known when the
+	// mediated search ran.
+	plan   *Plan
+	ledger *planLedger
 	// researchEvidence accumulates only complete, validated web.search
 	// snapshots from THIS execution. evidenceOverflow latches when the bound is
 	// exceeded; the snapshot is then dropped rather than exposing a partial
@@ -172,15 +178,34 @@ type run struct {
 // object — and therefore the accumulator — belongs to exactly one execution.
 // If the combined list would exceed the durable bound, the whole snapshot is
 // dropped and no later capture can resurrect a partial list.
-func (rn *run) captureResearchEvidence(ev *execjournal.ResearchEvidence) {
-	if rn == nil || ev == nil || rn.evidenceOverflow {
+//
+// stepID and observationID are the stable execution-scoped identities known at
+// the moment the mediated tool call ran. A source is associated with a step
+// only through this operation record; nothing is inferred later from source
+// order, titles, URLs or timestamps.
+func (rn *run) captureResearchEvidence(ev *execjournal.ResearchEvidence, stepID, observationID string) {
+	if rn == nil || ev == nil || rn.evidenceOverflow ||
+		ev.Version != execjournal.ResearchEvidenceVersion {
 		return
+	}
+	if rn.researchEvidence != nil &&
+		rn.researchEvidence.Version != execjournal.ResearchEvidenceVersion {
+		// A resumed v1 snapshot cannot be merged: legacy source rows have no
+		// ids, and assigning them now would invent identity. Keep the persisted
+		// legacy evidence readable and do not claim provenance for new searches.
+		return
+	}
+	if stepID != "" && observationID != "" && rn.hasResearchOperation(observationID) {
+		return // repeated delivery of the same mediated operation
 	}
 	if rn.researchEvidence == nil {
 		copy := *ev
-		copy.Sources = append([]execjournal.ResearchSource(nil), ev.Sources...)
+		// Keep the JSON representation an array even for a complete search
+		// that returned zero sources; null would be indistinguishable from
+		// evidence absent on the read side.
+		copy.Sources = []execjournal.ResearchSource{}
+		copy.Plan, copy.Steps, copy.Operations = nil, nil, nil
 		rn.researchEvidence = &copy
-		return
 	}
 	combined := len(rn.researchEvidence.Sources) + len(ev.Sources)
 	if combined > execjournal.MaxResearchEvidenceSources {
@@ -188,8 +213,105 @@ func (rn *run) captureResearchEvidence(ev *execjournal.ResearchEvidence) {
 		rn.evidenceOverflow = true
 		return
 	}
-	rn.researchEvidence.Sources = append(rn.researchEvidence.Sources, ev.Sources...)
+	if stepID != "" && observationID != "" &&
+		len(rn.researchEvidence.Operations)+1 > execjournal.MaxResearchOperations {
+		rn.researchEvidence = nil
+		rn.evidenceOverflow = true
+		return
+	}
+	offset := len(rn.researchEvidence.Sources)
+	sourceIDs := make([]string, 0, len(ev.Sources))
+	for i, source := range ev.Sources {
+		source.ID = fmt.Sprintf("src-%d", offset+i+1)
+		rn.researchEvidence.Sources = append(rn.researchEvidence.Sources, source)
+		sourceIDs = append(sourceIDs, source.ID)
+	}
 	rn.researchEvidence.Count = len(rn.researchEvidence.Sources)
+	if stepID != "" && observationID != "" {
+		rn.researchEvidence.Operations = append(rn.researchEvidence.Operations,
+			execjournal.ResearchOperationEvidence{
+				OperationID: observationID,
+				StepID:      stepID,
+				ToolID:      execjournal.ResearchEvidenceCapability,
+				Operation:   execjournal.ResearchEvidenceOperation,
+				SourceIDs:   sourceIDs,
+			})
+	}
+}
+
+func (rn *run) hasResearchOperation(operationID string) bool {
+	if rn == nil || rn.researchEvidence == nil {
+		return false
+	}
+	for _, op := range rn.researchEvidence.Operations {
+		if op.OperationID == operationID {
+			return true
+		}
+	}
+	return false
+}
+
+// finalizeResearchEvidence attaches the active plan/step snapshot to the
+// evidence. It runs immediately before the outcome hand-off and again before
+// an approval snapshot, because a paused run must resume with the same
+// authoritative step state it durably recorded. The snapshot is final plan
+// order; operations whose step no longer exists are dropped (their sources
+// remain explicitly unattributed rather than guessed onto another step).
+func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
+	if rn == nil || rn.researchEvidence == nil ||
+		rn.researchEvidence.Version != execjournal.ResearchEvidenceVersion {
+		return
+	}
+	ev := rn.researchEvidence
+	operations := ev.Operations
+	ev.Plan, ev.Steps, ev.Operations = nil, nil, nil
+	if plan == nil || ledger == nil {
+		return
+	}
+	ev.Plan = &execjournal.ResearchPlanEvidence{
+		PlanID: plan.PlanID, Version: plan.Version,
+	}
+	allowed := make(map[string]struct{}, len(plan.Steps))
+	for _, step := range plan.Steps {
+		rec := ledger.get(step.StepID)
+		if rec == nil {
+			// A plan step with no ledger record has no provable lifecycle
+			// state. Do not invent one; an operation for it is dropped below
+			// and its sources stay unattributed.
+			continue
+		}
+		ev.Steps = append(ev.Steps, execjournal.ResearchStepEvidence{
+			StepID:        step.StepID,
+			Dependencies:  append([]string(nil), step.Dependencies...),
+			Status:        string(rec.Status),
+			ObservationID: rec.ObservationID,
+		})
+		allowed[step.StepID] = struct{}{}
+	}
+	if len(ev.Steps) == 0 {
+		// A plan with no provable steps cannot satisfy the evidence contract.
+		// Keep the source records, but expose no invented plan identity.
+		ev.Plan = nil
+		return
+	}
+	for _, op := range operations {
+		if _, ok := allowed[op.StepID]; !ok {
+			continue
+		}
+		ev.Operations = append(ev.Operations, op)
+	}
+	// Model-authored plan identifiers are validated only as non-empty by the
+	// plan validator. If the settled provenance cannot satisfy the durable
+	// evidence contract, drop the provenance rather than poisoning the
+	// terminal write; the source records remain honest but unattributed.
+	if err := execjournal.ValidateResearchEvidenceForExecution(ev.Plan.PlanID, ev); err != nil {
+		ev.Plan, ev.Steps, ev.Operations = nil, nil, nil
+		if err := execjournal.ValidateResearchEvidence(ev); err != nil {
+			// The source rows themselves cannot be represented honestly.
+			// Drop the whole snapshot rather than fail the terminal write.
+			rn.researchEvidence = nil
+		}
+	}
 }
 
 func (rn *run) emit(ev event.EventType, extra map[string]string) {
@@ -264,6 +386,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	// that actually ran, not a success claim. The journal remains the only
 	// durable exposure; this hand-off is internal.
 	defer func() {
+		rn.finalizeResearchEvidence(rn.plan, rn.ledger)
 		if out != nil && rn.researchEvidence != nil {
 			out.ResearchEvidence = rn.researchEvidence
 		}
@@ -354,6 +477,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 		// facts are decided here (contract §3, §4).
 		ledger = newPlanLedger(plan)
 	}
+	rn.plan, rn.ledger = plan, ledger
 
 	agentID = r.resolveAgent(obj, req)
 	if !resumed {
@@ -540,7 +664,11 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 		}
 		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
-		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, agentID, working, usage, budget)
+		currentStepID := ""
+		if current != nil {
+			currentStepID = step.StepID
+		}
+		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, currentStepID, agentID, working, usage, budget)
 		usage = next
 		// Completion gate (contract §7). With criteria on the objective, a
 		// completion claim is only a REQUEST: it is accepted when every
@@ -750,6 +878,7 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			plan = newPlan
 			rn.planVersion = newPlan.Version
 			ledger = ledger.carryCompleted(newPlan)
+			rn.plan, rn.ledger = plan, ledger
 			usage.NoProgress = 0
 			continue
 		}
@@ -803,7 +932,7 @@ func (r *Runtime) planner() Planner {
 // perform executes exactly one validated action and returns the observation it
 // produced plus the updated counters. It can only cause the five mediated
 // effects of §6; the returned terminal state is "" when the loop continues.
-func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action, agentID string, working *WorkingMemory, usage BudgetUsage, budget Budget) (*Observation, BudgetUsage, State, string) {
+func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action, stepID, agentID string, working *WorkingMemory, usage BudgetUsage, budget Budget) (*Observation, BudgetUsage, State, string) {
 	switch a.Type {
 	case ActionComplete:
 		// Completion needs runtime evidence, not model assertion: at least
@@ -902,7 +1031,7 @@ func (r *Runtime) perform(rn *run, ctx context.Context, obj Objective, a Action,
 		// evidence. ParseWebSearchEvidence rejects the whole snapshot on a
 		// count/format/size mismatch, so a partial source list is never stored.
 		if ev, ok := execjournal.ParseWebSearchEvidence(a.Tool, res.Operation, out, res.Truncated); ok {
-			rn.captureResearchEvidence(ev)
+			rn.captureResearchEvidence(ev, stepID, obs.ObservationID)
 		}
 		obs.Result = out
 		obs.Text = kvString(out)

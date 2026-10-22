@@ -924,7 +924,7 @@ func sampleEvidence(title string) *ResearchEvidence {
 	return &ResearchEvidence{
 		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 		Operation: ResearchEvidenceOperation, Count: 1,
-		Sources: []ResearchSource{{Title: title, URL: "https://example.test/source", Source: "example.test", Snippet: "bounded snippet"}},
+		Sources: []ResearchSource{{ID: "src-1", Title: title, URL: "https://example.test/source", Source: "example.test", Snippet: "bounded snippet"}},
 	}
 }
 
@@ -976,8 +976,79 @@ func TestTerminalWithEvidenceSurvivesReopen(t *testing.T) {
 	}
 }
 
-// An approval pause is provisionally terminal. Its pause timestamp and evidence
-// are replaced by the real final outcome when the pause is superseded.
+// A v2 plan/step/operation snapshot is written atomically with the terminal
+// transition and survives reopening the durable store. The association is
+// execution-scoped: a plan id from another execution never becomes durable.
+func TestTerminalWithResearchProvenanceSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStoreWithClock(dir, fixedClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := New(st, fixedClock())
+	if err := j.Accepted("exec-prov", "biz-1", "div-1", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.TerminalWithEvidence("exec-prov", StateCompleted, "", provenanceEvidence("exec-prov")); err != nil {
+		t.Fatalf("terminal with provenance: %v", err)
+	}
+	rec, ok, err := j.Get("exec-prov")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Plan == nil ||
+		rec.ResearchEvidence.Plan.PlanID != "exec-prov" ||
+		len(rec.ResearchEvidence.Steps) != 2 || len(rec.ResearchEvidence.Operations) != 2 {
+		t.Fatalf("provenance not recorded: %+v", rec.ResearchEvidence)
+	}
+
+	st2, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec2, ok, err := New(st2, nil).Get("exec-prov")
+	if err != nil || !ok {
+		t.Fatalf("reopen get: ok=%v err=%v", ok, err)
+	}
+	if rec2.ResearchEvidence == nil ||
+		rec2.ResearchEvidence.Operations[0].SourceIDs[0] != "src-1" ||
+		rec2.ResearchEvidence.Steps[1].Status != "completed" {
+		t.Fatalf("provenance did not survive restart: %+v", rec2.ResearchEvidence)
+	}
+
+	// Cross-execution plan identity is refused before the terminal write.
+	if err := j.TerminalWithEvidence("exec-other", StateCompleted, "", provenanceEvidence("exec-prov")); err == nil {
+		t.Fatal("a plan from another execution must not become durable")
+	}
+}
+
+// Legacy v52/v53 records carry evidence schema v1, which has no source ids,
+// plan, steps or operations. It must remain readable exactly as written.
+func TestLegacyResearchEvidenceDecodesWithoutInventedProvenance(t *testing.T) {
+	st := store.NewMemStore()
+	raw := []byte(`{"version":1,"id":"legacy-evidence","business_id":"biz-1","state":"completed",` +
+		`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:01:00Z",` +
+		`"research_evidence":{"version":1,"capability":"web.search","operation":"search","count":1,` +
+		`"sources":[{"title":"Legacy","url":"https://legacy.example","source":"legacy.example","snippet":"old"}]}}`)
+	if err := st.Put(&store.Record{ID: execKey("legacy-evidence"), Type: recordTypeExecution, Data: raw}); err != nil {
+		t.Fatal(err)
+	}
+	rec, ok, err := New(st, fixedClock()).Get("legacy-evidence")
+	if err != nil || !ok {
+		t.Fatalf("legacy evidence get: ok=%v err=%v", ok, err)
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Version != ResearchEvidenceLegacyVersion {
+		t.Fatalf("legacy evidence missing: %+v", rec.ResearchEvidence)
+	}
+	if rec.ResearchEvidence.Plan != nil || len(rec.ResearchEvidence.Steps) != 0 ||
+		len(rec.ResearchEvidence.Operations) != 0 {
+		t.Fatalf("legacy evidence must not invent provenance: %+v", rec.ResearchEvidence)
+	}
+	if rec.ResearchEvidence.Sources[0].ID != "" {
+		t.Fatalf("legacy evidence must not invent source ids: %+v", rec.ResearchEvidence.Sources[0])
+	}
+}
+
 func TestSupersedeApprovedPauseUpdatesTimestampsAndEvidence(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 	clock := func() time.Time { return now }
@@ -1084,5 +1155,23 @@ func TestUnsupportedEvidenceVersionFailsClosed(t *testing.T) {
 	}
 	if _, _, err := New(st, fixedClock()).Get("bad-evidence"); err == nil {
 		t.Fatal("unsupported evidence version must fail closed")
+	}
+}
+
+// A plan snapshot belongs to exactly one execution. A record whose persisted
+// plan id names another execution must not decode as valid provenance.
+func TestForeignResearchPlanFailsClosedAtDecode(t *testing.T) {
+	st := store.NewMemStore()
+	raw := []byte(`{"version":1,"id":"exec-mismatch","business_id":"biz-1","state":"completed",` +
+		`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:01:00Z",` +
+		`"research_evidence":{"version":2,"capability":"web.search","operation":"search","count":0,"sources":[],` +
+		`"plan":{"plan_id":"exec-other","version":1},` +
+		`"steps":[{"step_id":"s1","status":"completed"}]}}`)
+	if err := st.Put(&store.Record{ID: execKey("exec-mismatch"), Type: recordTypeExecution, Data: raw}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := New(st, fixedClock()).Get("exec-mismatch")
+	if err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Fatalf("a foreign research plan id must fail closed at decode, got %v", err)
 	}
 }

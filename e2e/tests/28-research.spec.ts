@@ -368,21 +368,71 @@ test.describe('Research Workspace E2E', () => {
     await expect(evidence.getByRole('link', { name: 'Open Nexus agent model in new tab' }))
       .toHaveAttribute('href', 'https://docs.example/agents');
 
-    // Step state visible from the trace (metadata only: step id + status).
-    // The trace confirms step lifecycle events were captured by the runtime.
+    // The durable detail read exposes the runtime-written plan/step provenance;
+    // the list read must stay free of the large evidence object.
     const listResp = await fetch(`${nexus.baseURL}/api/v1/recovery/executions?business_id=${nexus.businessID}`, {
       headers: { ...bootstrapHeaders(nexus) },
     });
     const list = await listResp.json();
     const execId = list.executions?.[0]?.execution_id;
-    const traceResp = await fetch(`${nexus.baseURL}/api/v1/intelligence/${execId}/trace?business_id=${nexus.businessID}`, {
-      headers: { ...bootstrapHeaders(nexus) },
-    });
-    const trace = await traceResp.json();
-    const stepTypes = trace.entries?.filter((e: any) => e.type && e.type.startsWith('step.')) ?? [];
-    expect(stepTypes.length).toBeGreaterThan(0);
-    await expect(output.getByText('s1', { exact: true })).toBeVisible();
-    await expect(output.getByText('s2', { exact: true })).toBeVisible();
+    expect(execId).toBeTruthy();
+    expect(list.executions?.[0]?.research_evidence).toBeUndefined();
+    const detailResp = await fetch(
+      `${nexus.baseURL}/api/v1/recovery/executions/${encodeURIComponent(execId)}?business_id=${nexus.businessID}`,
+      { headers: { ...bootstrapHeaders(nexus) } }
+    );
+    expect(detailResp.ok).toBeTruthy();
+    const detail = await detailResp.json();
+    const durableEvidence = detail.research_evidence;
+    expect(durableEvidence.version).toBe(2);
+    expect(durableEvidence.plan).toEqual({ plan_id: execId, version: 1 });
+    expect(durableEvidence.steps.map((step: any) => step.step_id)).toEqual(['s1', 's2']);
+    expect(durableEvidence.steps.map((step: any) => step.status)).toEqual(['completed', 'completed']);
+    expect(durableEvidence.steps[1].dependencies).toEqual(['s1']);
+    expect(durableEvidence.operations).toHaveLength(2);
+
+    // Attribution is the runtime's operation record, not source order in the
+    // UI. Verify each step maps to the titles its own search returned.
+    const sourcesById = new Map<string, any>(
+      durableEvidence.sources.map((source: any) => [source.id, source])
+    );
+    const titlesByStep = new Map<string, string[]>();
+    for (const operation of durableEvidence.operations) {
+      titlesByStep.set(
+        operation.step_id,
+        operation.source_ids.map((id: string) => sourcesById.get(id)?.title)
+      );
+    }
+    expect(titlesByStep.get('s1')).toEqual(['Nexus capability boundary', 'External content is data']);
+    expect(titlesByStep.get('s2')).toEqual(['Nexus agent model', 'Tool platform boundary']);
+    expect(durableEvidence.sources.map((source: any) => source.id)).toEqual([
+      'src-1',
+      'src-2',
+      'src-3',
+      'src-4',
+    ]);
+
+    // The recovered durable plan is rendered separately from process-local
+    // trace state and is labeled as the durable record.
+    const plan = output.locator('section[aria-label="Durable research plan"]');
+    await expect(plan).toBeVisible({ timeout: 15000 });
+    await expect(plan.getByText('Research plan')).toBeVisible();
+    await expect(plan.getByText('Durable record')).toBeVisible();
+    await expect(plan.locator('[data-step-id="s1"]')).toContainText('Completed');
+    await expect(plan.locator('[data-step-id="s2"]')).toContainText('after s1');
+    await expect(output.getByText('Research steps', { exact: true })).toHaveCount(0);
+
+    const stepOneSources = evidence.locator('section[aria-label="Sources for step s1"]');
+    const stepTwoSources = evidence.locator('section[aria-label="Sources for step s2"]');
+    await expect(stepOneSources).toBeVisible();
+    await expect(stepTwoSources).toBeVisible();
+    await expect(stepOneSources.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
+    await expect(stepOneSources.getByText('External content is data', { exact: true })).toBeVisible();
+    await expect(stepOneSources.getByText('Nexus agent model', { exact: true })).toHaveCount(0);
+    await expect(stepTwoSources.getByText('Nexus agent model', { exact: true })).toBeVisible();
+    await expect(stepTwoSources.getByText('Tool platform boundary', { exact: true })).toBeVisible();
+    await expect(stepTwoSources.getByText('Nexus capability boundary', { exact: true })).toHaveCount(0);
+    await expect(evidence.getByText('Unattributed sources')).toHaveCount(0);
 
     // Real lifecycle timestamps from the durable record.
     await expect(output.getByText('Submitted')).toBeVisible();
@@ -408,6 +458,23 @@ test.describe('Research Workspace E2E', () => {
     await expect(evidence.getByText('Tool platform boundary', { exact: true })).toBeVisible();
     await expect(evidence.getByText('4 sources')).toBeVisible();
     await expect(evidence.locator('a')).toHaveCount(4);
+
+    // Plan identity, step order and per-step source groups are recovered from
+    // the journal alone; the process-local trace and synthesis are gone.
+    const recoveredPlan = output.locator('section[aria-label="Durable research plan"]');
+    await expect(recoveredPlan).toBeVisible({ timeout: 15000 });
+    await expect(recoveredPlan.getByText('Durable record')).toBeVisible();
+    await expect(recoveredPlan.locator('[data-step-id="s1"]')).toContainText('Completed');
+    await expect(recoveredPlan.locator('[data-step-id="s2"]')).toContainText('after s1');
+    const recoveredStepOne = evidence.locator('section[aria-label="Sources for step s1"]');
+    const recoveredStepTwo = evidence.locator('section[aria-label="Sources for step s2"]');
+    await expect(recoveredStepOne.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
+    await expect(recoveredStepOne.getByText('External content is data', { exact: true })).toBeVisible();
+    await expect(recoveredStepOne.getByText('Nexus agent model', { exact: true })).toHaveCount(0);
+    await expect(recoveredStepTwo.getByText('Nexus agent model', { exact: true })).toBeVisible();
+    await expect(recoveredStepTwo.getByText('Tool platform boundary', { exact: true })).toBeVisible();
+    await expect(recoveredStepTwo.getByText('Nexus capability boundary', { exact: true })).toHaveCount(0);
+    await expect(evidence.getByText('Unattributed sources')).toHaveCount(0);
 
     // Grounded terminal timestamp survives too.
     await expect(output.getByText('Finished')).toBeVisible({ timeout: 15000 });

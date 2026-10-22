@@ -276,6 +276,9 @@ describe('parseDurableResearchEvidence', () => {
 
     expect(parsed.present).toBe(true);
     expect(parsed.count).toBe(2);
+    expect(parsed.plan).toBeUndefined();
+    expect(parsed.steps).toEqual([]);
+    expect(parsed.unattributedSources).toHaveLength(2);
     expect(parsed.sources).toEqual([
       {
         index: 1,
@@ -297,12 +300,10 @@ describe('parseDurableResearchEvidence', () => {
   });
 
   it('treats missing evidence as not present', () => {
-    expect(parseDurableResearchEvidence(undefined)).toEqual({ present: false, sources: [] });
-    expect(parseDurableResearchEvidence(null)).toEqual({ present: false, sources: [] });
-    expect(parseDurableResearchEvidence({} as unknown as DurableResearchEvidence)).toEqual({
-      present: false,
-      sources: [],
-    });
+    const absent = { present: false, sources: [], steps: [], unattributedSources: [] };
+    expect(parseDurableResearchEvidence(undefined)).toEqual(absent);
+    expect(parseDurableResearchEvidence(null)).toEqual(absent);
+    expect(parseDurableResearchEvidence({} as unknown as DurableResearchEvidence)).toEqual(absent);
   });
 
   it('rejects an empty search as "not evidence" when capability differs', () => {
@@ -324,7 +325,7 @@ describe('parseDurableResearchEvidence', () => {
   });
 
   it('rejects an unknown version', () => {
-    const wrongVersion = { ...source, version: 2 };
+    const wrongVersion = { ...source, version: 3 };
     expect(parseDurableResearchEvidence(wrongVersion).present).toBe(false);
   });
 
@@ -376,6 +377,223 @@ describe('parseDurableResearchEvidence', () => {
     expect(parsed.present).toBe(true);
     expect(parsed.count).toBe(0);
     expect(parsed.sources).toHaveLength(0);
+  });
+
+  it('maps v2 operations to ordered durable steps and source ids', () => {
+    const v2: DurableResearchEvidence = {
+      version: 2,
+      capability: 'web.search',
+      operation: 'search',
+      count: 3,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+        { id: 'src-2', title: 'Two', url: 'https://two.example', source: 'two', snippet: '2' },
+        { id: 'src-3', title: 'Three', url: 'https://three.example', source: 'three', snippet: '3' },
+      ],
+      plan: { plan_id: 'exec-1', version: 2 },
+      steps: [
+        { step_id: 's1', status: 'completed', observation_id: 'obs-1' },
+        {
+          step_id: 's2',
+          status: 'completed',
+          dependencies: ['s1'],
+          observation_id: 'obs-2',
+        },
+      ],
+      operations: [
+        {
+          operation_id: 'obs-1',
+          step_id: 's1',
+          tool_id: 'web.search',
+          operation: 'search',
+          source_ids: ['src-1', 'src-2'],
+        },
+        {
+          operation_id: 'obs-2',
+          step_id: 's2',
+          tool_id: 'web.search',
+          operation: 'search',
+          source_ids: ['src-3'],
+        },
+      ],
+    };
+
+    const parsed = parseDurableResearchEvidence(v2);
+
+    expect(parsed.present).toBe(true);
+    expect(parsed.plan).toEqual({ plan_id: 'exec-1', version: 2 });
+    expect(parsed.steps.map((step) => step.stepId)).toEqual(['s1', 's2']);
+    expect(parsed.steps[0]).toMatchObject({
+      stepId: 's1',
+      status: 'completed',
+      dependencies: [],
+      observationId: 'obs-1',
+    });
+    expect(parsed.steps[0].sources.map((item) => item.id)).toEqual(['src-1', 'src-2']);
+    expect(parsed.steps[1].sources.map((item) => item.id)).toEqual(['src-3']);
+    expect(parsed.steps[1].dependencies).toEqual(['s1']);
+    expect(parsed.unattributedSources).toEqual([]);
+  });
+
+  it('keeps v2 sources without an operation explicitly unattributed', () => {
+    const sourceOnly: DurableResearchEvidence = {
+      version: 2,
+      capability: 'web.search',
+      operation: 'search',
+      count: 1,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+      ],
+    };
+
+    const parsed = parseDurableResearchEvidence(sourceOnly);
+
+    expect(parsed.present).toBe(true);
+    expect(parsed.plan).toBeUndefined();
+    expect(parsed.steps).toEqual([]);
+    expect(parsed.unattributedSources.map((item) => item.id)).toEqual(['src-1']);
+  });
+
+  it('rejects invented provenance without plan identity', () => {
+    const noPlan = {
+      version: 2,
+      capability: 'web.search',
+      operation: 'search',
+      count: 1,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+      ],
+      steps: [{ step_id: 's1', status: 'completed' }],
+    } as unknown as DurableResearchEvidence;
+
+    expect(parseDurableResearchEvidence(noPlan).present).toBe(false);
+  });
+
+  it('rejects malformed or inconsistent v2 provenance wholesale', () => {
+    const base: DurableResearchEvidence = {
+      version: 2,
+      capability: 'web.search',
+      operation: 'search',
+      count: 2,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+        { id: 'src-2', title: 'Two', url: 'https://two.example', source: 'two', snippet: '2' },
+      ],
+      plan: { plan_id: 'exec-1', version: 1 },
+      steps: [
+        { step_id: 's1', status: 'completed', observation_id: 'obs-1' },
+        { step_id: 's2', status: 'ready', dependencies: ['s1'] },
+      ],
+      operations: [
+        {
+          operation_id: 'obs-1',
+          step_id: 's1',
+          tool_id: 'web.search',
+          operation: 'search',
+          source_ids: ['src-1'],
+        },
+      ],
+    };
+
+    const mutations: Array<(value: DurableResearchEvidence) => void> = [
+      (value) => {
+        value.sources = value.sources.map((row, index) =>
+          index === 0 ? { ...row, id: undefined } : row
+        );
+      },
+      (value) => {
+        value.steps = [{ step_id: 's1', status: 'completed' }, { step_id: 's1', status: 'ready' }];
+      },
+      (value) => {
+        value.steps = [{ step_id: 's1', status: 'completed', dependencies: ['s9'] }];
+      },
+      (value) => {
+        value.steps = [
+          { step_id: 's1', status: 'completed', dependencies: ['s2'] },
+          { step_id: 's2', status: 'completed', dependencies: ['s1'] },
+        ];
+      },
+      (value) => {
+        value.steps = [{ step_id: 's1', status: 'succeeded' as never }];
+      },
+      (value) => {
+        value.operations = [
+          {
+            operation_id: 'obs-1',
+            step_id: 's9',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+        ];
+      },
+      (value) => {
+        value.operations = [
+          {
+            operation_id: 'obs-1',
+            step_id: 's1',
+            tool_id: 'web.fetch',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+        ];
+      },
+      (value) => {
+        value.operations = [
+          {
+            operation_id: 'obs-1',
+            step_id: 's1',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-9'],
+          },
+        ];
+      },
+      (value) => {
+        value.operations = [
+          {
+            operation_id: 'obs-1',
+            step_id: 's1',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1', 'src-1'],
+          },
+        ];
+      },
+      (value) => {
+        value.operations = [
+          {
+            operation_id: 'obs-1',
+            step_id: 's1',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+          {
+            operation_id: 'obs-2',
+            step_id: 's2',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+        ];
+      },
+    ];
+
+    for (const mutate of mutations) {
+      const candidate = structuredClone(base);
+      mutate(candidate);
+      expect(parseDurableResearchEvidence(candidate).present).toBe(false);
+    }
+  });
+
+  it('rejects legacy evidence that carries invented ids', () => {
+    const legacyWithID = {
+      ...source,
+      sources: [{ ...source.sources[0], id: 'src-1' }, source.sources[1]],
+    } as unknown as DurableResearchEvidence;
+
+    expect(parseDurableResearchEvidence(legacyWithID).present).toBe(false);
   });
 });
 
@@ -479,10 +697,12 @@ describe('buildResearchFindings', () => {
       { index: 1, title: 'A', url: 'https://a.example', source: 'a', snippet: 's', linkable: true },
       { index: 2, title: 'B', url: 'https://b.example', source: 'b', snippet: 's', linkable: true },
     ],
+    steps: [],
+    unattributedSources: [],
   };
 
-  const durableEmpty = { present: true, sources: [] };
-  const durableAbsent = { present: false, sources: [] };
+  const durableEmpty = { present: true, sources: [], steps: [], unattributedSources: [] };
+  const durableAbsent = { present: false, sources: [], steps: [], unattributedSources: [] };
 
   it('keeps synthesis and sources distinct', () => {
     const findings = buildResearchFindings(
@@ -521,6 +741,34 @@ describe('buildResearchFindings', () => {
     );
 
     expect(findings.partial).toBe(true);
+  });
+
+  it('uses durable step statuses when no process-local trace survives', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableWithSources,
+      [],
+      [
+        { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
+        { stepId: 's2', status: 'cancelled', dependencies: ['s1'], sources: [] },
+      ]
+    );
+
+    expect(findings.partial).toBe(true);
+  });
+
+  it('does not mark findings partial from stale trace state when durable steps exist', () => {
+    const findings = buildResearchFindings(
+      parsedStructured,
+      durableWithSources,
+      [{ stepId: 'trace-s1', status: 'failed' }],
+      [
+        { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
+        { stepId: 's2', status: 'ready', dependencies: ['s1'], sources: [] },
+      ]
+    );
+
+    expect(findings.partial).toBe(false);
   });
 
   it('represents absent durable evidence honestly', () => {

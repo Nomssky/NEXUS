@@ -4,9 +4,11 @@
  * Sources are rendered from two grounded inputs, in priority order:
  *
  * 1. The durable research evidence snapshot from the recovery detail read
- *    (v52). It is a capture taken at the capability boundary, so it survives
- *    restarts and is authoritative; presence with zero sources means the
- *    search really ran and returned nothing.
+ *    (v52; v54 adds plan/step/operation provenance). It is a capture taken at
+ *    the capability boundary, so it survives restarts and is authoritative;
+ *    presence with zero sources means the search really ran and returned
+ *    nothing. In v2, source groups use only the runtime's operation references:
+ *    a source with no operation stays explicitly unattributed.
  * 2. The documented web.search output envelope (`{ sources, count }`) parsed
  *    from the process-local execution output, used only while the durable
  *    read is unavailable (e.g. an older backend).
@@ -26,6 +28,8 @@ import type { DurableResearchEvidence, ParsedWebSearchSource, WebSearchResult } 
 import { parseWebSearchResult } from '../../types/api';
 import {
   parseDurableResearchEvidence,
+  type ParsedDurableEvidence,
+  type ParsedDurableStep,
   type ResearchToolActivity,
 } from '../../types/research';
 import styles from './ResearchEvidence.module.css';
@@ -35,6 +39,12 @@ interface ResearchEvidenceProps {
   result?: WebSearchResult;
   /** Durable source snapshot from the recovery detail read. Preferred. */
   durableEvidence?: DurableResearchEvidence | null;
+  /**
+   * Already-parsed durable evidence. The page parses once so plan/steps and
+   * sources share one validated snapshot; the component still parses raw input
+   * when used on its own.
+   */
+  parsedEvidence?: ParsedDurableEvidence;
   /** Terminal tool events from the execution trace. Metadata only. */
   toolActivity?: ResearchToolActivity[];
   status?: string;
@@ -45,25 +55,30 @@ interface ResearchEvidenceProps {
 export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
   result,
   durableEvidence,
+  parsedEvidence,
   toolActivity = [],
   status,
   executionId,
   onViewTrace,
 }) => {
   const durable = useMemo(
-    () => parseDurableResearchEvidence(durableEvidence),
-    [durableEvidence]
+    () => parsedEvidence ?? parseDurableResearchEvidence(durableEvidence),
+    [parsedEvidence, durableEvidence]
   );
   const localSources = useMemo(() => (result ? parseWebSearchResult(result) : []), [result]);
 
   // Durable evidence wins when present: it is the persisted capability-boundary
   // capture and it survives restarts. The process-local envelope is only a
-  // fallback for backends that do not expose the durable read.
+  // fallback for backends that do not expose the durable read. Step grouping
+  // uses only the runtime-written operation references in the snapshot.
   if (durable.present) {
     if (durable.sources.length > 0) {
       return (
         <SourcesPanel
           sources={durable.sources}
+          steps={durable.steps.length > 0 ? durable.steps : undefined}
+          unattributedSources={durable.unattributedSources}
+          durable
           executionId={executionId}
           onViewTrace={onViewTrace}
         />
@@ -134,6 +149,12 @@ export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
 
 interface SourcesPanelProps {
   sources: ParsedWebSearchSource[];
+  /** Ordered durable steps, when the record carries plan provenance. */
+  steps?: ParsedDurableStep[];
+  /** Sources the durable snapshot did not attribute to any operation. */
+  unattributedSources?: ParsedWebSearchSource[];
+  /** True when this panel renders the durable journal snapshot. */
+  durable?: boolean;
   executionId?: string;
   onViewTrace?: (executionId: string) => void;
   /** Declared count from a process-local envelope, when known. */
@@ -143,16 +164,27 @@ interface SourcesPanelProps {
 
 const SourcesPanel: React.FC<SourcesPanelProps> = ({
   sources,
+  steps,
+  unattributedSources = [],
+  durable = false,
   executionId,
   onViewTrace,
   declaredCount,
   missingCount = 0,
 }) => {
+  const attributedSteps = steps?.filter((step) => step.sources.length > 0) ?? [];
+  const hasPlanProvenance = steps !== undefined && steps.length > 0;
+
   return (
     <div className={styles.evidenceContainer}>
       <div className={styles.header}>
         <h3 className={styles.title}>Research Sources</h3>
         <div className={styles.meta}>
+          {durable && (
+            <Badge variant="info" size="sm">
+              Durable record
+            </Badge>
+          )}
           <Badge variant="info" size="sm">
             {sources.length} source{sources.length !== 1 ? 's' : ''}
           </Badge>
@@ -171,41 +203,151 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({
         </p>
       )}
 
-      <div className={styles.sources}>
-        {sources.map((source) => (
-          <article key={`${source.index}-${source.url || source.title}`} className={styles.sourceCard}>
-            <div className={styles.sourceHeader}>
-              <span className={styles.sourceIndex}>{source.index}.</span>
-              <div className={styles.sourceHeading}>
-                <h4 className={styles.sourceTitle}>{source.title}</h4>
-                <div className={styles.sourceMeta}>
-                  {source.source && <span className={styles.sourceDomain}>{source.source}</span>}
-                  {source.linkable ? (
-                    <a
-                      href={source.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className={styles.sourceLink}
-                      aria-label={`Open ${source.title} in new tab`}
-                    >
-                      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-                        <path d="M4 10h6M10 4v6M7 11l4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                      </svg>
-                      <span>Open source</span>
-                    </a>
-                  ) : (
-                    <span className={styles.sourceUnavailable}>No link available</span>
-                  )}
-                </div>
+      {hasPlanProvenance ? (
+        <div className={styles.sourceGroups}>
+          {attributedSteps.map((step) => (
+            <section
+              key={step.stepId}
+              className={styles.sourceGroup}
+              aria-label={`Sources for step ${step.stepId}`}
+              data-step-id={step.stepId}
+            >
+              <div className={styles.sourceGroupHeader}>
+                <h4 className={styles.sourceGroupTitle}>Step {step.stepId}</h4>
+                <Badge variant={durableStepVariant(step.status)} size="sm">
+                  {durableStepLabel(step.status)}
+                </Badge>
+                <span className={styles.sourceGroupCount}>
+                  {step.sources.length} record{step.sources.length === 1 ? '' : 's'}
+                </span>
               </div>
-            </div>
-            {source.snippet && <p className={styles.sourceSnippet}>{source.snippet}</p>}
-          </article>
-        ))}
-      </div>
+              <div className={styles.sources}>
+                {step.sources.map((source) => (
+                  <SourceCard key={source.id ?? `${source.index}-${source.url}`} source={source} />
+                ))}
+              </div>
+            </section>
+          ))}
+
+          {attributedSteps.length === 0 && (
+            <p className={styles.attributionNote}>
+              The durable record did not attribute these sources to a research step.
+            </p>
+          )}
+
+          {unattributedSources.length > 0 && (
+            <section
+              className={styles.sourceGroup}
+              aria-label="Unattributed sources"
+              data-step-id="unattributed"
+            >
+              <div className={styles.sourceGroupHeader}>
+                <h4 className={styles.sourceGroupTitle}>Unattributed sources</h4>
+                <Badge variant="warning" size="sm">
+                  Not associated
+                </Badge>
+                <span className={styles.sourceGroupCount}>
+                  {unattributedSources.length} record
+                  {unattributedSources.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              <p className={styles.attributionNote}>
+                No step association was persisted for these records. They are shown without one
+                rather than guessed.
+              </p>
+              <div className={styles.sources}>
+                {unattributedSources.map((source) => (
+                  <SourceCard key={source.id ?? `${source.index}-${source.url}`} source={source} />
+                ))}
+              </div>
+            </section>
+          )}
+        </div>
+      ) : (
+        <div className={styles.sources}>
+          {sources.map((source) => (
+            <SourceCard key={source.id ?? `${source.index}-${source.url}`} source={source} />
+          ))}
+        </div>
+      )}
     </div>
   );
 };
+
+const SourceCard: React.FC<{ source: ParsedWebSearchSource }> = ({ source }) => (
+  <article
+    className={styles.sourceCard}
+    data-source-id={source.id}
+    data-source-index={source.index}
+  >
+    <div className={styles.sourceHeader}>
+      <span className={styles.sourceIndex}>{source.index}.</span>
+      <div className={styles.sourceHeading}>
+        <h4 className={styles.sourceTitle}>{source.title}</h4>
+        <div className={styles.sourceMeta}>
+          {source.source && <span className={styles.sourceDomain}>{source.source}</span>}
+          {source.linkable ? (
+            <a
+              href={source.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className={styles.sourceLink}
+              aria-label={`Open ${source.title} in new tab`}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                <path d="M4 10h6M10 4v6M7 11l4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+              <span>Open source</span>
+            </a>
+          ) : (
+            <span className={styles.sourceUnavailable}>No link available</span>
+          )}
+        </div>
+      </div>
+    </div>
+    {source.snippet && <p className={styles.sourceSnippet}>{source.snippet}</p>}
+  </article>
+);
+
+function durableStepVariant(
+  status: ParsedDurableStep['status']
+): BadgeVariant {
+  switch (status) {
+    case 'completed':
+      return 'success';
+    case 'executing':
+    case 'observing':
+      return 'info';
+    case 'failed':
+    case 'cancelled':
+      return 'error';
+    default:
+      return 'warning';
+  }
+}
+
+function durableStepLabel(status: ParsedDurableStep['status']): string {
+  switch (status) {
+    case 'pending':
+      return 'Pending';
+    case 'ready':
+      return 'Ready';
+    case 'executing':
+      return 'Executing';
+    case 'observing':
+      return 'Observing';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    case 'blocked':
+      return 'Blocked';
+    case 'cancelled':
+      return 'Cancelled';
+    default:
+      return status;
+  }
+}
 
 const ToolActivity: React.FC<{ activity: ResearchToolActivity[] }> = ({ activity }) => (
   <div className={styles.activity}>

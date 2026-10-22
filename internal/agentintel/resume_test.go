@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/control"
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
@@ -993,5 +994,56 @@ func TestRestoredEffectIsNotCountedTwiceAcrossResume(t *testing.T) {
 		memory.Query{BusinessID: "biz-1"})
 	if len(res.Records) != 1 {
 		t.Fatalf("the durable write must exist exactly once across the resume, got %d", len(res.Records))
+	}
+}
+
+// A paused run snapshots the settled plan/steps/operations so resuming cannot
+// inherit stale or aliased provenance. Mutating the resumed copy must never
+// mutate the paused snapshot.
+func TestCopyResearchEvidenceDeepCopiesProvenance(t *testing.T) {
+	original := &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceVersion,
+		Capability: execjournal.ResearchEvidenceCapability,
+		Operation:  execjournal.ResearchEvidenceOperation,
+		Count:      1,
+		Sources: []execjournal.ResearchSource{
+			{ID: "src-1", Title: "One", URL: "https://one.example"},
+		},
+		Plan: &execjournal.ResearchPlanEvidence{PlanID: "exec-1", Version: 1},
+		Steps: []execjournal.ResearchStepEvidence{
+			{StepID: "s1", Status: "completed", ObservationID: "obs-1", Dependencies: []string{}},
+		},
+		Operations: []execjournal.ResearchOperationEvidence{
+			{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+				Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"}},
+		},
+	}
+	copied := copyResearchEvidence(original)
+	if copied == nil {
+		t.Fatal("copy must be present")
+	}
+	copied.Plan.PlanID = "exec-2"
+	copied.Steps[0].Dependencies = append(copied.Steps[0].Dependencies, "s2")
+	copied.Operations[0].SourceIDs[0] = "src-9"
+	if original.Plan.PlanID != "exec-1" ||
+		len(original.Steps[0].Dependencies) != 0 ||
+		original.Operations[0].SourceIDs[0] != "src-1" {
+		t.Fatalf("copy aliased the paused provenance: %+v", original)
+	}
+
+	empty := copyResearchEvidence(&execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Sources: []execjournal.ResearchSource{},
+		Operations: []execjournal.ResearchOperationEvidence{{
+			OperationID: "obs-empty", StepID: "s1",
+			ToolID: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+			SourceIDs: []string{},
+		}},
+	})
+	if empty.Sources == nil {
+		t.Fatal("an empty source capture must remain a non-nil JSON array")
+	}
+	if empty.Operations[0].SourceIDs == nil {
+		t.Fatal("an empty source association must remain a non-nil JSON array")
 	}
 }

@@ -2,7 +2,10 @@ package agentintel
 
 import (
 	"context"
+	"slices"
 	"testing"
+
+	"github.com/Nomssky/NEXUS/internal/execjournal"
 )
 
 // TestMultiStepLoopCapturesEvidenceFromBothSteps verifies that the control
@@ -51,5 +54,42 @@ func TestMultiStepLoopCapturesEvidenceFromBothSteps(t *testing.T) {
 	}
 	if f.provider.count() != 2 {
 		t.Fatalf("expected 2 provider calls, got %d", f.provider.count())
+	}
+
+	ev := out.ResearchEvidence
+	if ev.Version != execjournal.ResearchEvidenceVersion || ev.Plan == nil {
+		t.Fatalf("expected a v2 plan snapshot, got %+v", ev)
+	}
+	if ev.Plan.PlanID != "exec-1" || ev.Plan.Version != 1 {
+		t.Fatalf("unexpected plan identity: %+v", ev.Plan)
+	}
+	if len(ev.Steps) != 2 || ev.Steps[0].StepID != "s1" || ev.Steps[1].StepID != "s2" {
+		t.Fatalf("expected ordered steps s1,s2: %+v", ev.Steps)
+	}
+	if ev.Steps[0].Status != string(StepCompleted) || ev.Steps[1].Status != string(StepCompleted) ||
+		ev.Steps[1].Dependencies[0] != "s1" {
+		t.Fatalf("unexpected step lifecycle: %+v", ev.Steps)
+	}
+	if len(ev.Operations) != 2 {
+		t.Fatalf("expected one operation per search, got %+v", ev.Operations)
+	}
+	wantByStep := map[string][]string{
+		"s1": {"src-1", "src-2"},
+		"s2": {"src-3", "src-4"},
+	}
+	for _, op := range ev.Operations {
+		if op.ToolID != execjournal.ResearchEvidenceCapability || op.Operation != execjournal.ResearchEvidenceOperation {
+			t.Fatalf("operation is not a mediated search: %+v", op)
+		}
+		if !slices.Equal(op.SourceIDs, wantByStep[op.StepID]) {
+			t.Fatalf("step %s source association = %v, want %v", op.StepID, op.SourceIDs, wantByStep[op.StepID])
+		}
+		delete(wantByStep, op.StepID)
+	}
+	if len(wantByStep) != 0 {
+		t.Fatalf("missing step operations: %v", wantByStep)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("captured provenance is invalid: %v", err)
 	}
 }

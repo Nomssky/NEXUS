@@ -265,5 +265,93 @@ describe('ResearchEvidence', () => {
 
       expect(markup).toContain('No source records available');
     });
+
+    it('renders v2 sources grouped by the durable step association', () => {
+      const durableV2: DurableResearchEvidence = {
+        version: 2,
+        capability: 'web.search',
+        operation: 'search',
+        count: 3,
+        sources: [
+          { id: 'src-1', title: 'First step source', url: 'https://one.example', source: 'one.example', snippet: 'one' },
+          { id: 'src-2', title: 'Second step source', url: 'https://two.example', source: 'two.example', snippet: 'two' },
+          { id: 'src-3', title: 'Loose source', url: 'https://three.example', source: 'three.example', snippet: 'three' },
+        ],
+        plan: { plan_id: 'exec-1', version: 1 },
+        steps: [
+          { step_id: 's1', status: 'completed', observation_id: 'obs-1' },
+          { step_id: 's2', status: 'completed', dependencies: ['s1'], observation_id: 'obs-2' },
+        ],
+        operations: [
+          {
+            operation_id: 'obs-1',
+            step_id: 's1',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+          {
+            operation_id: 'obs-2',
+            step_id: 's2',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-2'],
+          },
+        ],
+      };
+
+      const markup = durableMarkup({ durableEvidence: durableV2, status: 'completed' });
+
+      expect(markup).toContain('Durable record');
+      expect(markup).toContain('Sources for step s1');
+      expect(markup).toContain('Sources for step s2');
+      expect(markup).toContain('First step source');
+      expect(markup).toContain('Second step source');
+      expect(markup).toContain('Unattributed sources');
+      expect(markup).toContain('Loose source');
+      expect(markup).toContain('data-source-id="src-1"');
+      expect(markup).toContain('data-source-id="src-3"');
+      expect(markup.match(/<article/g)?.length ?? 0).toBe(3);
+      expect(markup.indexOf('Sources for step s1')).toBeLessThan(
+        markup.indexOf('Sources for step s2')
+      );
+    });
+
+    it('does not invent step attribution for legacy v1 evidence', () => {
+      const markup = durableMarkup({ durableEvidence: durable, status: 'completed' });
+
+      expect(markup).toContain('Durable record');
+      expect(markup).toContain('Nexus capability boundary');
+      expect(markup).not.toContain('Sources for step');
+      expect(markup).not.toContain('Unattributed sources');
+    });
+
+    it('rejects malformed v2 provenance wholesale instead of showing sources', () => {
+      const malformed = {
+        version: 2,
+        capability: 'web.search',
+        operation: 'search',
+        count: 1,
+        sources: [
+          { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one.example', snippet: 'one' },
+        ],
+        plan: { plan_id: 'exec-1', version: 1 },
+        steps: [{ step_id: 's1', status: 'completed' }],
+        operations: [
+          {
+            operation_id: 'obs-1',
+            step_id: 'missing-step',
+            tool_id: 'web.search',
+            operation: 'search',
+            source_ids: ['src-1'],
+          },
+        ],
+      } as unknown as DurableResearchEvidence;
+
+      const markup = durableMarkup({ durableEvidence: malformed, status: 'completed' });
+
+      expect(markup).toContain('No source records available');
+      expect(markup).not.toContain('One');
+    });
   });
 });

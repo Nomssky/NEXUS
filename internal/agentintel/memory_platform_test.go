@@ -261,7 +261,7 @@ func TestPromotionCannotCarryModelText(t *testing.T) {
 		Text: "runtime value", Outcome: "unknown", ReconciliationRequired: true})
 	_, _, state, msg := rt.perform(rn, context.Background(), Objective{Description: "o"},
 		Action{Type: ActionMemoryWrite, Key: "k", ObservationID: "obs-1"},
-		"helper", wm, BudgetUsage{}, Budget{})
+		"", "helper", wm, BudgetUsage{}, Budget{})
 	if state != "" {
 		t.Fatalf("a clean promotion must succeed: %q", msg)
 	}

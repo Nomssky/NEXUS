@@ -850,7 +850,7 @@ func coreSampleEvidence(title string) *execjournal.ResearchEvidence {
 		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
 		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
 		Sources: []execjournal.ResearchSource{{
-			Title: title, URL: "https://docs.example/nexus", Source: "docs.example",
+			ID: "src-1", Title: title, URL: "https://docs.example/nexus", Source: "docs.example",
 			Snippet: "The runtime decides; the model proposes.",
 		}},
 	}

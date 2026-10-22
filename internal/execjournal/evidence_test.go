@@ -1,6 +1,8 @@
 package execjournal
 
 import (
+	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -28,13 +30,14 @@ func TestParseWebSearchEvidenceCompleteSnapshot(t *testing.T) {
 		t.Fatalf("expected 2 sources, got %d", len(ev.Sources))
 	}
 	if ev.Sources[0].Title != "Nexus capability boundary" ||
+		ev.Sources[0].ID != "src-1" ||
 		ev.Sources[0].URL != "https://docs.example/nexus" ||
 		ev.Sources[0].Source != "docs.example" ||
 		ev.Sources[0].Snippet != "The runtime decides; the model proposes." {
 		t.Fatalf("first source mangled: %+v", ev.Sources[0])
 	}
-	if ev.Sources[1].Snippet != "Inert | data" {
-		t.Fatalf("snippet separator must be preserved: %q", ev.Sources[1].Snippet)
+	if ev.Sources[1].ID != "src-2" || ev.Sources[1].Snippet != "Inert | data" {
+		t.Fatalf("second source mangled: %+v", ev.Sources[1])
 	}
 }
 
@@ -109,11 +112,38 @@ func TestParseWebSearchEvidenceHandlesCRLFAndBlankLines(t *testing.T) {
 	}
 }
 
+// Required collection fields are arrays in the wire contract. Producers that
+// leave them nil must not turn a present empty capture into null, and the
+// normalization must not mutate the stored evidence.
+func TestResearchEvidenceMarshalUsesRequiredArrays(t *testing.T) {
+	ev := &ResearchEvidence{
+		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 0,
+		Operations: []ResearchOperationEvidence{{
+			OperationID: "obs-1", StepID: "s1",
+			ToolID: ResearchEvidenceCapability, Operation: ResearchEvidenceOperation,
+		}},
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"sources":[]`) {
+		t.Fatalf("missing sources array: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"source_ids":[]`) {
+		t.Fatalf("missing source_ids array: %s", raw)
+	}
+	if ev.Sources != nil || ev.Operations[0].SourceIDs != nil {
+		t.Fatal("marshaling must not mutate the stored evidence")
+	}
+}
+
 func TestValidateResearchEvidence(t *testing.T) {
 	valid := &ResearchEvidence{
 		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 		Operation: ResearchEvidenceOperation, Count: 1,
-		Sources: []ResearchSource{{Title: "A", URL: "https://a.example"}},
+		Sources: []ResearchSource{{ID: "src-1", Title: "A", URL: "https://a.example"}},
 	}
 	if err := ValidateResearchEvidence(valid); err != nil {
 		t.Fatalf("valid evidence rejected: %v", err)
@@ -122,17 +152,26 @@ func TestValidateResearchEvidence(t *testing.T) {
 		t.Fatalf("nil evidence must be allowed: %v", err)
 	}
 	cases := map[string]*ResearchEvidence{
-		"version":    {Version: 2, Capability: ResearchEvidenceCapability, Operation: ResearchEvidenceOperation},
+		"version":    {Version: 3, Capability: ResearchEvidenceCapability, Operation: ResearchEvidenceOperation},
 		"capability": {Version: ResearchEvidenceVersion, Capability: "other", Operation: ResearchEvidenceOperation},
 		"operation":  {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability, Operation: "fetch"},
 		"count mismatch": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
-			Operation: ResearchEvidenceOperation, Count: 2, Sources: []ResearchSource{{}}},
+			Operation: ResearchEvidenceOperation, Count: 2, Sources: []ResearchSource{{ID: "src-1"}}},
 		"oversized": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 1,
-			Sources: []ResearchSource{{Snippet: strings.Repeat("x", MaxResearchSourceSnippet+1)}}},
+			Sources: []ResearchSource{{ID: "src-1", Snippet: strings.Repeat("x", MaxResearchSourceSnippet+1)}}},
 		"control": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 1,
-			Sources: []ResearchSource{{Title: "a\nb"}}},
+			Sources: []ResearchSource{{ID: "src-1", Title: "a\nb"}}},
+		"missing source id": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+			Operation: ResearchEvidenceOperation, Count: 1,
+			Sources: []ResearchSource{{Title: "A"}}},
+		"duplicate source id": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+			Operation: ResearchEvidenceOperation, Count: 2,
+			Sources: []ResearchSource{{ID: "src-1"}, {ID: "src-1"}}},
+		"too many sources": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+			Operation: ResearchEvidenceOperation, Count: MaxResearchEvidenceSources + 1,
+			Sources: make([]ResearchSource, MaxResearchEvidenceSources+1)},
 	}
 	for name, ev := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -140,5 +179,139 @@ func TestValidateResearchEvidence(t *testing.T) {
 				t.Fatalf("invalid evidence accepted: %+v", ev)
 			}
 		})
+	}
+}
+
+func provenanceEvidence(executionID string) *ResearchEvidence {
+	return &ResearchEvidence{
+		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 3,
+		Sources: []ResearchSource{
+			{ID: "src-1", Title: "One", URL: "https://one.example"},
+			{ID: "src-2", Title: "Two", URL: "https://two.example"},
+			{ID: "src-3", Title: "Three", URL: "https://three.example"},
+		},
+		Plan: &ResearchPlanEvidence{PlanID: executionID, Version: 2},
+		Steps: []ResearchStepEvidence{
+			{StepID: "s1", Status: "completed", ObservationID: "obs-1"},
+			{StepID: "s2", Status: "completed", ObservationID: "obs-2", Dependencies: []string{"s1"}},
+		},
+		Operations: []ResearchOperationEvidence{
+			{OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
+				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"}},
+			{OperationID: "obs-2", StepID: "s2", ToolID: ResearchEvidenceCapability,
+				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-3"}},
+		},
+	}
+}
+
+func TestValidateResearchEvidenceProvenance(t *testing.T) {
+	ev := provenanceEvidence("exec-1")
+	if err := ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("valid provenance rejected: %v", err)
+	}
+	// Plan identity is execution-scoped; a snapshot cannot be re-attributed to
+	// another execution on a write or read boundary.
+	if err := ValidateResearchEvidenceForExecution("exec-2", ev); err == nil {
+		t.Fatal("a plan from another execution must be rejected")
+	}
+}
+
+func TestValidateResearchEvidenceRejectsInvalidProvenance(t *testing.T) {
+	cases := map[string]func(*ResearchEvidence){
+		"steps without plan": func(ev *ResearchEvidence) {
+			ev.Plan = nil
+		},
+		"operations without plan": func(ev *ResearchEvidence) {
+			ev.Plan = nil
+			ev.Steps = nil
+		},
+		"plan with no steps": func(ev *ResearchEvidence) {
+			ev.Steps = nil
+		},
+		"duplicate step": func(ev *ResearchEvidence) {
+			ev.Steps[1].StepID = ev.Steps[0].StepID
+		},
+		"invalid status": func(ev *ResearchEvidence) {
+			ev.Steps[0].Status = "succeeded"
+		},
+		"unknown dependency": func(ev *ResearchEvidence) {
+			ev.Steps[1].Dependencies = []string{"s9"}
+		},
+		"self dependency": func(ev *ResearchEvidence) {
+			ev.Steps[0].Dependencies = []string{"s1"}
+		},
+		"dependency cycle": func(ev *ResearchEvidence) {
+			ev.Steps[0].Dependencies = []string{"s2"}
+		},
+		"unsupported plan version": func(ev *ResearchEvidence) {
+			ev.Plan.Version = 0
+		},
+		"unknown operation step": func(ev *ResearchEvidence) {
+			ev.Operations[0].StepID = "s9"
+		},
+		"unknown operation source": func(ev *ResearchEvidence) {
+			ev.Operations[0].SourceIDs[0] = "src-9"
+		},
+		"duplicate operation ref": func(ev *ResearchEvidence) {
+			ev.Operations[0].SourceIDs = []string{"src-1", "src-1"}
+		},
+		"source attributed twice": func(ev *ResearchEvidence) {
+			ev.Operations[1].SourceIDs = []string{"src-1"}
+		},
+		"unsupported operation": func(ev *ResearchEvidence) {
+			ev.Operations[0].Operation = "fetch"
+		},
+		"duplicate operation id": func(ev *ResearchEvidence) {
+			ev.Operations[1].OperationID = ev.Operations[0].OperationID
+		},
+		"empty operation id": func(ev *ResearchEvidence) {
+			ev.Operations[0].OperationID = ""
+		},
+		"too many steps": func(ev *ResearchEvidence) {
+			ev.Steps = make([]ResearchStepEvidence, MaxResearchPlanSteps+1)
+			for i := range ev.Steps {
+				ev.Steps[i] = ResearchStepEvidence{StepID: "s" + strconv.Itoa(i), Status: "pending"}
+			}
+		},
+		"too many dependencies": func(ev *ResearchEvidence) {
+			ev.Steps[0].Dependencies = make([]string, MaxResearchStepDependencies+1)
+		},
+		"too many operations": func(ev *ResearchEvidence) {
+			ev.Operations = make([]ResearchOperationEvidence, MaxResearchOperations+1)
+		},
+		"too many source refs": func(ev *ResearchEvidence) {
+			ev.Operations[0].SourceIDs = make([]string, MaxResearchOperationSourceRefs+1)
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			ev := provenanceEvidence("exec-1")
+			mutate(ev)
+			if err := ValidateResearchEvidence(ev); err == nil {
+				t.Fatalf("invalid provenance accepted: %+v", ev)
+			}
+		})
+	}
+}
+
+func TestLegacyResearchEvidenceIsReadableWithoutProvenance(t *testing.T) {
+	legacy := &ResearchEvidence{
+		Version: ResearchEvidenceLegacyVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 1,
+		Sources: []ResearchSource{{Title: "Legacy", URL: "https://legacy.example"}},
+	}
+	if err := ValidateResearchEvidenceForExecution("legacy", legacy); err != nil {
+		t.Fatalf("legacy evidence must remain readable: %v", err)
+	}
+	legacy.Sources[0].ID = "src-1"
+	if err := ValidateResearchEvidence(legacy); err == nil {
+		t.Fatal("legacy evidence must not acquire invented source ids")
+	}
+	legacy.Sources[0].ID = ""
+	legacy.Plan = &ResearchPlanEvidence{PlanID: "legacy", Version: 1}
+	legacy.Steps = []ResearchStepEvidence{{StepID: "s1", Status: "completed"}}
+	if err := ValidateResearchEvidence(legacy); err == nil {
+		t.Fatal("legacy evidence must not acquire invented provenance")
 	}
 }

@@ -274,6 +274,11 @@ export interface WebSearchResult {
 
 export interface ParsedWebSearchSource {
   index: number;
+  /**
+   * Stable durable source identity when the record carries one (v2). Legacy
+   * v1 evidence has no id and remains deliberately unattributed.
+   */
+  id?: string;
   title: string;
   url: string;
   source: string;
@@ -639,17 +644,53 @@ export interface DurableExecution {
   approvals?: DurableApprovalView[];
 }
 
-// ---- Durable research evidence (v52) ----
-// Mirrors internal/execjournal.ResearchEvidence: one normalized provider
-// record per web.search call, bounded, and validated wholesale at write time.
-// Dates and authors are deliberately absent — the provider envelope has no
-// grounded value for them, so none is exposed.
+// ---- Durable research evidence (v52, extended by v54) ----
+// Mirrors internal/execjournal.ResearchEvidence: normalized provider records
+// from one or more web.search calls, bounded, and validated wholesale at write
+// time. Dates and authors are deliberately absent — the provider envelope has
+// no grounded value for them, so none is exposed.
+//
+// v2 adds optional runtime-owned plan/step/operation provenance. The backend
+// derives every association from execution-scoped identifiers known at tool
+// mediation time; the frontend never infers attribution from URLs or order.
 
 export interface DurableResearchSource {
+  /** Stable execution-scoped source id. Absent only on legacy v1 records. */
+  id?: string;
   title: string;
   url: string;
   source: string;
   snippet: string;
+}
+
+export interface DurableResearchPlan {
+  plan_id: string;
+  version: number;
+}
+
+export type DurableResearchStepStatus =
+  | 'pending'
+  | 'ready'
+  | 'executing'
+  | 'observing'
+  | 'completed'
+  | 'failed'
+  | 'blocked'
+  | 'cancelled';
+
+export interface DurableResearchStep {
+  step_id: string;
+  dependencies?: string[];
+  status: DurableResearchStepStatus;
+  observation_id?: string;
+}
+
+export interface DurableResearchOperation {
+  operation_id: string;
+  step_id: string;
+  tool_id: string;
+  operation: string;
+  source_ids: string[];
 }
 
 export interface DurableResearchEvidence {
@@ -659,6 +700,9 @@ export interface DurableResearchEvidence {
   /** The count declared by the provider envelope; equals sources.length. */
   count: number;
   sources: DurableResearchSource[];
+  plan?: DurableResearchPlan;
+  steps?: DurableResearchStep[];
+  operations?: DurableResearchOperation[];
 }
 
 export interface DurableExecutionList {
