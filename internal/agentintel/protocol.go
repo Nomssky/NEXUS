@@ -135,7 +135,7 @@ func writeEvidencePrompt(b *strings.Builder, ev *execjournal.ResearchEvidence) {
 		return
 	}
 	b.WriteString(fmt.Sprintf("EVIDENCE (validated, current execution only; version=%d count=%d):\n", ev.Version, ev.Count))
-	if ev.Version != execjournal.ResearchEvidenceVersion {
+	if ev.Version < execjournal.ResearchEvidenceProvenanceVersion {
 		b.WriteString("- legacy evidence has no stable source ids; do not return a typed synthesis for this execution.\n")
 		return
 	}

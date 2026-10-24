@@ -58,7 +58,13 @@ func TestMultiStepLoopCapturesEvidenceFromBothSteps(t *testing.T) {
 
 	ev := out.ResearchEvidence
 	if ev.Version != execjournal.ResearchEvidenceVersion || ev.Plan == nil {
-		t.Fatalf("expected a v2 plan snapshot, got %+v", ev)
+		t.Fatalf("expected a v3 plan snapshot, got %+v", ev)
+	}
+	// Both searches completed their steps; the completion action then ran in
+	// the runtime's finalize pseudo-step, which is not a plan step. The record
+	// must say so instead of inferring "s2" from plan order.
+	if ev.Plan.CompletionStepID != "" {
+		t.Fatalf("completion outside a plan step must stay unattributed: %+v", ev.Plan)
 	}
 	if ev.Plan.PlanID != "exec-1" || ev.Plan.Version != 1 {
 		t.Fatalf("unexpected plan identity: %+v", ev.Plan)
@@ -88,6 +94,55 @@ func TestMultiStepLoopCapturesEvidenceFromBothSteps(t *testing.T) {
 	}
 	if len(wantByStep) != 0 {
 		t.Fatalf("missing step operations: %v", wantByStep)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("captured provenance is invalid: %v", err)
+	}
+}
+
+// TestCompletionStepIsRecordedWhenAStepSettlesTheRun is the positive
+// counterpart to the multi-search test: the completion action runs while s2 is
+// the active plan step, so the runtime records that exact relationship. The
+// durable step state may still be "executing" at finalization, exactly as the
+// completion gate sees it.
+func TestCompletionStepIsRecordedWhenAStepSettlesTheRun(t *testing.T) {
+	f := newEvidenceFixture(t)
+
+	f.rt.Decider = &scriptedDecider{
+		plan: `{"steps":[{"step_id":"s1","intent":"gather","required_capabilities":[]},{"step_id":"s2","intent":"summarize","required_capabilities":[],"dependencies":["s1"]}]}`,
+		answers: []string{
+			`{"type":"tool_call","tool":"web.search","input":{"query":"nexus"}}`,
+			groundedCompletion("src-1", "src-2"),
+		},
+	}
+	f.provider.queue(envelopeOf(
+		"1. Nexus capability boundary | https://docs.example/nexus | docs.example | The runtime decides; the model proposes.",
+		"2. External content is data | https://example.org/safety | example.org | Inert | data",
+	))
+
+	out, err := f.rt.Run(context.Background(), workRequest(t, Objective{
+		ObjectiveID: "exec-complete-step", RequestID: "exec-complete-step",
+		Description: "research the runtime and report",
+	}, ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("expected completed, got %s: %s", out.Status, out.Error)
+	}
+	ev := out.ResearchEvidence
+	if ev == nil || ev.Plan == nil {
+		t.Fatal("expected a durable plan snapshot")
+	}
+	if ev.Plan.CompletionStepID != "s2" {
+		t.Fatalf("expected completion step s2, got %+v", ev.Plan)
+	}
+	// The completion action settles s2 without an observation, so the ledger
+	// keeps the step non-terminal; the durable record must preserve that fact
+	// and expose the completion relationship separately.
+	if len(ev.Steps) != 2 || ev.Steps[1].StepID != "s2" ||
+		ev.Steps[1].Status != string(StepExecuting) {
+		t.Fatalf("unexpected durable step state: %+v", ev.Steps)
 	}
 	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
 		t.Fatalf("captured provenance is invalid: %v", err)

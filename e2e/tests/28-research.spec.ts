@@ -467,12 +467,46 @@ test.describe('Research Workspace E2E', () => {
     expect(detailResp.ok).toBeTruthy();
     const detail = await detailResp.json();
     const durableEvidence = detail.research_evidence;
-    expect(durableEvidence.version).toBe(2);
-    expect(durableEvidence.plan).toEqual({ plan_id: execId, version: 1 });
+    expect(durableEvidence.version).toBe(3);
+    expect(durableEvidence.plan.plan_id).toBe(execId);
+    expect(durableEvidence.plan.version).toBe(1);
+    expect(durableEvidence.plan.objective_id).toBe(execId);
+    // Both searches completed their plan steps; the completion action then ran
+    // in the runtime's finalize pseudo-step, which is not a plan step. The
+    // record must not infer "s2" from plan order.
+    expect(durableEvidence.plan.completion_step_id).toBeUndefined();
+    expect(durableEvidence.plan.provenance).toBe('authoritative');
     expect(durableEvidence.steps.map((step: any) => step.step_id)).toEqual(['s1', 's2']);
     expect(durableEvidence.steps.map((step: any) => step.status)).toEqual(['completed', 'completed']);
+    expect(durableEvidence.steps.map((step: any) => step.intent)).toEqual([
+      'gather the required inputs',
+      'produce the requested result',
+    ]);
+    expect(durableEvidence.steps.map((step: any) => step.plan_version)).toEqual([1, 1]);
+    expect(durableEvidence.steps.map((step: any) => step.provenance)).toEqual([
+      'authoritative',
+      'authoritative',
+    ]);
     expect(durableEvidence.steps[1].dependencies).toEqual(['s1']);
     expect(durableEvidence.operations).toHaveLength(2);
+    expect(durableEvidence.operations.map((operation: any) => operation.provenance)).toEqual([
+      'authoritative',
+      'authoritative',
+    ]);
+    expect(durableEvidence.attribution).toBe('derived');
+
+    // Synthesis and evaluation are bound to the exact plan revision and
+    // evidence snapshot persisted with the execution.
+    expect(detail.research_synthesis.version).toBe(1);
+    expect(detail.research_synthesis.status).toBe('complete');
+    expect(detail.research_synthesis.plan_version).toBe(1);
+    expect(detail.research_synthesis.evidence_fingerprint).toBeTruthy();
+    expect(detail.research_evaluation.version).toBe(1);
+    expect(detail.research_evaluation.plan_version).toBe(1);
+    expect(detail.research_evaluation.evidence_version).toBe(3);
+    expect(detail.research_evaluation.evidence_count).toBe(4);
+    expect(detail.research_evaluation.synthesis_status).toBe('complete');
+    expect(detail.research_evaluation.synthesis_fingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     // Attribution is the runtime's operation record, not source order in the
     // UI. Verify each step maps to the titles its own search returned.
@@ -501,8 +535,16 @@ test.describe('Research Workspace E2E', () => {
     await expect(plan).toBeVisible({ timeout: 15000 });
     await expect(plan.getByText('Research plan')).toBeVisible();
     await expect(plan.getByText('Durable record')).toBeVisible();
+    await expect(plan.getByText(`Objective ${execId}`)).toBeVisible();
+    await expect(plan.getByText('No plan step settled completion.')).toBeVisible();
+    await expect(plan.getByText('Settled by completion step')).toHaveCount(0);
+    await expect(plan.getByText('Plan facts recorded by the runtime.')).toBeVisible();
+    await expect(plan.getByText('Source-to-step grouping derived from runtime operation records.'))
+      .toBeVisible();
     await expect(plan.locator('[data-step-id="s1"]')).toContainText('Completed');
+    await expect(plan.locator('[data-step-id="s1"]')).toContainText('gather the required inputs');
     await expect(plan.locator('[data-step-id="s2"]')).toContainText('after s1');
+    await expect(plan.locator('[data-step-id="s2"]')).toContainText('produce the requested result');
     await expect(output.getByText('Research steps', { exact: true })).toHaveCount(0);
 
     const stepOneSources = evidence.locator('section[aria-label="Sources for step s1"]');
@@ -543,12 +585,23 @@ test.describe('Research Workspace E2E', () => {
     await expect(evidence.locator('a')).toHaveCount(4);
 
     // Plan identity, step order and per-step source groups are recovered from
-    // the journal alone; the process-local trace and synthesis are gone.
+    // the journal alone; the process-local trace is gone.
     const recoveredPlan = output.locator('section[aria-label="Durable research plan"]');
     await expect(recoveredPlan).toBeVisible({ timeout: 15000 });
     await expect(recoveredPlan.getByText('Durable record')).toBeVisible();
+    await expect(recoveredPlan.getByText('Historical plan snapshot persisted with this execution'))
+      .toBeVisible();
+    await expect(recoveredPlan.getByText(`Objective ${execId}`)).toBeVisible();
+    await expect(recoveredPlan.getByText('No plan step settled completion.')).toBeVisible();
+    await expect(recoveredPlan.getByText('Settled by completion step')).toHaveCount(0);
+    await expect(recoveredPlan.getByText('Plan facts recorded by the runtime.')).toBeVisible();
+    await expect(recoveredPlan.getByText('Source-to-step grouping derived from runtime operation records.'))
+      .toBeVisible();
+    await expect(recoveredPlan.getByText(/predates v3 plan provenance/)).toHaveCount(0);
     await expect(recoveredPlan.locator('[data-step-id="s1"]')).toContainText('Completed');
+    await expect(recoveredPlan.locator('[data-step-id="s1"]')).toContainText('gather the required inputs');
     await expect(recoveredPlan.locator('[data-step-id="s2"]')).toContainText('after s1');
+    await expect(recoveredPlan.locator('[data-step-id="s2"]')).toContainText('produce the requested result');
     const recoveredStepOne = evidence.locator('section[aria-label="Sources for step s1"]');
     const recoveredStepTwo = evidence.locator('section[aria-label="Sources for step s2"]');
     await expect(recoveredStepOne.getByText('Nexus capability boundary', { exact: true })).toBeVisible();
@@ -573,6 +626,12 @@ test.describe('Research Workspace E2E', () => {
     await expect(
       durableSynthesis.getByRole('link', { name: 'Nexus agent model' })
     ).toHaveAttribute('href', 'https://docs.example/agents');
+    await expect(durableSynthesis.getByText('Bound to plan revision 1.')).toBeVisible();
+
+    const recoveredQuality = output.locator('[aria-label="Research quality evaluation"]');
+    await expect(recoveredQuality).toBeVisible({ timeout: 20000 });
+    await expect(recoveredQuality.getByText('Bound to plan revision 1.')).toBeVisible();
+    await expect(recoveredQuality.getByText('the same persisted snapshot')).toBeVisible();
 
     // Honest post-restart state: the raw result text is unavailable, the
     // durable synthesis, evidence and plan are intact.

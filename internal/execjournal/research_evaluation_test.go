@@ -19,16 +19,28 @@ func evaluationEvidence(executionID string) *ResearchEvidence {
 			URL: "https://docs.example/nexus", Source: "docs.example",
 			Snippet: "The runtime decides; the model proposes.",
 		}},
-		Plan:  &ResearchPlanEvidence{PlanID: executionID, Version: 1},
-		Steps: []ResearchStepEvidence{{StepID: "s1", Status: "completed"}},
+		Plan: &ResearchPlanEvidence{
+			PlanID: executionID, Version: 1, ObjectiveID: "objective-" + executionID,
+			CompletionStepID: "s1", Provenance: ResearchProvenanceAuthoritative,
+		},
+		Steps: []ResearchStepEvidence{{
+			StepID: "s1", Intent: "gather sources", PlanVersion: 1, Status: "completed",
+			Provenance: ResearchProvenanceAuthoritative,
+		}},
 		Operations: []ResearchOperationEvidence{{
 			OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1"},
+			Provenance: ResearchProvenanceAuthoritative,
 		}},
+		Attribution: ResearchAttributionDerived,
 	}
 }
 
 func evaluationFor(executionID string, evidence *ResearchEvidence) *ResearchEvaluation {
+	planVersion := 0
+	if evidence.Plan != nil {
+		planVersion = evidence.Plan.Version
+	}
 	return &ResearchEvaluation{
 		Version:             ResearchEvaluationVersion,
 		Method:              ResearchEvaluationMethod,
@@ -36,6 +48,7 @@ func evaluationFor(executionID string, evidence *ResearchEvidence) *ResearchEval
 		EvidenceVersion:     evidence.Version,
 		EvidenceCount:       evidence.Count,
 		EvidenceFingerprint: ResearchEvidenceFingerprint(evidence),
+		PlanVersion:         planVersion,
 		Status:              ResearchEvaluationPassed,
 		Dimensions: []ResearchEvaluationDimension{
 			{ID: ResearchDimensionEvidenceCoverage, Status: ResearchDimensionPass},

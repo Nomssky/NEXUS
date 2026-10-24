@@ -1,4 +1,4 @@
-# NEXUS — Durable Research Synthesis (v59)
+# NEXUS — Durable Research Synthesis (v59–v60)
 
 Authoritative for the durable representation of a validated research
 synthesis. It extends the existing research architecture; it never replaces
@@ -12,11 +12,14 @@ it. Cross-references (never redefines): `AGENT_INTELLIGENCE_CONTRACTS.md`,
 
 This milestone makes the **already-validated typed synthesis** a durable,
 execution-scoped artifact. A completed research execution now has one
-consistent durable snapshot of three things:
+consistent durable snapshot of four things:
 
 1. the durable synthesis (`execjournal.ResearchSynthesis`, v59),
-2. the durable evidence snapshot (`execjournal.ResearchEvidence` v2), and
-3. the deterministic quality verdict (`execjournal.ResearchEvaluation` v1).
+2. the durable evidence snapshot (`execjournal.ResearchEvidence` v3), which
+   contains the exact plan/step snapshot the runtime finalized,
+3. the deterministic quality verdict (`execjournal.ResearchEvaluation` v1), and
+4. the plan revision binding that ties the synthesis and verdict to that
+   evidence snapshot.
 
 Before v59 the synthesis existed only for the lifetime of the process that ran
 the execution. A restart destroyed the user-facing research conclusion even
@@ -45,7 +48,7 @@ synthesis that cannot be bound is never persisted as a valid result.
 | No credential, transport payload, or raw provider response persisted | The durable synthesis carries statements and source **ids** only. |
 | No regeneration on read | A legacy record without a synthesis reports it as unavailable; it is never recomputed. |
 | No new endpoint | The existing durable detail read carries the snapshot; the list stays bounded. |
-| No change to the synthesis contract | The same fields, the same meanings, the same validation limits. |
+| No second synthesis pipeline or contract | v60 adds one binding field, `plan_version`; the statements, citations, statuses and limits are unchanged. |
 | No claim of semantic truth | Persisting a synthesis does not make it true. v58's limitations remain authoritative. |
 
 ## 1. The durable synthesis object
@@ -65,6 +68,7 @@ synthesis that cannot be bound is never persisted as a valid result.
 | `conflicts` | disagreements the captured sources support |
 | `unresolved_questions` | gaps the execution could not settle |
 | `evidence_fingerprint` | SHA-256 over the normalized evidence snapshot this synthesis was validated against |
+| `plan_version` | the plan revision recorded in that evidence snapshot (`0` only for preserved legacy records that never captured one) |
 
 The field set mirrors `executor.ResearchSynthesis` exactly. No field was added
 or removed to make persistence easier, and no field carries source metadata:
@@ -85,22 +89,27 @@ applies at every durable write and decode boundary:
 4. **Evidence binding**: a non-nil synthesis requires a non-nil evidence
    snapshot whose fingerprint equals `evidence_fingerprint`. A synthesis
    without evidence is rejected.
-5. **Status** must be one of the three documented completion statuses.
-6. **Shape and bounds** (mirroring the executor's limits):
+5. **Plan binding**: when `plan_version` is non-zero it must be in range and
+   equal `evidence.plan.version`. A v3 evidence snapshot that carries a plan
+   requires the binding. A synthesis over evidence with no plan must not claim
+   a plan revision. `0` is accepted only for a preserved v2 record that never
+   captured the revision; it is reported as unavailable, never invented.
+6. **Status** must be one of the three documented completion statuses.
+7. **Shape and bounds** (mirroring the executor's limits):
    `summary` non-empty and ≤ 4000 characters; ≤ 12 evidence-backed
    statements, ≤ 12 inferences, ≤ 8 conflicts, ≤ 8 unresolved questions;
    statement ≤ 2000 characters; question ≤ 1000 characters.
-7. **Statement uniqueness**: no statement repeats an earlier one across
+8. **Statement uniqueness**: no statement repeats an earlier one across
    evidence-backed statements and conflicts.
-8. **Citations**: every statement carries at least one and at most 12 source
+9. **Citations**: every statement carries at least one and at most 12 source
    ids; each id is well-formed (non-empty, ≤ 64 characters, no control
    characters), unique within its statement, and resolves to a source id in
    **this** execution's evidence snapshot. A source id from another execution
    does not resolve and is rejected.
-9. **Status semantics**: `inconclusive` carries no evidence-backed statement
-   or conflict; `partial` carries at least one; `complete` carries at least
-   one evidence-backed statement; a synthesis over zero captured sources must
-   be `inconclusive`.
+10. **Status semantics**: `inconclusive` carries no evidence-backed statement
+    or conflict; `partial` carries at least one; `complete` carries at least
+    one evidence-backed statement; a synthesis over zero captured sources must
+    be `inconclusive`.
 
 A malformed, oversized, unsupported, cross-execution or unbound synthesis is
 never persisted, and a record containing one fails closed on decode.
@@ -112,7 +121,9 @@ never persisted, and a record containing one fails closed on decode.
 * **Unavailable** — the record carries no `research_synthesis` at all. This
   means no synthesis was captured or validated for that execution (including
   every record written before v59). Absence is never interpreted as an empty
-  answer, and it is never filled in on read.
+  answer, and it is never filled in on read. A preserved v2 synthesis with
+  `plan_version: 0` is present but its plan binding is reported as
+  unavailable; the missing revision is never inferred from the current plan.
 
 ### Partial and inconclusive
 
@@ -124,15 +135,17 @@ inconclusive — never as a complete answer.
 ### Legacy records
 
 A record written before v59 has no `research_synthesis` field and decodes
-unchanged. The durable read omits the field, and the UI reports the synthesis
-as unavailable for that record. Nothing is back-filled, migrated, or
-reconstructed: no destructive migration and no rewrite of historical records.
+unchanged. A v59 record with preserved v2 evidence may carry a synthesis
+without a plan binding (`plan_version` absent or `0`); it remains readable and
+is explicitly reported as lacking a plan binding. Nothing is back-filled,
+migrated, or reconstructed: no destructive migration and no rewrite of
+historical records.
 
 ## 2. Atomic lifecycle
 
-The three artifacts form one snapshot. They are written in the same durable
-record update, under the journal's existing mutex and optimistic-concurrency
-check.
+The three artifacts plus the evidence-embedded plan snapshot form one
+snapshot. They are written in the same durable record update, under the
+journal's existing mutex and optimistic-concurrency check.
 
 | Lifecycle path | Evidence | Evaluation | Synthesis |
 |---|---|---|---|
@@ -152,16 +165,18 @@ Rules:
 2. **Bound.** The synthesis is validated against the exact evidence snapshot
    that will be persisted, and the evaluation is validated against the same
    snapshot. A synthesis can never be stored beside evidence it did not
-   describe, and an evaluation can never describe evidence it did not evaluate.
+   describe, an evaluation can never describe evidence it did not evaluate,
+   and both are bound to the plan revision recorded in that evidence.
 3. **Never blocking.** The synthesis and the evaluation are derived data. One
    that does not bind to the snapshot being persisted is dropped rather than
    written, and it never fails the terminal lifecycle write. A valid evidence
    snapshot and the terminal record are always written.
 4. **Replacement, not mutation.** There is no in-place update path. A new
    evidence snapshot replaces the evaluation and the synthesis together, so
-   neither can outlive the snapshot it described. When the snapshot is
-   preserved (a resumed run that captured no new evidence), the evaluation
-   and synthesis that describe the preserved snapshot are preserved with it.
+   neither can outlive the snapshot (or the plan revision) it described. When
+   the snapshot is preserved (a resumed run that captured no new evidence), the
+   evaluation and synthesis that describe the preserved snapshot are preserved
+   with it.
 5. **No accidental inheritance.** A newer execution result never inherits a
    previous synthesis or evaluation. Each terminal write supplies its own
    artifacts, and a mismatched one is dropped rather than paired with the
@@ -221,8 +236,13 @@ The Research workspace distinguishes, explicitly:
   "Synthesis" and is the answer on screen while the process holds it.
 * **Persisted synthesis** — after a restart the same validated answer is
   rendered in a block labeled "Durable synthesis" and badged "Durable
-  record", with the provenance stated in the panel. It is never presented as
-  live state and never regenerated.
+  record", with the plan revision and provenance stated in the panel. It is
+  never presented as live state and never regenerated.
+* **Historical plan snapshot** — the plan/steps persisted with the evidence are
+  labeled as a historical durable record, not the current live plan. Step
+  intent, objective reference, completion relationship and authoritative
+  markers are shown only when the record captured them. A preserved v2 record
+  shows an explicit legacy notice instead of inferred values.
 * **Evidence supporting the synthesis** — citations are re-resolved against
   the durable source records; titles and URLs never come from the synthesis.
 * **The quality verdict and its limitations** — unchanged from v58.
@@ -237,17 +257,17 @@ The live synthesis takes precedence over the durable one when both are
 available, so the same answer is never rendered twice.
 
 The client re-validates the durable synthesis defensively — version, method,
-execution id, status, bounds, statement uniqueness, and citation resolution
-against the parsed durable evidence — and hides the whole block rather than
-rendering a partial or unverifiable answer.
+execution id, status, bounds, statement uniqueness, plan-revision binding and
+citation resolution against the parsed durable evidence — and hides the whole
+block rather than rendering a partial or unverifiable answer.
 
 ## 6. Reference corpus
 
 `internal/execjournal/research_synthesis_test.go` covers the schema, the
-fingerprint, the execution/evidence binding, every bound, unknown and
+fingerprint, the execution/evidence/plan binding, every bound, unknown and
 malformed citations, duplicate statements, status semantics, atomic
-persistence, restart survival, drop-on-mismatch, supersession, and concurrent
-terminal writes.
+persistence, restart survival, drop-on-mismatch, supersession, invalidation by
+new evidence, failed terminal writes, and concurrent terminal writes.
 `internal/core/execjournal_test.go` covers the engine path end to end: a
 validated synthesis is written with the terminal record and survives a real
 restart over the same durable directory.
@@ -257,6 +277,8 @@ without one, and no source content leaks into the durable record.
 `internal/agentintel/research_synthesis_test.go` covers the runtime: the loop
 attaches the validated synthesis, it passes durable validation, and a
 cross-execution citation is rejected before it can be persisted.
+`internal/researchquality/provenance_test.go` covers the evaluator's plan
+revision and provenance findings over v2 and v3 evidence.
 `e2e/tests/28-research.spec.ts` covers the real-binary restart: after a
 genuine process restart the persisted synthesis, its citations and the quality
 verdict are all rendered from the durable record.

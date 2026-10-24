@@ -146,6 +146,14 @@ export interface DurableResearchSynthesis {
   unresolved_questions: string[];
   /** SHA-256 over the normalized evidence snapshot this synthesis was validated against. */
   evidence_fingerprint: string;
+  /**
+   * Plan revision this synthesis was validated against. Must equal the durable
+   * evidence plan revision when one was captured. Zero means the revision was
+   * not recorded (legacy v2 evidence only); v3 plan evidence requires it.
+   * Absent on v59 records written before this field existed; readers treat it
+   * as zero/unavailable rather than rejecting the record.
+   */
+  plan_version?: number;
 }
 
 export type ResearchEvaluationStatus = 'passed' | 'warnings' | 'incomplete' | 'failed';
@@ -194,6 +202,11 @@ export interface ResearchEvaluation {
   evidence_version: number;
   evidence_count: number;
   evidence_fingerprint: string;
+  /**
+   * Plan revision of the evidence snapshot that was evaluated. Required for v3
+   * plan evidence; absent/zero for legacy records or evidence without a plan.
+   */
+  plan_version?: number;
   synthesis_status?: ResearchSynthesisStatus;
   synthesis_fingerprint?: string;
   status: ResearchEvaluationStatus;
@@ -808,6 +821,12 @@ export interface DurableResearchSource {
 export interface DurableResearchPlan {
   plan_id: string;
   version: number;
+  /** Runtime-owned objective reference, present on v3 records when available. */
+  objective_id?: string;
+  /** Step whose completion action settled a completed run, when recorded. */
+  completion_step_id?: string;
+  /** `authoritative` on v3 records; absent on legacy v2 records. */
+  provenance?: 'authoritative';
 }
 
 export type DurableResearchStepStatus =
@@ -822,9 +841,15 @@ export type DurableResearchStepStatus =
 
 export interface DurableResearchStep {
   step_id: string;
+  /** Runtime-owned step declaration, recorded on v3 records. */
+  intent?: string;
+  /** Plan revision in which the step was declared, recorded on v3 records. */
+  plan_version?: number;
   dependencies?: string[];
   status: DurableResearchStepStatus;
   observation_id?: string;
+  /** `authoritative` on v3 records; absent on legacy v2 records. */
+  provenance?: 'authoritative';
 }
 
 export interface DurableResearchOperation {
@@ -833,6 +858,8 @@ export interface DurableResearchOperation {
   tool_id: string;
   operation: string;
   source_ids: string[];
+  /** `authoritative` on v3 records; absent on legacy v2 records. */
+  provenance?: 'authoritative';
 }
 
 export interface DurableResearchEvidence {
@@ -845,6 +872,11 @@ export interface DurableResearchEvidence {
   plan?: DurableResearchPlan;
   steps?: DurableResearchStep[];
   operations?: DurableResearchOperation[];
+  /**
+   * Evidence-level source-to-step grouping state. v3 requires `derived` when
+   * operations exist and `unavailable` otherwise; absent on legacy records.
+   */
+  attribution?: 'derived' | 'unavailable';
 }
 
 export interface DurableExecutionList {

@@ -94,6 +94,9 @@ export const ResearchQuality: React.FC<ResearchQualityProps> = ({
           <p className={styles.provenance}>
             Deterministic checks over this execution&apos;s evidence and cited synthesis.
             No model judgment, trust score or page fetch is involved.
+            {evaluation.plan_version
+              ? ` Bound to plan revision ${evaluation.plan_version}.`
+              : ''}
           </p>
         </div>
         <Badge variant={evaluationStatusVariant(evaluation.status)} size="sm">

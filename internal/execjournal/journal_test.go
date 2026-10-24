@@ -924,7 +924,8 @@ func sampleEvidence(title string) *ResearchEvidence {
 	return &ResearchEvidence{
 		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 		Operation: ResearchEvidenceOperation, Count: 1,
-		Sources: []ResearchSource{{ID: "src-1", Title: title, URL: "https://example.test/source", Source: "example.test", Snippet: "bounded snippet"}},
+		Sources:     []ResearchSource{{ID: "src-1", Title: title, URL: "https://example.test/source", Source: "example.test", Snippet: "bounded snippet"}},
+		Attribution: ResearchAttributionUnavailable,
 	}
 }
 

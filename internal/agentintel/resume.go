@@ -109,7 +109,7 @@ type runSnapshot struct {
 // pending_approval path calls this, right before returning.
 func (r *Runtime) snapshotRun(rn *run, id objectiveIdentity, plan *Plan, ledger *planLedger,
 	observations []Observation, usage BudgetUsage, working *WorkingMemory, deadline time.Time) {
-	rn.finalizeResearchEvidence(plan, ledger)
+	rn.finalizeResearchEvidence(plan, ledger, "")
 	snap := &runSnapshot{
 		identity:          id,
 		businessID:        rn.businessID,

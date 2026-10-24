@@ -46,13 +46,21 @@ import (
 	"github.com/Nomssky/NEXUS/internal/executor"
 )
 
-// Step is the runtime-owned plan fact supplied to the evaluator. Status is the
-// final ledger status; an empty status means no provable lifecycle fact exists.
+// Step is one plan fact supplied to the evaluator. When the evidence snapshot
+// carries an authoritative plan, the evaluator uses the durable step rows as
+// the source of status and dependencies; this runtime view is retained only for
+// missing-step detection and as the intent fallback for legacy v2 evidence.
+// Status is the final ledger status; an empty status means no provable
+// lifecycle fact exists.
 type Step struct {
-	StepID   string
-	Intent   string
-	Status   string
-	Optional bool
+	StepID       string
+	Intent       string
+	Status       string
+	Optional     bool
+	Dependencies []string
+	// PlanVersion is the plan revision in which the step was declared. Zero
+	// means the runtime did not record it (legacy/unavailable).
+	PlanVersion int
 }
 
 // Input is one execution's evaluation input. The evaluator never mutates it.
@@ -115,6 +123,18 @@ const (
 	findingPlanStepState             = "plan_step_state_unavailable"
 	findingPlanStepFailed            = "plan_step_failed"
 	findingPlanIncomplete            = "plan_incomplete"
+	// v60 provenance findings. They describe what the durable snapshot can
+	// prove; none of them claims that a step's work or a source's content is
+	// true or sufficient.
+	findingEvidenceProvenanceUnavailable   = "evidence_provenance_unavailable"
+	findingPlanStepMissing                 = "plan_step_missing_from_snapshot"
+	findingPlanStepNotInRuntime            = "plan_step_not_in_runtime_plan"
+	findingPlanStepUnknown                 = "plan_step_unknown_reference"
+	findingPlanDependencyIncomplete        = "plan_dependency_incomplete"
+	findingPlanCompletionMismatch          = "plan_completion_step_mismatch"
+	findingSourceAttributionUnavailable    = "source_attribution_unavailable"
+	findingSynthesisPlanVersionMismatch    = "synthesis_plan_version_mismatch"
+	findingSynthesisPlanVersionUnavailable = "synthesis_plan_version_unavailable"
 )
 
 var evaluationLimitations = []string{
@@ -146,11 +166,21 @@ func Evaluate(in Input) *execjournal.ResearchEvaluation {
 		},
 	}
 	b.evidenceVersion = 0
+	b.planVersion = 0
 	if in.Evidence != nil {
 		b.evidenceVersion = in.Evidence.Version
 		b.evidenceCount = in.Evidence.Count
+		if in.Evidence.Plan != nil {
+			// The evaluation binds to the plan revision recorded in the exact
+			// evidence snapshot, not to the process-local current plan.
+			b.planVersion = in.Evidence.Plan.Version
+		}
 	}
 	b.evidenceFingerprint = execjournal.ResearchEvidenceFingerprint(in.Evidence)
+	// The runtime's in-flight step is the fallback completion relationship for
+	// legacy evidence, which never recorded one. A durable v3 completion step
+	// replaces it once the snapshot is validated.
+	b.completionStepID = in.CurrentStepID
 	if in.Synthesis != nil {
 		b.synthesisStatus = in.Synthesis.Status
 		b.synthesisFingerprint = synthesisFingerprint(in.Synthesis)
@@ -163,6 +193,7 @@ func Evaluate(in Input) *execjournal.ResearchEvaluation {
 		EvidenceVersion:      b.evidenceVersion,
 		EvidenceCount:        b.evidenceCount,
 		EvidenceFingerprint:  b.evidenceFingerprint,
+		PlanVersion:          b.planVersion,
 		SynthesisStatus:      b.synthesisStatus,
 		SynthesisFingerprint: b.synthesisFingerprint,
 		Status:               b.overallStatus(),
@@ -179,6 +210,11 @@ type builder struct {
 	evidenceVersion      int
 	evidenceCount        int
 	evidenceFingerprint  string
+	planVersion          int
+	durablePlan          *execjournal.ResearchPlanEvidence
+	durableSteps         []execjournal.ResearchStepEvidence
+	completionStepID     string
+	completionMismatch   bool
 	synthesisStatus      string
 	synthesisFingerprint string
 	synthesisValid       bool
@@ -201,7 +237,7 @@ func (b *builder) assessEvidence() {
 		return
 	}
 
-	planMismatch := raw.Version == execjournal.ResearchEvidenceVersion && raw.Plan != nil &&
+	planMismatch := raw.Version >= execjournal.ResearchEvidenceProvenanceVersion && raw.Plan != nil &&
 		raw.Plan.PlanID != b.in.ExecutionID
 	if err := execjournal.ValidateResearchEvidenceForExecution(b.in.ExecutionID, raw); err != nil {
 		if planMismatch {
@@ -216,6 +252,18 @@ func (b *builder) assessEvidence() {
 		return
 	}
 	b.evidence = raw
+	if raw.Plan != nil {
+		// Durable plan/steps/completion facts are authoritative. The runtime
+		// plan is compared against them below but never overrides them.
+		b.durablePlan = raw.Plan
+		b.durableSteps = raw.Steps
+		if raw.Plan.CompletionStepID != "" {
+			if b.completionStepID != "" && b.completionStepID != raw.Plan.CompletionStepID {
+				b.completionMismatch = true
+			}
+			b.completionStepID = raw.Plan.CompletionStepID
+		}
+	}
 
 	if raw.Version == execjournal.ResearchEvidenceLegacyVersion {
 		b.addWarning(execjournal.ResearchDimensionCitationIntegrity, findingLegacyEvidence,
@@ -250,7 +298,7 @@ func (b *builder) assessEvidence() {
 	b.assessCoverage()
 	b.assessConflictHandling()
 	b.assessUncertainty()
-	if b.synthesisValid {
+	if b.synthesisValid && !b.hasWarning(execjournal.ResearchDimensionCitationIntegrity) {
 		b.set(execjournal.ResearchDimensionCitationIntegrity, execjournal.ResearchDimensionPass)
 	}
 }
@@ -281,6 +329,32 @@ func (b *builder) validateSynthesis(ev *execjournal.ResearchEvidence) bool {
 		len(s.UnresolvedQuestions) > executor.MaxResearchSynthesisQuestions {
 		fail(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisInvalid,
 			"Synthesis exceeds a collection bound.")
+	}
+
+	// The synthesis must be bound to the exact plan revision recorded in the
+	// evidence snapshot it cites. A v3 plan snapshot requires the binding; a
+	// preserved v2 synthesis without one stays readable but is reported as
+	// unavailable instead of being silently assumed to match.
+	if s.PlanVersion < 0 || s.PlanVersion > execjournal.MaxResearchSynthesisPlanVersion {
+		fail(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisPlanVersionMismatch,
+			"Synthesis plan revision is outside its bound.")
+	} else if b.durablePlan == nil {
+		if s.PlanVersion != 0 {
+			fail(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisPlanVersionMismatch,
+				"Synthesis claims a plan revision but the evidence snapshot has no plan.")
+		}
+	} else if s.PlanVersion == 0 {
+		if ev.Version == execjournal.ResearchEvidenceVersion {
+			fail(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisPlanVersionUnavailable,
+				"Synthesis does not carry the plan revision of its evidence snapshot.")
+		} else {
+			b.addWarning(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisPlanVersionUnavailable,
+				"Legacy synthesis does not carry the plan revision of its evidence snapshot.", "", "")
+		}
+	} else if s.PlanVersion != b.durablePlan.Version {
+		fail(execjournal.ResearchDimensionCitationIntegrity, findingSynthesisPlanVersionMismatch,
+			fmt.Sprintf("Synthesis plan revision %d does not match evidence plan revision %d.",
+				s.PlanVersion, b.durablePlan.Version))
 	}
 
 	known := make(map[string]struct{}, len(ev.Sources))
@@ -521,7 +595,16 @@ func (b *builder) assessSources() {
 		b.addWarning(execjournal.ResearchDimensionSourceQuality, findingSourcesAllLowInformation,
 			"No captured source has both a usable URL and usable text.", "", "")
 	}
-	if b.evidence.Version == execjournal.ResearchEvidenceVersion && b.evidence.Plan != nil {
+	if b.evidence.Version == execjournal.ResearchEvidenceVersion && b.evidence.Plan == nil {
+		b.addWarning(execjournal.ResearchDimensionSourceQuality, findingSourceAttributionUnavailable,
+			"No plan snapshot was captured, so sources cannot be attributed to a step.", "", "")
+	}
+	if b.evidence.Plan != nil {
+		if b.evidence.Version == execjournal.ResearchEvidenceVersion &&
+			b.evidence.Attribution != execjournal.ResearchAttributionDerived {
+			b.addWarning(execjournal.ResearchDimensionSourceQuality, findingSourceAttributionUnavailable,
+				"Source-to-step attribution is unavailable for this evidence snapshot.", "", "")
+		}
 		referenced := make(map[string]struct{}, len(b.evidence.Sources))
 		for _, operation := range b.evidence.Operations {
 			for _, sourceID := range operation.SourceIDs {
@@ -566,8 +649,9 @@ func (b *builder) assessRelevance() {
 			"No captured source has meaningful lexical overlap with the objective.", "", "")
 	}
 
-	intentByStep := make(map[string][]string, len(b.in.Plan))
-	for _, step := range b.in.Plan {
+	steps := b.planSteps()
+	intentByStep := make(map[string][]string, len(steps))
+	for _, step := range steps {
 		tokens := meaningfulTokens(step.Intent)
 		if len(tokens) < 2 {
 			continue
@@ -610,8 +694,29 @@ func (b *builder) assessPlan() {
 		return
 	}
 	b.set(execjournal.ResearchDimensionPlanCompleteness, execjournal.ResearchDimensionPass)
+
+	// A v2 snapshot still carries plan identity and step statuses, but it
+	// predates step intent, objective reference, completion relationship and
+	// the authoritative markers. Report that gap explicitly; never infer the
+	// missing facts from the current runtime plan.
+	if b.evidence != nil && b.evidence.Version == execjournal.ResearchEvidenceProvenanceVersion {
+		b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingEvidenceProvenanceUnavailable,
+			"Evidence predates v3 plan provenance; step intent, objective reference, completion relationship and authoritative markers are unavailable.",
+			"", "")
+	}
+	if b.completionMismatch {
+		b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanCompletionMismatch,
+			"The durable completion step differs from the runtime completion step.", "", "")
+	}
+
+	statusByID := make(map[string]string, len(steps))
 	for _, step := range steps {
-		if step.StepID == b.in.CurrentStepID {
+		statusByID[step.StepID] = step.Status
+	}
+	b.assessPlanSnapshot(steps)
+
+	for _, step := range steps {
+		if step.StepID == b.completionStepID {
 			// The completion action settled this step; its ledger status has
 			// no observation of its own.
 			continue
@@ -628,32 +733,130 @@ func (b *builder) assessPlan() {
 			b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanStepState,
 				"A research step has no provable lifecycle status.", "", step.StepID)
 		}
+		// A completed step that depends on an unsettled step is a recorded
+		// inconsistency. Dependencies of nonterminal steps are expected to be
+		// unsettled and are already covered by the status finding above.
+		if step.Status != "completed" {
+			continue
+		}
+		for _, dependency := range step.Dependencies {
+			if _, known := statusByID[dependency]; !known {
+				b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanStepUnknown,
+					"A step depends on a step that is not present in the plan snapshot.", "", step.StepID)
+				continue
+			}
+			if !b.stepSettled(dependency, statusByID) {
+				b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanDependencyIncomplete,
+					"A completed step depends on a step that did not complete.", "", step.StepID)
+			}
+		}
 	}
+}
+
+// assessPlanSnapshot compares the durable plan (authoritative) with the
+// process-local runtime plan. A mismatch is reported, never repaired: the
+// durable snapshot is what the execution actually recorded.
+func (b *builder) assessPlanSnapshot(steps []Step) {
+	if b.durablePlan == nil || len(b.in.Plan) == 0 {
+		return
+	}
+	durable := make(map[string]struct{}, len(steps))
+	for _, step := range steps {
+		durable[step.StepID] = struct{}{}
+	}
+	runtime := make(map[string]struct{}, len(b.in.Plan))
+	for _, step := range b.in.Plan {
+		runtime[step.StepID] = struct{}{}
+		if _, ok := durable[step.StepID]; !ok {
+			b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanStepMissing,
+				"A runtime plan step is absent from the durable plan snapshot.", "", step.StepID)
+		}
+	}
+	for _, step := range steps {
+		if _, ok := runtime[step.StepID]; !ok {
+			b.addWarning(execjournal.ResearchDimensionPlanCompleteness, findingPlanStepNotInRuntime,
+				"A durable plan step is absent from the runtime plan.", "", step.StepID)
+		}
+	}
+}
+
+func (b *builder) stepSettled(stepID string, statusByID map[string]string) bool {
+	if stepID == b.completionStepID {
+		// The completion action settles the step it names even though its
+		// ledger status can still read "executing".
+		return true
+	}
+	return statusByID[stepID] == "completed"
 }
 
 func (b *builder) planSteps() []Step {
+	if b.durablePlan != nil && len(b.durableSteps) > 0 {
+		runtimeIntent := make(map[string]string, len(b.in.Plan))
+		for _, step := range b.in.Plan {
+			runtimeIntent[step.StepID] = step.Intent
+		}
+		steps := make([]Step, 0, len(b.durableSteps))
+		for _, step := range b.durableSteps {
+			intent := step.Intent
+			if intent == "" {
+				// v2 evidence never recorded intent. The runtime plan is the
+				// only honest fallback for the lexical relevance check; it is
+				// never used to fill any other durable field.
+				intent = runtimeIntent[step.StepID]
+			}
+			steps = append(steps, Step{
+				StepID:       step.StepID,
+				Intent:       intent,
+				Status:       step.Status,
+				Dependencies: append([]string(nil), step.Dependencies...),
+				PlanVersion:  step.PlanVersion,
+			})
+		}
+		return steps
+	}
 	if len(b.in.Plan) > 0 {
 		return b.in.Plan
 	}
-	if b.evidence == nil || b.evidence.Version != execjournal.ResearchEvidenceVersion {
-		return nil
-	}
-	steps := make([]Step, 0, len(b.evidence.Steps))
-	for _, step := range b.evidence.Steps {
-		steps = append(steps, Step{StepID: step.StepID, Status: step.Status})
-	}
-	return steps
+	return nil
 }
 
 func (b *builder) planIsIncomplete() bool {
-	for _, step := range b.planSteps() {
-		if step.StepID == b.in.CurrentStepID {
+	steps := b.planSteps()
+	statusByID := make(map[string]string, len(steps))
+	for _, step := range steps {
+		statusByID[step.StepID] = step.Status
+	}
+	if b.durablePlan != nil && len(b.in.Plan) > 0 {
+		// A runtime step the snapshot did not record means the final plan
+		// facts are not fully durable. A complete synthesis is not honest
+		// over that gap.
+		for _, step := range b.in.Plan {
+			if _, ok := statusByID[step.StepID]; !ok {
+				return true
+			}
+		}
+	}
+	for _, step := range steps {
+		if step.StepID == b.completionStepID {
 			// The step that carried the completion is settled by the
 			// completion action itself, not by an observation.
 			continue
 		}
 		if step.Status != "completed" {
 			return true
+		}
+	}
+	for _, step := range steps {
+		if step.Status != "completed" {
+			continue
+		}
+		for _, dependency := range step.Dependencies {
+			if _, known := statusByID[dependency]; !known {
+				return true
+			}
+			if !b.stepSettled(dependency, statusByID) {
+				return true
+			}
 		}
 	}
 	return false
@@ -718,6 +921,15 @@ func (b *builder) hasFinding(dimension, code, sourceID, stepID string) bool {
 func (b *builder) hasError() bool {
 	for _, finding := range b.findings {
 		if finding.Severity == execjournal.ResearchFindingError {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *builder) hasWarning(dimension string) bool {
+	for _, finding := range b.findings {
+		if finding.Dimension == dimension && finding.Severity == execjournal.ResearchFindingWarning {
 			return true
 		}
 	}

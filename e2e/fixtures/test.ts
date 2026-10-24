@@ -6,7 +6,9 @@ import { startNexus, NexusHandle } from './nexus';
  * test that pauses the runtime must restore it before it finishes (and the
  * pause/resume spec does).
  */
-export const test = base.extend<{ nexus: NexusHandle }>({
+// `nexus` is worker-scoped, so it belongs in the second type parameter of
+// extend: the first parameter only accepts test-scoped fixtures.
+export const test = base.extend<{}, { nexus: NexusHandle }>({
   nexus: [
     async ({}, use) => {
       const handle = await startNexus();

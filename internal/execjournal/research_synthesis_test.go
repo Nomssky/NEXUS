@@ -19,16 +19,28 @@ func synthesisEvidence(executionID string) *ResearchEvidence {
 			URL: "https://docs.example/nexus", Source: "docs.example",
 			Snippet: "The runtime decides; the model proposes.",
 		}},
-		Plan:  &ResearchPlanEvidence{PlanID: executionID, Version: 1},
-		Steps: []ResearchStepEvidence{{StepID: "s1", Status: "completed"}},
+		Plan: &ResearchPlanEvidence{
+			PlanID: executionID, Version: 1, ObjectiveID: "obj-1",
+			CompletionStepID: "s1", Provenance: ResearchProvenanceAuthoritative,
+		},
+		Steps: []ResearchStepEvidence{{
+			StepID: "s1", Intent: "Search for the capability boundary.", PlanVersion: 1,
+			Status: "completed", Provenance: ResearchProvenanceAuthoritative,
+		}},
 		Operations: []ResearchOperationEvidence{{
 			OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1"},
+			Provenance: ResearchProvenanceAuthoritative,
 		}},
+		Attribution: ResearchAttributionDerived,
 	}
 }
 
 func synthesisFor(executionID string, evidence *ResearchEvidence) *ResearchSynthesis {
+	planVersion := 0
+	if evidence != nil && evidence.Plan != nil {
+		planVersion = evidence.Plan.Version
+	}
 	return &ResearchSynthesis{
 		Version:     ResearchSynthesisVersion,
 		Method:      ResearchSynthesisMethod,
@@ -43,6 +55,7 @@ func synthesisFor(executionID string, evidence *ResearchEvidence) *ResearchSynth
 		Conflicts:           []ResearchSynthesisStatement{},
 		UnresolvedQuestions: []string{},
 		EvidenceFingerprint: ResearchEvidenceFingerprint(evidence),
+		PlanVersion:         planVersion,
 	}
 }
 
@@ -124,8 +137,76 @@ func synthesisEvidenceZero() *ResearchEvidence {
 		Operation:  ResearchEvidenceOperation,
 		Count:      0,
 		Sources:    []ResearchSource{},
-		Plan:       &ResearchPlanEvidence{PlanID: "exec-zero", Version: 1},
-		Steps:      []ResearchStepEvidence{{StepID: "s1", Status: "completed"}},
+		Plan: &ResearchPlanEvidence{
+			PlanID: "exec-zero", Version: 1, ObjectiveID: "obj-zero",
+			Provenance: ResearchProvenanceAuthoritative,
+		},
+		Steps: []ResearchStepEvidence{{
+			StepID: "s1", Intent: "Search for the capability boundary.", PlanVersion: 1,
+			Status: "completed", Provenance: ResearchProvenanceAuthoritative,
+		}},
+		Attribution: ResearchAttributionUnavailable,
+	}
+}
+
+func TestValidateResearchSynthesisPlanBinding(t *testing.T) {
+	v3 := synthesisEvidence("exec-1")
+	v3.Plan.Version = 2
+	v3.Steps[0].PlanVersion = 2
+
+	bound := synthesisFor("exec-1", v3)
+	if err := ValidateResearchSynthesisForExecution("exec-1", bound, v3); err != nil {
+		t.Fatalf("matching v3 plan binding rejected: %v", err)
+	}
+
+	unbound := synthesisFor("exec-1", v3)
+	unbound.PlanVersion = 0
+	if err := ValidateResearchSynthesisForExecution("exec-1", unbound, v3); err == nil ||
+		!strings.Contains(err.Error(), "requires a plan version") {
+		t.Fatalf("v3 plan evidence requires the binding, got %v", err)
+	}
+
+	mismatch := synthesisFor("exec-1", v3)
+	mismatch.PlanVersion = 1
+	if err := ValidateResearchSynthesisForExecution("exec-1", mismatch, v3); err == nil ||
+		!strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched v3 plan binding must fail, got %v", err)
+	}
+
+	v2 := &ResearchEvidence{
+		Version: ResearchEvidenceProvenanceVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 1,
+		Sources: []ResearchSource{{ID: "src-1", Title: "Legacy", URL: "https://legacy.example"}},
+		Plan:    &ResearchPlanEvidence{PlanID: "exec-1", Version: 2},
+		Steps:   []ResearchStepEvidence{{StepID: "s1", Status: "completed"}},
+		Operations: []ResearchOperationEvidence{{
+			OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
+			Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1"},
+		}},
+	}
+	legacyUnbound := synthesisFor("exec-1", v2)
+	legacyUnbound.PlanVersion = 0
+	if err := ValidateResearchSynthesisForExecution("exec-1", legacyUnbound, v2); err != nil {
+		t.Fatalf("v2 synthesis without a captured revision must stay readable: %v", err)
+	}
+	legacyBound := synthesisFor("exec-1", v2)
+	if err := ValidateResearchSynthesisForExecution("exec-1", legacyBound, v2); err != nil {
+		t.Fatalf("matching v2 plan binding rejected: %v", err)
+	}
+	legacyMismatch := synthesisFor("exec-1", v2)
+	legacyMismatch.PlanVersion = 1
+	if err := ValidateResearchSynthesisForExecution("exec-1", legacyMismatch, v2); err == nil {
+		t.Fatal("mismatched v2 plan binding must fail")
+	}
+
+	sourceOnly := synthesisEvidence("exec-1")
+	sourceOnly.Plan, sourceOnly.Steps, sourceOnly.Operations = nil, nil, nil
+	sourceOnly.Attribution = ResearchAttributionUnavailable
+	noPlan := synthesisFor("exec-1", sourceOnly)
+	noPlan.PlanVersion = 1
+	if err := ValidateResearchSynthesisForExecution("exec-1", noPlan, sourceOnly); err == nil ||
+		!strings.Contains(err.Error(), "without an evidence plan") {
+		t.Fatalf("a claimed revision without an evidence plan must fail, got %v", err)
 	}
 }
 
@@ -301,6 +382,62 @@ func TestSupersedeKeepsPauseSynthesisWhenResumedRunHasNoEvidence(t *testing.T) {
 	if rec.ResearchSynthesis == nil ||
 		rec.ResearchSynthesis.EvidenceFingerprint != ResearchEvidenceFingerprint(rec.ResearchEvidence) {
 		t.Fatalf("the preserved synthesis must stay bound to the preserved evidence: %+v", rec.ResearchSynthesis)
+	}
+}
+
+func TestSupersedeNewEvidenceDropsUnboundAuxiliaryArtifacts(t *testing.T) {
+	j := New(store.NewMemStore(), fixedClock())
+	if err := j.Accepted("exec-1", "biz-1", "div-1", "actor-1"); err != nil {
+		t.Fatalf("accepted: %v", err)
+	}
+	pauseEvidence := synthesisEvidence("exec-1")
+	pauseSynth := synthesisFor("exec-1", pauseEvidence)
+	pauseEval := evaluationFor("exec-1", pauseEvidence)
+	if err := j.TerminalWithResearch("exec-1", StateFailed, ApprovalRequiredClass, pauseEvidence, pauseEval, pauseSynth); err != nil {
+		t.Fatalf("pause terminal: %v", err)
+	}
+
+	finalEvidence := synthesisEvidence("exec-1")
+	finalEvidence.Sources[0].Title = "Replaced evidence"
+	// The caller did not supply auxiliary artifacts for the new snapshot. The
+	// pause's synthesis and evaluation describe different evidence and must not
+	// survive against it merely because the execution id still matches.
+	if err := j.SupersedeApprovedPauseWithResearch("exec-1", StateCompleted, "", finalEvidence, nil, nil); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	rec, _, err := j.Get("exec-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if rec.ResearchEvidence == nil || rec.ResearchEvidence.Sources[0].Title != "Replaced evidence" {
+		t.Fatalf("final evidence not written: %+v", rec.ResearchEvidence)
+	}
+	if rec.ResearchSynthesis != nil || rec.ResearchEvaluation != nil {
+		t.Fatalf("old auxiliary artifacts must be invalidated: synth=%+v eval=%+v",
+			rec.ResearchSynthesis, rec.ResearchEvaluation)
+	}
+}
+
+func TestTerminalWithResearchWriteFailureLeavesNoDurableClaim(t *testing.T) {
+	base := store.NewMemStore()
+	failing := evidenceWriteFailStore{Store: base, marker: `"research_evidence"`}
+	j := New(failing, fixedClock())
+	if err := j.Accepted("exec-fail-research", "biz-1", "", "actor-1"); err != nil {
+		t.Fatal(err)
+	}
+	evidence := synthesisEvidence("exec-fail-research")
+	evaluation := evaluationFor("exec-fail-research", evidence)
+	synth := synthesisFor("exec-fail-research", evidence)
+	if err := j.TerminalWithResearch("exec-fail-research", StateCompleted, "", evidence, evaluation, synth); err == nil {
+		t.Fatal("the injected terminal write must fail")
+	}
+	rec, ok, err := j.Get("exec-fail-research")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if rec.State.Terminal() || rec.CompletedAt != nil || rec.ResearchEvidence != nil ||
+		rec.ResearchEvaluation != nil || rec.ResearchSynthesis != nil {
+		t.Fatalf("failed write must not claim durable completion: %+v", rec)
 	}
 }
 

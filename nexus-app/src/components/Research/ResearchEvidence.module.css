@@ -61,6 +61,14 @@
   margin: 0;
 }
 
+.sourceGroupIntent {
+  margin: 0;
+  font-size: var(--font-size-xs);
+  line-height: var(--line-height-normal);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .sourceGroupCount {
   margin-left: auto;
   font-size: var(--font-size-xs);

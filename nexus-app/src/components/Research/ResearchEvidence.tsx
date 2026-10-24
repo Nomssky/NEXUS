@@ -4,11 +4,12 @@
  * Sources are rendered from two grounded inputs, in priority order:
  *
  * 1. The durable research evidence snapshot from the recovery detail read
- *    (v52; v54 adds plan/step/operation provenance). It is a capture taken at
- *    the capability boundary, so it survives restarts and is authoritative;
- *    presence with zero sources means the search really ran and returned
- *    nothing. In v2, source groups use only the runtime's operation references:
- *    a source with no operation stays explicitly unattributed.
+ *    (v52; v54 adds plan/step/operation provenance; v60 adds intent,
+ *    objective, completion relationship and explicit provenance markers). It
+ *    is a capture taken at the capability boundary, so it survives restarts
+ *    and is authoritative; presence with zero sources means the search really
+ *    ran and returned nothing. Source groups use only the runtime's operation
+ *    references: a source with no operation stays explicitly unattributed.
  * 2. The documented web.search output envelope (`{ sources, count }`) parsed
  *    from the process-local execution output, used only while the durable
  *    read is unavailable (e.g. an older backend).
@@ -78,6 +79,8 @@ export const ResearchEvidence: React.FC<ResearchEvidenceProps> = ({
           sources={durable.sources}
           steps={durable.steps.length > 0 ? durable.steps : undefined}
           unattributedSources={durable.unattributedSources}
+          attribution={durable.attribution}
+          evidenceVersion={durable.version}
           durable
           executionId={executionId}
           onViewTrace={onViewTrace}
@@ -153,6 +156,10 @@ interface SourcesPanelProps {
   steps?: ParsedDurableStep[];
   /** Sources the durable snapshot did not attribute to any operation. */
   unattributedSources?: ParsedWebSearchSource[];
+  /** Evidence-level source-to-step grouping state, when the record states one. */
+  attribution?: 'derived' | 'unavailable';
+  /** Durable evidence schema version; 1/2 are legacy records. */
+  evidenceVersion?: number;
   /** True when this panel renders the durable journal snapshot. */
   durable?: boolean;
   executionId?: string;
@@ -166,6 +173,8 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({
   sources,
   steps,
   unattributedSources = [],
+  attribution,
+  evidenceVersion,
   durable = false,
   executionId,
   onViewTrace,
@@ -203,6 +212,26 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({
         </p>
       )}
 
+      {durable && attribution === 'derived' && (
+        <p className={styles.attributionNote}>
+          Source groups are a deterministic join over runtime-written operation
+          records. They identify which step retrieved a source, not whether the
+          source supports a claim.
+        </p>
+      )}
+      {durable && attribution === 'unavailable' && (
+        <p className={styles.attributionNote}>
+          This snapshot records no source-to-step attribution. Sources are shown
+          without a step association rather than guessed.
+        </p>
+      )}
+      {durable && evidenceVersion !== undefined && evidenceVersion < 3 && !hasPlanProvenance && (
+        <p className={styles.attributionNote}>
+          Legacy v{evidenceVersion} evidence: no plan or step provenance was
+          captured. Sources are shown as recorded.
+        </p>
+      )}
+
       {hasPlanProvenance ? (
         <div className={styles.sourceGroups}>
           {attributedSteps.map((step) => (
@@ -221,6 +250,7 @@ const SourcesPanel: React.FC<SourcesPanelProps> = ({
                   {step.sources.length} record{step.sources.length === 1 ? '' : 's'}
                 </span>
               </div>
+              {step.intent && <p className={styles.sourceGroupIntent}>{step.intent}</p>}
               <div className={styles.sources}>
                 {step.sources.map((source) => (
                   <SourceCard key={source.id ?? `${source.index}-${source.url}`} source={source} />

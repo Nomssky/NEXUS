@@ -28,6 +28,7 @@ const MAX_CODE = 64;
 const MAX_SOURCE_ID = 64;
 const MAX_STEP_ID = 128;
 const MAX_EVIDENCE_COUNT = 50;
+const MAX_PLAN_VERSION = 1_000_000;
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 const CODE = /^[a-z0-9_]{1,64}$/;
 
@@ -90,7 +91,7 @@ export function parseResearchEvaluation(
   }
   if (
     !isNonNegativeInt(raw.evidence_version) ||
-    raw.evidence_version > 2 ||
+    raw.evidence_version > 3 ||
     !isNonNegativeInt(raw.evidence_count) ||
     raw.evidence_count > MAX_EVIDENCE_COUNT ||
     typeof raw.evidence_fingerprint !== 'string' ||
@@ -99,6 +100,29 @@ export function parseResearchEvaluation(
     return undefined;
   }
   if (raw.evidence_version === 0 && raw.evidence_count !== 0) return undefined;
+
+  let planVersion = 0;
+  if (raw.plan_version !== undefined) {
+    if (
+      !isNonNegativeInt(raw.plan_version) ||
+      raw.plan_version > MAX_PLAN_VERSION ||
+      raw.evidence_version === 0
+    ) {
+      return undefined;
+    }
+    planVersion = raw.plan_version;
+  }
+  if (durableEvidence?.present) {
+    if (durableEvidence.plan) {
+      if (durableEvidence.version === 3) {
+        if (planVersion !== durableEvidence.plan.version) return undefined;
+      } else if (planVersion !== 0 && planVersion !== durableEvidence.plan.version) {
+        return undefined;
+      }
+    } else if (planVersion !== 0) {
+      return undefined;
+    }
+  }
 
   const synthesisStatus = raw.synthesis_status;
   if (synthesisStatus !== undefined) {
@@ -170,6 +194,7 @@ export function parseResearchEvaluation(
     evidence_version: raw.evidence_version,
     evidence_count: raw.evidence_count,
     evidence_fingerprint: raw.evidence_fingerprint,
+    ...(planVersion > 0 ? { plan_version: planVersion } : {}),
     ...(synthesisStatus !== undefined
       ? {
           synthesis_status: synthesisStatus as ResearchSynthesisStatus,

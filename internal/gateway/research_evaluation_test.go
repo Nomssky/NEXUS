@@ -16,6 +16,7 @@ func recoverySampleEvaluation(executionID string, evidence *execjournal.Research
 		EvidenceVersion:     evidence.Version,
 		EvidenceCount:       evidence.Count,
 		EvidenceFingerprint: execjournal.ResearchEvidenceFingerprint(evidence),
+		PlanVersion:         evidence.Plan.Version,
 		Status:              execjournal.ResearchEvaluationWarnings,
 		Dimensions: []execjournal.ResearchEvaluationDimension{
 			{ID: execjournal.ResearchDimensionEvidenceCoverage, Status: execjournal.ResearchDimensionPass},

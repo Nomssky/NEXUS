@@ -123,6 +123,57 @@ func TestValidateResearchSynthesisRequiresV2Evidence(t *testing.T) {
 	}
 }
 
+func TestValidateResearchSynthesisBindsToEvidencePlanRevision(t *testing.T) {
+	ev := synthesisEvidence("src-1")
+	ev.Plan = &execjournal.ResearchPlanEvidence{
+		PlanID: "exec-1", Version: 2, Provenance: execjournal.ResearchProvenanceAuthoritative,
+	}
+	ev.Steps = []execjournal.ResearchStepEvidence{{
+		StepID: "s1", Intent: "gather", PlanVersion: 2, Status: "completed",
+		Provenance: execjournal.ResearchProvenanceAuthoritative,
+	}}
+
+	matching := validSynthesis("src-1")
+	matching.PlanVersion = 2
+	if err := ValidateResearchSynthesis(matching, ev, false); err != nil {
+		t.Fatalf("matching v3 plan revision rejected: %v", err)
+	}
+
+	missing := validSynthesis("src-1")
+	if err := ValidateResearchSynthesis(missing, ev, false); err == nil ||
+		!strings.Contains(err.Error(), "requires a plan version") {
+		t.Fatalf("v3 plan evidence requires a plan revision, got %v", err)
+	}
+
+	mismatch := validSynthesis("src-1")
+	mismatch.PlanVersion = 1
+	if err := ValidateResearchSynthesis(mismatch, ev, false); err == nil ||
+		!strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched v3 plan revision must fail, got %v", err)
+	}
+
+	v2 := &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceProvenanceVersion,
+		Capability: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+		Count: 1, Sources: ev.Sources,
+		Plan:  &execjournal.ResearchPlanEvidence{PlanID: "exec-1", Version: 2},
+		Steps: []execjournal.ResearchStepEvidence{{StepID: "s1", Status: "completed"}},
+		Operations: []execjournal.ResearchOperationEvidence{{
+			OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+			Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"},
+		}},
+	}
+	legacyUnbound := validSynthesis("src-1")
+	if err := ValidateResearchSynthesis(legacyUnbound, v2, false); err != nil {
+		t.Fatalf("v2 synthesis without a captured revision must stay readable: %v", err)
+	}
+	legacyMismatch := validSynthesis("src-1")
+	legacyMismatch.PlanVersion = 1
+	if err := ValidateResearchSynthesis(legacyMismatch, v2, false); err == nil {
+		t.Fatal("mismatched v2 plan revision must fail")
+	}
+}
+
 func TestValidateResearchSynthesisRejectsUnboundedCitations(t *testing.T) {
 	ids := make([]string, MaxResearchSynthesisCitationRefs+1)
 	evIDs := make([]string, 0, len(ids))

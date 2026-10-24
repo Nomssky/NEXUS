@@ -344,21 +344,35 @@ describe('ResearchOutput', () => {
       output: COMPLETED_SUMMARY,
       status: 'completed',
       steps: [{ stepId: 'trace-s1', status: 'running', actionType: 'tool_call' }],
-      durablePlan: { plan_id: 'exec-1', version: 2 },
+      durablePlan: {
+        plan_id: 'exec-1',
+        version: 2,
+        objective_id: 'objective-exec-1',
+        completion_step_id: 's2',
+        provenance: 'authoritative',
+      },
+      durableEvidenceVersion: 3,
+      durableAttribution: 'derived',
       durableSteps: [
         {
           stepId: 's1',
+          intent: 'Gather sources.',
+          planVersion: 1,
           status: 'completed',
           dependencies: [],
           observationId: 'obs-1',
           sources: [],
+          authoritative: true,
         },
         {
           stepId: 's2',
+          intent: 'Synthesize findings.',
+          planVersion: 2,
           status: 'completed',
           dependencies: ['s1'],
           observationId: 'obs-2',
           sources: [],
+          authoritative: true,
         },
       ],
     });
@@ -366,13 +380,79 @@ describe('ResearchOutput', () => {
     expect(markup).toContain('Research plan');
     expect(markup).toContain('Durable record');
     expect(markup).toContain('exec-1');
-    expect(markup).toContain('version 2');
+    expect(markup).toContain('revision 2');
+    expect(markup).toContain('Historical plan snapshot');
+    expect(markup).toContain('not the current live plan');
+    expect(markup).toContain('Objective');
+    expect(markup).toContain('objective-exec-1');
+    expect(markup).toContain('Settled by completion step');
+    expect(markup).toContain('Plan facts recorded by the runtime.');
+    expect(markup).toContain('Source-to-step grouping derived from runtime operation records.');
+    expect(markup).toContain('Gather sources.');
+    expect(markup).toContain('Synthesize findings.');
+    expect(markup).toContain('declared in revision 1');
     expect(markup).toContain('data-step-id="s1"');
     expect(markup).toContain('after s1');
+    expect(markup).not.toContain('predates v3 plan provenance');
     // The live trace is not presented as durable plan state.
     expect(markup).not.toContain('Research steps');
     expect(markup).not.toContain('Live trace');
     expect(markup).not.toContain('trace-s1');
+  });
+
+  it('states when no plan step settled completion instead of inferring one', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      durablePlan: {
+        plan_id: 'exec-1',
+        version: 1,
+        objective_id: 'exec-1',
+        provenance: 'authoritative',
+      },
+      durableEvidenceVersion: 3,
+      durableAttribution: 'derived',
+      durableSteps: [
+        {
+          stepId: 's1',
+          intent: 'Gather sources.',
+          planVersion: 1,
+          status: 'completed',
+          dependencies: [],
+          sources: [],
+          authoritative: true,
+        },
+      ],
+    });
+
+    expect(markup).toContain('No plan step settled completion.');
+    expect(markup).not.toContain('Settled by completion step');
+    expect(markup).not.toContain('predates v3 plan provenance');
+  });
+
+  it('renders preserved v2 plan provenance as explicit legacy state', () => {
+    const markup = render({
+      output: COMPLETED_SUMMARY,
+      status: 'completed',
+      durablePlan: { plan_id: 'exec-legacy', version: 1 },
+      durableEvidenceVersion: 2,
+      durableSteps: [
+        {
+          stepId: 's1',
+          status: 'completed',
+          dependencies: [],
+          sources: [],
+          authoritative: false,
+        },
+      ],
+    });
+
+    expect(markup).toContain('Legacy v2');
+    expect(markup).toContain('predates v3 plan provenance');
+    expect(markup).toContain('shown as unavailable rather than inferred');
+    expect(markup).toContain('Plan provenance markers unavailable on this legacy record.');
+    expect(markup).not.toContain('Plan facts recorded by the runtime.');
+    expect(markup).not.toContain('Settled by completion step');
   });
 
   describe('durable lifecycle timestamps (recovery detail read)', () => {
@@ -461,12 +541,13 @@ describe('ResearchOutput', () => {
         completedAt: '2026-10-20T10:05:30Z',
         durablePlan: { plan_id: 'exec-1', version: 1 },
         durableSteps: [
-          { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
+          { stepId: 's1', status: 'completed', dependencies: [], sources: [], authoritative: true },
           {
             stepId: 's2',
             status: 'completed',
             dependencies: ['s1'],
             sources: [],
+            authoritative: true,
           },
         ],
       });
@@ -570,6 +651,7 @@ describe('ResearchOutput', () => {
       inferences: [],
       conflicts: [],
       unresolvedQuestions: [],
+      planVersion: 2,
     };
 
     it('renders persisted durable synthesis distinctly from live synthesis', () => {
@@ -586,6 +668,7 @@ describe('ResearchOutput', () => {
       expect(markup).toContain('data-provenance="durable"');
       expect(markup).toContain('Durable synthesis');
       expect(markup).toContain('Durable record');
+      expect(markup).toContain('Bound to plan revision 2.');
       expect(markup).toContain('Synthesized from the captured source.');
       expect(markup).toContain('The runtime decides and the model proposes.');
       expect(markup).toContain('docs.example/nexus');

@@ -255,9 +255,10 @@ func scriptedAnswer(prompt string) string {
 }
 
 // scriptedEvidenceIDs reads only the runtime's current-execution EVIDENCE block
-// from the prompt. The second return value reports that a v2 evidence block is
-// present (even when it captured zero sources), so the simulation provider can
-// return an honest typed synthesis. Legacy v1 evidence is deliberately ignored.
+// from the prompt. The second return value reports that a stable-id evidence
+// block (v2 or v3) is present, even when it captured zero sources, so the
+// simulation provider can return an honest typed synthesis. Legacy v1 evidence
+// is deliberately ignored.
 func scriptedEvidenceIDs(lower string) ([]string, bool) {
 	const marker = "evidence (validated, current execution only;"
 	i := strings.Index(lower, marker)
@@ -268,7 +269,7 @@ func scriptedEvidenceIDs(lower string) ([]string, bool) {
 	if end := strings.Index(header, "\n"); end >= 0 {
 		header = header[:end]
 	}
-	if !strings.Contains(header, "version=2") {
+	if !strings.Contains(header, "version=2") && !strings.Contains(header, "version=3") {
 		return nil, false
 	}
 	ids := make([]string, 0, 4)

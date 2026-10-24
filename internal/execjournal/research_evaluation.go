@@ -111,6 +111,11 @@ type ResearchEvaluation struct {
 	EvidenceVersion     int    `json:"evidence_version"`
 	EvidenceCount       int    `json:"evidence_count"`
 	EvidenceFingerprint string `json:"evidence_fingerprint"`
+	// PlanVersion is the plan revision of the evidence snapshot that was
+	// evaluated. It is required for v3 plan evidence and unavailable (0) for
+	// legacy records or evidence without a plan. It binds the verdict to the
+	// exact plan revision, not merely to the execution id.
+	PlanVersion int `json:"plan_version,omitempty"`
 	// SynthesisStatus and SynthesisFingerprint bind the verdict to the typed
 	// synthesis that was evaluated. They are absent when no synthesis existed.
 	// The synthesis itself is not stored here: this record carries only the
@@ -222,6 +227,19 @@ func ValidateResearchEvaluationForExecution(executionID string, evaluation *Rese
 	} else {
 		if evaluation.EvidenceVersion != evidence.Version || evaluation.EvidenceCount != evidence.Count {
 			return fmt.Errorf("execjournal: research evaluation evidence version/count mismatch")
+		}
+	}
+	if evidence != nil && evidence.Version == ResearchEvidenceVersion && evidence.Plan != nil {
+		if evaluation.PlanVersion != evidence.Plan.Version {
+			return fmt.Errorf("execjournal: research evaluation plan version %d does not match evidence plan version %d",
+				evaluation.PlanVersion, evidence.Plan.Version)
+		}
+	} else if evaluation.PlanVersion != 0 {
+		if evaluation.PlanVersion < 1 || evaluation.PlanVersion > MaxResearchProvenancePlanVersion {
+			return fmt.Errorf("execjournal: research evaluation plan version %d out of range", evaluation.PlanVersion)
+		}
+		if evidence == nil || evidence.Plan == nil || evaluation.PlanVersion != evidence.Plan.Version {
+			return fmt.Errorf("execjournal: research evaluation claims a plan version without a matching evidence plan")
 		}
 	}
 	if evaluation.SynthesisStatus == "" {

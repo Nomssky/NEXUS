@@ -37,6 +37,10 @@ type ResearchSynthesis struct {
 	Conflicts []ResearchEvidenceStatement `json:"conflicts"`
 	// UnresolvedQuestions are gaps the execution could not settle.
 	UnresolvedQuestions []string `json:"unresolved_questions"`
+	// PlanVersion is the plan version active when this synthesis was validated.
+	// The runtime stamps it; the model never sets it. The durable journal
+	// enforces binding to evidence.Plan.Version at persistence time.
+	PlanVersion int `json:"plan_version"`
 }
 
 // ResearchEvidenceStatement is one claim plus the execution-scoped source ids
@@ -73,6 +77,12 @@ const (
 // execution. Evidence records from another execution are not accepted because
 // they are not in ev.
 //
+// v2 and v3 evidence are both accepted because both carry stable source ids.
+// When the evidence already carries a finalized plan snapshot, a captured
+// synthesis plan revision must match it exactly; a v3 plan snapshot requires
+// the binding to be present. The runtime stamps PlanVersion before calling this
+// validator, so the model can never choose the revision.
+//
 // partial is the runtime's verdict that some plan steps did not complete. A
 // model may not claim a complete synthesis over a partial execution. When the
 // execution captured no sources, only an inconclusive synthesis is honest.
@@ -83,18 +93,35 @@ func ValidateResearchSynthesis(s *ResearchSynthesis, ev *execjournal.ResearchEvi
 	if ev == nil {
 		return fmt.Errorf("synthesis requires a captured evidence snapshot")
 	}
-	if ev.Version != execjournal.ResearchEvidenceVersion {
-		return fmt.Errorf("synthesis requires v2 evidence with stable source ids")
+	if ev.Version != execjournal.ResearchEvidenceVersion &&
+		ev.Version != execjournal.ResearchEvidenceProvenanceVersion {
+		return fmt.Errorf("synthesis requires v2 or v3 evidence with stable source ids")
 	}
 	// Validate the source rows without their in-progress provenance: at
 	// completion the plan/step snapshot has not necessarily been finalized yet.
-	base := *ev
-	base.Plan, base.Steps, base.Operations = nil, nil, nil
-	if err := execjournal.ValidateResearchEvidence(&base); err != nil {
+	// The evidence-level attribution is also a finalization fact, so the base
+	// copy must use the value that matches "no operations" for its schema.
+	base := &execjournal.ResearchEvidence{
+		Version: ev.Version, Capability: ev.Capability, Operation: ev.Operation,
+		Count: ev.Count, Sources: ev.Sources,
+	}
+	if ev.Version == execjournal.ResearchEvidenceVersion {
+		base.Attribution = execjournal.ResearchAttributionUnavailable
+	}
+	if err := execjournal.ValidateResearchEvidence(base); err != nil {
 		return fmt.Errorf("invalid evidence: %w", err)
 	}
 	if ev.Count < 0 || ev.Count != len(ev.Sources) {
 		return fmt.Errorf("invalid evidence count")
+	}
+	if s.PlanVersion < 0 || s.PlanVersion > execjournal.MaxResearchSynthesisPlanVersion {
+		return fmt.Errorf("invalid synthesis plan version")
+	}
+	if ev.Plan != nil && s.PlanVersion != 0 && s.PlanVersion != ev.Plan.Version {
+		return fmt.Errorf("synthesis plan version does not match the evidence plan")
+	}
+	if ev.Version == execjournal.ResearchEvidenceVersion && ev.Plan != nil && s.PlanVersion == 0 {
+		return fmt.Errorf("synthesis over v3 plan evidence requires a plan version")
 	}
 
 	switch s.Status {
@@ -239,6 +266,7 @@ func DurableResearchSynthesis(s *ResearchSynthesis, executionID string, evidence
 		Status:              s.Status,
 		Summary:             s.Summary,
 		EvidenceFingerprint: execjournal.ResearchEvidenceFingerprint(evidence),
+		PlanVersion:         s.PlanVersion,
 	}
 	for _, statement := range s.EvidenceBacked {
 		durable.EvidenceBacked = append(durable.EvidenceBacked, execjournal.ResearchSynthesisStatement{

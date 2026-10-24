@@ -143,7 +143,8 @@ func TestValidateResearchEvidence(t *testing.T) {
 	valid := &ResearchEvidence{
 		Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 		Operation: ResearchEvidenceOperation, Count: 1,
-		Sources: []ResearchSource{{ID: "src-1", Title: "A", URL: "https://a.example"}},
+		Sources:     []ResearchSource{{ID: "src-1", Title: "A", URL: "https://a.example"}},
+		Attribution: ResearchAttributionUnavailable,
 	}
 	if err := ValidateResearchEvidence(valid); err != nil {
 		t.Fatalf("valid evidence rejected: %v", err)
@@ -152,26 +153,32 @@ func TestValidateResearchEvidence(t *testing.T) {
 		t.Fatalf("nil evidence must be allowed: %v", err)
 	}
 	cases := map[string]*ResearchEvidence{
-		"version":    {Version: 3, Capability: ResearchEvidenceCapability, Operation: ResearchEvidenceOperation},
-		"capability": {Version: ResearchEvidenceVersion, Capability: "other", Operation: ResearchEvidenceOperation},
-		"operation":  {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability, Operation: "fetch"},
+		"version":    {Version: 99, Capability: ResearchEvidenceCapability, Operation: ResearchEvidenceOperation},
+		"capability": {Version: ResearchEvidenceVersion, Capability: "other", Operation: ResearchEvidenceOperation, Attribution: ResearchAttributionUnavailable},
+		"operation":  {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability, Operation: "fetch", Attribution: ResearchAttributionUnavailable},
 		"count mismatch": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
-			Operation: ResearchEvidenceOperation, Count: 2, Sources: []ResearchSource{{ID: "src-1"}}},
+			Operation: ResearchEvidenceOperation, Count: 2, Sources: []ResearchSource{{ID: "src-1"}},
+			Attribution: ResearchAttributionUnavailable},
 		"oversized": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 1,
-			Sources: []ResearchSource{{ID: "src-1", Snippet: strings.Repeat("x", MaxResearchSourceSnippet+1)}}},
+			Sources:     []ResearchSource{{ID: "src-1", Snippet: strings.Repeat("x", MaxResearchSourceSnippet+1)}},
+			Attribution: ResearchAttributionUnavailable},
 		"control": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 1,
-			Sources: []ResearchSource{{ID: "src-1", Title: "a\nb"}}},
+			Sources:     []ResearchSource{{ID: "src-1", Title: "a\nb"}},
+			Attribution: ResearchAttributionUnavailable},
 		"missing source id": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 1,
-			Sources: []ResearchSource{{Title: "A"}}},
+			Sources:     []ResearchSource{{Title: "A"}},
+			Attribution: ResearchAttributionUnavailable},
 		"duplicate source id": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: 2,
-			Sources: []ResearchSource{{ID: "src-1"}, {ID: "src-1"}}},
+			Sources:     []ResearchSource{{ID: "src-1"}, {ID: "src-1"}},
+			Attribution: ResearchAttributionUnavailable},
 		"too many sources": {Version: ResearchEvidenceVersion, Capability: ResearchEvidenceCapability,
 			Operation: ResearchEvidenceOperation, Count: MaxResearchEvidenceSources + 1,
-			Sources: make([]ResearchSource, MaxResearchEvidenceSources+1)},
+			Sources:     make([]ResearchSource, MaxResearchEvidenceSources+1),
+			Attribution: ResearchAttributionUnavailable},
 	}
 	for name, ev := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -191,17 +198,92 @@ func provenanceEvidence(executionID string) *ResearchEvidence {
 			{ID: "src-2", Title: "Two", URL: "https://two.example"},
 			{ID: "src-3", Title: "Three", URL: "https://three.example"},
 		},
-		Plan: &ResearchPlanEvidence{PlanID: executionID, Version: 2},
+		Plan: &ResearchPlanEvidence{
+			PlanID: executionID, Version: 2, ObjectiveID: "objective-" + executionID,
+			CompletionStepID: "s2", Provenance: ResearchProvenanceAuthoritative,
+		},
 		Steps: []ResearchStepEvidence{
-			{StepID: "s1", Status: "completed", ObservationID: "obs-1"},
-			{StepID: "s2", Status: "completed", ObservationID: "obs-2", Dependencies: []string{"s1"}},
+			{StepID: "s1", Intent: "gather sources", PlanVersion: 1, Status: "completed",
+				ObservationID: "obs-1", Provenance: ResearchProvenanceAuthoritative},
+			{StepID: "s2", Intent: "synthesize findings", PlanVersion: 2, Status: "completed",
+				ObservationID: "obs-2", Dependencies: []string{"s1"}, Provenance: ResearchProvenanceAuthoritative},
 		},
 		Operations: []ResearchOperationEvidence{
 			{OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
-				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"}},
+				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"},
+				Provenance: ResearchProvenanceAuthoritative},
 			{OperationID: "obs-2", StepID: "s2", ToolID: ResearchEvidenceCapability,
-				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-3"}},
+				Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-3"},
+				Provenance: ResearchProvenanceAuthoritative},
 		},
+		Attribution: ResearchAttributionDerived,
+	}
+}
+
+func TestLegacyResearchEvidenceV2IsReadableWithoutInventingV3Fields(t *testing.T) {
+	legacy := &ResearchEvidence{
+		Version: ResearchEvidenceProvenanceVersion, Capability: ResearchEvidenceCapability,
+		Operation: ResearchEvidenceOperation, Count: 1,
+		Sources: []ResearchSource{{ID: "src-1", Title: "Legacy v2", URL: "https://legacy.example"}},
+		Plan:    &ResearchPlanEvidence{PlanID: "exec-1", Version: 2},
+		Steps: []ResearchStepEvidence{
+			{StepID: "s1", Status: "completed", Dependencies: []string{"s2"}},
+			{StepID: "s2", Status: "completed"},
+		},
+		Operations: []ResearchOperationEvidence{{
+			OperationID: "obs-1", StepID: "s1", ToolID: ResearchEvidenceCapability,
+			Operation: ResearchEvidenceOperation, SourceIDs: []string{"src-1"},
+		}},
+	}
+	if err := ValidateResearchEvidenceForExecution("exec-1", legacy); err != nil {
+		t.Fatalf("v2 evidence must remain readable: %v", err)
+	}
+	if legacy.Attribution != "" || legacy.Steps[0].Intent != "" ||
+		legacy.Steps[0].PlanVersion != 0 || legacy.Steps[0].Provenance != "" ||
+		legacy.Plan.ObjectiveID != "" || legacy.Plan.CompletionStepID != "" ||
+		legacy.Plan.Provenance != "" || legacy.Operations[0].Provenance != "" {
+		t.Fatalf("v2 evidence must not acquire v3 fields on read: %+v", legacy)
+	}
+
+	cases := map[string]func(*ResearchEvidence){
+		"attribution": func(ev *ResearchEvidence) {
+			ev.Attribution = ResearchAttributionDerived
+		},
+		"plan objective": func(ev *ResearchEvidence) {
+			ev.Plan.ObjectiveID = "obj-1"
+		},
+		"plan completion": func(ev *ResearchEvidence) {
+			ev.Plan.CompletionStepID = "s1"
+		},
+		"plan provenance": func(ev *ResearchEvidence) {
+			ev.Plan.Provenance = ResearchProvenanceAuthoritative
+		},
+		"step intent": func(ev *ResearchEvidence) {
+			ev.Steps[0].Intent = "invented"
+		},
+		"step plan version": func(ev *ResearchEvidence) {
+			ev.Steps[0].PlanVersion = 1
+		},
+		"step provenance": func(ev *ResearchEvidence) {
+			ev.Steps[0].Provenance = ResearchProvenanceAuthoritative
+		},
+		"operation provenance": func(ev *ResearchEvidence) {
+			ev.Operations[0].Provenance = ResearchProvenanceAuthoritative
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			ev := *legacy
+			plan := *legacy.Plan
+			ev.Plan = &plan
+			ev.Steps = append([]ResearchStepEvidence(nil), legacy.Steps...)
+			ev.Operations = append([]ResearchOperationEvidence(nil), legacy.Operations...)
+			ev.Operations[0].SourceIDs = append([]string(nil), legacy.Operations[0].SourceIDs...)
+			mutate(&ev)
+			if err := ValidateResearchEvidence(&ev); err == nil {
+				t.Fatalf("v2 evidence accepted a v3-only field: %+v", ev)
+			}
+		})
 	}
 }
 
@@ -282,6 +364,36 @@ func TestValidateResearchEvidenceRejectsInvalidProvenance(t *testing.T) {
 		},
 		"too many source refs": func(ev *ResearchEvidence) {
 			ev.Operations[0].SourceIDs = make([]string, MaxResearchOperationSourceRefs+1)
+		},
+		"missing plan provenance": func(ev *ResearchEvidence) {
+			ev.Plan.Provenance = ""
+		},
+		"wrong plan provenance": func(ev *ResearchEvidence) {
+			ev.Plan.Provenance = ResearchAttributionDerived
+		},
+		"missing step intent": func(ev *ResearchEvidence) {
+			ev.Steps[0].Intent = ""
+		},
+		"missing step plan version": func(ev *ResearchEvidence) {
+			ev.Steps[0].PlanVersion = 0
+		},
+		"step plan version after plan": func(ev *ResearchEvidence) {
+			ev.Steps[0].PlanVersion = ev.Plan.Version + 1
+		},
+		"missing step provenance": func(ev *ResearchEvidence) {
+			ev.Steps[0].Provenance = ""
+		},
+		"missing operation provenance": func(ev *ResearchEvidence) {
+			ev.Operations[0].Provenance = ""
+		},
+		"missing attribution": func(ev *ResearchEvidence) {
+			ev.Attribution = ""
+		},
+		"attribution does not match operations": func(ev *ResearchEvidence) {
+			ev.Attribution = ResearchAttributionUnavailable
+		},
+		"unknown completion step": func(ev *ResearchEvidence) {
+			ev.Plan.CompletionStepID = "s9"
 		},
 	}
 	for name, mutate := range cases {

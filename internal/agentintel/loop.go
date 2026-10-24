@@ -279,7 +279,11 @@ func (rn *run) hasResearchOperation(operationID string) bool {
 // authoritative step state it durably recorded. The snapshot is final plan
 // order; operations whose step no longer exists are dropped (their sources
 // remain explicitly unattributed rather than guessed onto another step).
-func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
+//
+// completionStepID is non-empty only when the outcome is a completed run
+// settled by that step's completion action. It is a runtime-owned fact and is
+// never inferred from ordering or the final step.
+func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger, completionStepID string) {
 	if rn == nil || rn.researchEvidence == nil ||
 		rn.researchEvidence.Version != execjournal.ResearchEvidenceVersion {
 		return
@@ -287,11 +291,13 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 	ev := rn.researchEvidence
 	operations := ev.Operations
 	ev.Plan, ev.Steps, ev.Operations = nil, nil, nil
+	ev.Attribution = execjournal.ResearchAttributionUnavailable
 	if plan == nil || ledger == nil {
 		return
 	}
 	ev.Plan = &execjournal.ResearchPlanEvidence{
-		PlanID: plan.PlanID, Version: plan.Version,
+		PlanID: plan.PlanID, Version: plan.Version, ObjectiveID: plan.ObjectiveID,
+		Provenance: execjournal.ResearchProvenanceAuthoritative,
 	}
 	allowed := make(map[string]struct{}, len(plan.Steps))
 	for _, step := range plan.Steps {
@@ -304,9 +310,12 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 		}
 		ev.Steps = append(ev.Steps, execjournal.ResearchStepEvidence{
 			StepID:        step.StepID,
+			Intent:        step.Intent,
+			PlanVersion:   rec.PlanVersion,
 			Dependencies:  append([]string(nil), step.Dependencies...),
 			Status:        string(rec.Status),
 			ObservationID: rec.ObservationID,
+			Provenance:    execjournal.ResearchProvenanceAuthoritative,
 		})
 		allowed[step.StepID] = struct{}{}
 	}
@@ -316,19 +325,29 @@ func (rn *run) finalizeResearchEvidence(plan *Plan, ledger *planLedger) {
 		ev.Plan = nil
 		return
 	}
+	if completionStepID != "" {
+		if _, ok := allowed[completionStepID]; ok {
+			ev.Plan.CompletionStepID = completionStepID
+		}
+	}
 	for _, op := range operations {
 		if _, ok := allowed[op.StepID]; !ok {
 			continue
 		}
+		op.Provenance = execjournal.ResearchProvenanceAuthoritative
 		ev.Operations = append(ev.Operations, op)
+	}
+	if len(ev.Operations) > 0 {
+		ev.Attribution = execjournal.ResearchAttributionDerived
 	}
 	// Model-authored plan identifiers are validated as bounded, non-empty and
 	// schema-shaped by the plan validator. If the settled provenance still
 	// cannot satisfy the durable evidence contract, drop the provenance rather
 	// than poisoning the terminal write; the source records remain honest but
 	// unattributed.
-	if err := execjournal.ValidateResearchEvidenceForExecution(ev.Plan.PlanID, ev); err != nil {
+	if err := execjournal.ValidateResearchEvidenceForExecution(rn.execID, ev); err != nil {
 		ev.Plan, ev.Steps, ev.Operations = nil, nil, nil
+		ev.Attribution = execjournal.ResearchAttributionUnavailable
 		if err := execjournal.ValidateResearchEvidence(ev); err != nil {
 			// The source rows themselves cannot be represented honestly.
 			// Drop the whole snapshot rather than fail the terminal write.
@@ -352,16 +371,20 @@ func (rn *run) evaluateResearch(status string) *execjournal.ResearchEvaluation {
 		steps = make([]researchquality.Step, 0, len(rn.plan.Steps))
 		for _, step := range rn.plan.Steps {
 			stepStatus := ""
+			planVersion := 0
 			if rn.ledger != nil {
 				if rec := rn.ledger.get(step.StepID); rec != nil {
 					stepStatus = string(rec.Status)
+					planVersion = rec.PlanVersion
 				}
 			}
 			steps = append(steps, researchquality.Step{
-				StepID:   step.StepID,
-				Intent:   step.Intent,
-				Status:   stepStatus,
-				Optional: step.Optional,
+				StepID:       step.StepID,
+				Intent:       step.Intent,
+				Status:       stepStatus,
+				Optional:     step.Optional,
+				Dependencies: append([]string(nil), step.Dependencies...),
+				PlanVersion:  planVersion,
 			})
 		}
 	}
@@ -383,14 +406,21 @@ func (rn *run) evaluateResearch(status string) *execjournal.ResearchEvaluation {
 }
 
 // validateCompletionSynthesis enforces the completion gate for research
-// evidence. v2 evidence requires a typed synthesis; v1 evidence has no stable
-// source ids and must not be upgraded into one. The model's synthesis is only
-// a proposal until executor.ValidateResearchSynthesis resolves every citation
-// against this run's current evidence and checks status against the plan facts.
+// evidence. v2 and v3 evidence require a typed synthesis; v1 evidence has no
+// stable source ids and must not be upgraded into one. The model's synthesis is
+// only a proposal until executor.ValidateResearchSynthesis resolves every
+// citation against this run's current evidence and checks status against the
+// plan facts.
+//
+// The runtime, not the model, owns the plan-revision binding. For v3 evidence
+// finalization will record the active plan snapshot, so the synthesis binds to
+// that same revision. For a preserved v2 snapshot the revision already stored
+// in the evidence is authoritative; if no plan was captured, no revision is
+// claimed.
 func (rn *run) validateCompletionSynthesis(s *executor.ResearchSynthesis, plan *Plan, ledger *planLedger, currentStepID string) error {
 	ev := rn.researchEvidence
 	if s == nil {
-		if ev != nil && ev.Version == execjournal.ResearchEvidenceVersion {
+		if ev != nil && ev.Version >= execjournal.ResearchEvidenceProvenanceVersion {
 			return fmt.Errorf("evidence was captured but the complete action has no synthesis")
 		}
 		return nil
@@ -398,8 +428,18 @@ func (rn *run) validateCompletionSynthesis(s *executor.ResearchSynthesis, plan *
 	if ev == nil {
 		return fmt.Errorf("synthesis requires evidence captured by this execution")
 	}
-	if ev.Version != execjournal.ResearchEvidenceVersion {
-		return fmt.Errorf("synthesis requires v2 evidence with stable source ids")
+	if ev.Version != execjournal.ResearchEvidenceVersion &&
+		ev.Version != execjournal.ResearchEvidenceProvenanceVersion {
+		return fmt.Errorf("synthesis requires v2 or v3 evidence with stable source ids")
+	}
+	s.PlanVersion = 0
+	switch {
+	case ev.Version == execjournal.ResearchEvidenceVersion:
+		if plan != nil {
+			s.PlanVersion = plan.Version
+		}
+	case ev.Plan != nil:
+		s.PlanVersion = ev.Plan.Version
 	}
 	return executor.ValidateResearchSynthesis(s, ev, completionIsPartial(plan, ledger, currentStepID))
 }
@@ -497,7 +537,11 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 	// that actually ran, not a success claim. The journal remains the only
 	// durable exposure; this hand-off is internal.
 	defer func() {
-		rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+		completionStepID := ""
+		if out != nil && out.Status == "completed" {
+			completionStepID = rn.currentStepID
+		}
+		rn.finalizeResearchEvidence(rn.plan, rn.ledger, completionStepID)
 		if out != nil && rn.researchEvidence != nil {
 			out.ResearchEvidence = rn.researchEvidence
 		}

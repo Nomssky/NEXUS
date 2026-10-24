@@ -360,7 +360,8 @@ func TestCaptureResearchEvidenceDoesNotUpgradeLegacySnapshot(t *testing.T) {
 // source whose step was dropped by a replan stays present but unattributed.
 func TestFinalizeResearchEvidenceDropsOnlyUnprovableStepReferences(t *testing.T) {
 	rn := &run{
-		plan: &Plan{PlanID: "exec-1", Version: 2, Steps: []Step{
+		execID: "exec-1",
+		plan: &Plan{PlanID: "exec-1", Version: 2, ObjectiveID: "obj-1", Steps: []Step{
 			{StepID: "s1", Intent: "gather", Dependencies: nil},
 			{StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
 		}},
@@ -391,11 +392,20 @@ func TestFinalizeResearchEvidenceDropsOnlyUnprovableStepReferences(t *testing.T)
 			},
 		},
 	}
-	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger, "s1")
 	ev := rn.researchEvidence
 	if ev.Plan == nil || ev.Plan.PlanID != "exec-1" || ev.Plan.Version != 2 ||
+		ev.Plan.ObjectiveID != "obj-1" || ev.Plan.CompletionStepID != "s1" ||
+		ev.Plan.Provenance != execjournal.ResearchProvenanceAuthoritative ||
 		len(ev.Steps) != 2 || len(ev.Operations) != 1 {
 		t.Fatalf("unexpected finalized provenance: %+v", ev)
+	}
+	if ev.Steps[0].Intent != "gather" || ev.Steps[0].PlanVersion != 1 ||
+		ev.Steps[0].Provenance != execjournal.ResearchProvenanceAuthoritative ||
+		ev.Steps[1].Intent != "summarize" || ev.Steps[1].PlanVersion != 2 ||
+		ev.Attribution != execjournal.ResearchAttributionDerived ||
+		ev.Operations[0].Provenance != execjournal.ResearchProvenanceAuthoritative {
+		t.Fatalf("v3 step provenance not finalized: %+v", ev)
 	}
 	if ev.Operations[0].StepID != "s1" || !slices.Equal(ev.Operations[0].SourceIDs, []string{"src-1"}) {
 		t.Fatalf("dropped-step operation must not be reassigned: %+v", ev.Operations[0])
@@ -410,6 +420,7 @@ func TestFinalizeResearchEvidenceDropsOnlyUnprovableStepReferences(t *testing.T)
 // the source stays present and unattributed.
 func TestFinalizeResearchEvidenceOmitsUnprovenStep(t *testing.T) {
 	rn := &run{
+		execID: "exec-1",
 		plan: &Plan{PlanID: "exec-1", Version: 1, Steps: []Step{
 			{StepID: "s1", Intent: "gather"},
 			{StepID: "s2", Intent: "summarize", Dependencies: []string{"s1"}},
@@ -440,7 +451,7 @@ func TestFinalizeResearchEvidenceOmitsUnprovenStep(t *testing.T) {
 			},
 		},
 	}
-	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger, "s1")
 	ev := rn.researchEvidence
 	if ev.Plan == nil || ev.Plan.PlanID != "exec-1" || len(ev.Steps) != 1 || len(ev.Operations) != 1 {
 		t.Fatalf("unproven step must be omitted: %+v", ev)
@@ -460,6 +471,7 @@ func TestFinalizeResearchEvidenceOmitsUnprovenStep(t *testing.T) {
 func TestFinalizeResearchEvidenceDropsInvalidProvenance(t *testing.T) {
 	longStepID := strings.Repeat("s", execjournal.MaxResearchStepID+1)
 	rn := &run{
+		execID: "exec-1",
 		plan: &Plan{PlanID: "exec-1", Version: 1, Steps: []Step{
 			{StepID: longStepID, Intent: "gather"},
 		}},
@@ -483,7 +495,7 @@ func TestFinalizeResearchEvidenceDropsInvalidProvenance(t *testing.T) {
 			},
 		},
 	}
-	rn.finalizeResearchEvidence(rn.plan, rn.ledger)
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger, "s1")
 	ev := rn.researchEvidence
 	if ev.Plan != nil || len(ev.Steps) != 0 || len(ev.Operations) != 0 {
 		t.Fatalf("invalid provenance must be dropped: %+v", ev)
@@ -493,6 +505,115 @@ func TestFinalizeResearchEvidenceDropsInvalidProvenance(t *testing.T) {
 	}
 	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
 		t.Fatalf("dropped provenance must still validate: %v", err)
+	}
+}
+
+// A runtime plan that claims another execution's identity must never become a
+// durable plan snapshot. The source records remain, with attribution
+// unavailable, and the terminal write is not poisoned by unprovable provenance.
+func TestFinalizeResearchEvidenceDropsForeignPlanIdentity(t *testing.T) {
+	rn := &run{
+		execID: "exec-1",
+		plan: &Plan{PlanID: "exec-other", Version: 1, Steps: []Step{
+			{StepID: "s1", Intent: "gather"},
+		}},
+		ledger: &planLedger{
+			planID: "exec-other", version: 1,
+			order: []string{"s1"},
+			steps: map[string]*Step{
+				"s1": {StepID: "s1", Intent: "gather"},
+			},
+			records: map[string]*StepRecord{
+				"s1": {StepID: "s1", Status: StepCompleted, PlanVersion: 1, ObservationID: "obs-1"},
+			},
+		},
+		researchEvidence: &execjournal.ResearchEvidence{
+			Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+			Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+			Sources: []execjournal.ResearchSource{{ID: "src-1", Title: "One", URL: "https://one.example"}},
+			Operations: []execjournal.ResearchOperationEvidence{
+				{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
+					Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1"}},
+			},
+		},
+	}
+	rn.finalizeResearchEvidence(rn.plan, rn.ledger, "s1")
+	ev := rn.researchEvidence
+	if ev.Plan != nil || len(ev.Steps) != 0 || len(ev.Operations) != 0 ||
+		ev.Attribution != execjournal.ResearchAttributionUnavailable {
+		t.Fatalf("foreign plan identity must not be persisted: %+v", ev)
+	}
+	if ev.Count != 1 || len(ev.Sources) != 1 || ev.Sources[0].ID != "src-1" {
+		t.Fatalf("source records must remain: %+v", ev)
+	}
+	if err := execjournal.ValidateResearchEvidenceForExecution("exec-1", ev); err != nil {
+		t.Fatalf("dropped provenance must still validate: %v", err)
+	}
+}
+
+// The runtime, not the model, owns the synthesis plan revision. v3 evidence is
+// stamped with the active plan revision at completion; a preserved v2 snapshot
+// keeps the revision it already recorded; a source-only snapshot claims none.
+func TestValidateCompletionSynthesisStampsRuntimePlanRevision(t *testing.T) {
+	plan := &Plan{PlanID: "exec-1", Version: 3, Steps: []Step{{StepID: "s1", Intent: "gather"}}}
+	ledger := &planLedger{
+		planID: "exec-1", version: 3, order: []string{"s1"},
+		steps: map[string]*Step{"s1": {StepID: "s1", Intent: "gather"}},
+		records: map[string]*StepRecord{
+			"s1": {StepID: "s1", Status: StepCompleted, PlanVersion: 3},
+		},
+	}
+	completion := func(ids ...string) *executor.ResearchSynthesis {
+		return &executor.ResearchSynthesis{
+			Status: executor.ResearchSynthesisComplete, Summary: "grounded",
+			EvidenceBacked: []executor.ResearchEvidenceStatement{{
+				Statement: "claim", SourceIDs: ids,
+			}},
+			PlanVersion: 99,
+		}
+	}
+	v3 := &execjournal.ResearchEvidence{
+		Version: execjournal.ResearchEvidenceVersion, Capability: execjournal.ResearchEvidenceCapability,
+		Operation: execjournal.ResearchEvidenceOperation, Count: 1,
+		Sources:     []execjournal.ResearchSource{{ID: "src-1", Title: "One", URL: "https://one.example"}},
+		Attribution: execjournal.ResearchAttributionUnavailable,
+	}
+	rn := &run{execID: "exec-1", researchEvidence: v3}
+	synth := completion("src-1")
+	if err := rn.validateCompletionSynthesis(synth, plan, ledger, "s1"); err != nil {
+		t.Fatalf("v3 completion rejected: %v", err)
+	}
+	if synth.PlanVersion != 3 {
+		t.Fatalf("v3 synthesis plan version = %d, want runtime plan revision 3", synth.PlanVersion)
+	}
+
+	v2 := &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceProvenanceVersion,
+		Capability: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+		Count: 1, Sources: v3.Sources,
+		Plan: &execjournal.ResearchPlanEvidence{PlanID: "exec-1", Version: 2},
+	}
+	rn = &run{execID: "exec-1", researchEvidence: v2}
+	synth = completion("src-1")
+	if err := rn.validateCompletionSynthesis(synth, plan, ledger, "s1"); err != nil {
+		t.Fatalf("v2 completion rejected: %v", err)
+	}
+	if synth.PlanVersion != 2 {
+		t.Fatalf("v2 synthesis plan version = %d, want evidence revision 2", synth.PlanVersion)
+	}
+
+	v2NoPlan := &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceProvenanceVersion,
+		Capability: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+		Count: 1, Sources: v3.Sources,
+	}
+	rn = &run{execID: "exec-1", researchEvidence: v2NoPlan}
+	synth = completion("src-1")
+	if err := rn.validateCompletionSynthesis(synth, plan, ledger, "s1"); err != nil {
+		t.Fatalf("v2 source-only completion rejected: %v", err)
+	}
+	if synth.PlanVersion != 0 {
+		t.Fatalf("source-only synthesis claimed plan version %d", synth.PlanVersion)
 	}
 }
 

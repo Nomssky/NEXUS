@@ -25,6 +25,7 @@ func recoverySampleSynthesis(executionID string, evidence *execjournal.ResearchE
 		Conflicts:           []execjournal.ResearchSynthesisStatement{},
 		UnresolvedQuestions: []string{},
 		EvidenceFingerprint: execjournal.ResearchEvidenceFingerprint(evidence),
+		PlanVersion:         evidence.Plan.Version,
 	}
 }
 

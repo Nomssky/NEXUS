@@ -1,4 +1,4 @@
-# NEXUS — Research Quality & Source Reliability Evaluation (v58)
+# NEXUS — Research Quality & Source Reliability Evaluation (v58–v60)
 
 Authoritative for the deterministic research quality verdict. It extends the
 existing research architecture; it never replaces it. Cross-references (never
@@ -14,7 +14,9 @@ execution's research output. It is a projection over two things the runtime
 already owns:
 
 1. the validated typed synthesis (`executor.ResearchSynthesis`), and
-2. the durable evidence snapshot (`execjournal.ResearchEvidence` v2).
+2. the durable evidence snapshot (`execjournal.ResearchEvidence` v3), including
+   the exact plan/step snapshot, completion relationship and source-to-step
+   operation records it captured.
 
 It introduces **no second research engine, store, planner or evaluator**. It
 adds no model call, no network call, no page fetch and no new persistence
@@ -53,6 +55,7 @@ never as a failure of the research itself.
 | `execution_id` | the execution this verdict belongs to; never another |
 | `evidence_version` / `evidence_count` | the evidence snapshot that was evaluated (`0`/`0` when no snapshot existed) |
 | `evidence_fingerprint` | SHA-256 over the normalized evidence JSON; binds the verdict to that exact snapshot |
+| `plan_version` | the plan revision recorded in that evidence snapshot; `0` when the snapshot has no plan or a preserved v2 record never captured it |
 | `synthesis_status` / `synthesis_fingerprint` | the synthesis that was evaluated. Since v59 the validated synthesis itself is also persisted (see `RESEARCH_SYNTHESIS_DURABLE_CONTRACTS.md`); this verdict still records only its status and fingerprint |
 | `status` | overall verdict (§2) |
 | `dimensions` | exactly eight dimension results (§3) |
@@ -97,13 +100,13 @@ rejects a record whose status contradicts its findings.
 | Dimension | What is measured | What is explicitly not measured |
 |---|---|---|
 | `evidence_coverage` | every evidence-backed statement carries at least one citation that resolves in this execution | semantic support of the statement by the cited source |
-| `citation_integrity` | statement/citation shape, bounds, uniqueness, execution-scoped source resolution, and the evidence snapshot's own binding to this execution | whether the citation is a good citation |
-| `relevance` | deterministic meaningful-token overlap between a captured source and the objective, and (when the step intent is itself related to the objective) the step that retrieved it | semantic relevance, ranking quality, or "the answer is right" |
-| `source_quality` | absolute `http(s)` URL with a host, usable title/excerpt, and per-step attribution of the source | page content, reputation, authorship, freshness, safety of the page |
+| `citation_integrity` | statement/citation shape, bounds, uniqueness, execution-scoped source resolution, the evidence snapshot's binding to this execution, and the synthesis plan-revision binding | whether the citation is a good citation |
+| `relevance` | deterministic meaningful-token overlap between a captured source and the objective, and (when the step intent is itself related to the objective) the step that retrieved it; step intent comes from the durable snapshot when v3 recorded it | semantic relevance, ranking quality, or "the answer is right" |
+| `source_quality` | absolute `http(s)` URL with a host, usable title/excerpt, and explicit source-to-step attribution state | page content, reputation, authorship, freshness, safety of the page |
 | `source_diversity` | exact canonical-URL duplication, exact normalized title+excerpt duplication, and host count | independence of sources, corroboration, or "one host is one source" |
 | `conflict_handling` | conflicts the synthesis explicitly declares are cited and resolvable | contradictions between excerpts that the synthesis did not declare |
 | `uncertainty_handling` | a `partial`/`inconclusive` synthesis states unresolved questions, and a `complete` synthesis is not asserted over a plan the runtime recorded as incomplete | whether the stated uncertainty is the *right* uncertainty |
-| `plan_completeness` | the final durable step statuses, including failed, blocked, cancelled and nonterminal steps | whether the plan was a good plan |
+| `plan_completeness` | the exact durable step states, dependencies, completion relationship and snapshot/runtime consistency, including failed, blocked, cancelled and nonterminal steps | whether the plan was a good plan |
 
 Deterministic rules that make the verdict reproducible:
 
@@ -123,7 +126,20 @@ Deterministic rules that make the verdict reproducible:
 * The step that carried a completed run's completion action is excluded from
   plan completeness, exactly like the runtime's own `completionIsPartial`
   verdict excludes it: a completed run settles that step through the
-  completion action, not through an observation.
+  completion action, not through an observation. The durable
+  `completion_step_id` is authoritative when v3 recorded it.
+* When v3 evidence carries a plan snapshot, its step states, dependencies,
+  completion relationship and intents are authoritative. The process-local
+  runtime plan is used only to detect a step the snapshot failed to record (a
+  completeness gap) and as the intent fallback for preserved v2 evidence. A
+  runtime status never overrides a durable status.
+* A completed step whose recorded dependency is absent from the snapshot or did
+  not settle makes the plan incomplete. An unknown dependency reference is
+  reported, never guessed.
+* Source-to-step attribution is `derived` only when the runtime wrote
+  operation records that deterministically join sources to steps. A source with
+  no operation record is `source_unattributed`; the evaluator never infers a
+  step from order or similarity.
 
 ## 4. Findings
 
@@ -163,6 +179,15 @@ execution-scoped `source_id`/`step_id`.
 | `plan_step_state_unavailable` | warning | a step has no provable lifecycle status |
 | `plan_step_failed` | warning | a step did not complete successfully |
 | `plan_incomplete` | warning | a step was still nonterminal when the execution settled |
+| `evidence_provenance_unavailable` | warning | v2 evidence predates v3 step intent, objective, completion and authoritative markers |
+| `plan_step_missing_from_snapshot` | warning | the runtime plan contains a step the durable snapshot did not record |
+| `plan_step_not_in_runtime_plan` | warning | the durable snapshot contains a step absent from the runtime plan |
+| `plan_step_unknown_reference` | warning | a step depends on a step that is not present in the plan |
+| `plan_dependency_incomplete` | warning | a completed step depends on a step that did not complete |
+| `plan_completion_step_mismatch` | warning | the durable completion step differs from the runtime completion step |
+| `source_attribution_unavailable` | warning | the v3 snapshot cannot prove which step captured a source |
+| `synthesis_plan_version_mismatch` | error | the synthesis claims a plan revision that does not match its evidence |
+| `synthesis_plan_version_unavailable` | warning/error | a v3 synthesis lacks the required plan revision (error); a preserved v2 synthesis without one stays readable (warning) |
 
 ## 5. Lifecycle, persistence and binding
 
@@ -180,14 +205,16 @@ execution-scoped `source_id`/`step_id`.
    evaluation that does not bind to the snapshot being persisted — stale, or
    belonging to another execution — is dropped, never paired with the wrong
    evidence.
-4. **Bind.** The evaluation carries the execution id and the evidence
-   fingerprint. The journal re-validates both at write time and at decode
-   time, so an evaluation can never be read against different evidence, and
-   never against another execution.
-5. **Invalidate by replacement.** The single narrow approval-resume path
-   replaces evidence and evaluation together. A non-nil evidence snapshot
-   replaces the evaluation; a nil snapshot preserves both. There is no
-   in-place update path, so an evaluation can never outlive its snapshot.
+4. **Bind.** The evaluation carries the execution id, the evidence
+   fingerprint and (when present) the evidence plan revision. The journal
+   re-validates all three at write time and at decode time, so an evaluation
+   can never be read against different evidence, a different plan revision, or
+   another execution.
+5. **Invalidate by replacement.** A non-nil evidence snapshot replaces the
+   evaluation, even when the execution id is unchanged; a nil snapshot
+   preserves both. The same rule applies to the synthesis. There is no in-place
+   update path, so an evaluation can never outlive its snapshot or its plan
+   revision.
 6. **Auxiliary, never blocking.** The evaluation is derived data. If it fails
    validation it is dropped rather than persisted; it must never block the
    durable terminal record. When the persisted snapshot is preserved (a
@@ -197,7 +224,9 @@ execution-scoped `source_id`/`step_id`.
    evaluation, and the UI reports the quality verdict as unavailable. Nothing
    is recomputed, back-filled or invented for it. Legacy v1 *evidence* stays
    readable as unattributed evidence and yields an `incomplete` verdict, never
-   an upgraded one.
+   an upgraded one. Preserved v2 evidence is evaluated from its durable
+   plan/step facts but explicitly reports `evidence_provenance_unavailable`;
+   no v3 field is inferred.
 
 ## 6. Surfaces
 
@@ -219,12 +248,12 @@ The Research workspace renders a quiet quality panel next to the synthesis:
 * A `failed` verdict is never rendered as a green summary; the panel states
   that the synthesis must not be read as a verified conclusion.
 * After a restart the panel states that the verdict was recorded when the
-  execution completed and that the typed synthesis is no longer available in
-  this process.
+  execution completed and that the synthesis shown alongside is the same
+  persisted snapshot. The plan revision is stated when the verdict carries one.
 * The client re-validates the object defensively: an unknown version, an
-  unknown dimension, an execution-id mismatch, an evidence-binding mismatch or
-  a status that contradicts the findings hides the whole panel instead of
-  rendering a partial verdict.
+  unknown dimension, an execution-id mismatch, an evidence-binding mismatch, a
+  plan-revision mismatch or a status that contradicts the findings hides the
+  whole panel instead of rendering a partial verdict.
 
 ## 8. Reference corpus
 
@@ -238,3 +267,8 @@ citation, a complete synthesis over an incomplete plan, a partial synthesis
 without unresolved questions, a statement without citations, content
 duplication across hosts, and a malformed synthesis. The redaction test proves
 the verdict carries no query, URL, snippet or title.
+`internal/researchquality/provenance_test.go` covers the v60 inputs: durable
+plan facts taking precedence over the runtime plan, v2 provenance unavailable,
+runtime/snapshot step mismatches, unknown and incomplete dependencies,
+completion-step mismatch, attribution unavailable, and synthesis plan-revision
+mismatch/unavailability.

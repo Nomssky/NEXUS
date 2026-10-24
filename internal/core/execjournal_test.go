@@ -854,6 +854,7 @@ func coreSampleEvidence(title string) *execjournal.ResearchEvidence {
 			ID: "src-1", Title: title, URL: "https://docs.example/nexus", Source: "docs.example",
 			Snippet: "The runtime decides; the model proposes.",
 		}},
+		Attribution: execjournal.ResearchAttributionUnavailable,
 	}
 }
 

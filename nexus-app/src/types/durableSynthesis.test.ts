@@ -39,6 +39,7 @@ function synthesis(overrides: Partial<DurableResearchSynthesis> = {}): DurableRe
     conflicts: [],
     unresolved_questions: [],
     evidence_fingerprint: 'a'.repeat(64),
+    plan_version: 0,
     ...overrides,
   } as DurableResearchSynthesis;
 }
@@ -148,6 +149,72 @@ describe('parseDurableResearchSynthesis', () => {
     const parsed = parseDurableResearchSynthesis(
       { ...synthesis(), evidence_fingerprint: 'not-a-fingerprint' },
       DURABLE_EVIDENCE,
+      'exec-1',
+    );
+    expect(parsed.rejection).toBe('invalid');
+  });
+
+  it('reads a v59 synthesis without a plan revision as unavailable', () => {
+    const legacy = { ...synthesis() };
+    delete legacy.plan_version;
+    const parsed = parseDurableResearchSynthesis(legacy, DURABLE_EVIDENCE, 'exec-1');
+    expect(parsed.rejection).toBeUndefined();
+    expect(parsed.synthesis?.planVersion).toBe(0);
+  });
+
+  it('accepts a matching plan revision on v2 evidence', () => {
+    const parsed = parseDurableResearchSynthesis(
+      synthesis({ plan_version: 1 }),
+      DURABLE_EVIDENCE,
+      'exec-1',
+    );
+    expect(parsed.rejection).toBeUndefined();
+    expect(parsed.synthesis?.planVersion).toBe(1);
+  });
+
+  it('rejects a synthesis bound to another plan revision', () => {
+    const parsed = parseDurableResearchSynthesis(
+      synthesis({ plan_version: 2 }),
+      DURABLE_EVIDENCE,
+      'exec-1',
+    );
+    expect(parsed.rejection).toBe('invalid');
+  });
+
+  it('requires a plan revision on v3 plan evidence', () => {
+    const v3Evidence: ParsedDurableEvidence = {
+      ...DURABLE_EVIDENCE,
+      version: 3,
+      steps: [
+        {
+          stepId: 's1',
+          intent: 'Gather sources.',
+          planVersion: 1,
+          status: 'completed',
+          dependencies: [],
+          sources: [],
+          authoritative: true,
+        },
+      ],
+      plan: { plan_id: 'exec-1', version: 1, provenance: 'authoritative' },
+      attribution: 'unavailable',
+    };
+    expect(
+      parseDurableResearchSynthesis(synthesis(), v3Evidence, 'exec-1').rejection,
+    ).toBe('invalid');
+    const parsed = parseDurableResearchSynthesis(
+      synthesis({ plan_version: 1 }),
+      v3Evidence,
+      'exec-1',
+    );
+    expect(parsed.rejection).toBeUndefined();
+    expect(parsed.synthesis?.planVersion).toBe(1);
+  });
+
+  it('rejects a plan revision without an evidence plan', () => {
+    const parsed = parseDurableResearchSynthesis(
+      synthesis({ plan_version: 1 }),
+      { ...DURABLE_EVIDENCE, plan: undefined },
       'exec-1',
     );
     expect(parsed.rejection).toBe('invalid');

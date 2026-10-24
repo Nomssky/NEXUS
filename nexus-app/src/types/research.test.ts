@@ -326,7 +326,7 @@ describe('parseDurableResearchEvidence', () => {
   });
 
   it('rejects an unknown version', () => {
-    const wrongVersion = { ...source, version: 3 };
+    const wrongVersion = { ...source, version: 4 };
     expect(parseDurableResearchEvidence(wrongVersion).present).toBe(false);
   });
 
@@ -453,6 +453,158 @@ describe('parseDurableResearchEvidence', () => {
     expect(parsed.plan).toBeUndefined();
     expect(parsed.steps).toEqual([]);
     expect(parsed.unattributedSources.map((item) => item.id)).toEqual(['src-1']);
+  });
+
+  it('parses v3 plan intent, completion relationship and authoritative attribution', () => {
+    const v3: DurableResearchEvidence = {
+      version: 3,
+      capability: 'web.search',
+      operation: 'search',
+      count: 2,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+        { id: 'src-2', title: 'Two', url: 'https://two.example', source: 'two', snippet: '2' },
+      ],
+      plan: {
+        plan_id: 'exec-1',
+        version: 2,
+        objective_id: 'objective-exec-1',
+        completion_step_id: 's2',
+        provenance: 'authoritative',
+      },
+      steps: [
+        {
+          step_id: 's1',
+          intent: 'Gather sources.',
+          plan_version: 1,
+          status: 'completed',
+          observation_id: 'obs-1',
+          provenance: 'authoritative',
+        },
+        {
+          step_id: 's2',
+          intent: 'Synthesize findings.',
+          plan_version: 2,
+          status: 'completed',
+          dependencies: ['s1'],
+          provenance: 'authoritative',
+        },
+      ],
+      operations: [
+        {
+          operation_id: 'obs-1',
+          step_id: 's1',
+          tool_id: 'web.search',
+          operation: 'search',
+          source_ids: ['src-1'],
+          provenance: 'authoritative',
+        },
+        {
+          operation_id: 'obs-2',
+          step_id: 's2',
+          tool_id: 'web.search',
+          operation: 'search',
+          source_ids: ['src-2'],
+          provenance: 'authoritative',
+        },
+      ],
+      attribution: 'derived',
+    };
+
+    const parsed = parseDurableResearchEvidence(v3);
+
+    expect(parsed.present).toBe(true);
+    expect(parsed.version).toBe(3);
+    expect(parsed.attribution).toBe('derived');
+    expect(parsed.plan).toEqual({
+      plan_id: 'exec-1',
+      version: 2,
+      objective_id: 'objective-exec-1',
+      completion_step_id: 's2',
+      provenance: 'authoritative',
+    });
+    expect(parsed.steps[0]).toMatchObject({
+      stepId: 's1',
+      intent: 'Gather sources.',
+      planVersion: 1,
+      authoritative: true,
+    });
+    expect(parsed.steps[1].intent).toBe('Synthesize findings.');
+    expect(parsed.steps[1].sources.map((item) => item.id)).toEqual(['src-2']);
+    expect(parsed.unattributedSources).toEqual([]);
+  });
+
+  it('rejects v3 attribution that contradicts its operations', () => {
+    const v3: DurableResearchEvidence = {
+      version: 3,
+      capability: 'web.search',
+      operation: 'search',
+      count: 1,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+      ],
+      plan: { plan_id: 'exec-1', version: 1, provenance: 'authoritative' },
+      steps: [
+        {
+          step_id: 's1',
+          intent: 'Gather sources.',
+          plan_version: 1,
+          status: 'completed',
+          provenance: 'authoritative',
+        },
+      ],
+      attribution: 'unavailable',
+    };
+    expect(parseDurableResearchEvidence(v3).present).toBe(true);
+    expect(
+      parseDurableResearchEvidence({
+        ...v3,
+        attribution: 'derived',
+      }).present
+    ).toBe(false);
+  });
+
+  it('rejects v3 plan evidence without authoritative provenance markers', () => {
+    const base: DurableResearchEvidence = {
+      version: 3,
+      capability: 'web.search',
+      operation: 'search',
+      count: 1,
+      sources: [
+        { id: 'src-1', title: 'One', url: 'https://one.example', source: 'one', snippet: '1' },
+      ],
+      plan: { plan_id: 'exec-1', version: 1, provenance: 'authoritative' },
+      steps: [
+        {
+          step_id: 's1',
+          intent: 'Gather sources.',
+          plan_version: 1,
+          status: 'completed',
+          provenance: 'authoritative',
+        },
+      ],
+      attribution: 'unavailable',
+    };
+    expect(parseDurableResearchEvidence(base).present).toBe(true);
+    expect(
+      parseDurableResearchEvidence({
+        ...base,
+        plan: { plan_id: 'exec-1', version: 1 },
+      }).present
+    ).toBe(false);
+    expect(
+      parseDurableResearchEvidence({
+        ...base,
+        steps: [
+          {
+            step_id: 's1',
+            plan_version: 1,
+            status: 'completed',
+            provenance: 'authoritative',
+          },
+        ],
+      }).present
+    ).toBe(false);
   });
 
   it('rejects invented provenance without plan identity', () => {
@@ -750,8 +902,8 @@ describe('buildResearchFindings', () => {
       durableWithSources,
       [],
       [
-        { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
-        { stepId: 's2', status: 'cancelled', dependencies: ['s1'], sources: [] },
+        { stepId: 's1', status: 'completed', dependencies: [], sources: [], authoritative: true },
+        { stepId: 's2', status: 'cancelled', dependencies: ['s1'], sources: [], authoritative: true },
       ]
     );
 
@@ -764,8 +916,8 @@ describe('buildResearchFindings', () => {
       durableWithSources,
       [{ stepId: 'trace-s1', status: 'failed' }],
       [
-        { stepId: 's1', status: 'completed', dependencies: [], sources: [] },
-        { stepId: 's2', status: 'ready', dependencies: ['s1'], sources: [] },
+        { stepId: 's1', status: 'completed', dependencies: [], sources: [], authoritative: true },
+        { stepId: 's2', status: 'ready', dependencies: ['s1'], sources: [], authoritative: true },
       ]
     );
 

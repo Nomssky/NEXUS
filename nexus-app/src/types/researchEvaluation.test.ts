@@ -10,7 +10,7 @@ function evaluation(overrides: Partial<ResearchEvaluation> = {}): ResearchEvalua
     version: 1,
     method: 'deterministic_v1',
     execution_id: 'exec-1',
-    evidence_version: 2,
+    evidence_version: 3,
     evidence_count: 1,
     evidence_fingerprint: FINGERPRINT,
     synthesis_status: 'complete',
@@ -42,11 +42,17 @@ function evaluation(overrides: Partial<ResearchEvaluation> = {}): ResearchEvalua
 
 const durableEvidence: ParsedDurableEvidence = {
   present: true,
-  version: 2,
+  version: 3,
   count: 1,
   sources: [],
   steps: [],
+  attribution: 'unavailable',
   unattributedSources: [],
+};
+
+const durablePlanEvidence: ParsedDurableEvidence = {
+  ...durableEvidence,
+  plan: { plan_id: 'exec-1', version: 2, provenance: 'authoritative' },
 };
 
 describe('parseResearchEvaluation', () => {
@@ -99,6 +105,29 @@ describe('parseResearchEvaluation', () => {
     const badDimension = evaluation();
     badDimension.findings[0].dimension = 'made_up' as never;
     expect(parseResearchEvaluation(badDimension, 'exec-1', durableEvidence)).toBeUndefined();
+  });
+
+  it('binds a v3 evaluation to the durable plan revision', () => {
+    const matching = evaluation({ plan_version: 2 });
+    expect(parseResearchEvaluation(matching, 'exec-1', durablePlanEvidence)?.plan_version).toBe(2);
+
+    const missing = evaluation();
+    expect(parseResearchEvaluation(missing, 'exec-1', durablePlanEvidence)).toBeUndefined();
+
+    const mismatched = evaluation({ plan_version: 1 });
+    expect(parseResearchEvaluation(mismatched, 'exec-1', durablePlanEvidence)).toBeUndefined();
+  });
+
+  it('rejects a plan revision without a durable plan', () => {
+    expect(
+      parseResearchEvaluation(evaluation({ plan_version: 2 }), 'exec-1', durableEvidence)
+    ).toBeUndefined();
+  });
+
+  it('rejects an unsupported evidence version', () => {
+    expect(
+      parseResearchEvaluation(evaluation({ evidence_version: 4 }), 'exec-1', durableEvidence)
+    ).toBeUndefined();
   });
 
   it('rejects a synthesis fingerprint without a synthesis status', () => {

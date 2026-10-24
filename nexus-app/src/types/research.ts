@@ -293,10 +293,17 @@ const MAX_DURABLE_STEP_ID = 128;
 const MAX_DURABLE_OBSERVATION_ID = 128;
 const MAX_DURABLE_OPERATION_ID = 128;
 const MAX_DURABLE_SOURCE_ID = 64;
+const MAX_DURABLE_STEP_INTENT = 2000;
+const MAX_DURABLE_OBJECTIVE_ID = 128;
 const MAX_DURABLE_PLAN_VERSION = 1_000_000;
 
-/** Schema version the journal writes today; v1 is readable legacy evidence. */
-const DURABLE_EVIDENCE_VERSION = 2;
+/**
+ * Schema version the journal writes today. v2 is readable legacy provenance
+ * (plan/step/operation records without intent, objective, completion
+ * relationship or explicit provenance markers); v1 is provenance-free legacy.
+ */
+const DURABLE_EVIDENCE_VERSION = 3;
+const DURABLE_EVIDENCE_PROVENANCE_VERSION = 2;
 const DURABLE_EVIDENCE_LEGACY_VERSION = 1;
 const DURABLE_EVIDENCE_CAPABILITY = 'web.search';
 const DURABLE_EVIDENCE_OPERATION = 'search';
@@ -308,10 +315,16 @@ const DURABLE_EVIDENCE_OPERATION = 'search';
  */
 export interface ParsedDurableStep {
   stepId: string;
+  /** Runtime-owned declaration, present only on v3 records. */
+  intent?: string;
+  /** Plan revision in which this step was declared, present only on v3. */
+  planVersion?: number;
   status: DurableResearchStepStatus;
   dependencies: string[];
   observationId?: string;
   sources: ParsedWebSearchSource[];
+  /** True only when the record explicitly marked this row authoritative. */
+  authoritative: boolean;
 }
 
 export interface ParsedDurableEvidence {
@@ -323,7 +336,7 @@ export interface ParsedDurableEvidence {
    * zero sources.
    */
   present: boolean;
-  /** Evidence schema version (2 today; 1 is readable legacy evidence). */
+  /** Evidence schema version (3 today; 2 and 1 are readable legacy records). */
   version?: number;
   capability?: string;
   operation?: string;
@@ -332,11 +345,18 @@ export interface ParsedDurableEvidence {
   sources: ParsedWebSearchSource[];
   /**
    * Plan identity from the durable record. Absent on legacy v1 evidence and on
-   * v2 source-only captures that were never associated with a plan.
+   * source-only captures that were never associated with a plan. On v2 records
+   * the identity has no intent/objective/completion markers; on v3 it does.
    */
   plan?: DurableResearchPlan;
   /** Ordered durable steps. Empty for legacy or source-only evidence. */
   steps: ParsedDurableStep[];
+  /**
+   * Evidence-level source-to-step grouping state. `derived` means the runtime
+   * wrote operation records that deterministically join sources to steps.
+   * `unavailable` means no such grouping exists. Undefined only on legacy v1.
+   */
+  attribution?: 'derived' | 'unavailable';
   /**
    * Sources that no operation references. Kept explicit instead of guessing a
    * step association; legacy v1 evidence places every source here.
@@ -379,7 +399,11 @@ export function parseDurableResearchEvidence(
   if (evidence.capability !== DURABLE_EVIDENCE_CAPABILITY) return NO_DURABLE_EVIDENCE;
 
   const version = evidence.version;
-  if (version !== DURABLE_EVIDENCE_VERSION && version !== DURABLE_EVIDENCE_LEGACY_VERSION) {
+  if (
+    version !== DURABLE_EVIDENCE_VERSION &&
+    version !== DURABLE_EVIDENCE_PROVENANCE_VERSION &&
+    version !== DURABLE_EVIDENCE_LEGACY_VERSION
+  ) {
     return NO_DURABLE_EVIDENCE;
   }
 
@@ -408,7 +432,7 @@ export function parseDurableResearchEvidence(
 
   const sources: ParsedWebSearchSource[] = [];
   const sourceIDs = new Set<string>();
-  const v2 = version === DURABLE_EVIDENCE_VERSION;
+  const hasProvenance = version >= DURABLE_EVIDENCE_PROVENANCE_VERSION;
   for (let i = 0; i < evidence.sources.length; i++) {
     const row = evidence.sources[i];
     if (!isRecord(row)) return NO_DURABLE_EVIDENCE;
@@ -429,7 +453,7 @@ export function parseDurableResearchEvidence(
     ) {
       return NO_DURABLE_EVIDENCE;
     }
-    if (v2) {
+    if (hasProvenance) {
       if (!isDurableID(id, MAX_DURABLE_SOURCE_ID) || sourceIDs.has(id)) {
         return NO_DURABLE_EVIDENCE;
       }
@@ -441,7 +465,7 @@ export function parseDurableResearchEvidence(
     }
     sources.push({
       index: i + 1,
-      id: v2 ? (id as string) : undefined,
+      id: hasProvenance ? (id as string) : undefined,
       title,
       url,
       source,
@@ -451,8 +475,13 @@ export function parseDurableResearchEvidence(
     });
   }
 
-  if (!v2) {
-    if (evidence.plan !== undefined || evidence.steps !== undefined || evidence.operations !== undefined) {
+  if (!hasProvenance) {
+    if (
+      evidence.plan !== undefined ||
+      evidence.steps !== undefined ||
+      evidence.operations !== undefined ||
+      evidence.attribution !== undefined
+    ) {
       return NO_DURABLE_EVIDENCE;
     }
     return {
@@ -467,6 +496,7 @@ export function parseDurableResearchEvidence(
     };
   }
 
+  const v3 = version === DURABLE_EVIDENCE_VERSION;
   const rawPlan = evidence.plan;
   const rawSteps = evidence.steps;
   const rawOperations = evidence.operations;
@@ -474,17 +504,24 @@ export function parseDurableResearchEvidence(
   const hasOperations = rawOperations !== undefined && rawOperations !== null;
 
   if (rawPlan === undefined || rawPlan === null) {
-    // Source-only v2 evidence is valid, but it cannot smuggle in provenance
-    // without the plan identity it belongs to.
+    // Source-only evidence is valid, but it cannot smuggle in provenance
+    // without the plan identity it belongs to. v3 must state explicitly that
+    // source-to-step attribution is unavailable.
     if (hasSteps || hasOperations) return NO_DURABLE_EVIDENCE;
+    if (v3) {
+      if (evidence.attribution !== 'unavailable') return NO_DURABLE_EVIDENCE;
+    } else if (evidence.attribution !== undefined) {
+      return NO_DURABLE_EVIDENCE;
+    }
     return {
       present: true,
-      version: DURABLE_EVIDENCE_VERSION,
+      version,
       capability: DURABLE_EVIDENCE_CAPABILITY,
       operation: DURABLE_EVIDENCE_OPERATION,
       count,
       sources,
       steps: [],
+      attribution: v3 ? 'unavailable' : undefined,
       unattributedSources: sources,
     };
   }
@@ -501,6 +538,40 @@ export function parseDurableResearchEvidence(
   ) {
     return NO_DURABLE_EVIDENCE;
   }
+
+  let objectiveId: string | undefined;
+  let completionStepId: string | undefined;
+  if (v3) {
+    if (rawPlan.provenance !== 'authoritative') return NO_DURABLE_EVIDENCE;
+    if (
+      rawPlan.objective_id !== undefined &&
+      rawPlan.objective_id !== null &&
+      rawPlan.objective_id !== ''
+    ) {
+      if (!isDurableID(rawPlan.objective_id, MAX_DURABLE_OBJECTIVE_ID)) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      objectiveId = rawPlan.objective_id;
+    }
+    if (
+      rawPlan.completion_step_id !== undefined &&
+      rawPlan.completion_step_id !== null &&
+      rawPlan.completion_step_id !== ''
+    ) {
+      if (!isDurableID(rawPlan.completion_step_id, MAX_DURABLE_STEP_ID)) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      completionStepId = rawPlan.completion_step_id;
+    }
+  } else if (
+    rawPlan.objective_id !== undefined ||
+    rawPlan.completion_step_id !== undefined ||
+    rawPlan.provenance !== undefined
+  ) {
+    // A v2 record can never acquire v3-only plan facts on read.
+    return NO_DURABLE_EVIDENCE;
+  }
+
   if (!Array.isArray(rawSteps) || rawSteps.length < 1 || rawSteps.length > MAX_DURABLE_PLAN_STEPS) {
     return NO_DURABLE_EVIDENCE;
   }
@@ -527,9 +598,37 @@ export function parseDurableResearchEvidence(
     ) {
       return NO_DURABLE_EVIDENCE;
     }
+
+    let intent: string | undefined;
+    let stepPlanVersion: number | undefined;
+    if (v3) {
+      if (!isDurableID(rawStep.intent, MAX_DURABLE_STEP_INTENT)) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      if (
+        typeof rawStep.plan_version !== 'number' ||
+        !Number.isInteger(rawStep.plan_version) ||
+        rawStep.plan_version < 1 ||
+        rawStep.plan_version > planVersion
+      ) {
+        return NO_DURABLE_EVIDENCE;
+      }
+      if (rawStep.provenance !== 'authoritative') return NO_DURABLE_EVIDENCE;
+      intent = rawStep.intent;
+      stepPlanVersion = rawStep.plan_version;
+    } else if (
+      rawStep.intent !== undefined ||
+      rawStep.plan_version !== undefined ||
+      rawStep.provenance !== undefined
+    ) {
+      return NO_DURABLE_EVIDENCE;
+    }
+
     stepIndex.add(stepId);
     steps.push({
       stepId,
+      intent,
+      planVersion: stepPlanVersion,
       status: status as DurableResearchStepStatus,
       dependencies,
       observationId:
@@ -537,6 +636,7 @@ export function parseDurableResearchEvidence(
           ? rawStep.observation_id
           : undefined,
       sources: [],
+      authoritative: v3,
     });
   }
   for (const step of steps) {
@@ -545,6 +645,7 @@ export function parseDurableResearchEvidence(
     }
   }
   if (durableStepsHaveCycle(steps)) return NO_DURABLE_EVIDENCE;
+  if (completionStepId && !stepIndex.has(completionStepId)) return NO_DURABLE_EVIDENCE;
 
   const sourcesByID = new Map<string, ParsedWebSearchSource>();
   for (const source of sources) {
@@ -574,6 +675,11 @@ export function parseDurableResearchEvidence(
     if (toolId !== DURABLE_EVIDENCE_CAPABILITY || operationName !== DURABLE_EVIDENCE_OPERATION) {
       return NO_DURABLE_EVIDENCE;
     }
+    if (v3) {
+      if (rawOperation.provenance !== 'authoritative') return NO_DURABLE_EVIDENCE;
+    } else if (rawOperation.provenance !== undefined) {
+      return NO_DURABLE_EVIDENCE;
+    }
     if (!Array.isArray(refs) || refs.length > MAX_DURABLE_OPERATION_SOURCE_REFS) {
       return NO_DURABLE_EVIDENCE;
     }
@@ -594,15 +700,31 @@ export function parseDurableResearchEvidence(
     }
   }
 
+  let attribution: 'derived' | 'unavailable' | undefined;
+  if (v3) {
+    const expected = operations.length > 0 ? 'derived' : 'unavailable';
+    if (evidence.attribution !== expected) return NO_DURABLE_EVIDENCE;
+    attribution = expected;
+  } else if (evidence.attribution !== undefined) {
+    return NO_DURABLE_EVIDENCE;
+  }
+
   return {
     present: true,
-    version: DURABLE_EVIDENCE_VERSION,
+    version,
     capability: DURABLE_EVIDENCE_CAPABILITY,
     operation: DURABLE_EVIDENCE_OPERATION,
     count,
     sources,
-    plan: { plan_id: planId, version: planVersion },
+    plan: {
+      plan_id: planId,
+      version: planVersion,
+      ...(objectiveId ? { objective_id: objectiveId } : {}),
+      ...(completionStepId ? { completion_step_id: completionStepId } : {}),
+      ...(v3 ? { provenance: 'authoritative' as const } : {}),
+    },
     steps,
+    attribution,
     unattributedSources: sources.filter(
       (source) => !source.id || !referencedSources.has(source.id)
     ),
@@ -781,6 +903,8 @@ export interface DurableParsedSynthesis {
   inferences: string[];
   conflicts: DurableParsedSynthesisStatement[];
   unresolvedQuestions: string[];
+  /** Plan revision this synthesis was validated against; 0 when unavailable. */
+  planVersion: number;
 }
 
 /**
@@ -798,7 +922,8 @@ export function parseDurableResearchSynthesis(
 ): { synthesis?: DurableParsedSynthesis; rejection?: 'invalid' } {
   if (synthesis === undefined || synthesis === null) return {};
   if (!isRecord(synthesis)) return { rejection: 'invalid' };
-  if (!durable.present || durable.version !== DURABLE_EVIDENCE_VERSION) {
+  if (!durable.present || durable.version === undefined ||
+      durable.version < DURABLE_EVIDENCE_PROVENANCE_VERSION) {
     return { rejection: 'invalid' };
   }
 
@@ -819,6 +944,31 @@ export function parseDurableResearchSynthesis(
     typeof synthesis.evidence_fingerprint !== 'string' ||
     !DURABLE_SYNTHESIS_FINGERPRINT.test(synthesis.evidence_fingerprint)
   ) {
+    return { rejection: 'invalid' };
+  }
+
+  // The synthesis must be bound to the exact durable plan revision it was
+  // validated against. A v3 plan snapshot requires the binding; a preserved v2
+  // record without one stays readable but is not silently assumed to match.
+  // v59 records predate plan_version. Treat an absent field as unavailable
+  // (0) so they stay readable; a v3 plan snapshot still requires a match.
+  const rawPlanVersion = synthesis.plan_version;
+  const planVersion = rawPlanVersion === undefined ? 0 : rawPlanVersion;
+  if (
+    typeof planVersion !== 'number' ||
+    !Number.isInteger(planVersion) ||
+    planVersion < 0 ||
+    planVersion > MAX_DURABLE_PLAN_VERSION
+  ) {
+    return { rejection: 'invalid' };
+  }
+  if (durable.plan) {
+    if (planVersion === 0) {
+      if (durable.version === DURABLE_EVIDENCE_VERSION) return { rejection: 'invalid' };
+    } else if (planVersion !== durable.plan.version) {
+      return { rejection: 'invalid' };
+    }
+  } else if (planVersion !== 0) {
     return { rejection: 'invalid' };
   }
 
@@ -952,6 +1102,7 @@ export function parseDurableResearchSynthesis(
       inferences,
       conflicts,
       unresolvedQuestions,
+      planVersion,
     },
   };
 }
@@ -974,7 +1125,8 @@ export function parseResearchSynthesis(
 ): ResearchSynthesisParseResult {
   if (synthesis === undefined || synthesis === null) return {};
   if (!isRecord(synthesis)) return { rejection: 'invalid' };
-  if (!durable.present || durable.version !== DURABLE_EVIDENCE_VERSION) {
+  if (!durable.present || durable.version === undefined ||
+      durable.version < DURABLE_EVIDENCE_PROVENANCE_VERSION) {
     return { rejection: 'no_evidence' };
   }
 

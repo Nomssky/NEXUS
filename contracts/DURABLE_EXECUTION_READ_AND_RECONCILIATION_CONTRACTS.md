@@ -224,7 +224,7 @@ label can falsely claim external success.
 - The new contract does not contradict the v10 recovery contract; it reads the
   same records and adds no writes.
 
-## 11. Optional research evidence (v52, extended by v54)
+## 11. Optional research evidence (v52, extended by v54 and v60)
 
 The detail read may carry an additive `research_evidence` object for executions
 that captured a complete, validated `web.search` result. Its absence means no
@@ -237,8 +237,8 @@ carries this object.
 - **v1 (legacy):** `{version, capability, operation, count, sources}`. Source
   rows have no ids, and there are no plan/step/operation fields. It is readable
   exactly as written; no identity, attribution, plan or timestamp is invented.
-- **v2 (current):** the same fields, each source with an execution-scoped
-  `id` (`src-1`, `src-2`, ...), plus optional:
+- **v2 (legacy provenance):** the same fields, each source with an
+  execution-scoped `id` (`src-1`, `src-2`, ...), plus optional:
   - `plan: {plan_id, version}` — the active plan version at the terminal
     transition. `plan_id` is execution-scoped and must equal the durable
     execution id.
@@ -248,32 +248,58 @@ carries this object.
     one record per mediated successful `web.search` invocation, written when
     the runtime knew the executing step and observation id. `source_ids` refer
     to source ids in the same object.
+  v2 predates intent, objective reference, completion relationship and explicit
+  provenance markers. Those fields are absent and are reported as unavailable;
+  they are never inferred on read.
+- **v3 (current):** the v2 shape plus:
+  - `plan: {plan_id, version, objective_id?, completion_step_id?,
+    provenance: "authoritative"}`. `objective_id` is the runtime-owned
+    objective reference. `completion_step_id` names the step whose completion
+    action settled a completed run.
+  - `steps: [{step_id, intent, plan_version, status, dependencies?,
+    observation_id?, provenance: "authoritative"}]`. `intent` is the
+    runtime-owned step declaration; `plan_version` is the revision in which the
+    step was declared.
+  - `operations: [{..., provenance: "authoritative"}]`.
+  - `attribution: "derived"` when at least one operation record exists, else
+    `"unavailable"`.
 
 Attribution is derived only from these runtime records. It is never inferred
 from source order, titles, URLs, timestamps, or the order of the provider's
 result rows. Sources without an operation remain explicitly unattributed.
 Operations whose step is absent from the final plan are dropped; their sources
-remain present but unattributed rather than being reassigned.
+remain present but unattributed rather than being reassigned. Step attribution
+proves which runtime step captured a source; it is not an entailment or truth
+claim about that source.
 
 ### 11.2 Bounds and failure behavior
 
 The snapshot is atomic with the terminal/supersede write. It is validated
-wholesale on write and read: unknown versions, missing v2 source ids, count
+wholesale on write and read: unknown versions, missing v2/v3 source ids, count
 mismatch, missing/duplicate/cyclic step references, unknown operation
 step/source ids, a source referenced by more than one operation, invalid status
-values, control characters, and the documented bounds fail closed. Bounds are
-50 sources, 64 plan steps, 32 dependencies per step, 64 operations, 50 source
-references per operation, 64-byte source ids, and 128-byte
-plan/step/observation/operation ids.
+values, missing or incorrect v3 authoritative markers, missing step intent or
+plan version, a completion step absent from the snapshot, control characters,
+and the documented bounds fail closed. A plan whose `plan_id` does not equal
+the durable execution id is rejected at write and decode. Bounds are 50
+sources, 64 plan steps, 32 dependencies per step, 64 operations, 50 source
+references per operation, 2000-byte step intent, 128-byte
+plan/step/objective/observation/operation ids, and 64-byte source ids.
 
 A repeated delivery of the same mediated operation id does not duplicate source
-or operation records. Legacy evidence cannot carry v2 ids or provenance.
+or operation records. Legacy v1 evidence cannot carry v2 ids or provenance;
+legacy v2 evidence cannot carry v3-only fields. Neither is upgraded on read.
 
 ### 11.3 What recovery may render
 
-Recovery may render the durable plan identity, step order and dependencies,
-step lifecycle statuses, operation-to-step source associations, source records,
-and the execution record's real lifecycle timestamps. It may not render the
-agent's synthesis text after restart: that text is process-local and is not
-durable. It may not fabricate step timestamps, source attribution, or a plan for
-legacy v1 evidence.
+Recovery may render the historical durable plan identity, revision, objective
+reference, completion relationship, step order, intent, dependencies and
+lifecycle statuses, operation-to-step source associations, source records, the
+durable validated synthesis and evaluation (v59/v60), and the execution
+record's real lifecycle timestamps. The plan block is explicitly labeled as the
+historical snapshot persisted at the terminal transition, not the current live
+plan; a later replan does not rewrite it. Legacy v2 evidence is labeled as
+lacking v3 intent/objective/completion/provenance, and legacy v1 as lacking
+plan provenance entirely; missing fields are shown as unavailable. Recovery
+may not fabricate step timestamps, source attribution, plan facts or a plan for
+legacy evidence, and may not imply that an old plan equals the current plan.

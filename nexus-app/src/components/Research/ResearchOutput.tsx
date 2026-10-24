@@ -57,6 +57,10 @@ interface ResearchOutputProps {
   findings?: ResearchFindings;
   /** Durable plan identity; present only when the journal persisted it. */
   durablePlan?: DurableResearchPlan;
+  /** Durable evidence schema version; 1/2 are legacy records. */
+  durableEvidenceVersion?: number;
+  /** Durable source-to-step attribution state, when the record states one. */
+  durableAttribution?: 'derived' | 'unavailable';
   /** Recovered durable steps in plan order. Distinct from process-local steps. */
   durableSteps?: ParsedDurableStep[];
   /**
@@ -92,6 +96,8 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
   steps,
   findings,
   durablePlan,
+  durableEvidenceVersion,
+  durableAttribution,
   durableSteps,
   evaluation,
   durableSynthesis,
@@ -127,7 +133,12 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
       return (
         <Card variant="outlined" padding="lg">
           {durablePlan && durableSteps && durableSteps.length > 0 && (
-            <DurablePlanSection plan={durablePlan} steps={durableSteps} />
+            <DurablePlanSection
+              plan={durablePlan}
+              steps={durableSteps}
+              evidenceVersion={durableEvidenceVersion}
+              attribution={durableAttribution}
+            />
           )}
           {evaluation && (
             <ResearchQuality
@@ -225,7 +236,12 @@ export const ResearchOutput: React.FC<ResearchOutputProps> = ({
         )}
 
         {durablePlan && durableSteps && durableSteps.length > 0 ? (
-          <DurablePlanSection plan={durablePlan} steps={durableSteps} />
+          <DurablePlanSection
+            plan={durablePlan}
+            steps={durableSteps}
+            evidenceVersion={durableEvidenceVersion}
+            attribution={durableAttribution}
+          />
         ) : (
           steps &&
           steps.length > 0 && (
@@ -358,47 +374,100 @@ interface DetailItem {
 const DurablePlanSection: React.FC<{
   plan: DurableResearchPlan;
   steps: ParsedDurableStep[];
-}> = ({ plan, steps }) => (
-  <section
-    className={styles.stepStates}
-    aria-label="Durable research plan"
-    data-provenance="durable"
-  >
-    <div className={styles.stepStatesHeader}>
-      <h4 className={styles.stepStatesTitle}>Research plan</h4>
-      <Badge variant="info" size="sm">
-        Durable record
-      </Badge>
-    </div>
-    <p className={styles.stepStatesNote}>
-      Recovered from the execution journal and persisted across restarts. Plan{' '}
-      <span className={styles.planIdentity}>{plan.plan_id}</span>, version {plan.version}.
-    </p>
-    <ul className={styles.stepStatesList}>
-      {steps.map((step) => (
-        <li
-          key={step.stepId}
-          className={`${styles.stepItem} ${styles[durableStepClassName(step.status)]}`}
-          data-step-id={step.stepId}
-          data-step-status={step.status}
-        >
-          <span className={styles.stepId}>{step.stepId}</span>
-          <Badge variant={durableStepStatusVariant(step.status)} size="sm">
-            {durableStepStatusLabel(step.status)}
+  evidenceVersion?: number;
+  attribution?: 'derived' | 'unavailable';
+}> = ({ plan, steps, evidenceVersion, attribution }) => {
+  const legacy = evidenceVersion !== undefined && evidenceVersion < 3;
+  return (
+    <section
+      className={styles.stepStates}
+      aria-label="Durable research plan"
+      data-provenance="durable"
+      data-evidence-version={evidenceVersion}
+    >
+      <div className={styles.stepStatesHeader}>
+        <h4 className={styles.stepStatesTitle}>Research plan</h4>
+        <div className={styles.planBadges}>
+          <Badge variant="info" size="sm">
+            Durable record
           </Badge>
-          {step.dependencies.length > 0 && (
-            <span className={styles.stepDependencies}>
-              after {step.dependencies.join(', ')}
-            </span>
+          {legacy && (
+            <Badge variant="default" size="sm">
+              Legacy v{evidenceVersion}
+            </Badge>
           )}
-          <span className={styles.stepSources}>
-            {step.sources.length} source{step.sources.length === 1 ? '' : 's'}
+        </div>
+      </div>
+      <p className={styles.stepStatesNote}>
+        Historical plan snapshot persisted with this execution at its terminal
+        transition. It is not the current live plan. Plan{' '}
+        <span className={styles.planIdentity}>{plan.plan_id}</span>, revision{' '}
+        {plan.version}.
+      </p>
+      <p className={styles.planMeta}>
+        {plan.objective_id && (
+          <span>
+            Objective <span className={styles.planIdentity}>{plan.objective_id}</span>
           </span>
-        </li>
-      ))}
-    </ul>
-  </section>
-);
+        )}
+        {plan.completion_step_id ? (
+          <span>
+            Settled by completion step{' '}
+            <span className={styles.planIdentity}>{plan.completion_step_id}</span>
+          </span>
+        ) : plan.provenance === 'authoritative' ? (
+          <span>No plan step settled completion.</span>
+        ) : null}
+        {plan.provenance === 'authoritative' ? (
+          <span>Plan facts recorded by the runtime.</span>
+        ) : (
+          <span>Plan provenance markers unavailable on this legacy record.</span>
+        )}
+        {attribution === 'derived' ? (
+          <span>Source-to-step grouping derived from runtime operation records.</span>
+        ) : attribution === 'unavailable' ? (
+          <span>Source-to-step attribution unavailable.</span>
+        ) : null}
+      </p>
+      {legacy && (
+        <p className={styles.legacyNotice}>
+          This record predates v3 plan provenance. Step intent, objective
+          reference, completion relationship and authoritative markers were not
+          captured, so they are shown as unavailable rather than inferred.
+        </p>
+      )}
+      <ul className={styles.stepStatesList}>
+        {steps.map((step) => (
+          <li
+            key={step.stepId}
+            className={`${styles.stepItem} ${styles[durableStepClassName(step.status)]}`}
+            data-step-id={step.stepId}
+            data-step-status={step.status}
+          >
+            <span className={styles.stepId}>{step.stepId}</span>
+            <Badge variant={durableStepStatusVariant(step.status)} size="sm">
+              {durableStepStatusLabel(step.status)}
+            </Badge>
+            {step.intent && <span className={styles.stepIntent}>{step.intent}</span>}
+            {step.dependencies.length > 0 && (
+              <span className={styles.stepDependencies}>
+                after {step.dependencies.join(', ')}
+              </span>
+            )}
+            {step.planVersion !== undefined && step.planVersion !== plan.version && (
+              <span className={styles.stepDependencies}>
+                declared in revision {step.planVersion}
+              </span>
+            )}
+            <span className={styles.stepSources}>
+              {step.sources.length} source{step.sources.length === 1 ? '' : 's'}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+};
 
 /**
  * Durable, validated synthesis persisted through the execution journal.
@@ -424,6 +493,11 @@ const DurableSynthesisBlock: React.FC<{
           Persisted validated answer, recovered from the execution journal.
           Citation titles and URLs come from Sources &amp; Evidence, never from
           the model.
+        </p>
+        <p className={styles.provenance}>
+          {synthesis.planVersion > 0
+            ? `Bound to plan revision ${synthesis.planVersion}.`
+            : 'Plan revision unavailable on this legacy synthesis.'}
         </p>
       </div>
       <Badge variant="info" size="sm">

@@ -322,8 +322,33 @@ describe('ResearchEvidence', () => {
 
       expect(markup).toContain('Durable record');
       expect(markup).toContain('Nexus capability boundary');
+      expect(markup).toContain('Legacy v1 evidence: no plan or step provenance was captured.');
       expect(markup).not.toContain('Sources for step');
       expect(markup).not.toContain('Unattributed sources');
+    });
+
+    it('marks a source-only v2 snapshot as lacking plan provenance', () => {
+      const markup = durableMarkup({
+        durableEvidence: {
+          version: 2,
+          capability: 'web.search',
+          operation: 'search',
+          count: 1,
+          sources: [
+            {
+              id: 'src-1',
+              title: 'Source without a plan',
+              url: 'https://one.example',
+              source: 'one.example',
+              snippet: 'recorded',
+            },
+          ],
+        },
+        status: 'completed',
+      });
+
+      expect(markup).toContain('Legacy v2 evidence: no plan or step provenance was captured.');
+      expect(markup).not.toContain('Sources for step');
     });
 
     it('rejects malformed v2 provenance wholesale instead of showing sources', () => {

@@ -56,6 +56,7 @@ const (
 	MaxResearchSynthesisStatementLen = 2000
 	MaxResearchSynthesisQuestionLen  = 1000
 	MaxResearchSynthesisCitationRefs = 12
+	MaxResearchSynthesisPlanVersion  = 1_000_000 // mirrors MaxResearchProvenancePlanVersion
 
 	MaxResearchSynthesisFindings = 256 // reserved; the durable synthesis carries no findings
 	MaxResearchSynthesisText     = 512 // reserved
@@ -101,6 +102,10 @@ type ResearchSynthesis struct {
 	// EvidenceFingerprint binds the synthesis to the exact evidence snapshot
 	// used during validation. SHA-256 over the normalized evidence JSON.
 	EvidenceFingerprint string `json:"evidence_fingerprint"`
+	// PlanVersion is the plan version active when this synthesis was validated.
+	// It must equal evidence.Plan.Version when a plan snapshot was captured;
+	// the journal enforces this binding at write and decode time.
+	PlanVersion int `json:"plan_version"`
 }
 
 // MarshalJSON makes required collection fields serialize as arrays even when a
@@ -174,6 +179,26 @@ func ValidateResearchSynthesisForExecution(executionID string, synthesis *Resear
 	}
 	if !validResearchSynthesisStatus(synthesis.Status) {
 		return fmt.Errorf("execjournal: research synthesis has invalid status %q", synthesis.Status)
+	}
+	// PlanVersion 0 means the plan revision was not captured (a v2 record
+	// written before this field existed). It stays readable and is reported as
+	// unavailable rather than invented. A captured version must be in range and
+	// must match the evidence snapshot's plan version. A v3 evidence snapshot
+	// with a plan requires the binding; a synthesis over evidence with no plan
+	// must not claim a plan revision at all.
+	if synthesis.PlanVersion != 0 {
+		if synthesis.PlanVersion < 1 || synthesis.PlanVersion > MaxResearchSynthesisPlanVersion {
+			return fmt.Errorf("execjournal: research synthesis plan version %d out of range", synthesis.PlanVersion)
+		}
+		if evidence.Plan == nil {
+			return fmt.Errorf("execjournal: research synthesis claims a plan version without an evidence plan")
+		}
+		if synthesis.PlanVersion != evidence.Plan.Version {
+			return fmt.Errorf("execjournal: research synthesis plan version %d does not match evidence plan version %d",
+				synthesis.PlanVersion, evidence.Plan.Version)
+		}
+	} else if evidence.Version == ResearchEvidenceVersion && evidence.Plan != nil {
+		return fmt.Errorf("execjournal: research synthesis over v3 plan evidence requires a plan version")
 	}
 	if strings.TrimSpace(synthesis.Summary) == "" {
 		return fmt.Errorf("execjournal: research synthesis summary is required")

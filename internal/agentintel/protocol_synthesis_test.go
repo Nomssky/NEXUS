@@ -84,7 +84,7 @@ func TestDecisionEnvelopeRendersValidatedEvidenceIdsOnly(t *testing.T) {
 	msgs := buildDecisionEnvelope(DecisionPrompt{StepID: "s2", Evidence: ev})
 	content := msgs[1].Content
 	for _, want := range []string{
-		"version=2", "source_id=src-1", "step=s1", "Authoritative title",
+		"version=3", "source_id=src-1", "step=s1", "Authoritative title",
 		"https://docs.example/nexus", "captured snippet",
 	} {
 		if !strings.Contains(content, want) {
@@ -93,6 +93,32 @@ func TestDecisionEnvelopeRendersValidatedEvidenceIdsOnly(t *testing.T) {
 	}
 	if strings.Contains(content, "src-2") {
 		t.Fatalf("evidence prompt must not invent source ids:\n%s", content)
+	}
+}
+
+func TestDecisionPromptAllowsTypedSynthesisForStableIDLegacyProvenance(t *testing.T) {
+	ev := &execjournal.ResearchEvidence{
+		Version:    execjournal.ResearchEvidenceProvenanceVersion,
+		Capability: execjournal.ResearchEvidenceCapability, Operation: execjournal.ResearchEvidenceOperation,
+		Count: 1, Plan: &execjournal.ResearchPlanEvidence{PlanID: "exec-1", Version: 1},
+		Sources: []execjournal.ResearchSource{{
+			ID: "src-1", Title: "Legacy stable source", URL: "https://docs.example/legacy",
+			Source: "docs.example", Snippet: "captured",
+		}},
+	}
+	content := buildDecisionEnvelope(DecisionPrompt{StepID: "s2", Evidence: ev})[1].Content
+	if strings.Contains(content, "do not return a typed synthesis") {
+		t.Fatalf("v2 stable-id evidence must remain synthesizable:\n%s", content)
+	}
+	if !strings.Contains(content, "source_id=src-1") {
+		t.Fatalf("v2 evidence prompt must expose stable source ids:\n%s", content)
+	}
+
+	ev.Version = execjournal.ResearchEvidenceLegacyVersion
+	ev.Plan = nil
+	content = buildDecisionEnvelope(DecisionPrompt{StepID: "s2", Evidence: ev})[1].Content
+	if !strings.Contains(content, "do not return a typed synthesis") {
+		t.Fatalf("provenance-free v1 evidence must block typed synthesis:\n%s", content)
 	}
 }
 

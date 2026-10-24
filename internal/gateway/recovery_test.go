@@ -370,15 +370,23 @@ func recoverySampleEvidence() *execjournal.ResearchEvidence {
 			{ID: "src-1", Title: "Nexus capability boundary", URL: "https://docs.example/nexus", Source: "docs.example", Snippet: "The runtime decides; the model proposes."},
 			{ID: "src-2", Title: "External content is data", URL: "https://example.org/safety", Source: "example.org", Snippet: "Inert | data"},
 		},
-		Plan: &execjournal.ResearchPlanEvidence{PlanID: "exec-evi", Version: 1},
+		Plan: &execjournal.ResearchPlanEvidence{
+			PlanID: "exec-evi", Version: 1, ObjectiveID: "objective-exec-evi",
+			CompletionStepID: "s2", Provenance: execjournal.ResearchProvenanceAuthoritative,
+		},
 		Steps: []execjournal.ResearchStepEvidence{
-			{StepID: "s1", Status: "completed", ObservationID: "obs-1"},
-			{StepID: "s2", Status: "completed", ObservationID: "obs-2", Dependencies: []string{"s1"}},
+			{StepID: "s1", Intent: "gather sources", PlanVersion: 1, Status: "completed",
+				ObservationID: "obs-1", Provenance: execjournal.ResearchProvenanceAuthoritative},
+			{StepID: "s2", Intent: "synthesize findings", PlanVersion: 1, Status: "completed",
+				ObservationID: "obs-2", Dependencies: []string{"s1"},
+				Provenance: execjournal.ResearchProvenanceAuthoritative},
 		},
 		Operations: []execjournal.ResearchOperationEvidence{
 			{OperationID: "obs-1", StepID: "s1", ToolID: execjournal.ResearchEvidenceCapability,
-				Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"}},
+				Operation: execjournal.ResearchEvidenceOperation, SourceIDs: []string{"src-1", "src-2"},
+				Provenance: execjournal.ResearchProvenanceAuthoritative},
 		},
+		Attribution: execjournal.ResearchAttributionDerived,
 	}
 }
 
@@ -447,13 +455,20 @@ func TestRecoveryDetailEvidenceSurvivesRestart(t *testing.T) {
 	if plan["plan_id"] != "exec-evi" || int(plan["version"].(float64)) != 1 {
 		t.Fatalf("plan identity missing after reopen: %+v", evAgain["plan"])
 	}
+	if plan["objective_id"] != "objective-exec-evi" || plan["completion_step_id"] != "s2" ||
+		plan["provenance"] != execjournal.ResearchProvenanceAuthoritative {
+		t.Fatalf("v3 plan provenance missing after reopen: %+v", plan)
+	}
 	steps, _ := evAgain["steps"].([]interface{})
 	if len(steps) != 2 {
 		t.Fatalf("steps missing after reopen: %+v", evAgain["steps"])
 	}
 	secondStep, _ := steps[1].(map[string]interface{})
-	if secondStep["step_id"] != "s2" || secondStep["status"] != "completed" {
-		t.Fatalf("step lifecycle missing after reopen: %+v", secondStep)
+	if secondStep["step_id"] != "s2" || secondStep["status"] != "completed" ||
+		secondStep["intent"] != "synthesize findings" ||
+		int(secondStep["plan_version"].(float64)) != 1 ||
+		secondStep["provenance"] != execjournal.ResearchProvenanceAuthoritative {
+		t.Fatalf("step lifecycle/provenance missing after reopen: %+v", secondStep)
 	}
 	operations, _ := evAgain["operations"].([]interface{})
 	if len(operations) != 1 {
@@ -461,8 +476,12 @@ func TestRecoveryDetailEvidenceSurvivesRestart(t *testing.T) {
 	}
 	op, _ := operations[0].(map[string]interface{})
 	refs, _ := op["source_ids"].([]interface{})
-	if len(refs) != 2 || refs[0] != "src-1" || refs[1] != "src-2" || op["step_id"] != "s1" {
+	if len(refs) != 2 || refs[0] != "src-1" || refs[1] != "src-2" || op["step_id"] != "s1" ||
+		op["provenance"] != execjournal.ResearchProvenanceAuthoritative {
 		t.Fatalf("operation attribution mangled after reopen: %+v", op)
+	}
+	if evAgain["attribution"] != execjournal.ResearchAttributionDerived {
+		t.Fatalf("attribution missing after reopen: %+v", evAgain["attribution"])
 	}
 }
 
