@@ -1,0 +1,387 @@
+.comparison {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-elevated);
+}
+
+.header,
+.heading,
+.controls,
+.result,
+.verdict,
+.side,
+.artifact,
+.differenceGroup,
+.findings {
+  display: flex;
+  flex-direction: column;
+}
+
+.header {
+  gap: var(--space-2);
+}
+
+.heading {
+  gap: var(--space-1);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.intro,
+.hint,
+.notice,
+.error,
+.noDifferences,
+.verdict p,
+.artifact p,
+.artifactDetails p,
+.findingText p {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+
+.hint,
+.notice {
+  padding: var(--space-3);
+  border-left: 3px solid var(--color-surface-border);
+  background: var(--color-surface-base);
+}
+
+.error {
+  padding: var(--space-3);
+  border-left: 3px solid var(--color-status-error, var(--color-error));
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+}
+
+.controls {
+  flex-direction: row;
+  align-items: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 220px;
+  flex: 1;
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+}
+
+.control select {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-base);
+  color: var(--color-text-primary);
+  font: inherit;
+}
+
+.compareButton {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-zone-research);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-weight: var(--font-weight-medium);
+  cursor: pointer;
+}
+
+.compareButton:hover:not(:disabled) {
+  background: var(--color-surface-base);
+}
+
+.compareButton:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.compareButton:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+}
+
+.result {
+  gap: var(--space-4);
+  padding-top: var(--space-2);
+}
+
+.verdict {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-base);
+}
+
+.verdict p {
+  color: var(--color-text-secondary);
+}
+
+.categories {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.category {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+
+.sides {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--space-3);
+}
+
+.side {
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-base);
+}
+
+.sideHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.sideTitle {
+  margin: 0;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.metadata {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+}
+
+.metadata > div {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.metadata dt {
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+}
+
+.metadata dd {
+  margin: 0;
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.mono {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  overflow-wrap: anywhere;
+}
+
+.artifact {
+  gap: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-surface-border);
+}
+
+.artifact h5,
+.groupHeading,
+.sectionHeading {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text-primary);
+}
+
+.artifactDetails {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.differences,
+.findings {
+  gap: var(--space-2);
+}
+
+.sectionHeading {
+  font-size: var(--font-size-base);
+}
+
+.differenceGroup {
+  gap: var(--space-2);
+}
+
+.groupHeading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  color: var(--color-text-secondary);
+}
+
+.groupHeading span {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+}
+
+.differenceList,
+.findingList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.difference {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-surface-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-base);
+}
+
+.differenceHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.differenceEntity {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+
+.differenceID {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.values dt {
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+}
+
+.values dd {
+  margin: 0;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.finding {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-left: 2px solid var(--color-surface-border);
+  background: var(--color-surface-base);
+}
+
+.findingText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.findingText code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-primary);
+  overflow-wrap: anywhere;
+}
+
+.findingCategory {
+  font-size: var(--font-size-xs, var(--font-size-sm));
+  color: var(--color-text-muted);
+}
+
+.limitations {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.limitations summary {
+  cursor: pointer;
+  color: var(--color-text-primary);
+}
+
+.limitations ul {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  line-height: 1.5;
+}
+
+@media (max-width: 768px) {
+  .controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .control {
+    min-width: 0;
+  }
+
+  .compareButton {
+    width: 100%;
+  }
+}

@@ -888,6 +888,163 @@ export interface DurableExecutionList {
   has_more: boolean;
 }
 
+// ---- Research provenance comparison (v61) ----
+// Mirrors internal/researchcompare. A comparison is a read-only projection
+// over two validated durable snapshots. It reports recorded differences only:
+// no trust score, confidence, factual verification or "better run" verdict.
+
+export type ResearchComparisonCategory =
+  | 'plan'
+  | 'steps'
+  | 'operations'
+  | 'evidence'
+  | 'synthesis'
+  | 'evaluation';
+
+export type ResearchComparisonKind =
+  | 'added'
+  | 'removed'
+  | 'changed'
+  | 'unavailable'
+  | 'incompatible'
+  | 'legacy';
+
+export type ResearchComparisonProvenance =
+  | 'authoritative'
+  | 'derived'
+  | 'unavailable'
+  | 'legacy';
+
+export type ResearchComparisonCompatibilityStatus =
+  | 'comparable'
+  | 'partial'
+  | 'incompatible';
+
+export type ResearchComparisonCategoryStatus =
+  | 'comparable'
+  | 'partial'
+  | 'unavailable'
+  | 'incompatible';
+
+export type ResearchComparisonSeverity = 'info' | 'warning' | 'error';
+
+export interface ResearchComparisonProvenanceSummary {
+  evidence: ResearchComparisonProvenance;
+  plan: ResearchComparisonProvenance;
+  steps: ResearchComparisonProvenance;
+  operations: ResearchComparisonProvenance;
+  source_attribution: ResearchComparisonProvenance;
+  synthesis: ResearchComparisonProvenance;
+  evaluation: ResearchComparisonProvenance;
+}
+
+export interface ResearchComparisonEvidenceSummary {
+  version: number;
+  capability: string;
+  operation: string;
+  count: number;
+  fingerprint: string;
+  attribution?: 'derived' | 'unavailable';
+  source_count: number;
+  step_count: number;
+  operation_count: number;
+}
+
+export interface ResearchComparisonPlanSummary {
+  plan_id: string;
+  version: number;
+  objective_id?: string;
+  completion_step_id?: string;
+  completion_recorded: boolean;
+  provenance: 'authoritative' | 'legacy';
+}
+
+export interface ResearchComparisonSynthesisSummary {
+  version: 1;
+  method: 'deterministic_v1';
+  status: ResearchSynthesisStatus;
+  plan_version: number;
+  plan_version_recorded: boolean;
+  evidence_fingerprint: string;
+  fingerprint: string;
+  evidence_backed_count: number;
+  inference_count: number;
+  conflict_count: number;
+  question_count: number;
+}
+
+export interface ResearchComparisonEvaluationSummary {
+  version: 1;
+  method: 'deterministic_v1';
+  status: ResearchEvaluationStatus;
+  evidence_version: number;
+  evidence_count: number;
+  evidence_fingerprint: string;
+  plan_version: number;
+  plan_version_recorded: boolean;
+  synthesis_status?: ResearchSynthesisStatus;
+  synthesis_fingerprint?: string;
+  dimension_count: number;
+  finding_count: number;
+}
+
+export interface ResearchComparisonSide {
+  role: 'left' | 'right';
+  execution_id: string;
+  division_id?: string;
+  state: DurableExecutionState;
+  created_at: string;
+  completed_at?: string;
+  provenance: ResearchComparisonProvenanceSummary;
+  evidence?: ResearchComparisonEvidenceSummary;
+  plan?: ResearchComparisonPlanSummary;
+  synthesis?: ResearchComparisonSynthesisSummary;
+  evaluation?: ResearchComparisonEvaluationSummary;
+}
+
+export interface ResearchComparisonDifference {
+  category: ResearchComparisonCategory;
+  kind: ResearchComparisonKind;
+  entity: string;
+  id?: string;
+  field?: string;
+  left?: string;
+  right?: string;
+  left_fingerprint?: string;
+  right_fingerprint?: string;
+  provenance?: ResearchComparisonProvenance;
+}
+
+export interface ResearchComparisonFinding {
+  code: string;
+  severity: ResearchComparisonSeverity;
+  category?: ResearchComparisonCategory;
+  message: string;
+}
+
+export interface ResearchComparisonCategoryCompatibility {
+  category: ResearchComparisonCategory;
+  status: ResearchComparisonCategoryStatus;
+}
+
+export interface ResearchComparisonCompatibility {
+  status: ResearchComparisonCompatibilityStatus;
+  categories: ResearchComparisonCategoryCompatibility[];
+}
+
+export interface ResearchComparison {
+  source: string;
+  version: 1;
+  method: 'deterministic_v1';
+  left: ResearchComparisonSide;
+  right: ResearchComparisonSide;
+  compatibility: ResearchComparisonCompatibility;
+  differences: ResearchComparisonDifference[];
+  findings: ResearchComparisonFinding[];
+  limitations: string[];
+  truncated: boolean;
+}
+
 // Error response wrapper
 export interface APIError extends Error {
   status: number;

@@ -335,6 +335,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	// endpoint exists (reconciliation is deferred).
 	s.mux.HandleFunc("GET /api/v1/recovery/executions", s.handleListRecoveryExecutions)
 	s.mux.HandleFunc("GET /api/v1/recovery/executions/{id}", s.handleGetRecoveryExecution)
+	s.mux.HandleFunc("GET /api/v1/recovery/comparisons", s.handleCompareRecoveryExecutions)
 
 	// Control surface endpoints
 	s.mux.HandleFunc("GET /api/v1/control/status", s.handleControlStatus)

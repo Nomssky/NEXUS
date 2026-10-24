@@ -14,6 +14,7 @@ import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
 import { ResearchInput } from '../components/Research/ResearchInput';
 import { ResearchOutput } from '../components/Research/ResearchOutput';
 import { ResearchEvidence } from '../components/Research/ResearchEvidence';
+import { ResearchComparison } from '../components/Research/ResearchComparison';
 import {
   queryKeys,
   useIntelligence,
@@ -415,6 +416,12 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
           />
         </section>
       </div>
+
+      <ResearchComparison
+        businessId={businessId}
+        executions={executions}
+        activeExecutionId={activeExecutionId}
+      />
 
       <section className={styles.historySection} aria-labelledby="history-heading">
         <h2 id="history-heading" className={styles.sectionTitle}>

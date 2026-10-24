@@ -26,6 +26,7 @@ import type {
   PaginationParams,
   DurableExecution,
   DurableExecutionList,
+  ResearchComparison,
 } from '../types/api';
 
 // Type for query options that excludes queryKey (provided by the hook)
@@ -47,6 +48,8 @@ export const queryKeys = {
   recoveryExecutions: (businessId: string) => ['recoveryExecutions', businessId] as const,
   recoveryExecution: (id: string, businessId: string) =>
     ['recoveryExecution', businessId, id] as const,
+  recoveryComparison: (businessId: string, leftId: string, rightId: string) =>
+    ['recoveryComparison', businessId, leftId, rightId] as const,
 };
 
 // Health & Status
@@ -268,6 +271,31 @@ export function useRecoveryExecution(
         state === 'unknown';
       return terminal ? false : 5000;
     },
+    ...options,
+  });
+}
+
+// Deterministic comparison of two eligible durable research snapshots. It is
+// fetched only for an explicitly requested pair and never polls: both inputs
+// are settled records, and the comparison itself is a read-only projection.
+export function useRecoveryComparison(
+  businessId: string,
+  leftExecutionId: string,
+  rightExecutionId: string,
+  options?: QueryOptions<ResearchComparison>
+) {
+  return useQuery({
+    queryKey: queryKeys.recoveryComparison(businessId, leftExecutionId, rightExecutionId),
+    queryFn: () =>
+      apiClient.compareRecoveryExecutions(businessId, leftExecutionId, rightExecutionId),
+    enabled:
+      !!businessId &&
+      !!leftExecutionId &&
+      !!rightExecutionId &&
+      leftExecutionId !== rightExecutionId,
+    retry: false,
+    refetchOnWindowFocus: false,
+    staleTime: 60_000,
     ...options,
   });
 }

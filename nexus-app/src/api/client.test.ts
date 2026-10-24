@@ -278,4 +278,22 @@ describe('recovery executions (authoritative activity)', () => {
       expect.anything()
     );
   });
+
+  it('calls the comparison endpoint with both execution ids and business scope', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ source: 'durable_journal', version: 1 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    );
+
+    await apiClient.compareRecoveryExecutions('biz-1', 'exec-left', 'exec-right');
+
+    const calls = mockFetch.mock.calls;
+    const url = String(calls[calls.length - 1]?.[0] ?? '');
+    expect(url).toContain('/api/v1/recovery/comparisons?');
+    expect(url).toContain('business_id=biz-1');
+    expect(url).toContain('left_execution_id=exec-left');
+    expect(url).toContain('right_execution_id=exec-right');
+  });
 });

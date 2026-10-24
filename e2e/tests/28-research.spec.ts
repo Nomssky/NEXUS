@@ -639,6 +639,129 @@ test.describe('Research Workspace E2E', () => {
     await expect(output.getByText('objective pursued deterministically', { exact: true })).toHaveCount(0);
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
+
+  test('research workspace: compares two settled runs without scores or inferred identity', async ({ page }) => {
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        actorId: actorID,
+        credential,
+        businessID,
+        businessId: businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    const listExecutions = async (): Promise<Array<{ execution_id: string; state: string }>> => {
+      const response = await fetch(
+        `${nexus.baseURL}/api/v1/recovery/executions?business_id=${nexus.businessID}`,
+        { headers: bootstrapHeaders(nexus) }
+      );
+      expect(response.ok).toBeTruthy();
+      const body = await response.json();
+      return body.executions ?? [];
+    };
+
+    const submitAndWait = async (): Promise<string> => {
+      const before = new Set((await listExecutions()).map((execution) => execution.execution_id));
+      await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
+      await page.click('button[type="submit"]', { timeout: 5000 });
+      await page.waitForFunction(() => {
+        const textarea = document.querySelector('textarea[placeholder*="research"]') as HTMLTextAreaElement | null;
+        return textarea?.value === '';
+      }, { timeout: 10000 });
+
+      let executionID = '';
+      for (let attempt = 0; attempt < 40 && !executionID; attempt += 1) {
+        const created = (await listExecutions()).find(
+          (execution) => !before.has(execution.execution_id)
+        );
+        if (created) {
+          executionID = created.execution_id;
+          break;
+        }
+        await page.waitForTimeout(250);
+      }
+      expect(executionID).not.toBe('');
+      await expect
+        .poll(async () => {
+          const current = (await listExecutions()).find(
+            (execution) => execution.execution_id === executionID
+          );
+          return current?.state;
+        }, { timeout: 30000, intervals: [250, 500, 1000] })
+        .toBe('completed');
+      return executionID;
+    };
+
+    const firstID = await submitAndWait();
+    const secondID = await submitAndWait();
+    expect(firstID).not.toBe(secondID);
+
+    // Reload so the comparison selectors read the complete settled list.
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    const comparison = page.locator('section[aria-labelledby="research-comparison-heading"]');
+    await expect(comparison).toBeVisible();
+    const leftSelect = comparison.getByLabel('Left comparison run');
+    const rightSelect = comparison.getByLabel('Right comparison run');
+    await expect(leftSelect.locator(`option[value="${firstID}"]`)).toHaveCount(1, { timeout: 15000 });
+    await expect(rightSelect.locator(`option[value="${secondID}"]`)).toHaveCount(1);
+
+    // Ensure both fresh runs are the selected pair. If a third eligible run
+    // exists, park the right selector on it first so neither fresh option is
+    // disabled while selecting.
+    const third = (await listExecutions())
+      .find(
+        (execution) =>
+          execution.state === 'completed' &&
+          execution.execution_id !== firstID &&
+          execution.execution_id !== secondID
+      )?.execution_id;
+    if (third) {
+      await rightSelect.selectOption(third);
+    }
+    await leftSelect.selectOption(firstID);
+    await rightSelect.selectOption(secondID);
+
+    await comparison.getByRole('button', { name: 'Compare', exact: true }).click();
+
+    const result = comparison.locator('[data-comparison-status]');
+    await expect(result).toBeVisible({ timeout: 15000 });
+    await expect(result).toHaveAttribute('data-comparison-status', 'comparable');
+    // The two runs record different execution-scoped operation labels. The
+    // comparison reports that recorded difference and explicitly refuses to
+    // infer that either operation is the same logical operation.
+    await expect(result.locator('[data-finding-code="operation_identity_scope"]')).toBeVisible();
+    await expect(result.getByText('Recorded differences')).toBeVisible();
+    await expect(result.getByText('Left only').first()).toBeVisible();
+    await expect(result.getByText('Right only').first()).toBeVisible();
+    await expect(result.getByText(firstID, { exact: true })).toBeVisible();
+    await expect(result.getByText(secondID, { exact: true })).toBeVisible();
+    await expect(result).not.toContainText('%');
+    await expect(result).not.toContainText('Trust score');
+    await expect(result).not.toContainText('No recorded differences');
+
+    // Changing either side invalidates the explicit pair; no stale result is
+    // left on screen.
+    if (third) {
+      await rightSelect.selectOption(third);
+      await expect(comparison.locator('[data-comparison-status]')).toHaveCount(0);
+      await expect(comparison.getByText(/Choose two settled runs/)).toBeVisible();
+    }
+  });
 });
 
 // The production adapter (not the scripted envelope provider) is booted through

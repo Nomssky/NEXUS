@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/execjournal"
+	"github.com/Nomssky/NEXUS/internal/researchcompare"
 )
 
 // Durable execution read API (v11,
@@ -19,6 +21,9 @@ const (
 	recoverySource       = "durable_journal"
 	recoveryDefaultLimit = 50
 	recoveryMaxLimit     = 200
+	// recoveryComparisonMaxID bounds a query-supplied execution id before any
+	// journal read. It is deliberately a little wider than generated ids.
+	recoveryComparisonMaxID = 512
 )
 
 // durableExecutionView is the allow-listed projection of a durable execution
@@ -175,6 +180,108 @@ func (s *Server) handleGetRecoveryExecution(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(durableDetailView(rec))
+}
+
+// durableComparisonView is the allow-listed comparison envelope. The
+// comparison itself contains only bounded summaries and recorded differences;
+// it never includes raw evidence, synthesis prose, prompts, actor ids or
+// recovery reasons.
+type durableComparisonView struct {
+	Source string `json:"source"`
+	researchcompare.Comparison
+}
+
+// handleCompareRecoveryExecutions projects a deterministic comparison of two
+// eligible durable research snapshots. Both executions are authorized
+// independently inside the requested business. Missing, foreign and
+// out-of-scope records are indistinguishable (404), and eligibility is checked
+// only after both records are authorized.
+func (s *Server) handleCompareRecoveryExecutions(w http.ResponseWriter, r *http.Request) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+	leftID := r.URL.Query().Get("left_execution_id")
+	rightID := r.URL.Query().Get("right_execution_id")
+	if !validComparisonExecutionID(leftID) || !validComparisonExecutionID(rightID) {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
+			"left_execution_id and right_execution_id are required and must be valid")
+		return
+	}
+	if leftID == rightID {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
+			"left_execution_id and right_execution_id must differ")
+		return
+	}
+	j, unavailable := s.journalOrUnavailable(w, r)
+	if unavailable {
+		return
+	}
+	left, right, leftOK, rightOK, err := j.GetPair(leftID, rightID)
+	if err != nil {
+		// A corrupt or unsupported record fails closed and is never partially
+		// interpreted as a comparison input.
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE",
+			"durable execution records are unavailable")
+		return
+	}
+	// Unknown, foreign, unreadable and out-of-scope are indistinguishable (404).
+	if !leftOK || !rightOK || left.BusinessID != businessID || right.BusinessID != businessID {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "durable execution record not found")
+		return
+	}
+	if !s.authorizeDivisionRead(res.IdentityID, businessID, left.DivisionID) ||
+		!s.authorizeDivisionRead(res.IdentityID, businessID, right.DivisionID) {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "durable execution record not found")
+		return
+	}
+	if !eligibleForResearchComparison(left) || !eligibleForResearchComparison(right) {
+		s.writeError(w, r, http.StatusConflict, "CONFLICT",
+			"both executions must be settled and eligible for comparison")
+		return
+	}
+	comparison, err := researchcompare.Compare(left, right)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE",
+			"durable comparison is unavailable")
+		return
+	}
+	if err := researchcompare.Validate(comparison); err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE",
+			"durable comparison is unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(durableComparisonView{
+		Source: recoverySource, Comparison: comparison,
+	})
+}
+
+func validComparisonExecutionID(id string) bool {
+	return id != "" && len(id) <= recoveryComparisonMaxID &&
+		!strings.ContainsAny(id, "\x00\n\r\t")
+}
+
+// eligibleForResearchComparison admits settled records only. A provisional
+// approval pause is a failed/APPROVAL_REQUIRED record that can still be
+// superseded by the narrow approval-resume path, so it is not a stable
+// comparison snapshot. StateUnknown is recovery-settled and therefore eligible.
+func eligibleForResearchComparison(rec execjournal.ExecutionRecord) bool {
+	if rec.State == execjournal.StateUnknown {
+		return true
+	}
+	if !rec.State.Terminal() {
+		return false
+	}
+	if rec.State == execjournal.StateFailed && rec.ErrorClass == execjournal.ApprovalRequiredClass {
+		return false
+	}
+	return true
 }
 
 // handleListRecoveryExecutions returns a bounded, newest-first page of durable

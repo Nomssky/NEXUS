@@ -574,6 +574,36 @@ func (j *Journal) Get(id string) (ExecutionRecord, bool, error) {
 	return er, ok, err
 }
 
+// GetPair returns two durable execution records from one journal write view.
+// It holds the journal mutex across both reads, so a journal transition cannot
+// land between them. Each returned record is still one independently validated
+// atomic record: the pair read never merges fields from different versions.
+//
+// This is a read-only helper for projections that must compare two snapshots;
+// it does not create a second store or a comparison record.
+func (j *Journal) GetPair(leftID, rightID string) (left, right ExecutionRecord, leftOK, rightOK bool, err error) {
+	if j == nil {
+		return ExecutionRecord{}, ExecutionRecord{}, false, false, nil
+	}
+	if leftID == "" || rightID == "" {
+		return ExecutionRecord{}, ExecutionRecord{}, false, false, fmt.Errorf("execjournal: both execution ids are required")
+	}
+	if leftID == rightID {
+		return ExecutionRecord{}, ExecutionRecord{}, false, false, fmt.Errorf("execjournal: execution ids must differ")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	left, _, leftOK, err = j.getExecution(leftID)
+	if err != nil {
+		return ExecutionRecord{}, ExecutionRecord{}, false, false, err
+	}
+	right, _, rightOK, err = j.getExecution(rightID)
+	if err != nil {
+		return ExecutionRecord{}, ExecutionRecord{}, false, false, err
+	}
+	return left, right, leftOK, rightOK, nil
+}
+
 // ListByBusiness returns up to maxRecords durable execution records for
 // businessID, newest first (by created_at, tie-broken by execution id). A
 // maxRecords < 1, or one above MaxListScan, is clamped to MaxListScan. Every

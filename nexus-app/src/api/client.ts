@@ -28,6 +28,7 @@ import type {
   APIError,
   DurableExecution,
   DurableExecutionList,
+  ResearchComparison,
   ResearchSynthesis,
   ResearchEvaluation,
 } from '../types/api';
@@ -265,6 +266,22 @@ class NexusAPIClient {
       'GET',
       `/recovery/executions/${encodeURIComponent(id)}?business_id=${businessId}`
     );
+  }
+
+  // Read-only comparison of two eligible durable research snapshots. The
+  // response is a bounded projection; the client parser re-validates it before
+  // rendering. No comparison is persisted and no execution is mutated.
+  async compareRecoveryExecutions(
+    businessId: string,
+    leftExecutionId: string,
+    rightExecutionId: string
+  ): Promise<ResearchComparison> {
+    const searchParams = new URLSearchParams({
+      business_id: businessId,
+      left_execution_id: leftExecutionId,
+      right_execution_id: rightExecutionId,
+    });
+    return this.request<ResearchComparison>('GET', `/recovery/comparisons?${searchParams}`);
   }
 
   // Approvals
