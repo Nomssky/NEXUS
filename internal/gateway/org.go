@@ -380,8 +380,17 @@ func (s *Server) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(ident)
 }
 
-// handleIdentityTransition applies suspend/revoke/activate (audit §9:
-// identity suspended/revoked).
+// handleIdentityTransition suspends, revokes, or reactivates an identity's
+// status. Per SCHEMA_IDENTITIES_ORG §12.1 (G1), the authority boundary for
+// identity lifecycle transitions is business-wide membership of the record's
+// business: any active business-wide member may transition a record,
+// including a record of their own id. Role labels are descriptive, not
+// authority (§10.1 MEMBERSHIP != AUTHORITY).
+//
+// Ordering: 404 for non-visible/foreign identities (no existence leak), then
+// 401 authentication, then 403 authorization. The registry persists the
+// transition and publishes EventTypeIdentityStatusChanged as durable audit
+// evidence (§9).
 func (s *Server) handleIdentityTransition(w http.ResponseWriter, r *http.Request, to identity.Status) {
 	if !s.requireRegistry(w, r) {
 		return
@@ -392,7 +401,19 @@ func (s *Server) handleIdentityTransition(w http.ResponseWriter, r *http.Request
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "identity not found")
 		return
 	}
-	updated, err := s.registry.SetIdentityStatus(id, to, currentActor(r))
+	// §12.1 G1: the authority boundary is business-wide membership of the
+	// record's business (orgScopeVisible above enforces visibility and this
+	// membership). Self-transition of one's own identity is explicitly
+	// allowed; transitioning another identity requires business-wide
+	// membership in that identity's business.
+	res, _ := actorFromContext(r.Context())
+	if res.IdentityID != ident.ID {
+		_, stopped := s.requireBusinessWideMembership(w, r, ident.BusinessID)
+		if stopped {
+			return
+		}
+	}
+	updated, err := s.registry.SetIdentityStatus(id, to, res.IdentityID)
 	if err != nil {
 		s.writeRegistryError(w, r, err)
 		return

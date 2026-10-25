@@ -9,9 +9,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
+	"github.com/Nomssky/NEXUS/internal/foundation/schema"
 	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
@@ -261,6 +263,286 @@ func TestGatewayIdentityTransitions(t *testing.T) {
 	// Unknown id → 404.
 	if w := postJSON(srv, "/api/v1/identities/nx:human:missing/revoke", nil); w.Code != http.StatusNotFound {
 		t.Errorf("unknown: expected 404, got %d", w.Code)
+	}
+}
+
+// authzGateway builds a gateway with identity enforcement ON so that identity
+// transition authorization (SCHEMA_IDENTITIES_ORG §12.1 G1) can be exercised:
+// business-wide membership is the authority, unauthenticated and foreign actors
+// are denied, and cross-business access leaks nothing.
+func authzGateway(t *testing.T) (*identity.Registry, *identity.LocalAuthenticator, *identity.MembershipSet, *Server) {
+	t.Helper()
+	engine, err := core.NewEngine(nil)
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	ctx := context.Background()
+	if err := engine.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = engine.Stop(ctx) })
+
+	reg := identity.NewRegistry("nx:nexus:test")
+	auth := identity.NewLocalAuthenticator()
+	auth.SetRegistry(reg)
+	members := identity.NewMembershipSet()
+
+	srv := NewServer(engine, ":0",
+		WithRegistry(reg),
+		WithIdentity(auth, members),
+		WithRequireAuthentication(true),
+		WithEnforceBusinessScope(true),
+	)
+	return reg, auth, members, srv
+}
+
+// mkBusiness creates a business owned by ownerID and returns its record.
+func mkBusiness(t *testing.T, reg *identity.Registry, id, name, ownerID string) identity.Business {
+	t.Helper()
+	b, err := reg.CreateBusiness(identity.Business{
+		EntityID:        id,
+		Name:            name,
+		OwnerIdentityID: ownerID,
+		Provenance:      schema.ProvenanceRef{Origin: "test", Producer: "test", ProducedAt: time.Now().UTC()},
+	}, "test")
+	if err != nil {
+		t.Fatalf("create business %q: %v", id, err)
+	}
+	return b
+}
+
+// mkIdentity creates an identity in businessID (which must already exist),
+// registers its credential, and adds an active membership. Returns the identity.
+func mkIdentity(t *testing.T, reg *identity.Registry, auth *identity.LocalAuthenticator, members *identity.MembershipSet, id, typ, businessID, divisionID, cred string) identity.Identity {
+	t.Helper()
+	scope := identity.GlobalScope()
+	if businessID != "" {
+		if divisionID != "" {
+			scope = identity.DivisionScope(businessID, divisionID)
+		} else {
+			scope = identity.BusinessScope(businessID)
+		}
+	}
+	ident, err := reg.CreateIdentity(identity.Identity{
+		ID:          id,
+		Type:        identity.Type(typ),
+		DisplayName: id,
+		BusinessID:  businessID,
+		DivisionID:  divisionID,
+		Scope:       scope,
+		Provenance:  schema.ProvenanceRef{Origin: "test", Producer: "test", ProducedAt: time.Now().UTC()},
+	}, "test")
+	if err != nil {
+		t.Fatalf("create identity %q: %v", id, err)
+	}
+	if err := auth.Register(ident.ID, security.HashCredential([]byte(cred)), identity.AuthMethodToken); err != nil {
+		t.Fatalf("register credential %q: %v", id, err)
+	}
+	if businessID != "" {
+		if err := members.Add(identity.Membership{
+			IdentityID: ident.ID,
+			BusinessID: businessID,
+			DivisionID: divisionID,
+			Role:       identity.RoleMember,
+			Status:     identity.StatusActive,
+		}); err != nil {
+			t.Fatalf("add membership %q: %v", id, err)
+		}
+	}
+	return ident
+}
+
+// authzPost issues an authenticated POST to an identity transition endpoint.
+func authzPost(t *testing.T, srv *Server, path, actorID, cred string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", path, nil)
+	req.Header.Set("X-Actor-ID", actorID)
+	req.Header.Set("X-Actor-Credential", cred)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// §12.1 G1: an active business-wide member may suspend/revoke/activate an
+// identity in their business, including their own.
+func TestIdentityTransitionAuthorizedBusinessWideMember(t *testing.T) {
+	reg, auth, members, srv := authzGateway(t)
+
+	// Owner is a business-wide member of biz-1.
+	owner := mkIdentity(t, reg, auth, members, "nx:human:owner", "human", "", "", "owner-secret")
+	mkBusiness(t, reg, "biz-1", "Acme", owner.ID)
+	if err := members.Add(identity.Membership{
+		IdentityID: owner.ID, BusinessID: "biz-1", DivisionID: "",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add owner membership: %v", err)
+	}
+	target := mkIdentity(t, reg, auth, members, "nx:human:target", "human", "biz-1", "", "target-secret")
+
+	// Suspend the target (another identity in the same business).
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/suspend", owner.ID, "owner-secret"); w.Code != http.StatusOK {
+		t.Fatalf("suspend: expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err == nil {
+		t.Error("suspended identity must not authenticate")
+	}
+
+	// Reactivate the target.
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/activate", owner.ID, "owner-secret"); w.Code != http.StatusOK {
+		t.Fatalf("activate: expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err != nil {
+		t.Errorf("reactivated identity must authenticate: %v", err)
+	}
+
+	// Revoke the target (terminal).
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/revoke", owner.ID, "owner-secret"); w.Code != http.StatusOK {
+		t.Fatalf("revoke: expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err == nil {
+		t.Error("revoked identity must not authenticate")
+	}
+
+	// Self-transition is allowed (§12.1 G1): the owner may revoke their own id.
+	if w := authzPost(t, srv, "/api/v1/identities/"+owner.ID+"/revoke", owner.ID, "owner-secret"); w.Code != http.StatusOK {
+		t.Fatalf("self-revoke: expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// §12.1 G3 / §12.4: a division-scoped membership cannot see business-level
+// identity records at all (404 non-disclosure); it is not sufficient for
+// business-level identity transitions.
+func TestIdentityTransitionDivisionScopedMemberDenied(t *testing.T) {
+	reg, auth, members, srv := authzGateway(t)
+
+	narrow := mkIdentity(t, reg, auth, members, "nx:human:narrow", "human", "", "", "narrow-secret")
+	mkBusiness(t, reg, "biz-1", "Acme", narrow.ID)
+	if err := members.Add(identity.Membership{
+		IdentityID: narrow.ID, BusinessID: "biz-1", DivisionID: "div-1",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add narrow membership: %v", err)
+	}
+	target := mkIdentity(t, reg, auth, members, "nx:human:target", "human", "biz-1", "", "target-secret")
+
+	// Division-scoped member attempts a business-level identity transition:
+	// the target is not visible at all (404, no existence leak).
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/suspend", narrow.ID, "narrow-secret"); w.Code != http.StatusNotFound {
+		t.Fatalf("division-scoped suspend: expected 404, got %d body=%s", w.Code, w.Body.String())
+	}
+	// State must be unchanged: the target still authenticates.
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err != nil {
+		t.Errorf("target state changed despite denied transition: %v", err)
+	}
+}
+
+// §12.1 G1: an unauthenticated actor is rejected with 401.
+func TestIdentityTransitionUnauthenticatedDenied(t *testing.T) {
+	_, _, _, srv := authzGateway(t)
+
+	// No credentials at all.
+	if w := authzPost(t, srv, "/api/v1/identities/nx:human:target/suspend", "", ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated: expected 401, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+// §12.1 / §12.4: an actor from another business is rejected without leaking
+// whether the target identity exists (404 non-disclosure).
+func TestIdentityTransitionCrossBusinessDenied(t *testing.T) {
+	reg, auth, members, srv := authzGateway(t)
+
+	foreign := mkIdentity(t, reg, auth, members, "nx:human:foreign", "human", "", "", "foreign-secret")
+	mkBusiness(t, reg, "biz-2", "ForeignCo", foreign.ID)
+	if err := members.Add(identity.Membership{
+		IdentityID: foreign.ID, BusinessID: "biz-2", DivisionID: "",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add foreign membership: %v", err)
+	}
+	// biz-1 exists (owned by foreign, who is not a member of it).
+	mkBusiness(t, reg, "biz-1", "Acme", foreign.ID)
+	target := mkIdentity(t, reg, auth, members, "nx:human:target", "human", "biz-1", "", "target-secret")
+	if err := members.Add(identity.Membership{
+		IdentityID: target.ID, BusinessID: "biz-1", DivisionID: "",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add target membership: %v", err)
+	}
+
+	// Foreign actor attempts to suspend an identity in biz-1.
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/suspend", foreign.ID, "foreign-secret"); w.Code != http.StatusNotFound {
+		t.Fatalf("cross-business suspend: expected 404 (no leak), got %d body=%s", w.Code, w.Body.String())
+	}
+	// Target state unchanged.
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err != nil {
+		t.Errorf("target state changed despite denied transition: %v", err)
+	}
+
+	// Foreign actor's own identity in biz-2 is unaffected.
+	if _, err := auth.Authenticate(foreign.ID, []byte("foreign-secret")); err != nil {
+		t.Errorf("foreign identity should still authenticate: %v", err)
+	}
+}
+
+// §12.1 G1: a rejected transition leaves identity state unchanged.
+func TestIdentityTransitionRejectedLeavesStateUnchanged(t *testing.T) {
+	reg, auth, members, srv := authzGateway(t)
+
+	narrow := mkIdentity(t, reg, auth, members, "nx:human:narrow", "human", "", "", "narrow-secret")
+	mkBusiness(t, reg, "biz-1", "Acme", narrow.ID)
+	if err := members.Add(identity.Membership{
+		IdentityID: narrow.ID, BusinessID: "biz-1", DivisionID: "div-1",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add narrow membership: %v", err)
+	}
+	target := mkIdentity(t, reg, auth, members, "nx:human:target", "human", "biz-1", "", "target-secret")
+
+	before, ok := reg.GetIdentity(target.ID)
+	if !ok {
+		t.Fatal("target identity missing")
+	}
+
+	// Division-scoped member denied: the target is not visible (404).
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/revoke", narrow.ID, "narrow-secret"); w.Code != http.StatusNotFound {
+		t.Fatalf("denied revoke: expected 404, got %d", w.Code)
+	}
+
+	after, ok := reg.GetIdentity(target.ID)
+	if !ok {
+		t.Fatal("target identity missing after denied transition")
+	}
+	if after.Status != before.Status {
+		t.Fatalf("target status changed from %s to %s despite denied transition", before.Status, after.Status)
+	}
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err != nil {
+		t.Errorf("target should still authenticate: %v", err)
+	}
+}
+
+// §12.1: revoked is terminal; reactivating a revoked identity is 409 even for
+// an authorized business-wide member.
+func TestIdentityTransitionRevokedTerminal(t *testing.T) {
+	reg, auth, members, srv := authzGateway(t)
+
+	owner := mkIdentity(t, reg, auth, members, "nx:human:owner", "human", "", "", "owner-secret")
+	mkBusiness(t, reg, "biz-1", "Acme", owner.ID)
+	if err := members.Add(identity.Membership{
+		IdentityID: owner.ID, BusinessID: "biz-1", DivisionID: "",
+		Role: identity.RoleMember, Status: identity.StatusActive,
+	}); err != nil {
+		t.Fatalf("add owner membership: %v", err)
+	}
+	target := mkIdentity(t, reg, auth, members, "nx:human:target", "human", "biz-1", "", "target-secret")
+
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/revoke", owner.ID, "owner-secret"); w.Code != http.StatusOK {
+		t.Fatalf("revoke: expected 200, got %d", w.Code)
+	}
+	if w := authzPost(t, srv, "/api/v1/identities/"+target.ID+"/activate", owner.ID, "owner-secret"); w.Code != http.StatusConflict {
+		t.Fatalf("reactivate revoked: expected 409, got %d body=%s", w.Code, w.Body.String())
+	}
+	if _, err := auth.Authenticate(target.ID, []byte("target-secret")); err == nil {
+		t.Error("revoked identity must not authenticate")
 	}
 }
 
