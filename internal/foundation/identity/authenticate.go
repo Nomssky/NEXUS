@@ -7,6 +7,12 @@
 //	AUTHENTICATION != AUTHORIZATION
 //
 // An authenticated identity is not automatically authorized (see authorize.go).
+// The module is structured as ports & adapters: the use-case core
+// (auth_service.go) depends only on the interfaces in auth_ports.go, while
+// concrete storage, registry lookup and hashing live in auth_adapters.go.
+// LocalAuthenticator below is a thin facade that wires those adapters and keeps
+// the original public API stable for embedders.
+//
 // M1 implements only the minimal, local primitives the foundation needs; no
 // external federation, OIDC, or network identity provider is implemented.
 //
@@ -16,14 +22,9 @@
 package identity
 
 import (
-	"encoding/json"
-	"fmt"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
-	"github.com/Nomssky/NEXUS/internal/foundation/security"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
@@ -99,79 +100,27 @@ type Authenticator interface {
 	Authenticate(identityID string, credential []byte) (AuthResult, error)
 }
 
-// credentialVerifier holds a verification hash for an identity. It never holds
-// the raw credential.
-type credentialVerifier struct {
-	identityID string
-	// hash is the SHA-256 of the (salted) credential; comparison is by hash to
-	// avoid storing the secret. Salting is left to the credential issuer (C02 at
-	// a later milestone); M1 demonstrates the boundary, not a production KDF.
-	hash   string
-	method AuthMethod
-}
-
-// LocalAuthenticator is a minimal, in-process authenticator.
+// LocalAuthenticator is the authentication module's public facade.
 //
 // It is deliberately simple and NOT a production identity provider. It exists so
 // the foundation can exercise the authentication boundary deterministically. It
 // stores only verification hashes, never raw credentials, and never grants
 // permission.
+//
+// The facade owns no authentication logic: every rule lives in
+// authenticationService and every storage detail lives in an adapter. Callers
+// keep this API so the internal architecture can change without a repo-wide
+// migration.
 type LocalAuthenticator struct {
-	mu        sync.RWMutex
-	verifiers map[string]credentialVerifier
-	// st is the optional write-through store (nil = in-memory only).
-	st store.Store
-	// registry, when wired, makes authentication consult the identity record:
-	// a credential alone is not enough — the record must exist and be usable
-	// (status active, not expired). Nil keeps the M1 credential-only posture
-	// for embedders that do not run a registry.
-	registry *Registry
-	// now is injectable for deterministic tests.
-	now func() time.Time
-	// ttl bounds the validity of a successful authentication (0 = no expiry).
-	ttl time.Duration
+	svc *authenticationService
 }
 
 // NewLocalAuthenticator constructs an empty, in-memory-only local
 // authenticator: registered credentials do not survive the process.
 func NewLocalAuthenticator() *LocalAuthenticator {
 	return &LocalAuthenticator{
-		verifiers: map[string]credentialVerifier{},
-		now:       func() time.Time { return time.Now().UTC() },
+		svc: newAuthenticationService(newMemoryCredentialRepository(), sha256Verifier{}),
 	}
-}
-
-// credentialRecord is the stored form of a verifier (SCHEMA_IDENTITIES_ORG
-// §10). It carries the verification hash and how the credential is presented —
-// never the raw credential, which never leaves the caller's hands.
-type credentialRecord struct {
-	SchemaVersion string     `json:"schema_version"`
-	EntityType    string     `json:"entity_type"`
-	IdentityID    string     `json:"identity_id"`
-	Hash          string     `json:"hash"`
-	Method        AuthMethod `json:"method"`
-}
-
-// Stored-envelope stamps for the two record types this package owns beyond
-// the registry's entities (SCHEMA_COMMON §3.1).
-const (
-	credentialSchemaVersion = "1.0.0"
-	entityTypeCredential    = "credential"
-	membershipSchemaVersion = "1.0.0"
-	entityTypeMembership    = "membership"
-)
-
-// Store record ids are unique across the whole store (Store.Get/Delete are
-// keyed by id alone, and FileStore keeps one index for every type), so a
-// credential or membership record cannot reuse its identity's id. Both are
-// therefore namespaced by their type, mirroring the SCHEMA_COMMON §7
-// {prefix}:{type}:{unique} shape with the identity id as the unique part.
-func credentialRecordID(identityID string) string {
-	return entityTypeCredential + ":" + identityID
-}
-
-func membershipRecordID(identityID string) string {
-	return entityTypeMembership + ":" + identityID
 }
 
 // OpenLocalAuthenticator constructs a write-through local authenticator: every
@@ -184,177 +133,51 @@ func membershipRecordID(identityID string) string {
 // The registry binding is separate (SetRegistry): durability answers "does
 // this hash survive?", the registry answers "is this identity usable?".
 func OpenLocalAuthenticator(st store.Store) (*LocalAuthenticator, error) {
-	a := NewLocalAuthenticator()
 	if st == nil {
-		return a, nil
+		return NewLocalAuthenticator(), nil
 	}
-	a.st = st
-	if err := a.hydrate(); err != nil {
+	repo, err := newStoreCredentialRepository(st)
+	if err != nil {
 		return nil, err
 	}
-	return a, nil
-}
-
-// hydrate loads every stored verification hash into memory. Soft-deleted
-// records are already excluded by the store's List. Call with a fresh
-// authenticator (nothing else holds a reference yet).
-func (a *LocalAuthenticator) hydrate() error {
-	records, err := a.st.List(store.Filter{Type: store.RecordTypeCredential})
-	if err != nil {
-		return fmt.Errorf("auth: hydrate credentials: %w", err)
-	}
-	for _, rec := range records {
-		var c credentialRecord
-		if err := json.Unmarshal(rec.Data, &c); err != nil {
-			return fmt.Errorf("auth: corrupt credential record %q: %w", rec.ID, err)
-		}
-		if credentialRecordID(c.IdentityID) != rec.ID {
-			return fmt.Errorf("auth: credential record %q carries identity_id %q", rec.ID, c.IdentityID)
-		}
-		if strings.TrimSpace(c.IdentityID) == "" || strings.TrimSpace(c.Hash) == "" {
-			return fmt.Errorf("auth: invalid credential record %q", rec.ID)
-		}
-		if !c.Method.IsValid() {
-			return fmt.Errorf("auth: credential record %q carries unknown method %q", rec.ID, c.Method)
-		}
-		a.verifiers[c.IdentityID] = credentialVerifier{
-			identityID: c.IdentityID,
-			hash:       c.Hash,
-			method:     c.Method,
-		}
-	}
-	return nil
+	return &LocalAuthenticator{
+		svc: newAuthenticationService(repo, sha256Verifier{}),
+	}, nil
 }
 
 // SetClock injects a clock for deterministic tests.
 func (a *LocalAuthenticator) SetClock(now func() time.Time) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.now = now
+	a.svc.SetClock(now)
 }
 
 // SetTTL sets how long a successful authentication remains valid.
 func (a *LocalAuthenticator) SetTTL(d time.Duration) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.ttl = d
+	a.svc.SetTTL(d)
 }
 
 // SetRegistry wires the identity-record registry for status/expiry enforcement
 // (contract §2.4: an identity "ceases to be valid" at expires_at; §2.2 status
 // active is the only usable state). With a registry wired, authentication
 // fails closed when the identity record is missing, not active, or expired —
-// the credential alone no longer suffices.
+// the credential alone no longer suffices. A nil registry removes the binding.
 func (a *LocalAuthenticator) SetRegistry(r *Registry) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.registry = r
+	if r == nil {
+		a.svc.SetDirectory(nil)
+		return
+	}
+	a.svc.SetDirectory(registryDirectory{registry: r})
 }
 
 // Register records a verification hash for an identity. The raw credential is
 // hashed by the caller via security.HashCredential and is never stored here.
-//
-// Write-through order matches the registry: persist → memory, so a store
-// failure leaves the authenticator untouched (no credential that exists only
-// in memory). A nil store keeps the historical in-memory-only posture.
 func (a *LocalAuthenticator) Register(identityID string, credentialHash string, method AuthMethod) error {
-	if strings.TrimSpace(identityID) == "" {
-		return nerrors.Validation("auth.identity_required", "identity id is required for authentication registration")
-	}
-	if strings.TrimSpace(credentialHash) == "" {
-		return nerrors.Validation("auth.credential_hash_required", "credential hash is required")
-	}
-	// Reject at the write rather than at the next boot: an unknown method
-	// would otherwise be persisted happily and then fail hydration closed.
-	if !method.IsValid() {
-		return nerrors.Validation("auth.method_invalid",
-			fmt.Sprintf("auth method %q is not a canonical method", method))
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.st != nil {
-		rec, err := marshalRecord(store.RecordTypeCredential, credentialRecordID(identityID), "", "", credentialRecord{
-			SchemaVersion: credentialSchemaVersion,
-			EntityType:    entityTypeCredential,
-			IdentityID:    identityID,
-			Hash:          credentialHash,
-			Method:        method,
-		})
-		if err != nil {
-			return err
-		}
-		if err := persistRecord(a.st, rec); err != nil {
-			return err
-		}
-	}
-	a.verifiers[identityID] = credentialVerifier{identityID: identityID, hash: credentialHash, method: method}
-	return nil
+	return a.svc.Register(identityID, credentialHash, method)
 }
 
-// unknownIdentityHash is what an identity with no verifier is compared
-// against. The unknown-id path therefore performs the same SHA-256 and the
-// same constant-time compare as a known id with a wrong credential — without
-// it the skipped work is a timing oracle for which identity ids exist (F11).
-// It can never authenticate anyone: the !ok branch fails regardless of the
-// comparison result.
-var unknownIdentityHash = security.HashCredential([]byte("nexus:unknown-identity"))
-
-// Authenticate implements Authenticator. It fails closed: unknown identities,
-// empty credentials, mismatches, and unusable records all return a
-// non-authenticated result with the same canonical AUTH error, the same
-// reason and the same method — nothing in the result distinguishes which
-// check failed — and all of them cost the same amount of work.
+// Authenticate implements Authenticator. It fails closed with a uniform result
+// and error for every failure cause (see authenticationService.Authenticate).
 func (a *LocalAuthenticator) Authenticate(identityID string, credential []byte) (AuthResult, error) {
-	a.mu.RLock()
-	v, ok := a.verifiers[identityID]
-	nowFn := a.now
-	reg := a.registry
-	a.mu.RUnlock()
-
-	// Hash and compare unconditionally: the branch below must not change how
-	// much work an unknown identity costs (F11).
-	expected := unknownIdentityHash
-	if ok {
-		expected = v.hash
-	}
-	matched := security.ConstantTimeEqual(security.HashCredential(credential), expected)
-
-	if !ok || len(credential) == 0 || !matched {
-		// Uniform failure: reason, method and error are identical whatever
-		// the cause, so neither the response nor its cost leaks which
-		// identities exist or which check failed.
-		return AuthResult{
-			Authenticated: false,
-			IdentityID:    identityID,
-			Method:        AuthMethodNone,
-			Reason:        "authentication failed",
-		}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
-	}
-	now := nowFn()
-	if reg != nil {
-		// Fail closed: no record, non-active status, or past expires_at all
-		// deny with the same uniform error (never reveal which).
-		ident, found := reg.GetIdentity(identityID)
-		if !found || ident.Status != StatusActive ||
-			(ident.ExpiresAt != nil && !now.Before(*ident.ExpiresAt)) {
-			return AuthResult{
-				Authenticated: false,
-				IdentityID:    identityID,
-				Method:        AuthMethodNone,
-				Reason:        "authentication failed",
-			}, nerrors.New("auth.failed", nerrors.CategoryAuth, "authentication failed")
-		}
-	}
-	res := AuthResult{
-		Authenticated:   true,
-		IdentityID:      identityID,
-		Method:          v.method,
-		AuthenticatedAt: now,
-	}
-	if a.ttl > 0 {
-		res.ExpiresAt = now.Add(a.ttl)
-	}
-	return res, nil
+	return a.svc.Authenticate(identityID, credential)
 }
 
 // RequireAuthenticated returns a canonical AUTH error unless the identity is

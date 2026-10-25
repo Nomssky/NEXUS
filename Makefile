@@ -10,7 +10,7 @@ COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LDFLAGS  = -X github.com/Nomssky/NEXUS/internal/foundation/version.Version=$(VERSION)
 LDFLAGS += -X github.com/Nomssky/NEXUS/internal/foundation/version.Commit=$(COMMIT)
 
-.PHONY: help build build-backup build-retention release release-verify smoke run test test-race cover vet lint fmt fmt-check check clean
+.PHONY: help build build-backup build-retention release release-verify smoke run test test-race test-auth cover bench-auth fuzz-auth vet lint fmt fmt-check check clean
 
 help: ## Show this help.
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -46,6 +46,16 @@ test-race: ## Run tests with the race detector.
 cover: ## Run tests with coverage profile and summary.
 	$(GO) test -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -1
+
+test-auth: ## Run the authentication module suite with race + coverage.
+	$(GO) test -count=1 -race -covermode=atomic -coverprofile=coverage-auth.out ./internal/foundation/identity/
+	$(GO) tool cover -func=coverage-auth.out | tail -1
+
+bench-auth: ## Benchmark the authentication hot paths.
+	$(GO) test -run '^$$' -bench '^Benchmark' -benchtime=20x -benchmem ./internal/foundation/identity/
+
+fuzz-auth: ## Short fuzz smoke for the authentication module.
+	$(GO) test -run '^$$' -fuzz '^FuzzAuthenticateUnknownIdentity$$' -fuzztime 10s ./internal/foundation/identity/
 
 vet: ## Run static analysis (go vet).
 	$(GO) vet ./...
