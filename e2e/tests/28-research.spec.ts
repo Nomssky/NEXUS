@@ -668,6 +668,13 @@ test.describe('Research Workspace E2E', () => {
 
     const output = page.locator('section[aria-labelledby="research-output-heading"]');
 
+    // Wait for the execution to complete so the durable synthesis (loaded from
+    // the recovery detail) is rendered. The citation audit panel is only
+    // fetched once a durable synthesis exists.
+    await expect(output.getByRole('heading', { name: 'Research result', exact: true })).toBeVisible({
+      timeout: 30000,
+    });
+
     // The durable synthesis is present for a completed run, so the citation
     // audit panel is fetched on demand and rendered.
     const durableSynthesis = output.locator('[aria-label="Durable research synthesis"]');
