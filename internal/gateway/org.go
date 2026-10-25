@@ -401,16 +401,28 @@ func (s *Server) handleIdentityTransition(w http.ResponseWriter, r *http.Request
 		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "identity not found")
 		return
 	}
-	// §12.1 G1: the authority boundary is business-wide membership of the
-	// record's business (orgScopeVisible above enforces visibility and this
-	// membership). Self-transition of one's own identity is explicitly
+	// §12.1 G1: when enforcement is off there is no authenticated actor, so
+	// keep the pre-existing behavior (no membership gate). When enforcement is
+	// on, the actor is authenticated and we enforce business-wide membership
+	// of the record's business (orgScopeVisible above enforces visibility and
+	// this membership). Self-transition of one's own identity is explicitly
 	// allowed; transitioning another identity requires business-wide
-	// membership in that identity's business.
+	// membership in that identity's business. Global identities (no business)
+	// may be transitioned by any actor holding a business-wide membership in
+	// at least one business (§12.1 bootstrap recovery).
 	res, _ := actorFromContext(r.Context())
-	if res.IdentityID != ident.ID {
-		_, stopped := s.requireBusinessWideMembership(w, r, ident.BusinessID)
-		if stopped {
-			return
+	if s.identityEnforced() && res.IdentityID != ident.ID {
+		if ident.BusinessID == "" {
+			if s.memberships == nil || !s.memberships.HasAnyBusinessWideMembership(res.IdentityID) {
+				s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+					"access denied: actor has no business-wide membership")
+				return
+			}
+		} else {
+			_, stopped := s.requireBusinessWideMembership(w, r, ident.BusinessID)
+			if stopped {
+				return
+			}
 		}
 	}
 	updated, err := s.registry.SetIdentityStatus(id, to, res.IdentityID)

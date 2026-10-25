@@ -94,6 +94,18 @@ func NewMembershipSet() *MembershipSet {
 	return &MembershipSet{byIdentity: map[string][]Membership{}}
 }
 
+// Stored-envelope stamps for membership records (SCHEMA_COMMON §3.1).
+const (
+	membershipSchemaVersion = "1.0.0"
+	entityTypeMembership    = "membership"
+)
+
+// membershipRecordID namespaces the membership record id by type, matching the
+// credential adapter and SCHEMA_COMMON §7.
+func membershipRecordID(identityID string) string {
+	return entityTypeMembership + ":" + identityID
+}
+
 // membershipRecord is the stored form of one identity's memberships
 // (SCHEMA_IDENTITIES_ORG §10). One record per identity keeps the record id
 // equal to the identity id, which is already a valid store record id.
@@ -255,6 +267,22 @@ func (s *MembershipSet) AllowsScope(identityID, businessID, divisionID string) b
 // business level" (that is AllowsScope).
 func (s *MembershipSet) HasAnyMembership(identityID, businessID string) bool {
 	return s.IsMember(identityID, businessID, "")
+}
+
+// HasAnyBusinessWideMembership reports whether the identity holds an active
+// business-wide membership (empty division) in at least one business. It is
+// used to authorize transitions of global identities (e.g. bootstrap) that
+// are not bound to a single business (§12.1 G1).
+func (s *MembershipSet) HasAnyBusinessWideMembership(identityID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, m := range s.byIdentity[identityID] {
+		if m.Status != StatusActive || m.DivisionID != "" {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // CurrentBusiness resolves the active business context for an identity and
