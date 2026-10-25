@@ -668,17 +668,20 @@ test.describe('Research Workspace E2E', () => {
 
     const output = page.locator('section[aria-labelledby="research-output-heading"]');
 
-    // Wait for the execution to complete so the durable synthesis (loaded from
-    // the recovery detail) is rendered. The citation audit panel is only
-    // fetched once a durable synthesis exists.
+    // Wait for the execution to complete so the durable synthesis (loaded
+    // from the recovery detail) is rendered. The citation audit panel is
+    // only fetched once a durable synthesis exists. Poll because the durable
+    // synthesis loads asynchronously after the process-local result.
     await expect(output.getByRole('heading', { name: 'Research result', exact: true })).toBeVisible({
       timeout: 30000,
     });
 
-    // The durable synthesis is present for a completed run, so the citation
-    // audit panel is fetched on demand and rendered.
     const durableSynthesis = output.locator('[aria-label="Durable research synthesis"]');
-    await expect(durableSynthesis).toBeVisible({ timeout: 20000 });
+    await expect
+      .poll(async () => {
+        return (await durableSynthesis.count()) > 0 && (await durableSynthesis.isVisible());
+      }, { timeout: 30000, intervals: [250, 500, 1000] })
+      .toBe(true);
     await expect(durableSynthesis).toHaveAttribute('data-synthesis-status', 'complete');
 
     const audit = page.locator('section[aria-labelledby="research-citation-audit-heading"]');
