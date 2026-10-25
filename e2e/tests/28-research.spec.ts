@@ -689,8 +689,8 @@ test.describe('Research Workspace E2E', () => {
     // Clean state: citations resolved against the exact evidence snapshot,
     // evidence available, no structural finding.
     await expect(audit.getByText('Citation audit passed')).toBeVisible();
-    await expect(audit.getByText('Citation resolved')).toBeVisible();
-    await expect(audit.getByText('Evidence available')).toBeVisible();
+    await expect(audit.getByText('Citation resolved').first()).toBeVisible();
+    await expect(audit.getByText('Evidence available').first()).toBeVisible();
     // Explicit restraint: no truth or support claim.
     await expect(audit.getByText('Semantic support not verified.')).toBeVisible();
     await expect(audit).not.toContainText('%');
@@ -712,8 +712,8 @@ test.describe('Research Workspace E2E', () => {
     const recoveredAudit = page.locator('section[aria-labelledby="research-citation-audit-heading"]');
     await expect(recoveredAudit).toBeVisible({ timeout: 20000 });
     await expect(recoveredAudit.getByText('Citation audit passed')).toBeVisible();
-    await expect(recoveredAudit.getByText('Citation resolved')).toBeVisible();
-    await expect(recoveredAudit.getByText('Evidence available')).toBeVisible();
+    await expect(recoveredAudit.getByText('Citation resolved').first()).toBeVisible();
+    await expect(recoveredAudit.getByText('Evidence available').first()).toBeVisible();
     await expect(recoveredAudit.getByText('Semantic support not verified.')).toBeVisible();
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
