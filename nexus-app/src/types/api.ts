@@ -1045,6 +1045,112 @@ export interface ResearchComparison {
   truncated: boolean;
 }
 
+// ---- Research citation audit (v62) ----
+// A deterministic, on-demand projection over one durable synthesis and its
+// exact evidence snapshot. It reports structural citation resolution and
+// evidence availability only. It is not a truth, quality or entailment verdict.
+
+export type ResearchCitationAuditStatus =
+  | 'passed'
+  | 'warnings'
+  | 'failed'
+  | 'incomplete'
+  | 'unavailable'
+  | 'incompatible';
+
+export type ResearchCitationAuditClaimCategory =
+  | 'evidence_backed'
+  | 'conflict'
+  | 'inference'
+  | 'unresolved_question';
+
+export type ResearchCitationAuditCitationRequirement = 'required' | 'not_required';
+
+export type ResearchCitationAuditClaimStatus =
+  | 'passed'
+  | 'warnings'
+  | 'failed'
+  | 'unavailable'
+  | 'not_applicable';
+
+export type ResearchCitationAuditCitationStatus =
+  | 'resolved'
+  | 'unresolved'
+  | 'malformed'
+  | 'duplicate'
+  | 'ambiguous'
+  | 'unavailable';
+
+export type ResearchCitationAuditEvidenceStatus =
+  | 'available'
+  | 'missing'
+  | 'ambiguous'
+  | 'unavailable';
+
+export type ResearchCitationAuditProvenance =
+  | 'authoritative'
+  | 'derived'
+  | 'legacy'
+  | 'unavailable'
+  | 'not_applicable';
+
+export type ResearchCitationAuditSeverity = 'warning' | 'error';
+
+export interface ResearchCitationAuditCitation {
+  index: number;
+  /** The exact recorded reference. It is never trimmed, repaired or normalized. */
+  reference: string;
+  status: ResearchCitationAuditCitationStatus;
+  evidence_status: ResearchCitationAuditEvidenceStatus;
+  content_available: boolean;
+  metadata_available: boolean;
+  provenance: ResearchCitationAuditProvenance;
+}
+
+export interface ResearchCitationAuditClaim {
+  claim_id: string;
+  category: ResearchCitationAuditClaimCategory;
+  index: number;
+  text: string;
+  citation_requirement: ResearchCitationAuditCitationRequirement;
+  status: ResearchCitationAuditClaimStatus;
+  provenance: ResearchCitationAuditProvenance;
+  citations: ResearchCitationAuditCitation[];
+}
+
+export interface ResearchCitationAuditFinding {
+  code: string;
+  severity: ResearchCitationAuditSeverity;
+  claim_id?: string;
+  claim_index?: number;
+  citation_index?: number;
+  source_id?: string;
+  message: string;
+}
+
+export interface ResearchCitationAudit {
+  source: string;
+  version: 1;
+  method: 'deterministic_v1';
+  execution_id: string;
+  evidence_version: number;
+  evidence_fingerprint: string;
+  synthesis_version: number;
+  synthesis_method: string;
+  synthesis_fingerprint: string;
+  synthesis_status: ResearchSynthesisStatus | '';
+  plan_version: number;
+  plan_version_recorded: boolean;
+  evidence_plan_version: number;
+  evidence_plan_recorded: boolean;
+  provenance: 'derived';
+  status: ResearchCitationAuditStatus;
+  claims: ResearchCitationAuditClaim[];
+  findings: ResearchCitationAuditFinding[];
+  limitations: string[];
+  truncated: boolean;
+}
+
 // Error response wrapper
 export interface APIError extends Error {
   status: number;

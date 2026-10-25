@@ -28,6 +28,7 @@ import type {
   APIError,
   DurableExecution,
   DurableExecutionList,
+  ResearchCitationAudit,
   ResearchComparison,
   ResearchSynthesis,
   ResearchEvaluation,
@@ -282,6 +283,19 @@ class NexusAPIClient {
       right_execution_id: rightExecutionId,
     });
     return this.request<ResearchComparison>('GET', `/recovery/comparisons?${searchParams}`);
+  }
+
+  // On-demand citation audit for one durable synthesis. It is a bounded,
+  // read-only projection over the exact recorded evidence snapshot; no audit is
+  // persisted and no execution is mutated.
+  async getRecoveryCitationAudit(
+    id: string,
+    businessId: string
+  ): Promise<ResearchCitationAudit> {
+    return this.request<ResearchCitationAudit>(
+      'GET',
+      `/recovery/executions/${encodeURIComponent(id)}/audit?business_id=${businessId}`
+    );
   }
 
   // Approvals

@@ -15,6 +15,7 @@ import { ResearchInput } from '../components/Research/ResearchInput';
 import { ResearchOutput } from '../components/Research/ResearchOutput';
 import { ResearchEvidence } from '../components/Research/ResearchEvidence';
 import { ResearchComparison } from '../components/Research/ResearchComparison';
+import { ResearchCitationAudit } from '../components/Research/ResearchCitationAudit';
 import {
   queryKeys,
   useIntelligence,
@@ -416,6 +417,12 @@ const ResearchZone: React.FC<ResearchZoneProps> = ({
           />
         </section>
       </div>
+
+      <ResearchCitationAudit
+        businessId={businessId}
+        executionId={activeExecutionId}
+        synthesisAvailable={!!durableSynthesis}
+      />
 
       <ResearchComparison
         businessId={businessId}

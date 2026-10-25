@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/execjournal"
+	"github.com/Nomssky/NEXUS/internal/researchaudit"
 	"github.com/Nomssky/NEXUS/internal/researchcompare"
 )
 
@@ -21,9 +23,11 @@ const (
 	recoverySource       = "durable_journal"
 	recoveryDefaultLimit = 50
 	recoveryMaxLimit     = 200
-	// recoveryComparisonMaxID bounds a query-supplied execution id before any
+	// recoveryExecutionMaxID bounds a path/query-supplied execution id before any
 	// journal read. It is deliberately a little wider than generated ids.
-	recoveryComparisonMaxID = 512
+	recoveryExecutionMaxID = 512
+	// recoveryComparisonMaxID is retained for the v61 comparison contract.
+	recoveryComparisonMaxID = recoveryExecutionMaxID
 )
 
 // durableExecutionView is the allow-listed projection of a durable execution
@@ -182,6 +186,85 @@ func (s *Server) handleGetRecoveryExecution(w http.ResponseWriter, r *http.Reque
 	_ = json.NewEncoder(w).Encode(durableDetailView(rec))
 }
 
+// durableCitationAuditView is the allow-listed citation-audit envelope. The
+// audit contains bounded claim text, citation references and structural
+// findings only; it never contains source content, prompts, reasoning, actor
+// ids or raw durable bytes.
+type durableCitationAuditView struct {
+	Source string `json:"source"`
+	researchaudit.Audit
+}
+
+// handleGetRecoveryCitationAudit projects the deterministic citation audit for
+// one authorized durable synthesis. Missing synthesis is an authorized
+// `unavailable` audit; incompatible bindings are an authorized `incompatible`
+// audit. Unknown, foreign and out-of-scope records remain indistinguishable
+// (404), and a corrupt record or invalid projection fails closed (503).
+func (s *Server) handleGetRecoveryCitationAudit(w http.ResponseWriter, r *http.Request) {
+	businessID := r.URL.Query().Get("business_id")
+	if businessID == "" {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+	res, stopped := s.requireActorMembership(w, r, businessID)
+	if stopped {
+		return
+	}
+	id := r.PathValue("id")
+	if !validRecoveryExecutionID(id) {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "execution ID required and must be valid")
+		return
+	}
+	j, unavailable := s.journalOrUnavailable(w, r)
+	if unavailable {
+		return
+	}
+	rec, ok, err := j.Get(id)
+	if err != nil {
+		// Fail closed on a corrupt/unsupported record; never reinterpret it.
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE",
+			"durable execution record is unavailable")
+		return
+	}
+	if !ok || rec.BusinessID != businessID || rec.ID != id {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "durable execution record not found")
+		return
+	}
+	if !s.authorizeDivisionRead(res.IdentityID, businessID, rec.DivisionID) {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "durable execution record not found")
+		return
+	}
+	audit, err := citationAuditForRecord(id, rec)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "RESOURCE_UNAVAILABLE",
+			"durable citation audit is unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(durableCitationAuditView{
+		Source: recoverySource,
+		Audit:  audit,
+	})
+}
+
+// citationAuditForRecord is the pure projection used by the endpoint. Keeping
+// it separate makes the fail-closed boundary explicit: the audit is built only
+// from the exact persisted synthesis and evidence on the record, and an invalid
+// projection is never partially encoded.
+func citationAuditForRecord(executionID string, rec execjournal.ExecutionRecord) (researchaudit.Audit, error) {
+	if rec.ID != executionID {
+		return researchaudit.Audit{}, fmt.Errorf("gateway: record id does not match execution id")
+	}
+	audit, err := researchaudit.Build(executionID, rec.ResearchSynthesis, rec.ResearchEvidence)
+	if err != nil {
+		return researchaudit.Audit{}, err
+	}
+	if err := researchaudit.Validate(audit); err != nil {
+		return researchaudit.Audit{}, err
+	}
+	return audit, nil
+}
+
 // durableComparisonView is the allow-listed comparison envelope. The
 // comparison itself contains only bounded summaries and recorded differences;
 // it never includes raw evidence, synthesis prose, prompts, actor ids or
@@ -208,7 +291,7 @@ func (s *Server) handleCompareRecoveryExecutions(w http.ResponseWriter, r *http.
 	}
 	leftID := r.URL.Query().Get("left_execution_id")
 	rightID := r.URL.Query().Get("right_execution_id")
-	if !validComparisonExecutionID(leftID) || !validComparisonExecutionID(rightID) {
+	if !validRecoveryExecutionID(leftID) || !validRecoveryExecutionID(rightID) {
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION",
 			"left_execution_id and right_execution_id are required and must be valid")
 		return
@@ -262,8 +345,8 @@ func (s *Server) handleCompareRecoveryExecutions(w http.ResponseWriter, r *http.
 	})
 }
 
-func validComparisonExecutionID(id string) bool {
-	return id != "" && len(id) <= recoveryComparisonMaxID &&
+func validRecoveryExecutionID(id string) bool {
+	return id != "" && len(id) <= recoveryExecutionMaxID &&
 		!strings.ContainsAny(id, "\x00\n\r\t")
 }
 

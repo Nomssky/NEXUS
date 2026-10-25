@@ -640,6 +640,75 @@ test.describe('Research Workspace E2E', () => {
     await expect(output.getByText('Research failed')).toHaveCount(0);
   });
 
+  test('research workspace: citation audit renders clean state and survives restart', async ({ page }) => {
+    await page.context().addInitScript(({ actorID, credential, businessID }) => {
+      localStorage.setItem('nexus-auth', JSON.stringify({
+        actorID,
+        actorId: actorID,
+        credential,
+        businessID,
+        businessId: businessID,
+        controlKey: '',
+      }));
+    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
+
+    await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+
+    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
+    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
+    await page.click('button[type="submit"]', { timeout: 5000 });
+    await page.waitForFunction(() => {
+      const textarea = document.querySelector('textarea[placeholder*="research"]') as HTMLTextAreaElement | null;
+      return textarea?.value === '';
+    }, { timeout: 10000 });
+
+    const output = page.locator('section[aria-labelledby="research-output-heading"]');
+
+    // The durable synthesis is present for a completed run, so the citation
+    // audit panel is fetched on demand and rendered.
+    const durableSynthesis = output.locator('[aria-label="Durable research synthesis"]');
+    await expect(durableSynthesis).toBeVisible({ timeout: 20000 });
+    await expect(durableSynthesis).toHaveAttribute('data-synthesis-status', 'complete');
+
+    const audit = page.locator('section[aria-labelledby="research-citation-audit-heading"]');
+    await expect(audit).toBeVisible({ timeout: 20000 });
+    await expect(audit.getByRole('heading', { name: 'Citation Integrity Audit', exact: true })).toBeVisible();
+    // Clean state: citations resolved against the exact evidence snapshot,
+    // evidence available, no structural finding.
+    await expect(audit.getByText('Citation audit passed')).toBeVisible();
+    await expect(audit.getByText('Citation resolved')).toBeVisible();
+    await expect(audit.getByText('Evidence available')).toBeVisible();
+    // Explicit restraint: no truth or support claim.
+    await expect(audit.getByText('Semantic support not verified.')).toBeVisible();
+    await expect(audit).not.toContainText('%');
+    await expect(audit).not.toContainText('score');
+    await expect(audit).not.toContainText('verified facts');
+
+    // Real binary restart: process-local state is gone, only the durable
+    // journal survives. The audit is an on-demand projection, not polled, so
+    // it re-fetches against the same durable snapshot after reload.
+    await nexus.restart();
+
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('text=Command Input', { timeout: 15000 });
+    await page.getByRole('tablist', { name: 'Main navigation' })
+      .getByRole('tab', { name: 'Research', exact: true })
+      .click();
+    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+
+    const recoveredAudit = page.locator('section[aria-labelledby="research-citation-audit-heading"]');
+    await expect(recoveredAudit).toBeVisible({ timeout: 20000 });
+    await expect(recoveredAudit.getByText('Citation audit passed')).toBeVisible();
+    await expect(recoveredAudit.getByText('Citation resolved')).toBeVisible();
+    await expect(recoveredAudit.getByText('Evidence available')).toBeVisible();
+    await expect(recoveredAudit.getByText('Semantic support not verified.')).toBeVisible();
+    await expect(output.getByText('Research failed')).toHaveCount(0);
+  });
+
   test('research workspace: compares two settled runs without scores or inferred identity', async ({ page }) => {
     await page.context().addInitScript(({ actorID, credential, businessID }) => {
       localStorage.setItem('nexus-auth', JSON.stringify({

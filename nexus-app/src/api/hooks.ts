@@ -26,6 +26,7 @@ import type {
   PaginationParams,
   DurableExecution,
   DurableExecutionList,
+  ResearchCitationAudit,
   ResearchComparison,
 } from '../types/api';
 
@@ -50,6 +51,8 @@ export const queryKeys = {
     ['recoveryExecution', businessId, id] as const,
   recoveryComparison: (businessId: string, leftId: string, rightId: string) =>
     ['recoveryComparison', businessId, leftId, rightId] as const,
+  recoveryCitationAudit: (businessId: string, executionId: string) =>
+    ['recoveryCitationAudit', businessId, executionId] as const,
 };
 
 // Health & Status
@@ -296,6 +299,26 @@ export function useRecoveryComparison(
     retry: false,
     refetchOnWindowFocus: false,
     staleTime: 60_000,
+    ...options,
+  });
+}
+
+// On-demand citation audit for one durable synthesis. It is enabled only when
+// the workspace has already parsed a durable synthesis, never polls, and is
+// cached for the lifetime of the immutable snapshot. The client parser
+// re-validates the bounded response before rendering.
+export function useRecoveryCitationAudit(
+  executionId: string | null | undefined,
+  businessId: string,
+  options?: QueryOptions<ResearchCitationAudit>
+) {
+  return useQuery({
+    queryKey: queryKeys.recoveryCitationAudit(businessId, executionId || ''),
+    queryFn: () => apiClient.getRecoveryCitationAudit(executionId as string, businessId),
+    enabled: !!businessId && !!executionId,
+    retry: false,
+    refetchOnWindowFocus: false,
+    staleTime: Infinity,
     ...options,
   });
 }
