@@ -94,18 +94,6 @@ func NewMembershipSet() *MembershipSet {
 	return &MembershipSet{byIdentity: map[string][]Membership{}}
 }
 
-// Stored-envelope stamps for membership records (SCHEMA_COMMON §3.1).
-const (
-	membershipSchemaVersion = "1.0.0"
-	entityTypeMembership    = "membership"
-)
-
-// membershipRecordID namespaces the membership record id by type, matching the
-// credential adapter and SCHEMA_COMMON §7.
-func membershipRecordID(identityID string) string {
-	return entityTypeMembership + ":" + identityID
-}
-
 // membershipRecord is the stored form of one identity's memberships
 // (SCHEMA_IDENTITIES_ORG §10). One record per identity keeps the record id
 // equal to the identity id, which is already a valid store record id.
