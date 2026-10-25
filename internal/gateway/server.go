@@ -265,6 +265,7 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 
 	s.mux.HandleFunc("GET /api/v1/businesses", s.handleListBusinesses)
 	s.mux.HandleFunc("POST /api/v1/businesses", s.handleCreateBusiness)
+	s.mux.HandleFunc("POST /api/v1/businesses/{id}/members", s.handleCreateBusinessMember)
 	s.mux.HandleFunc("GET /api/v1/businesses/{id}", s.handleGetBusiness)
 	s.mux.HandleFunc("POST /api/v1/businesses/{id}/suspend",
 		func(w http.ResponseWriter, r *http.Request) {

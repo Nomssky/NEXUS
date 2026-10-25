@@ -85,6 +85,7 @@ authentication groups cover all of them:
 | `POST` | `/api/v1/identities/{id}/activate` | Reactivate an identity |
 | `GET` | `/api/v1/businesses` | List the businesses the actor belongs to |
 | `POST` | `/api/v1/businesses` | Onboard a business (bootstrap: membership-free) |
+| `POST` | `/api/v1/businesses/{id}/members` | Establish the owner's initial business-wide membership (onboarding) |
 | `GET` | `/api/v1/businesses/{id}` | Read one business |
 | `POST` | `/api/v1/businesses/{id}/suspend` | Suspend a business |
 | `POST` | `/api/v1/businesses/{id}/archive` | Archive a business |
@@ -463,7 +464,46 @@ Common rules:
 > identity every identity-scoped endpoint answers `401` until the data
 > directory is reset or enforcement is relaxed. The control API key and the
 > health surface are unaffected.
->
+
+#### POST /api/v1/businesses/{id}/members — initial membership (onboarding)
+
+Establishes the owner's initial business-wide membership in a business. This
+resolves the circular dependency of `POST /api/v1/businesses`: business
+creation is membership-free (the business does not exist yet), so the owner is
+not automatically enrolled. The owner claims their first membership here.
+
+Authorization:
+
+* **Authentication required.** The identity middleware binds the actor (A6); no
+  credentials → `401 UNAUTHORIZED`.
+* **Actor must be the `owner_identity_id`** recorded on the business. Any other
+  authenticated identity is refused `403 AUTHORIZATION` — no caller may enroll
+  arbitrary members in arbitrary businesses.
+* **Business must exist** (`404 VALIDATION`) and be `active` (G2 —
+  `409 CONFLICT` otherwise).
+* Idempotent: if the owner already holds a business-wide membership, this is a
+  no-op returning `200` (safe to retry after a transient failure or on a second
+  boot).
+
+Body: `{}` (empty). The response echoes `business_id`, `identity_id`, `role`
+(`OWNER`) and `status` (`active`). The role is descriptive only
+(MEMBERSHIP != AUTHORITY); it grants no governance permission.
+
+This is the supported path to make a newly created business usable by its
+owner: after this call, the owner can submit work, create divisions, and use
+every business-scoped endpoint for that business.
+
+| Status | Category | When |
+|---|---|---|
+| `200` | — | membership established (or already existed) |
+| `400` | `VALIDATION` | `business_id` missing |
+| `401` | `UNAUTHORIZED` | enforcement on, no/invalid credentials |
+| `403` | `AUTHORIZATION` | authenticated actor is not the business owner |
+| `404` | `VALIDATION` | unknown business |
+| `409` | `CONFLICT` | business is not `active` (G2) |
+| `503` | `DEPENDENCY_FAILURE` | membership store not configured |
+
+---
 
 `POST /api/v1/identities` body: `entity_id?`, `identity_type` (required,
 canonical), `display_name`, `status` (`active`/`pending` only at creation),

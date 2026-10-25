@@ -22,6 +22,7 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -478,6 +479,108 @@ func (s *Server) handleCreateBusiness(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(created)
+}
+
+// handleCreateBusinessMember establishes the initial membership for a
+// business. The authenticated actor must be the business's owner_identity_id.
+// This resolves the circular dependency: POST /api/v1/businesses is
+// membership-free (the business does not exist yet), so the owner is not
+// automatically enrolled; this endpoint lets the owner claim their first
+// business-wide membership. MEMBERSHIP != AUTHORITY — the OWNER role is
+// descriptive, not a governance grant.
+//
+// Authorization: authenticated actor == owner_identity_id; business exists
+// and is active (G2). Any other authenticated identity is refused (403) — no
+// caller may enroll arbitrary members in arbitrary businesses. When identity
+// enforcement is off there is no authenticated actor to verify, so the
+// endpoint fails closed (401).
+func (s *Server) handleCreateBusinessMember(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRegistry(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "business_id required")
+		return
+	}
+
+	// Identity-bound: the actor must be authenticated. When enforcement is
+	// off the middleware never binds an actor, so there is nothing to
+	// verify against the owner — fail closed.
+	res, ok := actorFromContext(r.Context())
+	if !ok || res.IdentityID == "" {
+		s.writeError(w, r, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	// Business must exist. Foreign-scope records answer 404 (no existence
+	// leak) — but here the id is in the path, so a missing business is just
+	// not found.
+	b, ok := s.registry.GetBusiness(id)
+	if !ok {
+		s.writeError(w, r, http.StatusNotFound, "VALIDATION", "business not found")
+		return
+	}
+
+	// G2: admission only into an active business.
+	if b.Status != identity.BusinessActive {
+		s.writeError(w, r, http.StatusConflict, "CONFLICT",
+			fmt.Sprintf("business %q is %s: no new membership is admitted", id, b.Status))
+		return
+	}
+
+	// Only the owner may establish the initial membership. The owner is a
+	// descriptive reference (§3.1), not authority; this check is the
+	// authorization boundary for the initial-membership operation itself.
+	if res.IdentityID != b.OwnerIdentityID {
+		s.writeError(w, r, http.StatusForbidden, "AUTHORIZATION",
+			"access denied: only the business owner may establish the initial membership")
+		return
+	}
+
+	if s.memberships == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "DEPENDENCY_FAILURE",
+			"membership store not configured")
+		return
+	}
+
+	// Idempotent: if the owner already holds a business-wide membership
+	// (second boot, retry after transient failure), this is a no-op.
+	// AllowsScope (not IsMember) is required here: IsMember would also match a
+	// division-scoped membership, which is not business-wide authority and must
+	// not short-circuit establishment of a business-wide membership (G3).
+	if s.memberships.AllowsScope(res.IdentityID, id, "") {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"business_id": id,
+			"identity_id": res.IdentityID,
+			"role":        string(identity.RoleOwner),
+			"status":      string(identity.StatusActive),
+		})
+		return
+	}
+
+	// Establish the membership (persist → memory, fail closed). A store
+	// failure leaves no membership that exists only in memory.
+	if err := s.memberships.Add(identity.Membership{
+		IdentityID: res.IdentityID,
+		BusinessID: id,
+		DivisionID: "", // business-wide scope
+		Role:       identity.RoleOwner,
+		Status:     identity.StatusActive,
+	}); err != nil {
+		s.writeInternal(w, r, http.StatusInternalServerError, "INTERNAL_FAILURE",
+			"membership add failed", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"business_id": id,
+		"identity_id": res.IdentityID,
+		"role":        string(identity.RoleOwner),
+		"status":      string(identity.StatusActive),
+	})
 }
 
 // handleListBusinesses lists businesses. With enforcement on the result is
