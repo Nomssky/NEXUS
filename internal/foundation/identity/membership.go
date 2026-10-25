@@ -104,6 +104,21 @@ type membershipRecord struct {
 	Memberships   []Membership `json:"memberships"`
 }
 
+// Stored-envelope stamps for membership records (SCHEMA_COMMON §3.1).
+const (
+	membershipSchemaVersion = "1.0.0"
+	entityTypeMembership    = "membership"
+)
+
+// Store record ids are unique across the whole store (Store.Get/Delete are
+// keyed by id alone, and FileStore keeps one index for every type), so a
+// membership record cannot reuse its identity's id. It is therefore namespaced
+// by type, mirroring the SCHEMA_COMMON §7 {prefix}:{type}:{unique} shape with
+// the identity id as the unique part.
+func membershipRecordID(identityID string) string {
+	return entityTypeMembership + ":" + identityID
+}
+
 // OpenMembershipSet constructs a write-through membership set: every Add is
 // persisted to st and the stored memberships are hydrated before
 // OpenMembershipSet returns. Hydration fails closed — a record that cannot be
