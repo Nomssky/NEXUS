@@ -279,7 +279,7 @@ func TestRecoveryCitationAuditAuthorizationAndExistenceNonDisclosure(t *testing.
 
 func TestRecoveryCitationAuditRestart(t *testing.T) {
 	dir := t.TempDir()
-	s1, e1, _ := newEvidenceServer(t, dir)
+	s1, e1, st1 := newEvidenceServer(t, dir)
 	evidence := gatewayComparisonEvidence("audit-restart")
 	synthesis := recoverySampleSynthesis("audit-restart", evidence)
 	seedGatewayComparisonRecord(t, e1.ExecutionJournal(),
@@ -291,6 +291,7 @@ func TestRecoveryCitationAuditRestart(t *testing.T) {
 		t.Fatalf("first audit = %+v", first.Audit)
 	}
 
+	closeStore(t, st1)
 	s2, _, _ := newEvidenceServer(t, dir)
 	w2 := evidenceGet(t, s2, gatewayAuditPath("audit-restart"), wideHeaders())
 	second := decodeCitationAudit(t, w2)

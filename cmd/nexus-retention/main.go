@@ -87,7 +87,7 @@ Notes:
 `)
 }
 
-func cmdRun(args []string, apply bool) int {
+func cmdRun(args []string, apply bool) (code int) {
 	mode := "plan"
 	if apply {
 		mode = "apply"
@@ -124,43 +124,65 @@ func cmdRun(args []string, apply bool) int {
 	// Operational accounting (v15): the run is timestamped and timed so an
 	// operator can correlate it with the durable evidence it reports. The clock
 	// is read once, here, and is never a metric claim.
+	//
+	// The store is closed before the report is printed so a failure to release
+	// ownership is reflected in the printed outcome and the exit code. Opening
+	// the store (creating the lock marker, tightening dirs, replaying a stale
+	// journal) touches the filesystem, so "plan" means "no records are deleted"
+	// rather than "no filesystem state is touched at all".
 	runAt := time.Now().UTC()
 	start := time.Now()
 
+	var (
+		rep     execjournal.RetentionReport
+		outcome = "ok"
+		deleted bool
+	)
+
 	if !apply {
-		rep, err := journal.PlanRetention(policy)
+		rep, err = journal.PlanRetention(policy)
 		if err != nil {
+			_ = st.Close()
 			fmt.Fprintf(os.Stderr, "nexus-retention plan: %v\n", err)
-			fmt.Fprintf(os.Stderr, "  outcome: FAILED — nothing was changed (plan is strictly non-mutating)\n")
+			fmt.Fprintf(os.Stderr, "  outcome: FAILED — nothing was changed (plan deletes no records)\n")
 			fmt.Fprintf(os.Stderr, "  duration: %s\n", time.Since(start).Round(time.Millisecond))
 			return 1
 		}
-		printReport(reportArgs{
-			mode: "plan", kind: "dry-run", policy: policy,
-			rep: rep, at: runAt, dur: time.Since(start), outcome: "ok",
-			deleted: false,
-		})
-		return 0
+		deleted = false
+	} else {
+		fmt.Printf("nexus-retention apply: removing terminal records older than %s (batch ≤ %d) — DESTRUCTIVE\n", age, *batch)
+		rep, err = journal.ApplyRetention(policy)
+		if err != nil {
+			_ = st.Close()
+			fmt.Fprintf(os.Stderr, "nexus-retention apply: %v\n", err)
+			// A failed batch is never reported as a deletion. DeleteBatchHard
+			// either rolls the batch back inline or leaves the batch journal for
+			// the next store open, which replays it as a rollback — so a failure
+			// means the removal is NOT durably applied.
+			fmt.Fprintf(os.Stderr, "  outcome: FAILED — no deletion is durably applied; an interrupted batch is rolled back when the store is next opened\n")
+			fmt.Fprintf(os.Stderr, "  duration: %s\n", time.Since(start).Round(time.Millisecond))
+			return 1
+		}
+		deleted = true
 	}
 
-	fmt.Printf("nexus-retention apply: removing terminal records older than %s (batch ≤ %d) — DESTRUCTIVE\n", age, *batch)
-	rep, err := journal.ApplyRetention(policy)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "nexus-retention apply: %v\n", err)
-		// A failed batch is never reported as a deletion. DeleteBatchHard
-		// either rolls the batch back inline or leaves the batch journal for
-		// the next store open, which replays it as a rollback — so a failure
-		// means the removal is NOT durably applied.
-		fmt.Fprintf(os.Stderr, "  outcome: FAILED — no deletion is durably applied; an interrupted batch is rolled back when the store is next opened\n")
-		fmt.Fprintf(os.Stderr, "  duration: %s\n", time.Since(start).Round(time.Millisecond))
-		return 1
+	// Release ownership before reporting. If release fails, the outcome is
+	// "failed" and the exit code is non-zero even though the durable work
+	// itself succeeded.
+	if cerr := st.Close(); cerr != nil {
+		outcome = "failed"
+		code = 1
+		fmt.Fprintf(os.Stderr, "nexus-retention %s: release store ownership: %v\n", mode, cerr)
 	}
+
 	printReport(reportArgs{
-		mode: "apply", kind: "applied", policy: policy,
-		rep: rep, at: runAt, dur: time.Since(start), outcome: "ok",
-		deleted: true,
+		mode:   mode,
+		kind:   map[bool]string{true: "applied", false: "dry-run"}[deleted],
+		policy: policy,
+		rep:    rep, at: runAt, dur: time.Since(start), outcome: outcome,
+		deleted: deleted,
 	})
-	return 0
+	return code
 }
 
 // reportArgs carries everything the operator output needs. It exists so the

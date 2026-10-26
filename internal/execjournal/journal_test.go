@@ -179,6 +179,9 @@ func TestDurableAcrossFileStoreReopen(t *testing.T) {
 	}
 
 	// "Restart": open a fresh store over the same directory and recover.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStoreWithClock(dir, fixedClock())
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -383,6 +386,9 @@ func TestAcceptedCannotEraseARecoveredUnknownRecord(t *testing.T) {
 		t.Fatalf("accepted: %v", err)
 	}
 	// "Restart": reopen and recover — the accepted record becomes unknown.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStoreWithClock(dir, fixedClock())
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -442,7 +448,8 @@ func equalStrings(a, b []string) bool {
 // and the completion is the truthful durable outcome.
 func TestApprovalHistorySurvivesCompletionAndRestart(t *testing.T) {
 	dir := t.TempDir()
-	j := New(mustStore(t, dir), fixedClock())
+	st := mustStore(t, dir)
+	j := New(st, fixedClock())
 	if err := j.Accepted("exec-a", "biz-1", "", "actor-1"); err != nil {
 		t.Fatalf("accepted: %v", err)
 	}
@@ -461,6 +468,9 @@ func TestApprovalHistorySurvivesCompletionAndRestart(t *testing.T) {
 		t.Fatalf("supersede: %v", err)
 	}
 
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	j2 := reopenJournal(t, dir)
 	rec, ok, err := j2.Get("exec-a")
 	if err != nil || !ok {
@@ -482,7 +492,8 @@ func TestApprovalHistorySurvivesCompletionAndRestart(t *testing.T) {
 // execution is terminally failed FOR THE DENIAL, not for the pause.
 func TestDenialIsDurablyRecordedWithTruthfulTerminal(t *testing.T) {
 	dir := t.TempDir()
-	j := New(mustStore(t, dir), fixedClock())
+	st := mustStore(t, dir)
+	j := New(st, fixedClock())
 	if err := j.Accepted("exec-d", "biz-1", "", "actor-1"); err != nil {
 		t.Fatalf("accepted: %v", err)
 	}
@@ -499,6 +510,9 @@ func TestDenialIsDurablyRecordedWithTruthfulTerminal(t *testing.T) {
 		t.Fatalf("supersede on denial: %v", err)
 	}
 
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	j2 := reopenJournal(t, dir)
 	rec, _, _ := j2.Get("exec-d")
 	if rec.State != StateFailed || rec.ErrorClass != ApprovalDeniedClass {
@@ -685,7 +699,9 @@ func TestAbandonedApprovalIsRetentionEligible(t *testing.T) {
 }
 
 // mustStore opens a real FileStore over dir for a test that later reopens it.
-func mustStore(t *testing.T, dir string) store.Store {
+// It returns the concrete type so callers can release ownership before the
+// next open of the same directory.
+func mustStore(t *testing.T, dir string) *store.FileStore {
 	t.Helper()
 	st, err := store.NewFileStoreWithClock(dir, fixedClock())
 	if err != nil {
@@ -960,6 +976,9 @@ func TestTerminalWithEvidenceSurvivesReopen(t *testing.T) {
 	}
 
 	// Restart: reopen the same durable directory with a fresh journal.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -1003,6 +1022,9 @@ func TestTerminalWithResearchProvenanceSurvivesReopen(t *testing.T) {
 		t.Fatalf("provenance not recorded: %+v", rec.ResearchEvidence)
 	}
 
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)

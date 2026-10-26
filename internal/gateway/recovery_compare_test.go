@@ -517,7 +517,7 @@ func TestRecoveryComparisonEligibilityAndValidation(t *testing.T) {
 
 func TestRecoveryComparisonSurvivesRestart(t *testing.T) {
 	dir := t.TempDir()
-	s1, e1, _ := newEvidenceServer(t, dir)
+	s1, e1, st1 := newEvidenceServer(t, dir)
 	j1 := e1.ExecutionJournal()
 	left := gatewayComparisonRecord("cmp-left")
 	right := gatewayComparisonRecord("cmp-right")
@@ -527,6 +527,7 @@ func TestRecoveryComparisonSurvivesRestart(t *testing.T) {
 	w1 := evidenceGet(t, s1, path, wideHeaders())
 	decodeComparison(t, w1)
 
+	closeStore(t, st1)
 	s2, _, _ := newEvidenceServer(t, dir)
 	w2 := evidenceGet(t, s2, path, wideHeaders())
 	decodeComparison(t, w2)

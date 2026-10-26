@@ -32,6 +32,9 @@ func seedOldTerminal(t *testing.T, dir, id string) string {
 		Status: store.RecordStatusActive, BusinessID: "biz-1", Data: data}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
 	return filepath.Join(dir, "execution", "nexus.execution:"+id+".json")
 }
 
@@ -311,6 +314,9 @@ func seedTerminalAt(t *testing.T, dir, id string, ts time.Time) string {
 	if err := st.Put(&store.Record{ID: "nexus.execution:" + id, Type: "execution",
 		Status: store.RecordStatusActive, BusinessID: "biz-1", Data: data}); err != nil {
 		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
 	}
 	return filepath.Join(dir, "execution", "nexus.execution:"+id+".json")
 }

@@ -48,6 +48,14 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "nexus: startup aborted: %s\n", safeMessage(err))
 		return int(lifecycle.ExitFailure)
 	}
+	// Release storage ownership on every exit after the store opened,
+	// including failures below this point and before the launcher hooks exist.
+	// Idempotent: orderly shutdown already closed it.
+	defer func() {
+		if cerr := a.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "nexus: release storage ownership: %v\n", cerr)
+		}
+	}()
 
 	cfg := a.Config()
 	log := a.Logger()

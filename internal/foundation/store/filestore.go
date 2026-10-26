@@ -30,32 +30,82 @@ type FileStore struct {
 	// index caches all records in memory for fast List/Count.
 	// Writes are flushed to disk. Reads serve from cache.
 	index map[string]*Record // id -> record
+
+	// ownership is the OS-level single-writer lock. It is held from
+	// construction until Close, and is released by the kernel even if the
+	// process crashes.
+	ownership *storageOwnership
+	closeOnce sync.Once
+	closed    bool
+	closeErr  error
 }
 
 // NewFileStore creates a new FileStore rooted at the given directory.
 // The directory is created if it doesn't exist.
+//
+// Exactly one live process may own a storage directory. Construction acquires
+// an OS advisory lock before any record is read; a second process fails closed
+// with ErrStorageOwned and, when Close is not called, the kernel releases the
+// lock on process exit.
 func NewFileStore(dir string) (*FileStore, error) {
 	return NewFileStoreWithClock(dir, time.Now)
 }
 
 // NewFileStoreWithClock creates a new FileStore with an injectable clock.
 func NewFileStoreWithClock(dir string, now func() time.Time) (*FileStore, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("filestore: create dir: %w", err)
+	canonical, err := prepareStorageDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("filestore: %w", err)
+	}
+	ownership, err := acquireStorageOwnership(canonical)
+	if err != nil {
+		return nil, fmt.Errorf("filestore: %w", err)
+	}
+	if err := tightenStorageDir(canonical); err != nil {
+		_ = ownership.Close()
+		return nil, fmt.Errorf("filestore: %w", err)
 	}
 
 	fs := &FileStore{
-		dir:   dir,
-		now:   now,
-		index: make(map[string]*Record),
+		dir:       canonical,
+		now:       now,
+		index:     make(map[string]*Record),
+		ownership: ownership,
 	}
 
-	// Load existing records from disk
+	// Load existing records from disk. A partial or failing load must not
+	// retain ownership: release it before returning the primary error.
 	if err := fs.loadAll(); err != nil {
+		_ = ownership.Close()
 		return nil, fmt.Errorf("filestore: load: %w", err)
 	}
 
 	return fs, nil
+}
+
+// Close releases exclusive storage ownership. It is idempotent and safe to
+// call after a startup failure. Once closed, record operations fail instead of
+// writing without ownership.
+func (fs *FileStore) Close() error {
+	fs.closeOnce.Do(func() {
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+		fs.closed = true
+		if fs.ownership != nil {
+			fs.closeErr = fs.ownership.Close()
+			fs.ownership = nil
+		}
+	})
+	return fs.closeErr
+}
+
+// ensureOpen reports whether the store still owns its directory. Callers must
+// hold fs.mu (read or write).
+func (fs *FileStore) ensureOpen() error {
+	if fs.closed {
+		return &StoreError{Code: "STORE_CLOSED", Message: "store is closed"}
+	}
+	return nil
 }
 
 // Put stores a record. If the record exists, it is updated with
@@ -67,9 +117,18 @@ func (fs *FileStore) Put(record *Record) error {
 	if record.ID == "" {
 		return &StoreError{Code: "INVALID_RECORD", Message: "record ID required"}
 	}
+	if !validStoreComponent(string(record.Type)) {
+		return &StoreError{Code: "INVALID_RECORD", Message: "record type is not a safe path component"}
+	}
+	if !validStoreComponent(record.ID) {
+		return &StoreError{Code: "INVALID_RECORD", Message: "record ID is not a safe path component"}
+	}
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if err := fs.ensureOpen(); err != nil {
+		return err
+	}
 
 	now := fs.now()
 
@@ -110,6 +169,9 @@ func (fs *FileStore) Put(record *Record) error {
 func (fs *FileStore) Get(id string) (*Record, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
+	if err := fs.ensureOpen(); err != nil {
+		return nil, err
+	}
 
 	record, ok := fs.index[id]
 	if !ok {
@@ -129,6 +191,9 @@ func (fs *FileStore) Get(id string) (*Record, error) {
 func (fs *FileStore) Delete(id string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if err := fs.ensureOpen(); err != nil {
+		return err
+	}
 
 	record, ok := fs.index[id]
 	if !ok {
@@ -177,6 +242,9 @@ func (fs *FileStore) DeleteBatch(ids []string) error {
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if err := fs.ensureOpen(); err != nil {
+		return err
+	}
 
 	// Validate the whole batch before mutating anything.
 	unique := make([]string, 0, len(ids))
@@ -326,6 +394,9 @@ func (fs *FileStore) DeleteBatchHard(ids []string) error {
 
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	if err := fs.ensureOpen(); err != nil {
+		return err
+	}
 
 	// Validate the whole batch before mutating anything.
 	unique := make([]string, 0, len(ids))
@@ -361,6 +432,19 @@ func (fs *FileStore) DeleteBatchHard(ids []string) error {
 	// Remove the files. On failure, restore the pre-batch state synchronously
 	// and drop the journal — the batch is entirely unapplied.
 	for i, p := range paths {
+		if info, lerr := os.Lstat(p); lerr == nil {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return &StoreError{
+					Code:    "IO_ERROR",
+					Message: fmt.Sprintf("hard delete batch unlink %s: target is not a regular file", originals[i].ID),
+				}
+			}
+		} else if !os.IsNotExist(lerr) {
+			return &StoreError{
+				Code:    "IO_ERROR",
+				Message: fmt.Sprintf("hard delete batch unlink %s: inspect target: %v", originals[i].ID, lerr),
+			}
+		}
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			for j := 0; j <= i; j++ {
 				if rerr := fs.writeRecord(originals[j]); rerr != nil {
@@ -453,7 +537,7 @@ func (fs *FileStore) publishBatchJournal(records []*Record) error {
 		_ = os.Remove(tmpName)
 		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal close: %v", err)}
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		_ = os.Remove(tmpName)
 		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("batch journal chmod: %v", err)}
 	}
@@ -487,6 +571,16 @@ func (fs *FileStore) removeBatchJournal() error {
 // is never exposed silently.
 func (fs *FileStore) recoverInterruptedBatch() error {
 	path := filepath.Join(fs.dir, batchJournalName)
+	if info, lerr := os.Lstat(path); lerr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return &StoreError{Code: "CORRUPT_RECORD", Message: "batch journal is a symlink: " + path}
+		}
+		if !info.Mode().IsRegular() {
+			return &StoreError{Code: "CORRUPT_RECORD", Message: "batch journal is not a regular file: " + path}
+		}
+	} else if !os.IsNotExist(lerr) {
+		return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("inspect batch journal: %v", lerr)}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -507,6 +601,9 @@ func (fs *FileStore) recoverInterruptedBatch() error {
 	for i := range j.Records {
 		if strings.TrimSpace(j.Records[i].ID) == "" || j.Records[i].Type == "" {
 			return &StoreError{Code: "CORRUPT_RECORD", Message: "batch journal carries an incomplete record"}
+		}
+		if !validStoreComponent(j.Records[i].ID) || !validStoreComponent(string(j.Records[i].Type)) {
+			return &StoreError{Code: "CORRUPT_RECORD", Message: "batch journal carries an unsafe record id/type"}
 		}
 		if err := fs.writeRecord(&j.Records[i]); err != nil {
 			return err
@@ -540,6 +637,9 @@ func syncDir(dir string) error {
 func (fs *FileStore) List(filter Filter) ([]*Record, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
+	if err := fs.ensureOpen(); err != nil {
+		return nil, err
+	}
 
 	var results []*Record
 	for _, r := range fs.index {
@@ -572,6 +672,9 @@ func (fs *FileStore) List(filter Filter) ([]*Record, error) {
 func (fs *FileStore) Count(filter Filter) (int, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
+	if err := fs.ensureOpen(); err != nil {
+		return 0, err
+	}
 
 	count := 0
 	for _, r := range fs.index {
@@ -586,6 +689,9 @@ func (fs *FileStore) Count(filter Filter) (int, error) {
 func (fs *FileStore) CountAll() int {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
+	if fs.closed {
+		return 0
+	}
 	return len(fs.index)
 }
 
@@ -624,9 +730,9 @@ func (fs *FileStore) recordPath(record *Record) string {
 // publishes it with os.Rename, which is what makes the publish atomic; a
 // batch stages every record before publishing any of them.
 func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, err error) {
-	typeDir := filepath.Join(fs.dir, string(record.Type))
-	if err := os.MkdirAll(typeDir, 0o755); err != nil {
-		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
+	typeDir, err := fs.ensureTypeDir(string(record.Type))
+	if err != nil {
+		return "", "", err
 	}
 
 	path = fs.recordPath(record)
@@ -653,11 +759,37 @@ func (fs *FileStore) stageRecord(record *Record) (tmpName string, path string, e
 	if err := tmp.Close(); err != nil {
 		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("close: %v", err)}
 	}
-	// Match the historical permissions of direct writes (os.WriteFile 0644).
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	// Stored records, including credential verification hashes and
+	// organizational state, are owner-only. This applies to new writes; open
+	// never rewrites the mode of existing record files.
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return "", "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("chmod: %v", err)}
 	}
 	return tmpName, path, nil
+}
+
+// ensureTypeDir returns the type directory, creating it with owner-only
+// permissions when absent. It refuses symlinks and non-directories so a
+// record write cannot be redirected outside the owned root.
+func (fs *FileStore) ensureTypeDir(name string) (string, error) {
+	if !validStoreComponent(name) {
+		return "", &StoreError{Code: "INVALID_RECORD", Message: "record type is not a safe path component"}
+	}
+	typeDir := filepath.Join(fs.dir, name)
+	if err := os.Mkdir(typeDir, 0o700); err != nil && !os.IsExist(err) {
+		return "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("create dir: %v", err)}
+	}
+	info, err := os.Lstat(typeDir)
+	if err != nil {
+		return "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("inspect type dir: %v", err)}
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("type dir %s is not a directory", typeDir)}
+	}
+	if err := tightenStorageDir(typeDir); err != nil {
+		return "", &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("restrict type dir: %v", err)}
+	}
+	return typeDir, nil
 }
 
 // loadAll loads all records from disk into the index.
@@ -685,16 +817,34 @@ func (fs *FileStore) loadAll() error {
 	}
 
 	for _, entry := range entries {
+		if entry.Name() == storageLockName {
+			continue // ownership marker, not a record directory
+		}
+		if entry.Name() == sandboxDirName {
+			continue // filesystem sandbox is not store data
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("refusing symlink %q in data root", entry.Name())}
+		}
 		if !entry.IsDir() {
 			continue
 		}
 		typeDir := filepath.Join(fs.dir, entry.Name())
+		if err := tightenStorageDir(typeDir); err != nil {
+			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("restrict type dir %s: %v", typeDir, err)}
+		}
 		files, err := os.ReadDir(typeDir)
 		if err != nil {
 			return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("read dir %s: %v", typeDir, err)}
 		}
 
 		for _, f := range files {
+			// A record file must never be a symlink: reading one could leak
+			// data outside the owned root, and silently skipping it would hide
+			// durable state and violate fail-closed hydration.
+			if f.Type()&os.ModeSymlink != 0 {
+				return &StoreError{Code: "IO_ERROR", Message: fmt.Sprintf("refusing symlink %q in %s", f.Name(), typeDir)}
+			}
 			if f.IsDir() || filepath.Ext(f.Name()) != ".json" {
 				continue
 			}
@@ -710,6 +860,9 @@ func (fs *FileStore) loadAll() error {
 			}
 			if record.ID == "" {
 				return &StoreError{Code: "CORRUPT_RECORD", Message: fmt.Sprintf("parse %s: record id is empty", path)}
+			}
+			if !validStoreComponent(record.ID) || !validStoreComponent(string(record.Type)) {
+				return &StoreError{Code: "CORRUPT_RECORD", Message: fmt.Sprintf("parse %s: record id/type is not a safe path component", path)}
 			}
 
 			fs.index[record.ID] = &record

@@ -26,6 +26,9 @@ func seedHardDeleteStore(t *testing.T, dir string) {
 			t.Fatalf("put %s: %v", id, err)
 		}
 	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
 }
 
 func TestRestoreRecoversInterruptedHardDeleteBatch(t *testing.T) {

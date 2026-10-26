@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+func closeStore(t *testing.T, fs *FileStore) {
+	t.Helper()
+	if err := fs.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+}
+
 func TestFileStorePutGet(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
@@ -187,7 +194,7 @@ func TestFileStorePersistence(t *testing.T) {
 	fs1, _ := NewFileStoreWithClock(dir, func() time.Time { return now })
 	fs1.Put(&Record{ID: "r1", Type: "test", Status: RecordStatusActive, Data: []byte("hello")})
 	fs1.Put(&Record{ID: "r2", Type: "test", Status: RecordStatusActive, Data: []byte("world")})
-	fs1 = nil // close/destroy
+	closeStore(t, fs1)
 
 	// Create new store from same directory — should load records
 	fs2, err := NewFileStoreWithClock(dir, func() time.Time { return now })
@@ -216,7 +223,7 @@ func TestFileStorePersistenceByType(t *testing.T) {
 
 	fs.Put(&Record{ID: "r1", Type: "workflow", Status: RecordStatusActive})
 	fs.Put(&Record{ID: "r2", Type: "task", Status: RecordStatusActive})
-	fs = nil
+	closeStore(t, fs)
 
 	// Verify directory structure
 	_, err := os.Stat(filepath.Join(dir, "workflow", "r1.json"))
@@ -343,6 +350,7 @@ func TestFileStoreAtomicWrite(t *testing.T) {
 	}
 
 	// Contents are the complete updated record.
+	closeStore(t, fs)
 	reopened, err := NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -411,6 +419,7 @@ func TestFileStoreDeleteBatchIsAllOrNothing(t *testing.T) {
 		}
 	}
 	// The batch survives a reopen: the mirror really was published.
+	closeStore(t, fs)
 	reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
@@ -455,6 +464,8 @@ func seedInterruptedBatch(t *testing.T, dir string, originals []*Record, replace
 	if err := os.WriteFile(filepath.Join(dir, batchJournalName), jdata, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Simulate the crash: release ownership so the next open is a fresh boot.
+	closeStore(t, fs)
 	// Simulate the crash: the target file for ONE member was already replaced
 	// by its deleted version, the journal says it was in flight, and the
 	// directory entries were never cleaned up.
@@ -500,6 +511,7 @@ func TestFileStoreRecoversInterruptedBatchToPreBatch(t *testing.T) {
 		t.Fatalf("the journal must be removed after recovery, stat err=%v", err)
 	}
 	// And the pre-batch state is what a later reader — after a second open — sees.
+	closeStore(t, fs)
 	reopened, err := NewFileStoreWithClock(dir, time.Now)
 	if err != nil {
 		t.Fatalf("second open: %v", err)
@@ -549,6 +561,7 @@ func TestFileStoreFailClosedOnCorruptBatchJournal(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, batchJournalName), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	closeStore(t, fs)
 	if _, err := NewFileStore(dir); err == nil {
 		t.Fatal("a parseable-corrupt batch journal must abort the open")
 	}
@@ -583,6 +596,7 @@ func TestFileStoreBatchOutcomeIsStableAcrossRestart(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, batchJournalName)); !os.IsNotExist(err) {
 		t.Fatal("a committed batch must not leave a journal behind")
 	}
+	closeStore(t, fs)
 	reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)

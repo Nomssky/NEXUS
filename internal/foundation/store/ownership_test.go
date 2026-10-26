@@ -221,6 +221,7 @@ func TestOwnershipSurvivesFileStoreReopen(t *testing.T) {
 	got.Data[0] = 'X'
 	*got.ExpiresAt = time.Unix(0, 0)
 
+	closeStore(t, fs)
 	fs2, err := NewFileStoreWithClock(dir, clk)
 	if err != nil {
 		t.Fatal(err)

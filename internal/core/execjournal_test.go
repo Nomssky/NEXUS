@@ -15,6 +15,13 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
+func closeStoreFile(t *testing.T, st *store.FileStore) {
+	t.Helper()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+}
+
 // The engine durably records acceptance before the caller is told the
 // execution exists, and the terminal state after the result is stored.
 func TestEngineJournalAcceptAndTerminal(t *testing.T) {
@@ -145,6 +152,7 @@ func TestEngineRefusesATerminalExecutionIDAfterRestart(t *testing.T) {
 	if rec, _, _ := j.Get("exec-across-restart"); rec.State != execjournal.StateCompleted {
 		t.Fatalf("the execution must be durably terminal before the restart, got %q", rec.State)
 	}
+	closeStoreFile(t, st)
 
 	// "Restart": a brand-new store, journal and engine over the same directory,
 	// with the same caller-supplied execution id.
@@ -189,7 +197,7 @@ func TestEngineRefusesATerminalExecutionIDAfterRestart(t *testing.T) {
 // durably "failed" forever. This asserts the approved policy using only the
 // existing journal API, so it fails against the current implementation.
 
-func newJournaledGateEngine(t *testing.T) (*Engine, *execjournal.Journal, *actionGateHandler, string) {
+func newJournaledGateEngine(t *testing.T) (*Engine, *execjournal.Journal, *actionGateHandler, string, *store.FileStore) {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.NewFileStore(dir)
@@ -208,13 +216,16 @@ func newJournaledGateEngine(t *testing.T) (*Engine, *execjournal.Journal, *actio
 	if err := e.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	t.Cleanup(func() { _ = e.Stop(context.Background()) })
+	t.Cleanup(func() {
+		_ = e.Stop(context.Background())
+		_ = st.Close()
+	})
 	h.engine = e
-	return e, j, h, dir
+	return e, j, h, dir, st
 }
 
 func TestResumedCompletionRecordsTheTruthfulDurableOutcome(t *testing.T) {
-	e, j, h, dir := newJournaledGateEngine(t)
+	e, j, h, dir, st := newJournaledGateEngine(t)
 
 	submitActionRequest(t, e, h, "exec-approve", "user-1")
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-approve"))
@@ -259,6 +270,7 @@ func TestResumedCompletionRecordsTheTruthfulDurableOutcome(t *testing.T) {
 
 	// And both approval facts must still be there after the outcome, proven by
 	// reopening the real store rather than reading a process-local map.
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -277,7 +289,7 @@ func TestResumedCompletionRecordsTheTruthfulDurableOutcome(t *testing.T) {
 // A denial is durable: after a restart the record says the execution was denied
 // and carries that fact, rather than still claiming to await an approval.
 func TestDeniedApprovalIsDurablyRecorded(t *testing.T) {
-	e, j, h, dir := newJournaledGateEngine(t)
+	e, j, h, dir, st := newJournaledGateEngine(t)
 
 	submitActionRequest(t, e, h, "exec-denied", "user-1")
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-denied"))
@@ -313,6 +325,7 @@ func TestDeniedApprovalIsDurablyRecorded(t *testing.T) {
 		t.Fatalf("a denial must be recorded immediately, got %q", live.ErrorClass)
 	}
 
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -461,13 +474,14 @@ func TestPauseWithoutApprovalHistoryIsTerminal(t *testing.T) {
 // Restart while an approval is pending must not imply the execution can resume:
 // the approval state is process-local, so the pause is final and unresumable.
 func TestRestartWhileApprovalPendingDoesNotClaimResumability(t *testing.T) {
-	e, _, h, dir := newJournaledGateEngine(t)
+	e, _, h, dir, st := newJournaledGateEngine(t)
 
 	submitActionRequest(t, e, h, "exec-pending", "user-1")
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-pending"))
 	if err := e.Stop(context.Background()); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+	closeStoreFile(t, st)
 
 	// "Restart": a brand-new store, journal and engine over the same directory.
 	st2, err := store.NewFileStore(dir)
@@ -578,7 +592,7 @@ func TestApproveRequestGrantWriteFailureRetryFails(t *testing.T) {
 // A successful grant write enables the resume. The execution runs, completes,
 // and the durable record shows the granted entry.
 func TestApproveRequestGrantSuccessEnablesResume(t *testing.T) {
-	e, j, h, _ := newJournaledGateEngine(t)
+	e, j, h, _, _ := newJournaledGateEngine(t)
 
 	submitActionRequest(t, e, h, "exec-grant-success", "user-1")
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-grant-success"))
@@ -665,6 +679,7 @@ func TestRestartAfterFailedGrantDoesNotInventGrant(t *testing.T) {
 	}
 
 	// "Restart": a brand-new store, journal and engine over the same directory.
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -737,6 +752,7 @@ func TestRestartAfterPartialDenialPreservesHistory(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 
+	closeStoreFile(t, st)
 	st3, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -759,7 +775,7 @@ func TestRestartAfterPartialDenialPreservesHistory(t *testing.T) {
 // A second DenyRequest for the same approval fails because the approval was
 // dropped from memory after the first denial. No duplicate history entry.
 func TestSecondDenyRequestFailsWithApprovalNotFound(t *testing.T) {
-	e, j, h, _ := newJournaledGateEngine(t)
+	e, j, h, _, _ := newJournaledGateEngine(t)
 
 	submitActionRequest(t, e, h, "exec-deny-twice", "user-1")
 	approvalID := approvalIDFrom(awaitResult(t, e, "exec-deny-twice"))
@@ -800,7 +816,7 @@ func TestSecondDenyRequestFailsWithApprovalNotFound(t *testing.T) {
 // The v25 guard survives: a completed or denied execution id cannot be
 // re-admitted, and its durable evidence is not erased.
 func TestCompletedAndDeniedIDsCannotBeReAdmitted(t *testing.T) {
-	e, j, h, _ := newJournaledGateEngine(t)
+	e, j, h, _, _ := newJournaledGateEngine(t)
 
 	// Denied execution.
 	submitActionRequest(t, e, h, "exec-guard-d", "user-1")
@@ -922,6 +938,7 @@ func TestEnginePersistsResearchEvidenceWithTerminalState(t *testing.T) {
 	if err := e.Stop(ctx); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -1022,6 +1039,7 @@ func TestEnginePersistsResearchSynthesisDurably(t *testing.T) {
 	if err := e.Stop(ctx); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -1101,6 +1119,7 @@ func TestEngineEvidenceWriteFailureNeverClaimsDurableEvidenceOrReplays(t *testin
 
 	// Restart: recovery must classify the interrupted record unknown, not
 	// completed, and it must not silently re-run the handler.
+	closeStoreFile(t, base)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)

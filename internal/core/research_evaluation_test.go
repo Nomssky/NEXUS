@@ -158,6 +158,7 @@ func TestEnginePersistsResearchEvaluationWithTerminalState(t *testing.T) {
 	if err := e.Stop(ctx); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
+	closeStoreFile(t, st)
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
