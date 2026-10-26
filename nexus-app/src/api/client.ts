@@ -33,6 +33,11 @@ import type {
   ResearchSynthesis,
   ResearchEvaluation,
 } from '../types/api';
+import type {
+  ConfigurationSnapshot,
+  StorageVolumesResponse,
+  StorageValidation,
+} from '../types/config';
 
 const DEFAULT_BASE_URL = '/api/v1';
 
@@ -70,9 +75,22 @@ async function handleResponse<T>(response: Response): Promise<T> {
 
     if (contentType?.includes('application/json')) {
       try {
-        const errorData = await response.json();
-        envelope = errorData;
-        message = errorData.message || message;
+        const errorData = (await response.json()) as unknown;
+        // The gateway uses CORE §3's nested contract:
+        // {"error":{"code","category","message",...}}. Accept a flat payload
+        // as a fallback so this parser remains compatible with any proxy or
+        // legacy route that predates the envelope.
+        const candidate =
+          errorData && typeof errorData === 'object' && 'error' in errorData
+            ? (errorData as { error: unknown }).error
+            : errorData;
+        if (candidate && typeof candidate === 'object') {
+          envelope = candidate as Envelope;
+          const envelopeMessage = (candidate as { message?: unknown }).message;
+          if (typeof envelopeMessage === 'string' && envelopeMessage) {
+            message = envelopeMessage;
+          }
+        }
       } catch {
         // Ignore JSON parse errors
       }
@@ -124,8 +142,18 @@ class NexusAPIClient {
     this.controlKey = null;
   }
 
-  getHeaders(useControl: boolean = false): Record<string, string> {
+  getHeaders(useControl: boolean = false, controlOnly: boolean = false): Record<string, string> {
     const headers: Record<string, string> = { ...this.defaultHeaders };
+
+    if (controlOnly) {
+      // Control endpoints authenticate with X-API-Key only. Never fall back
+      // to actor credentials: that would send identity material to a surface
+      // that does not use it and could mask a missing operator key.
+      if (this.controlKey) {
+        Object.assign(headers, createControlHeaders(this.controlKey));
+      }
+      return headers;
+    }
 
     if (useControl && this.controlKey) {
       Object.assign(headers, createControlHeaders(this.controlKey));
@@ -144,7 +172,8 @@ class NexusAPIClient {
   ): Promise<T> {
     const base = options.baseUrl ?? this.baseURL;
     const url = `${base}${path}`;
-    const headers = this.getHeaders(options.useControl);
+    const controlPath = path === '/control' || path.startsWith('/control/');
+    const headers = this.getHeaders(options.useControl, controlPath);
 
     const response = await fetch(url, {
       method,
@@ -375,6 +404,32 @@ class NexusAPIClient {
 
   async putPolicy(id: string, policy: unknown): Promise<void> {
     return this.request('PUT', `/control/policies/${encodeURIComponent(id)}`, policy, { useControl: true });
+  }
+
+  // Read-only configuration and storage inspection (control plane).
+  // These calls require the operator control key; no credential value is ever
+  // returned by the backend.
+  async getConfiguration(): Promise<ConfigurationSnapshot> {
+    return this.request<ConfigurationSnapshot>('GET', '/control/config', undefined, {
+      useControl: true,
+    });
+  }
+
+  async getStorageVolumes(): Promise<StorageVolumesResponse> {
+    return this.request<StorageVolumesResponse>('GET', '/control/config/storage', undefined, {
+      useControl: true,
+    });
+  }
+
+  // Validation only. The backend never creates, moves or applies a data
+  // directory from this request.
+  async validateStoragePath(path: string): Promise<StorageValidation> {
+    return this.request<StorageValidation>(
+      'POST',
+      '/control/config/storage/validate',
+      { path },
+      { useControl: true }
+    );
   }
 }
 

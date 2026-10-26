@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { apiClient, createAPIClient, EventStream, createEventStream } from './client';
+import { apiClient, createAPIClient, EventStream, createEventStream, APIError } from './client';
 import type {
   DurableExecution,
   HealthResponse,
@@ -295,5 +295,161 @@ describe('recovery executions (authoritative activity)', () => {
     expect(url).toContain('business_id=biz-1');
     expect(url).toContain('left_execution_id=exec-left');
     expect(url).toContain('right_execution_id=exec-right');
+  });
+});
+
+describe('configuration client', () => {
+  beforeEach(() => {
+    apiClient.setControlKey('test-control-key');
+  });
+
+  afterEach(() => {
+    apiClient.setControlKey('');
+  });
+
+  const requestOptions = (callIndex: number) => {
+    const call = mockFetch.mock.calls[callIndex];
+    return (call?.[1] ?? {}) as RequestInit;
+  };
+
+  it('fetches the redacted configuration with the control key header', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          loaded: true,
+          environment: 'test',
+          nexus_id: 'nx:nexus:test',
+          credential_storage: 'environment_only',
+          model_providers: [],
+          model_routing: { mode: 'simulated', seeded: true },
+          web_search: { provider: 'disabled', credential_status: 'not_required' },
+          storage: { configured: false, mode: 'memory' },
+          readiness: { gate_zero_authorized: false, live_verified: false },
+          generated_at: '2026-10-26T00:00:00Z',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    const result = await apiClient.getConfiguration();
+
+    expect(result.credential_storage).toBe('environment_only');
+    expect(result.readiness.gate_zero_authorized).toBe(false);
+    const call = mockFetch.mock.calls[0];
+    expect(String(call?.[0])).toContain('/api/v1/control/config');
+    expect((requestOptions(0).headers as Record<string, string>)['X-API-Key']).toBe(
+      'test-control-key'
+    );
+    expect((requestOptions(0).headers as Record<string, string>)['X-Actor-ID']).toBeUndefined();
+    expect((requestOptions(0).headers as Record<string, string>)['X-Actor-Credential']).toBeUndefined();
+  });
+
+  it('unwraps the nested CORE error envelope', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 'UNAUTHORIZED',
+            category: 'AUTH',
+            message: 'invalid or missing API key',
+            retryable: false,
+            correlation_id: 'corr-config-401',
+            timestamp: '2026-10-26T00:00:00Z',
+          },
+        }),
+        { status: 401, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    const error = await apiClient.getConfiguration().catch((err) => err);
+
+    expect(error).toBeInstanceOf(APIError);
+    expect(error.status).toBe(401);
+    expect(error.message).toBe('invalid or missing API key');
+    expect(error.envelope?.code).toBe('UNAUTHORIZED');
+    expect(error.envelope?.correlation_id).toBe('corr-config-401');
+  });
+
+  it('never sends actor credentials to a control endpoint without a control key', async () => {
+    apiClient.setControlKey('');
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: {
+            code: 'UNAUTHORIZED',
+            category: 'AUTH',
+            message: 'invalid or missing API key',
+            retryable: false,
+            correlation_id: 'corr-config-no-key',
+            timestamp: '2026-10-26T00:00:00Z',
+          },
+        }),
+        { status: 401, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    await apiClient.getConfiguration().catch(() => undefined);
+
+    const headers = requestOptions(0).headers as Record<string, string>;
+    expect(headers['X-API-Key']).toBeUndefined();
+    expect(headers['X-Actor-ID']).toBeUndefined();
+    expect(headers['X-Actor-Credential']).toBeUndefined();
+  });
+
+  it('fetches bounded storage volumes without a filesystem query', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          host_kind: 'local_host',
+          discovery: 'bounded',
+          volumes: [],
+          generated_at: '2026-10-26T00:00:00Z',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    const result = await apiClient.getStorageVolumes();
+
+    expect(result.discovery).toBe('bounded');
+    expect(result.volumes).toEqual([]);
+    const url = String(mockFetch.mock.calls[0]?.[0]);
+    expect(url).toContain('/api/v1/control/config/storage');
+    expect(url).not.toContain('?');
+  });
+
+  it('submits a path for validation without applying it', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          path: '/srv/nexus/data',
+          valid: true,
+          exists: true,
+          parent_exists: true,
+          is_directory: true,
+          writable: true,
+          write_probe: 'access_check',
+          same_as_current_data_dir: false,
+          checks: [{ id: 'directory', status: 'pass', message: 'ok' }],
+          applying_supported: false,
+          restart_required: true,
+          migration_supported: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      )
+    );
+
+    const result = await apiClient.validateStoragePath('/srv/nexus/data');
+
+    expect(result.valid).toBe(true);
+    expect(result.applying_supported).toBe(false);
+    expect(result.migration_supported).toBe(false);
+    const call = mockFetch.mock.calls[0];
+    expect(String(call?.[0])).toContain('/api/v1/control/config/storage/validate');
+    expect(requestOptions(0).method).toBe('POST');
+    expect(JSON.parse(String(requestOptions(0).body))).toEqual({ path: '/srv/nexus/data' });
+    expect((requestOptions(0).headers as Record<string, string>)['X-API-Key']).toBe(
+      'test-control-key'
+    );
   });
 });

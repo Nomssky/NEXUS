@@ -29,6 +29,11 @@ import type {
   ResearchCitationAudit,
   ResearchComparison,
 } from '../types/api';
+import type {
+  ConfigurationSnapshot,
+  StorageVolumesResponse,
+  StorageValidation,
+} from '../types/config';
 
 // Type for query options that excludes queryKey (provided by the hook)
 type QueryOptions<T> = Omit<UseQueryOptions<T>, 'queryKey' | 'queryFn'>;
@@ -53,6 +58,10 @@ export const queryKeys = {
     ['recoveryComparison', businessId, leftId, rightId] as const,
   recoveryCitationAudit: (businessId: string, executionId: string) =>
     ['recoveryCitationAudit', businessId, executionId] as const,
+  // Configuration keys deliberately exclude the control key value: an
+  // operator credential must never be copied into cache keys or devtools.
+  configuration: ['configuration'] as const,
+  storageVolumes: ['storageVolumes'] as const,
 };
 
 // Health & Status
@@ -319,6 +328,48 @@ export function useRecoveryCitationAudit(
     retry: false,
     refetchOnWindowFocus: false,
     staleTime: Infinity,
+    ...options,
+  });
+}
+
+// Configuration & storage (read-only control plane).
+//
+// `controlKey` only gates the request; it is never part of the query key. A
+// missing key produces a permission state in the Settings page instead of an
+// unauthorized request.
+export function useConfiguration(
+  controlKey: string,
+  options?: QueryOptions<ConfigurationSnapshot>
+) {
+  return useQuery({
+    queryKey: queryKeys.configuration,
+    queryFn: () => apiClient.getConfiguration(),
+    enabled: !!controlKey,
+    retry: false,
+    refetchOnWindowFocus: false,
+    ...options,
+  });
+}
+
+export function useStorageVolumes(
+  controlKey: string,
+  options?: QueryOptions<StorageVolumesResponse>
+) {
+  return useQuery({
+    queryKey: queryKeys.storageVolumes,
+    queryFn: () => apiClient.getStorageVolumes(),
+    enabled: !!controlKey,
+    retry: false,
+    refetchOnWindowFocus: false,
+    ...options,
+  });
+}
+
+export function useValidateStoragePath(
+  options?: UseMutationOptions<StorageValidation, Error, string>
+) {
+  return useMutation({
+    mutationFn: (path) => apiClient.validateStoragePath(path),
     ...options,
   });
 }
