@@ -94,8 +94,10 @@ type StructuredOutputSchema struct {
 
 // Message represents a conversation message.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // ToolDefinition represents a tool available to the model.
@@ -105,16 +107,25 @@ type ToolDefinition struct {
 	Parameters  interface{} `json:"parameters"`
 }
 
+// ToolCall is a provider-proposed function call. It is untrusted data and must
+// be validated and mediated by the execution runtime before any effect occurs.
+type ToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
 // GenerateResponse is a normalized response from a model provider.
 type GenerateResponse struct {
-	RequestID    string `json:"request_id"`
-	ModelID      string `json:"model_id"`
-	Content      string `json:"content"`
-	FinishReason string `json:"finish_reason"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	TotalTokens  int    `json:"total_tokens"`
-	LatencyMs    int64  `json:"latency_ms"`
+	RequestID    string     `json:"request_id"`
+	ModelID      string     `json:"model_id"`
+	Content      string     `json:"content"`
+	FinishReason string     `json:"finish_reason"`
+	InputTokens  int        `json:"input_tokens"`
+	OutputTokens int        `json:"output_tokens"`
+	TotalTokens  int        `json:"total_tokens"`
+	LatencyMs    int64      `json:"latency_ms"`
+	ToolCalls    []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // LocalProvider is a concrete provider for local inference (Ollama, etc).
