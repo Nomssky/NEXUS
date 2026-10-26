@@ -35,14 +35,15 @@ import (
 
 // Launcher wires the Core Runtime and HTTP Gateway into a running system.
 type Launcher struct {
-	cfg     config.Config
-	log     *logging.Logger
-	health  *health.Server
-	engine  *core.Engine
-	gateway *gateway.Server
-	life    *lifecycle.Manager
-	addr    string // actual gateway listen address
-	initErr error
+	cfg      config.Config
+	snapshot config.Snapshot
+	log      *logging.Logger
+	health   *health.Server
+	engine   *core.Engine
+	gateway  *gateway.Server
+	life     *lifecycle.Manager
+	addr     string // actual gateway listen address
+	initErr  error
 	// metrics is the process-local operational metrics owner (v15). It is
 	// shared by the engine, the capability platform and the agent runtime, and
 	// it records the startup recovery outcome the launcher performs itself.
@@ -64,7 +65,13 @@ func (l *Launcher) Metrics() *metrics.Metrics {
 
 // Options configures the launcher.
 type Options struct {
-	Config    config.Config
+	Config config.Config
+	// Snapshot is the immutable configuration snapshot captured at boot. When
+	// supplied it is authoritative: the launcher derives its effective Config
+	// from it and passes this exact snapshot to the gateway, so the read-only
+	// configuration surface is a projection of the running process rather than
+	// a reconstruction. cmd/nexus supplies the snapshot loaded by app.New.
+	Snapshot  config.Snapshot
 	Logger    *logging.Logger
 	Health    *health.Server
 	Lifecycle *lifecycle.Manager
@@ -106,6 +113,11 @@ type Options struct {
 
 // New creates a new launcher with all components wired.
 func New(opts Options) *Launcher {
+	// The snapshot is authoritative when supplied. Tests and embedders may
+	// still pass Config alone; it is frozen here so every process has one
+	// immutable boot snapshot.
+	cfg, snap := effectiveConfig(opts)
+
 	// Durable execution journal (v10). Nil when no durable store is configured
 	// (in-memory/dev installs) — execution state stays process-local there.
 	journal := execjournal.New(opts.Store, opts.Now)
@@ -121,7 +133,7 @@ func New(opts Options) *Launcher {
 	// Identity-bound admission stages (A: chain IDENTITY/AUTHORIZATION)
 	// share the A6 flags and membership store — one posture for both
 	// boundaries (gateway edge, chain defense in depth).
-	engine, err := core.NewEngine(&opts.Config,
+	engine, err := core.NewEngine(&cfg,
 		core.WithIdentity(opts.Memberships, opts.RequireAuthentication, opts.EnforceBusinessScope),
 		core.WithExecutionJournal(journal),
 		core.WithMetrics(m),
@@ -129,7 +141,8 @@ func New(opts Options) *Launcher {
 	if err != nil {
 		// Store error; will be returned by Start
 		return &Launcher{
-			cfg:            opts.Config,
+			cfg:            cfg,
+			snapshot:       snap,
 			log:            opts.Logger,
 			health:         opts.Health,
 			life:           opts.Lifecycle,
@@ -148,7 +161,7 @@ func New(opts Options) *Launcher {
 		if rerr != nil {
 			m.RecoveryFailed()
 			return &Launcher{
-				cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
 				metrics: m,
 				initErr: fmt.Errorf("durable execution recovery failed: %w", rerr),
 			}
@@ -184,7 +197,7 @@ func New(opts Options) *Launcher {
 	// Production inference is exclusively opt-in: the launcher registers real
 	// providers ONLY from explicit models.providers configuration. Without it,
 	// the deterministic seeded simulation remains the default (offline/CI).
-	for _, prov := range opts.Config.Models.Providers {
+	for _, prov := range cfg.Models.Providers {
 		p, err := modelrouter.NewOpenAIProvider(modelrouter.ProviderConfig{
 			ID: prov.ID, Name: prov.Name, Endpoint: prov.Endpoint,
 			APIKeyEnv: prov.APIKeyEnv, Timeout: prov.Timeout,
@@ -192,7 +205,7 @@ func New(opts Options) *Launcher {
 			MaxRequestBytes:   prov.MaxRequestBytes, MaxResponseBytes: prov.MaxResponseBytes,
 		})
 		if err != nil {
-			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+			return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
 				metrics: m, initErr: fmt.Errorf("model provider %q: %w", prov.ID, err)}
 		}
 		engine.ModelRouter().RegisterProvider(p)
@@ -221,7 +234,7 @@ func New(opts Options) *Launcher {
 			ExternalTransfer: true,
 			DataRetention:    "standard",
 		}); regErr != nil {
-			return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+			return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
 				metrics: m, initErr: fmt.Errorf("register model %q: %w", prov.ModelID, regErr)}
 		}
 		if opts.Logger != nil {
@@ -239,18 +252,19 @@ func New(opts Options) *Launcher {
 		// that reaches New with production and an empty registry (including a
 		// provider-registration that produced zero models). Fail closed; never
 		// seed a simulator into production.
-		if opts.Config.IsProduction() {
+		if cfg.IsProduction() {
 			return &Launcher{
-				cfg:     opts.Config,
-				log:     opts.Logger,
-				health:  opts.Health,
-				life:    opts.Lifecycle,
-				metrics: m,
+				cfg:      cfg,
+				snapshot: snap,
+				log:      opts.Logger,
+				health:   opts.Health,
+				life:     opts.Lifecycle,
+				metrics:  m,
 				initErr: nerrors.Configuration("launcher.provider_missing",
 					"production refuses to start without a registered real model provider; the simulated/scripted provider is development-only"),
 			}
 		}
-		seedStatus := modelrouter.ProviderStatus(opts.Config.Models.SeededProviderStatus)
+		seedStatus := modelrouter.ProviderStatus(cfg.Models.SeededProviderStatus)
 		if seedStatus == "" {
 			seedStatus = modelrouter.ProviderStatusHealthy
 		}
@@ -262,7 +276,7 @@ func New(opts Options) *Launcher {
 		// provider abstraction; neither is a production provider.
 		seedID := "simulated"
 		var simProvider modelrouter.Provider
-		if opts.Config.Models.SeededProviderMode == "scripted" {
+		if cfg.Models.SeededProviderMode == "scripted" {
 			seedID = "scripted"
 			simProvider = modelrouter.NewScriptedProvider(modelrouter.ProviderConfig{ID: seedID, Status: seedStatus})
 		} else {
@@ -308,26 +322,26 @@ func New(opts Options) *Launcher {
 		gateway.WithControlAPIKey(opts.ControlAPIKey),
 		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
 		gateway.WithRegistry(opts.Registry),
-		gateway.WithNexusID(opts.Config.Nexus.ID),
-		gateway.WithConfiguration(opts.Config),
+		gateway.WithNexusID(cfg.Nexus.ID),
+		gateway.WithConfigurationSnapshot(snap),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
 		// F4: process-local HTTP rate limiting (config defaults: enabled).
 		gateway.WithRateLimit(gateway.RateLimitPolicy{
-			Enabled:          opts.Config.RateLimit.Enabled,
-			SubmitPerMinute:  opts.Config.RateLimit.SubmitPerMinute,
-			RequestPerMinute: opts.Config.RateLimit.RequestPerMinute,
-			PerIPPerMinute:   opts.Config.RateLimit.PerIPPerMinute,
+			Enabled:          cfg.RateLimit.Enabled,
+			SubmitPerMinute:  cfg.RateLimit.SubmitPerMinute,
+			RequestPerMinute: cfg.RateLimit.RequestPerMinute,
+			PerIPPerMinute:   cfg.RateLimit.PerIPPerMinute,
 		}),
 		// F5: explicit CORS allow-list (empty = same-origin default).
-		gateway.WithCORS(gateway.CORSPolicy{AllowedOrigins: opts.Config.HTTP.CORSAllowedOrigins}),
+		gateway.WithCORS(gateway.CORSPolicy{AllowedOrigins: cfg.HTTP.CORSAllowedOrigins}),
 	}
 	// Agent execution layer v1: durable agent definitions + runtime wired
 	// through the canonical request path (governance inherits unchanged).
 	agentTools := tool.NewToolRegistry()
-	agentReg, err := agentexec.OpenRegistry(opts.Config.Nexus.ID, opts.Registry, agentTools, opts.Store)
+	agentReg, err := agentexec.OpenRegistry(cfg.Nexus.ID, opts.Registry, agentTools, opts.Store)
 	if err != nil {
-		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
+		return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
 	}
 	agentRt := agentexec.NewRuntime(agentReg, agentTools, engine.ModelRouter(), engine.EventBus())
 	// Agent Governance & Control Integration v1: the admission controller is
@@ -351,7 +365,7 @@ func New(opts Options) *Launcher {
 	// platform. There is one registry, one invocation path, one credential
 	// boundary and one result/redaction pipeline. Governance stays upstream
 	// and unchanged — the platform performs no policy evaluation of its own.
-	platform, capErr := capabilityPlatform(os.Getenv, opts.Config.Storage.DataDir,
+	platform, webSearch, capErr := capabilityPlatform(os.Getenv, cfg.Storage.DataDir,
 		agentTools, opts.Memberships, engine.EventBus(), opts.Capability, m)
 	if capErr != nil {
 		if opts.Logger != nil {
@@ -364,7 +378,7 @@ func New(opts Options) *Launcher {
 		// established fail-closed degraded boot path.
 		if errors.Is(capErr, errResearchProviderConfig) {
 			return &Launcher{
-				cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
 				metrics: m, initErr: capErr,
 			}
 		}
@@ -376,6 +390,10 @@ func New(opts Options) *Launcher {
 		}
 		gwOpts = append(gwOpts, gateway.WithCapabilityPlatform(platform))
 	}
+	// Report the descriptor captured from the adapter this boot actually
+	// constructed. On a non-fatal platform failure it carries Registered=false
+	// and the surface can say the selected provider is unavailable.
+	gwOpts = append(gwOpts, gateway.WithWebSearchSelection(webSearch))
 
 	// Agent intelligence layer v1: the bounded control loop. It runs inside
 	// the same admitted request pipeline and reuses the agent execution
@@ -396,7 +414,7 @@ func New(opts Options) *Launcher {
 	}
 	intelMem, err := agentintel.OpenMemory(opts.Store, memDeps)
 	if err != nil {
-		return &Launcher{cfg: opts.Config, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
+		return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
 	}
 	intelRt := agentintel.New(agentReg, agentRt,
 		&agentintel.Decision{Router: engine.ModelRouter()}, engine.EventBus(), intelMem)
@@ -413,17 +431,27 @@ func New(opts Options) *Launcher {
 	gw := gateway.NewServer(engine, opts.Addr, gwOpts...)
 
 	return &Launcher{
-		cfg:     opts.Config,
-		log:     opts.Logger,
-		health:  opts.Health,
-		engine:  engine,
-		gateway: gw,
-		life:    opts.Lifecycle,
-		metrics: m,
-		addr:    opts.Addr,
+		cfg:      cfg,
+		snapshot: snap,
+		log:      opts.Logger,
+		health:   opts.Health,
+		engine:   engine,
+		gateway:  gw,
+		life:     opts.Lifecycle,
+		metrics:  m,
+		addr:     opts.Addr,
 		// C-1: default 30s, bounds the startup barrier only.
 		startupTimeout: 30 * time.Second,
 	}
+}
+
+// effectiveConfig resolves the authoritative boot configuration. A supplied
+// snapshot wins; otherwise the caller-provided Config is frozen here.
+func effectiveConfig(opts Options) (config.Config, config.Snapshot) {
+	if opts.Snapshot.Fingerprint() != "" {
+		return opts.Snapshot.Settings(), opts.Snapshot
+	}
+	return opts.Config, opts.Config.Snapshot()
 }
 
 // Start starts the Core Runtime and HTTP Gateway.
@@ -581,7 +609,12 @@ func (l *Launcher) Gateway() *gateway.Server {
 
 // Run starts the launcher and blocks until shutdown signal.
 func (l *Launcher) Run(ctx context.Context) lifecycle.ExitCode {
-	l.log.Info("nexus system starting", logging.Fields{})
+	l.log.Info("nexus system starting", logging.Fields{
+		Context: map[string]any{
+			"environment":        l.cfg.Nexus.Environment,
+			"config_fingerprint": l.snapshot.Fingerprint(),
+		},
+	})
 
 	// Register lifecycle hook
 	l.life.RegisterHook(lifecycle.Hook{

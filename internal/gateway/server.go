@@ -40,7 +40,6 @@ import (
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/executor"
-	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
@@ -120,10 +119,11 @@ type Server struct {
 	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
 	nexusID string
 
-	// configuration is the effective boot configuration exposed by the
-	// read-only control-plane configuration surface. It contains credential
-	// references only; raw secret values are never stored here.
-	configuration *config.Config
+	// bootConfig is the exact immutable configuration snapshot and the
+	// credential/provider selections captured from it at boot. Request
+	// handlers project this state; they never reconstruct configuration or
+	// web-search selection from the environment.
+	bootConfig *bootConfigState
 
 	// G-010: maxResponseBytes caps one-shot JSON response bodies (GET result).
 	// maxSSEEventBytes caps each individual SSE event frame; it does not bound

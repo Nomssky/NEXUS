@@ -23,6 +23,7 @@ import type {
   StorageCheck,
   StorageValidation,
   StorageVolumeView,
+  WebSearchKind,
   WebSearchView,
 } from '../types/config';
 import styles from './Settings.module.css';
@@ -74,7 +75,53 @@ function credentialBadge(status: CredentialStatus) {
       return <Badge variant="warning" size="sm" dot>Credential missing</Badge>;
     case 'not_required':
       return <Badge variant="default" size="sm">No key required</Badge>;
+    case 'unknown':
+      return <Badge variant="default" size="sm">Credential unknown</Badge>;
   }
+}
+
+/**
+ * Derive the boot descriptor kind for servers that predate the `kind` field.
+ * A missing kind is treated as injected/unknown rather than guessed live.
+ */
+function webSearchKind(ws: WebSearchView): WebSearchKind {
+  if (ws.kind) return ws.kind;
+  switch (ws.mode) {
+    case 'scripted':
+      return 'scripted';
+    case 'live':
+      return 'live';
+    case 'injected':
+      return 'injected';
+    case 'invalid':
+      return 'invalid';
+  }
+  if (ws.provider === 'scripted' || ws.provider === 'scripted-research') return 'scripted';
+  if (ws.provider === 'disabled') return 'disabled';
+  if (ws.provider === 'invalid') return 'invalid';
+  return ws.live ? 'live' : 'injected';
+}
+
+/** Canonical adapter identifier; older servers send "scripted". */
+function webSearchProvider(ws: WebSearchView): string {
+  if (webSearchKind(ws) === 'scripted') return 'scripted-research';
+  return ws.provider;
+}
+
+/** Older responses did not report registration; infer only the unambiguous cases. */
+function webSearchRegistered(ws: WebSearchView): boolean {
+  if (typeof ws.registered === 'boolean') return ws.registered;
+  const kind = webSearchKind(ws);
+  return kind !== 'disabled' && kind !== 'invalid';
+}
+
+/** Never present an undeclared credential requirement as "not required". */
+function webSearchCredentialReference(ws: WebSearchView): string {
+  if (ws.credential_env) return ws.credential_env;
+  const kind = webSearchKind(ws);
+  return kind === 'live' || kind === 'scripted' || kind === 'disabled'
+    ? 'not required'
+    : 'not declared';
 }
 
 function modeBadge(mode: WebSearchView['mode']) {
@@ -85,6 +132,10 @@ function modeBadge(mode: WebSearchView['mode']) {
       return <Badge variant="info" size="sm">Live adapter selected</Badge>;
     case 'scripted':
       return <Badge variant="warning" size="sm">Scripted test-only</Badge>;
+    case 'injected':
+      return <Badge variant="default" size="sm">Injected adapter</Badge>;
+    case 'invalid':
+      return <Badge variant="error" size="sm">Unsupported</Badge>;
     case 'disabled':
       return <Badge variant="unknown" size="sm">Disabled</Badge>;
   }
@@ -288,7 +339,9 @@ function readinessItems(config: ConfigurationSnapshot): Array<{
     },
     {
       label: 'Web search',
-      detail: ws.provider === 'disabled' ? 'Disabled' : `${ws.provider} · ${ws.mode}`,
+      detail: webSearchKind(ws) === 'disabled'
+        ? 'Disabled'
+        : `${webSearchProvider(ws)} · ${ws.mode}`,
       state: r.web_search_configured ? (r.web_search_live ? 'ready' : 'blocked') : 'blocked',
     },
     {
@@ -297,7 +350,9 @@ function readinessItems(config: ConfigurationSnapshot): Array<{
         ? `${ws.credential_env} · ${ws.credential_status}`
         : ws.keyless
           ? 'Keyless provider'
-          : 'Not applicable',
+          : webSearchKind(ws) === 'injected'
+            ? 'Unknown — adapter did not declare requirements'
+            : 'Not applicable',
       state: r.web_search_credential_ready ? 'ready' : 'blocked',
     },
     {
@@ -356,7 +411,9 @@ const ProviderCard: React.FC<{ provider: ModelProviderView; onRefresh: () => voi
         <p className={styles.mutedText}>
           {provider.credential_status === 'missing'
             ? `The environment variable ${provider.api_key_env} is not set. The process would fail closed for this provider.`
-            : 'The credential reference is present. This page has not contacted the endpoint.'}
+            : provider.credential_status === 'unknown'
+              ? 'The adapter did not declare a credential requirement. Presence is not inferred.'
+              : 'The credential reference is present. This page has not contacted the endpoint.'}
         </p>
         <div className={styles.inlineActions}>
           <Button variant="ghost" size="sm" onClick={onRefresh} leftIcon={<IconRefresh />}>
@@ -384,6 +441,10 @@ const OverviewTab: React.FC<{ config: ConfigurationSnapshot; onRefresh: () => vo
   const ws = config.web_search;
   const storage = config.storage;
   const used = usedPercent(storage.used_bytes, storage.total_bytes);
+  const sources = config.sources
+    ? Object.entries(config.sources).sort(([a], [b]) => a.localeCompare(b))
+    : [];
+  const provenance = config.provenance;
 
   return (
     <div className={styles.tabStack}>
@@ -435,6 +496,43 @@ const OverviewTab: React.FC<{ config: ConfigurationSnapshot; onRefresh: () => vo
         </SectionCard>
       </div>
 
+      <SectionCard
+        title="Configuration provenance"
+        subtitle="Section-level sources for the immutable boot snapshot"
+        icon={<IconLock />}
+        actions={<Badge variant={provenance?.immutable === false ? 'warning' : 'default'} size="sm">
+          {provenance ? (provenance.immutable ? 'Immutable' : 'Mutable') : 'Not reported'}
+        </Badge>}
+      >
+        {config.fingerprint ? (
+          <div className={styles.kvList}>
+            <div><span>Fingerprint</span><span className={`${styles.mono} ${styles.fingerprint}`}>{config.fingerprint}</span></div>
+            <div><span>Schema</span><span className={styles.mono}>{config.fingerprint_version || 'not reported'}</span></div>
+            <div><span>Provenance</span><span className={styles.mono}>{provenance?.kind || 'boot_snapshot'}</span></div>
+            <div><span>Precedence</span><span className={styles.mono}>{provenance?.precedence || 'defaults < file < environment'}</span></div>
+            <div><span>Captured</span><span className={styles.mono}>
+              {provenance?.captured_at ? new Date(provenance.captured_at).toLocaleString() : 'not reported'}
+            </span></div>
+          </div>
+        ) : (
+          <EmptyState title="Fingerprint not reported">
+            This server does not expose a boot-configuration fingerprint. The page does not invent
+            one; upgrade the gateway to report the snapshot identifier.
+          </EmptyState>
+        )}
+        {sources.length > 0 ? (
+          <div className={styles.kvList}>
+            {sources.map(([section, source]) => (
+              <div key={section}><span>{section}</span><span className={styles.mono}>{source}</span></div>
+            ))}
+          </div>
+        ) : (
+          <p className={styles.footnote}>
+            No section-level source metadata was reported. Values are shown from the snapshot only.
+          </p>
+        )}
+      </SectionCard>
+
       <div className={styles.twoColumn}>
         <SectionCard
           title="Web search"
@@ -443,8 +541,10 @@ const OverviewTab: React.FC<{ config: ConfigurationSnapshot; onRefresh: () => vo
           actions={modeBadge(ws.mode)}
         >
           <div className={styles.kvList}>
-            <div><span>Provider</span><span className={styles.mono}>{ws.provider}</span></div>
-            <div><span>Credential</span><span className={styles.mono}>{ws.credential_env || 'not required'}</span></div>
+            <div><span>Provider</span><span className={styles.mono}>{webSearchProvider(ws)}</span></div>
+            <div><span>Kind</span><span className={styles.mono}>{webSearchKind(ws)}</span></div>
+            <div><span>Registered</span><span className={styles.mono}>{webSearchRegistered(ws) ? 'yes' : 'no'}</span></div>
+            <div><span>Credential</span><span className={styles.mono}>{webSearchCredentialReference(ws)}</span></div>
             <div><span>Status</span><span>{credentialBadge(ws.credential_status)}</span></div>
             <div><span>Endpoint</span><span className={styles.mono}>{ws.endpoint || '—'}</span></div>
           </div>
@@ -573,6 +673,8 @@ const ModelsTab: React.FC<{
 
 const SearchTab: React.FC<{ config: ConfigurationSnapshot }> = ({ config }) => {
   const ws = config.web_search;
+  const kind = webSearchKind(ws);
+  const selectedProvider = webSearchProvider(ws);
   const options: Array<{
     id: string;
     title: string;
@@ -580,10 +682,11 @@ const SearchTab: React.FC<{ config: ConfigurationSnapshot }> = ({ config }) => {
     mode: WebSearchView['mode'];
     selected: boolean;
   }> = [
-    { id: 'brave', title: 'Brave Search', detail: 'Live general web search · BRAVE_API_KEY required', mode: 'live', selected: ws.provider === 'brave' },
-    { id: 'wikipedia', title: 'Wikipedia', detail: 'Live MediaWiki search · keyless', mode: 'live', selected: ws.provider === 'wikipedia' },
-    { id: 'scripted', title: 'Scripted', detail: 'Deterministic fixtures · test-only, never live evidence', mode: 'scripted', selected: ws.provider === 'scripted' },
-    { id: 'disabled', title: 'Disabled', detail: 'No web.search capability is registered', mode: 'disabled', selected: ws.provider === 'disabled' || ws.provider === 'invalid' },
+    { id: 'brave', title: 'Brave Search', detail: 'Live general web search · BRAVE_API_KEY required', mode: 'live', selected: kind === 'live' && selectedProvider === 'brave' },
+    { id: 'wikipedia', title: 'Wikipedia', detail: 'Live MediaWiki search · keyless', mode: 'live', selected: kind === 'live' && selectedProvider === 'wikipedia' },
+    { id: 'scripted', title: 'Scripted', detail: 'Deterministic fixtures · test-only, never live evidence', mode: 'scripted', selected: kind === 'scripted' },
+    { id: 'injected', title: 'Injected adapter', detail: 'Supplied by the embedding process · liveness and credentials unknown', mode: 'injected', selected: kind === 'injected' },
+    { id: 'disabled', title: 'Disabled', detail: 'No web.search capability is registered', mode: 'disabled', selected: kind === 'disabled' || kind === 'invalid' },
   ];
 
   return (
@@ -602,14 +705,16 @@ const SearchTab: React.FC<{ config: ConfigurationSnapshot }> = ({ config }) => {
       >
         <div className={styles.selectedProvider}>
           <div>
-            <div className={styles.selectedName}>{ws.provider}</div>
+            <div className={styles.selectedName}>{selectedProvider}</div>
             <p className={styles.mutedText}>{ws.verification_note}</p>
           </div>
           {credentialBadge(ws.credential_status)}
         </div>
         <div className={styles.kvList}>
+          <div><span>Adapter kind</span><span className={styles.mono}>{kind}</span></div>
+          <div><span>Registered at boot</span><span className={styles.mono}>{webSearchRegistered(ws) ? 'yes' : 'no'}</span></div>
           <div><span>Endpoint</span><span className={styles.mono}>{ws.endpoint || '—'}</span></div>
-          <div><span>Credential env</span><span className={styles.mono}>{ws.credential_env || 'not required'}</span></div>
+          <div><span>Credential env</span><span className={styles.mono}>{webSearchCredentialReference(ws)}</span></div>
           <div><span>Language</span><span className={styles.mono}>{ws.language || '—'}</span></div>
           <div><span>Live verified</span><span className={styles.mono}>{ws.live_verified ? 'yes' : 'no'}</span></div>
         </div>
@@ -648,6 +753,7 @@ const SearchTab: React.FC<{ config: ConfigurationSnapshot }> = ({ config }) => {
           <ul className={styles.plainList}>
             <li><strong>Live:</strong> Brave or Wikipedia records come from an external service and can support citations.</li>
             <li><strong>Scripted:</strong> deterministic fixture records are useful for regression tests but are never proof of live evidence.</li>
+            <li><strong>Injected:</strong> an embedding process supplied the adapter directly; this page cannot verify its liveness or credential requirements.</li>
             <li><strong>No silent fallback:</strong> the runtime never substitutes a scripted provider during a live run.</li>
           </ul>
         </SectionCard>

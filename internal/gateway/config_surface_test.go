@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,22 +11,36 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
 )
 
 const configTestControlKey = "config-surface-test-key"
 
-func configTestServer(t *testing.T, cfg config.Config) *Server {
+func configTestServer(t *testing.T, cfg config.Config, opts ...ServerOption) *Server {
 	t.Helper()
 	engine, err := core.NewEngine(nil)
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
-	return NewServer(engine, ":0",
+	base := []ServerOption{
 		WithControlAPIKey(configTestControlKey),
-		WithConfiguration(cfg),
-	)
+		WithConfigurationSnapshot(cfg.Snapshot()),
+	}
+	return NewServer(engine, ":0", append(base, opts...)...)
+}
+
+func testBraveDescriptor() capability.ResearchProviderDescriptor {
+	return capability.ResearchProviderDescriptor{
+		Provider:      "brave",
+		Kind:          capability.ResearchKindLive,
+		Registered:    true,
+		Live:          true,
+		CredentialEnv: "BRAVE_API_KEY",
+		Endpoint:      capability.DefaultBraveEndpoint,
+		SelectedBy:    "NEXUS_CAPABILITY_WEB",
+	}
 }
 
 func configTestRequest(t *testing.T, srv *Server, method, path string, body []byte, key string) *httptest.ResponseRecorder {
@@ -76,7 +91,7 @@ func TestConfigurationSurfaceRequiresControlKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("engine: %v", err)
 	}
-	noKeySrv := NewServer(noKeyEngine, ":0", WithConfiguration(cfg))
+	noKeySrv := NewServer(noKeyEngine, ":0", WithConfigurationSnapshot(cfg.Snapshot()))
 	w := configTestRequest(t, noKeySrv, http.MethodGet, "/api/v1/control/config", nil, "")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("disabled status = %d, want 403; body=%s", w.Code, w.Body.String())
@@ -122,7 +137,7 @@ func TestConfigurationSurfaceRedactsCredentials(t *testing.T) {
 	t.Setenv("NEXUS_CAPABILITY_WEB", "brave")
 	cfg := testConfig(t)
 	cfg.Models.Providers[0].Endpoint = "https://user:url-secret@models.example.invalid/v1?token=query-secret"
-	srv := configTestServer(t, cfg)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(testBraveDescriptor()))
 
 	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
 	if w.Code != http.StatusOK {
@@ -686,7 +701,7 @@ func TestConfigurationSurfaceDoesNotClaimLiveReadiness(t *testing.T) {
 	t.Setenv("BRAVE_API_KEY", secret)
 	t.Setenv("NEXUS_CAPABILITY_WEB", "brave")
 	cfg := testConfig(t)
-	srv := configTestServer(t, cfg)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(testBraveDescriptor()))
 
 	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
 	if w.Code != http.StatusOK {
@@ -709,12 +724,230 @@ func TestConfigurationSurfaceDoesNotClaimLiveReadiness(t *testing.T) {
 	if !strings.Contains(joined, "Gate 0") {
 		t.Fatalf("Gate 0 must remain a blocking item: %v", view.Readiness.Blocking)
 	}
+	if !view.Readiness.ModelCredentialsPresent || !view.Readiness.WebSearchCredentialReady {
+		t.Fatalf("boot-captured credentials should be reported present: %+v", view.Readiness)
+	}
 	if strings.Contains(w.Body.String(), secret) {
 		t.Fatal("credential value leaked in the readiness response")
 	}
 }
 
-// TEST-CONFIG-012: routes answer 503 in the contract envelope when the process
+// TEST-CONFIG-012: the surface projects the boot snapshot's fingerprint,
+// schema version, section sources and immutable provenance.
+func TestConfigurationSurfaceReportsProvenance(t *testing.T) {
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", "not-a-real-secret")
+	cfg := testConfig(t)
+	srv := configTestServer(t, cfg)
+
+	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var view ConfigurationView
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.Fingerprint != cfg.Snapshot().Fingerprint() {
+		t.Fatalf("fingerprint = %q, want %q", view.Fingerprint, cfg.Snapshot().Fingerprint())
+	}
+	if view.FingerprintVersion != config.FingerprintSchema {
+		t.Fatalf("fingerprint_version = %q, want %q", view.FingerprintVersion, config.FingerprintSchema)
+	}
+	if !strings.HasPrefix(view.Fingerprint, view.FingerprintVersion+":") {
+		t.Fatalf("fingerprint %q does not carry version %q", view.Fingerprint, view.FingerprintVersion)
+	}
+	if view.Provenance.Kind != "boot_snapshot" || !view.Provenance.Immutable {
+		t.Fatalf("provenance = %+v", view.Provenance)
+	}
+	if view.Provenance.Precedence != "defaults < file < environment" {
+		t.Fatalf("provenance precedence = %q", view.Provenance.Precedence)
+	}
+	if view.RuntimeMutable || view.RestartRequired != true {
+		t.Fatalf("read-only framing = runtime_mutable:%v restart_required:%v",
+			view.RuntimeMutable, view.RestartRequired)
+	}
+	for _, section := range config.SectionNames() {
+		got, ok := view.Sources[section]
+		if !ok {
+			t.Fatalf("sources missing section %q: %v", section, view.Sources)
+		}
+		if got != string(config.SourceDefault) {
+			t.Fatalf("source for %q = %q, want default for a defaults-only config", section, got)
+		}
+	}
+	if _, ok := view.Sources["rate_limit"]; !ok {
+		t.Fatal("rate_limit source must be reported")
+	}
+	if _, ok := view.Sources["http"]; !ok {
+		t.Fatal("HTTP/CORS source must be reported")
+	}
+}
+
+// TEST-CONFIG-013: environment changes after boot cannot retcon the reported
+// credential status or web-search selection.
+func TestConfigurationSurfaceProjectsBootCapture(t *testing.T) {
+	const secret = "sk-boot-capture-secret"
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", secret)
+	t.Setenv("BRAVE_API_KEY", secret)
+	cfg := testConfig(t)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(testBraveDescriptor()))
+
+	var before ConfigurationView
+	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &before); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if before.WebSearch.Provider != "brave" || before.WebSearch.CredentialStatus != credentialPresent {
+		t.Fatalf("boot web search = %+v", before.WebSearch)
+	}
+	if before.ModelProviders[0].CredentialStatus != credentialPresent {
+		t.Fatalf("boot model credential = %q", before.ModelProviders[0].CredentialStatus)
+	}
+
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", "")
+	t.Setenv("BRAVE_API_KEY", "")
+	t.Setenv("NEXUS_CAPABILITY_WEB", "wikipedia")
+
+	w = configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var after ConfigurationView
+	if err := json.Unmarshal(w.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if after.WebSearch.Provider != before.WebSearch.Provider ||
+		after.WebSearch.Kind != before.WebSearch.Kind ||
+		after.WebSearch.SelectedBy != before.WebSearch.SelectedBy {
+		t.Fatalf("web search selection changed after boot: before=%+v after=%+v", before.WebSearch, after.WebSearch)
+	}
+	if after.WebSearch.CredentialStatus != credentialPresent {
+		t.Fatalf("web credential status changed after boot: %q", after.WebSearch.CredentialStatus)
+	}
+	if after.ModelProviders[0].CredentialStatus != credentialPresent {
+		t.Fatalf("model credential status changed after boot: %q", after.ModelProviders[0].CredentialStatus)
+	}
+	if after.Fingerprint != before.Fingerprint {
+		t.Fatalf("fingerprint changed after boot: %q -> %q", before.Fingerprint, after.Fingerprint)
+	}
+}
+
+// TEST-CONFIG-014: the scripted adapter reports its canonical identifier and
+// never masquerades as a live provider.
+func TestConfigurationSurfaceScriptedDescriptor(t *testing.T) {
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", "not-a-real-secret")
+	desc := capability.DescribeResearchProvider(&capability.ScriptedResearchProvider{})
+	desc.Registered = true
+	desc.SelectedBy = "NEXUS_CAPABILITY_WEB"
+	cfg := testConfig(t)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(desc))
+
+	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var view ConfigurationView
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.WebSearch.Provider != "scripted-research" {
+		t.Fatalf("scripted provider id = %q, want canonical scripted-research", view.WebSearch.Provider)
+	}
+	if view.WebSearch.Kind != capability.ResearchKindScripted || view.WebSearch.Mode != "scripted" {
+		t.Fatalf("scripted descriptor misreported: %+v", view.WebSearch)
+	}
+	if view.WebSearch.Live || view.WebSearch.LiveVerified {
+		t.Fatalf("scripted provider claimed liveness: %+v", view.WebSearch)
+	}
+	if view.WebSearch.CredentialStatus != credentialNotRequired {
+		t.Fatalf("scripted credential status = %q", view.WebSearch.CredentialStatus)
+	}
+	if !view.WebSearch.ScriptedFallback || !view.WebSearch.Registered {
+		t.Fatalf("scripted descriptor flags = %+v", view.WebSearch)
+	}
+	joined := strings.Join(view.Readiness.Blocking, "\n")
+	if !strings.Contains(joined, "scripted provider") {
+		t.Fatalf("scripted provider must remain a blocking item: %v", view.Readiness.Blocking)
+	}
+}
+
+// TEST-CONFIG-015: a provider injected by an embedder is reported as injected
+// with unknown liveness and credential requirements, not guessed live.
+func TestConfigurationSurfaceInjectedDescriptor(t *testing.T) {
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", "not-a-real-secret")
+	desc := capability.DescribeResearchProvider(injectedResearchProvider{})
+	if desc.Kind != capability.ResearchKindInjected {
+		t.Fatalf("described kind = %q, want injected", desc.Kind)
+	}
+	desc.Registered = true
+	cfg := testConfig(t)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(desc))
+
+	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var view ConfigurationView
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.WebSearch.Kind != capability.ResearchKindInjected || view.WebSearch.Mode != "injected" {
+		t.Fatalf("injected descriptor misreported: %+v", view.WebSearch)
+	}
+	if view.WebSearch.Live || view.WebSearch.LiveVerified {
+		t.Fatalf("injected provider claimed liveness: %+v", view.WebSearch)
+	}
+	if view.WebSearch.CredentialStatus != credentialUnknown {
+		t.Fatalf("injected credential status = %q, want unknown", view.WebSearch.CredentialStatus)
+	}
+	if view.WebSearch.CredentialEnv != "" {
+		t.Fatalf("injected provider must not invent a credential env: %q", view.WebSearch.CredentialEnv)
+	}
+	joined := strings.Join(view.Readiness.Blocking, "\n")
+	if !strings.Contains(joined, "injected adapter") {
+		t.Fatalf("injected provider must remain a blocking item: %v", view.Readiness.Blocking)
+	}
+}
+
+// TEST-CONFIG-016: descriptor endpoints are projected without userinfo, query
+// or fragment, so a credential-bearing URL cannot leak.
+func TestConfigurationSurfaceWebSearchEndpointRedacted(t *testing.T) {
+	const secret = "sk-websearch-endpoint-secret"
+	t.Setenv("NEXUS_CONFIG_TEST_MODEL_KEY", "not-a-real-secret")
+	desc := testBraveDescriptor()
+	desc.Endpoint = "https://user:" + secret + "@search.example.invalid/v1?token=" + secret + "#frag"
+	cfg := testConfig(t)
+	srv := configTestServer(t, cfg, WithWebSearchSelection(desc))
+
+	w := configTestRequest(t, srv, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), secret) {
+		t.Fatal("web-search endpoint credential leaked in configuration response")
+	}
+	var view ConfigurationView
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if view.WebSearch.Endpoint != "https://search.example.invalid/v1" {
+		t.Fatalf("endpoint = %q, want redacted URL", view.WebSearch.Endpoint)
+	}
+}
+
+// injectedResearchProvider intentionally implements only the base adapter
+// interface: it declares no kind, liveness or credential requirement.
+type injectedResearchProvider struct{}
+
+func (injectedResearchProvider) Identify() string { return "injected-adapter" }
+func (injectedResearchProvider) Search(context.Context, string, int) ([]capability.Source, error) {
+	return nil, nil
+}
+
+// TEST-CONFIG-017: routes answer 503 in the contract envelope when the process
 // has no boot configuration snapshot.
 func TestConfigurationSurfaceUnavailableWithoutConfiguration(t *testing.T) {
 	engine, err := core.NewEngine(nil)
@@ -722,6 +955,16 @@ func TestConfigurationSurfaceUnavailableWithoutConfiguration(t *testing.T) {
 		t.Fatalf("engine: %v", err)
 	}
 	srv := NewServer(engine, ":0", WithControlAPIKey(configTestControlKey))
+
+	// A web-search descriptor without a loaded snapshot is not a boot
+	// configuration and must not make the surface available.
+	webOnly := NewServer(engine, ":0",
+		WithControlAPIKey(configTestControlKey),
+		WithWebSearchSelection(testBraveDescriptor()))
+	w := configTestRequest(t, webOnly, http.MethodGet, "/api/v1/control/config", nil, configTestControlKey)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("web-selection-only status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
 
 	for _, tc := range []struct {
 		name   string

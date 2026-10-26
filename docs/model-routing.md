@@ -33,10 +33,10 @@ interface; nothing in the agent layer depends on a specific one.
 
 ## Selection and fallback
 
-`ModelRouter.Route` is deterministic (documented strategy, stable ordering:
-local-first by policy, then health demotion). `Invoke` owns the bounded
-failover chain: the primary attempt fails → health is recorded → the next
-chain entry is tried. The runtime reports:
+`ModelRouter.Route` applies a documented strategy (manual allow-list, privacy,
+cost, latency, local-first, or capability match) and then health demotion.
+`Invoke` owns the bounded failover chain: the primary attempt fails → health is
+recorded → the next chain entry is tried. The runtime reports:
 
 | Field | Meaning |
 |---|---|
@@ -45,6 +45,25 @@ chain entry is tried. The runtime reports:
 | `outcome.metrics.routing_reason` | router's own reason string (a failover reason starts with `failover`) |
 | `outcome.metrics.fallback` | `true` when a failover produced the result |
 | `outcome.metrics.retries` | extra runtime-level attempts (bounded, transient-only) |
+
+### Known determinism limitation (open)
+
+The *strategy* is deterministic, but the primary choice among candidates in the
+same preference class is not currently guaranteed. Concrete evidence:
+
+- `ModelRegistry.models` is a Go map (`internal/foundation/modelrouter/registry.go`);
+  `FindByCapabilities` ranges that map, so its result order is unspecified.
+- `demoteUnhealthy` and `sortByPolicy` use stable partitions/sorts, which
+  preserve that unspecified order for ties (equal health, locality, or price).
+- Neither `contracts/PROVIDER_CONTRACTS.md` §5 nor the routing code defines a
+  final tie-break (registration order, model id, cost, latency, etc.).
+
+Consequences: two processes with the same configuration can pick different
+primary/fallback candidates when more than one model matches and no policy
+distinguishes them. This is an unresolved routing-contract question, not a
+claim that routing is currently deterministic. Changing the tie-break would
+change primary/fallback behavior, so this milestone documents the gap and does
+not alter selection pending an owner/contract decision.
 
 ## Failure semantics
 

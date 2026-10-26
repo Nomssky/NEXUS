@@ -56,7 +56,14 @@ func capabilityPlatform(
 	bus *event.MemBus,
 	opts CapabilityOptions,
 	m *metrics.Metrics,
-) (*capability.Platform, error) {
+) (*capability.Platform, capability.ResearchProviderDescriptor, error) {
+	// Selection provenance is boot-time only. An injected adapter was supplied
+	// by the embedding process; an adapter built from the environment was
+	// selected by NEXUS_CAPABILITY_WEB.
+	selectedBy := "NEXUS_CAPABILITY_WEB"
+	if opts.ResearchProvider != nil {
+		selectedBy = "launcher_option"
+	}
 	resolver := capability.NewScopedCredentialResolver(security.NewDevResolver())
 	// The operator-provided credential value is registered under its named
 	// reference and registered for redaction, so it can never escape into a
@@ -92,10 +99,15 @@ func capabilityPlatform(
 	if opts.ResearchProvider == nil {
 		provider, err := researchProviderFromEnv(env)
 		if err != nil {
-			return nil, fmt.Errorf("capability platform: %w: %w", errResearchProviderConfig, err)
+			return nil, capability.ResearchProviderDescriptor{},
+				fmt.Errorf("capability platform: %w: %w", errResearchProviderConfig, err)
 		}
 		opts.ResearchProvider = provider
 	}
+	// Capture the descriptor from the adapter that was actually constructed.
+	// No environment is re-read and no provider is contacted.
+	webSearch := capability.DescribeResearchProvider(opts.ResearchProvider)
+	webSearch.SelectedBy = selectedBy
 	if ref := env("NEXUS_CAPABILITY_GITHUB_REF"); ref != "" && opts.GitHubCredentialRef == "" {
 		opts.GitHubCredentialRef = ref
 		opts.GitHubBusinessID = firstNonEmpty(opts.GitHubBusinessID, env("NEXUS_CAPABILITY_GITHUB_BUSINESS"),
@@ -105,12 +117,12 @@ func capabilityPlatform(
 	if policyErr != nil {
 		// Fail closed on an unusable policy: a malformed port list or a
 		// loopback opt-in in production must not silently widen access.
-		return nil, fmt.Errorf("capability platform: http policy: %w", policyErr)
+		return nil, webSearch, fmt.Errorf("capability platform: http policy: %w", policyErr)
 	}
 	root := workspaceRoot(env, dataDir, firstNonEmpty(opts.GitHubBusinessID, env("NEXUS_BOOTSTRAP_BUSINESS")))
 	if root != "" {
 		if err := capability.EnsureWorkspaceRoot(root); err != nil {
-			return nil, err
+			return nil, webSearch, err
 		}
 	}
 	capOpts := capability.Options{
@@ -121,8 +133,12 @@ func capabilityPlatform(
 		GitHubBusinessID:    opts.GitHubBusinessID,
 	}
 	if err := capability.RegisterAll(tools, capOpts); err != nil {
-		return nil, fmt.Errorf("capability platform: %w", err)
+		return nil, webSearch, fmt.Errorf("capability platform: %w", err)
 	}
+	// The descriptor reports registration only after the catalogue actually
+	// registered the web.search capability; a selected-but-failed platform is
+	// not a registered provider.
+	webSearch.Registered = opts.ResearchProvider != nil
 	if bus != nil {
 		for _, m := range tools.ListManifests() {
 			diagnostic := map[string]string{
@@ -146,7 +162,7 @@ func capabilityPlatform(
 			})
 		}
 	}
-	return platform, nil
+	return platform, webSearch, nil
 }
 
 func researchProviderFromEnv(env func(string) string) (capability.ResearchProvider, error) {

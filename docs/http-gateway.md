@@ -556,8 +556,14 @@ storage. They are deliberately read-only:
 - The snapshot never contains a credential value. A model provider reports the
   name of its `api_key_env` and `credential_status`
   (`present`/`missing`/`not_required`); a Brave search provider reports
-  `BRAVE_API_KEY` presence the same way. `credential_storage` is always
-  `environment_only`.
+  `BRAVE_API_KEY` presence the same way. Injected adapters that declare no
+  credential requirement report `unknown`, never `present` or
+  `not_required`. `credential_storage` is always `environment_only`.
+- Credential presence and the web-search selection are sampled **at boot**,
+  from the descriptor the launcher captured from the adapter it actually
+  constructed. Request handling does not re-read `NEXUS_CAPABILITY_WEB` or a
+  credential variable, so changing the environment afterwards cannot retcon
+  the reported posture.
 - `live_verified` and `readiness.gate_zero_authorized` are always `false`. The
   gateway does not probe a model or search endpoint from these routes.
 - `model_routing.per_purpose_selection` is always `false`: this build registers
@@ -565,10 +571,28 @@ storage. They are deliberately read-only:
 
 `GET /api/v1/control/config` returns the redacted snapshot: environment, nexus
 id, providers (adapter `openai_compatible`, endpoint, model id, timeout,
-capabilities), actual web-search provider (`disabled`, `scripted`, `wikipedia`
-or `brave`; an unknown value is reported as `invalid`), storage posture,
-readiness blockers and warnings. `scripted` is labelled test-only; it is never
-presented as live evidence.
+capabilities), the boot-captured web-search descriptor, storage posture,
+readiness blockers and warnings. It also returns provenance fields:
+
+- `fingerprint` — versioned `sha256:v2:<64 hex>` identifier of the effective
+  non-secret settings; `fingerprint_version` is `sha256:v2`. The fingerprint is
+  material to audit/drift correlation and carries no authority.
+- `sources` — section-level provenance for `nexus`, `logging`, `health`,
+  `lifecycle`, `security`, `storage`, `models`, `rate_limit` and `http`, with
+  values `default`, `file`, `environment` or `mixed` (both file and environment
+  supplied a value in that section). It is not per-field provenance.
+- `provenance` — `kind: "boot_snapshot"`, documented precedence, `immutable`,
+  and the capture time.
+
+The web-search descriptor reports `provider` (canonical adapter id such as
+`scripted-research`, `wikipedia` or `brave`), `kind` (`disabled`, `scripted`,
+`live` or `injected`), `registered`, `live`, endpoint (userinfo/query/fragment
+stripped), and credential status. The scripted provider is always labelled
+test-only and is never presented as live evidence. An adapter injected by an
+embedding process is reported as `injected` with unknown liveness and
+credential requirements; the gateway does not guess. An unknown
+`NEXUS_CAPABILITY_WEB` value still fails boot closed and is never reported as a
+registered provider.
 
 `GET /api/v1/control/config/storage` returns bounded volume candidates: the
 configured `storage.data_dir`, the process user's home, `/`, mounts under
