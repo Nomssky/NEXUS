@@ -46,24 +46,26 @@ recorded → the next chain entry is tried. The runtime reports:
 | `outcome.metrics.fallback` | `true` when a failover produced the result |
 | `outcome.metrics.retries` | extra runtime-level attempts (bounded, transient-only) |
 
-### Known determinism limitation (open)
+### Deterministic tie-break contract
 
-The *strategy* is deterministic, but the primary choice among candidates in the
-same preference class is not currently guaranteed. Concrete evidence:
+When multiple candidates have equal policy rank, the tie is broken by
+**ascending lexicographic model ID**. This is deterministic across runs,
+across processes, and regardless of model registration order.
 
-- `ModelRegistry.models` is a Go map (`internal/foundation/modelrouter/registry.go`);
-  `FindByCapabilities` ranges that map, so its result order is unspecified.
-- `demoteUnhealthy` and `sortByPolicy` use stable partitions/sorts, which
-  preserve that unspecified order for ties (equal health, locality, or price).
-- Neither `contracts/PROVIDER_CONTRACTS.md` §5 nor the routing code defines a
-  final tie-break (registration order, model id, cost, latency, etc.).
+- `FindByCapabilities` enumerates candidates in ascending model-ID order, so
+  candidate enumeration is deterministic before policy sorting (the previous
+  Go map iteration order was unspecified).
+- `sortByPolicy` uses stable sorts/partitions, so equal-rank ties preserve the
+  ID order: `cheapest` ties by price keep ID order; `local_first` ties within
+  each locality class keep ID order; `nearest`/`random` keep ID order.
+- `random` is not genuine randomness — it preserves the deterministic
+  enumeration order. This is intentional: routing is deterministic, not
+  load-balanced (PROVIDER_CONTRACTS §7.3).
+- Policy precedence is unchanged: cost/latency/local-first still dominate;
+  model ID only breaks ties among equal-rank candidates.
 
-Consequences: two processes with the same configuration can pick different
-primary/fallback candidates when more than one model matches and no policy
-distinguishes them. This is an unresolved routing-contract question, not a
-claim that routing is currently deterministic. Changing the tie-break would
-change primary/fallback behavior, so this milestone documents the gap and does
-not alter selection pending an owner/contract decision.
+This tie-break mirrors the agent-selection contract in
+`docs/agent-contract.md` ("tie-break lexicographic id").
 
 ## Failure semantics
 
