@@ -381,6 +381,10 @@
   font-size: var(--font-size-xs);
 }
 
+.fingerprint {
+  overflow-wrap: anywhere;
+}
+
 .mutedText {
   margin: 0;
   font-size: var(--font-size-sm);

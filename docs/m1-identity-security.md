@@ -92,11 +92,30 @@ parsed strictly (`true`/`false`/`1`/`0`); ambiguous values fail closed.
 
 Configuration is frozen into an immutable `Snapshot` at startup:
 
-- `Snapshot.Settings()` returns the effective (validated) `Config`.
-- `Snapshot.Fingerprint()` returns a deterministic `sha256:` id over non-secret
-  settings — useful for audit/drift reasoning without exposing secrets.
-- `Snapshot.Source(section)` returns where a section came from (`default`,
-  `file`, or `environment`).
+- `Snapshot.Settings()` returns a deep copy of the effective (validated)
+  `Config`; `Redacted()` is likewise independent. Nested slices such as
+  provider capabilities, the security egress allow-list and CORS origins are
+  copied on construction and on every access, so a caller cannot mutate the
+  running process's configuration through a snapshot.
+- `Snapshot.Fingerprint()` returns a deterministic
+  `sha256:v2:<64 hex>` id over the material, non-secret settings (providers and
+  registration order, seeded mode/status, rate limits, CORS, security,
+  storage, logging, identity, health and lifecycle). Credential values never
+  enter the canonical input; only the `api_key_env` variable *name* does.
+  Provider endpoints are stripped of userinfo/query/fragment before hashing.
+  The schema version is part of both the identifier and the canonical input.
+- `Snapshot.Source(section)` returns where a section came from: `default`,
+  `file`, `environment`, or `mixed` when both explicit layers supplied a value
+  in that section. `SourceMap()` reports every documented section, including
+  `rate_limit` and `http`.
+- `LoadSnapshot` captures the environment exactly once, so effective values
+  and source attribution observe the same environment.
+
+The running launcher passes this exact snapshot to the gateway via an explicit
+option rather than letting the gateway reconstruct configuration or web-search
+selection from the environment at request time. The boot-time web-search
+descriptor (adapter id, kind, registration, endpoint, declared credential env)
+is captured from the adapter that was actually constructed.
 
 The snapshot is **not** hot-reloadable (deferred; see below). Business/division
 context is **not** process-global — it belongs to the request/session context

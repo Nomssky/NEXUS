@@ -91,6 +91,7 @@ func run() int {
 
 	launch := launcher.New(launcher.Options{
 		Config:        cfg,
+		Snapshot:      a.ConfigSnapshot(),
 		Logger:        log,
 		Health:        healthSrv,
 		Lifecycle:     life,

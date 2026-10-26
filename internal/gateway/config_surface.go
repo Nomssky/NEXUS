@@ -39,6 +39,9 @@ const (
 	credentialPresent     = "present"
 	credentialMissing     = "missing"
 	credentialNotRequired = "not_required"
+	// credentialUnknown is used for an injected adapter whose credential
+	// requirements were not declared. It is never a "present" claim.
+	credentialUnknown = "unknown"
 )
 
 // ModelProviderView is one configured OpenAI-compatible model provider. It
@@ -73,7 +76,9 @@ type ModelRoutingView struct {
 // WebSearchView describes the actual web.search provider selected at boot.
 type WebSearchView struct {
 	Provider          string `json:"provider"`
+	Kind              string `json:"kind"`
 	Mode              string `json:"mode"`
+	Registered        bool   `json:"registered"`
 	Live              bool   `json:"live"`
 	Keyless           bool   `json:"keyless"`
 	CredentialEnv     string `json:"credential_env,omitempty"`
@@ -124,22 +129,35 @@ type ConfigReadiness struct {
 	Notes                    []string `json:"notes,omitempty"`
 }
 
+// ConfigProvenance identifies where the response's snapshot came from and
+// states that it cannot be mutated through this process.
+type ConfigProvenance struct {
+	Kind       string `json:"kind"`
+	Precedence string `json:"precedence"`
+	Immutable  bool   `json:"immutable"`
+	CapturedAt string `json:"captured_at"`
+}
+
 // ConfigurationView is the complete redacted snapshot returned to the UI.
 type ConfigurationView struct {
-	Loaded            bool                `json:"loaded"`
-	Environment       string              `json:"environment"`
-	NexusID           string              `json:"nexus_id"`
-	Source            string              `json:"source"`
-	RuntimeMutable    bool                `json:"runtime_mutable"`
-	RestartRequired   bool                `json:"restart_required"`
-	CredentialStorage string              `json:"credential_storage"`
-	ModelProviders    []ModelProviderView `json:"model_providers"`
-	ModelRouting      ModelRoutingView    `json:"model_routing"`
-	WebSearch         WebSearchView       `json:"web_search"`
-	Storage           StorageView         `json:"storage"`
-	Readiness         ConfigReadiness     `json:"readiness"`
-	Warnings          []string            `json:"warnings,omitempty"`
-	GeneratedAt       string              `json:"generated_at"`
+	Loaded             bool                `json:"loaded"`
+	Environment        string              `json:"environment"`
+	NexusID            string              `json:"nexus_id"`
+	Source             string              `json:"source"`
+	Fingerprint        string              `json:"fingerprint"`
+	FingerprintVersion string              `json:"fingerprint_version"`
+	Sources            map[string]string   `json:"sources"`
+	Provenance         ConfigProvenance    `json:"provenance"`
+	RuntimeMutable     bool                `json:"runtime_mutable"`
+	RestartRequired    bool                `json:"restart_required"`
+	CredentialStorage  string              `json:"credential_storage"`
+	ModelProviders     []ModelProviderView `json:"model_providers"`
+	ModelRouting       ModelRoutingView    `json:"model_routing"`
+	WebSearch          WebSearchView       `json:"web_search"`
+	Storage            StorageView         `json:"storage"`
+	Readiness          ConfigReadiness     `json:"readiness"`
+	Warnings           []string            `json:"warnings,omitempty"`
+	GeneratedAt        string              `json:"generated_at"`
 }
 
 // StorageVolumeView is one bounded storage candidate. The path is host-local
@@ -214,38 +232,101 @@ type mountEntry struct {
 	source     string
 }
 
-// WithConfiguration supplies the process's effective boot configuration to
-// the read-only configuration surface. It contains credential *references*
-// only; no raw secret is ever placed on Server.
-func WithConfiguration(cfg config.Config) ServerOption {
+// bootConfigState is the immutable boot projection used by the read-only
+// surface. Credential presence and the web-search selection are sampled once,
+// when the options are applied, so later environment changes cannot retcon
+// what the process actually booted with.
+type bootConfigState struct {
+	snapshot                   config.Snapshot
+	capturedAt                 time.Time
+	modelCredentialStatus      []string
+	webSearch                  capability.ResearchProviderDescriptor
+	webSearchCredentialPresent bool
+}
+
+// WithConfigurationSnapshot supplies the exact immutable boot snapshot. It
+// contains credential *references* only; no raw secret is ever placed on
+// Server. Model credential presence is captured here, once.
+func WithConfigurationSnapshot(snap config.Snapshot) ServerOption {
 	return func(s *Server) {
-		c := cfg
-		s.configuration = &c
+		// A zero snapshot is not a loaded configuration; leave the surface
+		// unavailable rather than serving an empty fingerprint as if it were
+		// real.
+		if snap.Fingerprint() == "" {
+			return
+		}
+		if s.bootConfig == nil {
+			s.bootConfig = &bootConfigState{}
+		}
+		s.bootConfig.snapshot = snap
+		if s.bootConfig.capturedAt.IsZero() {
+			s.bootConfig.capturedAt = s.now().UTC()
+		}
+		settings := snap.Settings()
+		statuses := make([]string, len(settings.Models.Providers))
+		for i, p := range settings.Models.Providers {
+			statuses[i] = bootCredentialStatus(p.APIKeyEnv)
+		}
+		s.bootConfig.modelCredentialStatus = statuses
 	}
 }
 
+// WithWebSearchSelection records the descriptor captured from the web-search
+// adapter the launcher actually constructed. Credential presence is sampled
+// here, once; request handling never reads NEXUS_CAPABILITY_WEB or the
+// credential variable again.
+func WithWebSearchSelection(desc capability.ResearchProviderDescriptor) ServerOption {
+	return func(s *Server) {
+		if s.bootConfig == nil {
+			s.bootConfig = &bootConfigState{}
+		}
+		s.bootConfig.webSearch = desc
+		s.bootConfig.webSearchCredentialPresent = desc.CredentialEnv != "" &&
+			strings.TrimSpace(os.Getenv(desc.CredentialEnv)) != ""
+	}
+}
+
+func bootCredentialStatus(envName string) string {
+	if strings.TrimSpace(envName) == "" {
+		return credentialMissing
+	}
+	if strings.TrimSpace(os.Getenv(envName)) == "" {
+		return credentialMissing
+	}
+	return credentialPresent
+}
+
+// bootConfiguration returns the boot state only when a real snapshot was
+// supplied. A web-search selection on its own is not a loaded configuration.
+func (s *Server) bootConfiguration() (*bootConfigState, bool) {
+	if s.bootConfig == nil || s.bootConfig.snapshot.Fingerprint() == "" {
+		return nil, false
+	}
+	return s.bootConfig, true
+}
+
 func (s *Server) handleGetConfiguration(w http.ResponseWriter, r *http.Request) {
-	if s.configuration == nil {
+	if _, ok := s.bootConfiguration(); !ok {
 		s.writeError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
 			"configuration snapshot is not available in this process")
 		return
 	}
-	view := buildConfigurationView(*s.configuration, os.Getenv, s.now)
+	view := buildConfigurationView(s.bootConfig, s.now)
 	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) handleGetStorageVolumes(w http.ResponseWriter, r *http.Request) {
-	if s.configuration == nil {
+	if _, ok := s.bootConfiguration(); !ok {
 		s.writeError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
 			"configuration snapshot is not available in this process")
 		return
 	}
-	resp := buildStorageVolumes(s.configuration.Storage.DataDir, os.Getenv, s.now)
+	resp := buildStorageVolumes(s.bootConfig.snapshot.Settings().Storage.DataDir, os.Getenv, s.now)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleValidateStoragePath(w http.ResponseWriter, r *http.Request) {
-	if s.configuration == nil {
+	if _, ok := s.bootConfiguration(); !ok {
 		s.writeError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
 			"configuration snapshot is not available in this process")
 		return
@@ -264,7 +345,8 @@ func (s *Server) handleValidateStoragePath(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, r, http.StatusBadRequest, "VALIDATION", "invalid storage validation request")
 		return
 	}
-	validation, status, msg := validateStoragePath(body.Path, s.configuration.Storage.DataDir, os.Getenv)
+	validation, status, msg := validateStoragePath(body.Path,
+		s.bootConfig.snapshot.Settings().Storage.DataDir, os.Getenv)
 	if status != http.StatusOK {
 		s.writeError(w, r, status, "VALIDATION", msg)
 		return
@@ -281,12 +363,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func buildConfigurationView(cfg config.Config, env func(string) string, now func() time.Time) ConfigurationView {
+func buildConfigurationView(boot *bootConfigState, now func() time.Time) ConfigurationView {
+	cfg := boot.snapshot.Settings()
+	web := normalizeWebSearchDescriptor(boot.webSearch)
 	view := ConfigurationView{
-		Loaded:            true,
-		Environment:       cfg.Nexus.Environment,
-		NexusID:           cfg.Nexus.ID,
-		Source:            "boot configuration (defaults < file < environment)",
+		Loaded:             true,
+		Environment:        cfg.Nexus.Environment,
+		NexusID:            cfg.Nexus.ID,
+		Source:             "boot configuration (defaults < file < environment)",
+		Fingerprint:        boot.snapshot.Fingerprint(),
+		FingerprintVersion: config.FingerprintSchema,
+		Sources:            sourceStrings(boot.snapshot.SourceMap()),
+		Provenance: ConfigProvenance{
+			Kind:       "boot_snapshot",
+			Precedence: "defaults < file < environment",
+			Immutable:  true,
+			CapturedAt: boot.capturedAt.UTC().Format(time.RFC3339),
+		},
 		RuntimeMutable:    false,
 		RestartRequired:   true,
 		CredentialStorage: "environment_only",
@@ -294,16 +387,13 @@ func buildConfigurationView(cfg config.Config, env func(string) string, now func
 	}
 
 	modelCredentials := true
-	for _, p := range cfg.Models.Providers {
-		cred := credentialNotRequired
-		if strings.TrimSpace(p.APIKeyEnv) == "" {
-			cred = credentialMissing
+	for i, p := range cfg.Models.Providers {
+		cred := credentialMissing
+		if i < len(boot.modelCredentialStatus) {
+			cred = boot.modelCredentialStatus[i]
+		}
+		if cred != credentialPresent {
 			modelCredentials = false
-		} else if strings.TrimSpace(env(p.APIKeyEnv)) == "" {
-			cred = credentialMissing
-			modelCredentials = false
-		} else {
-			cred = credentialPresent
 		}
 		timeout := p.Timeout
 		if timeout <= 0 {
@@ -354,7 +444,7 @@ func buildConfigurationView(cfg config.Config, env func(string) string, now func
 			"No real model provider is configured; the simulated provider is development-only.")
 	}
 
-	view.WebSearch = buildWebSearchView(env)
+	view.WebSearch = buildWebSearchView(web, boot.webSearchCredentialPresent)
 
 	view.Storage = inspectStorage(cfg.Storage.DataDir)
 	if !view.Storage.Configured {
@@ -364,37 +454,48 @@ func buildConfigurationView(cfg config.Config, env func(string) string, now func
 		view.Warnings = append(view.Warnings,
 			"The configured storage.data_dir is not currently usable; boot would fail closed.")
 	}
-	if view.WebSearch.Provider == "disabled" {
+	switch view.WebSearch.Mode {
+	case "disabled":
 		view.Warnings = append(view.Warnings,
 			"web.search is disabled; research executions cannot retrieve sources.")
-	}
-	if view.WebSearch.Provider == "scripted" {
+	case "scripted":
 		view.Warnings = append(view.Warnings,
 			"web.search uses the scripted provider; results are deterministic fixtures, not live evidence.")
+	case "injected":
+		view.Warnings = append(view.Warnings,
+			"web.search uses an injected adapter whose liveness and credential requirements are not declared.")
+	case "invalid":
+		view.Warnings = append(view.Warnings,
+			"The selected web.search provider is unsupported; boot fails closed.")
+	}
+	if !view.WebSearch.Registered && view.WebSearch.Mode != "disabled" && view.WebSearch.Mode != "invalid" {
+		view.Warnings = append(view.Warnings,
+			"The selected web.search provider is not registered in this process.")
 	}
 	if view.WebSearch.CredentialStatus == credentialMissing {
 		view.Warnings = append(view.Warnings,
 			fmt.Sprintf("%s is not set; the selected live search provider cannot start.", view.WebSearch.CredentialEnv))
 	}
-	if view.WebSearch.Provider == "invalid" {
-		view.Warnings = append(view.Warnings,
-			"NEXUS_CAPABILITY_WEB is not a supported provider; boot fails closed.")
-	}
 
 	modelConfigured := len(view.ModelProviders) > 0
-	searchCredentialReady := view.WebSearch.CredentialStatus == credentialPresent || view.WebSearch.CredentialStatus == credentialNotRequired
+	webConfigured := view.WebSearch.Registered &&
+		view.WebSearch.Mode != "disabled" && view.WebSearch.Mode != "invalid"
+	webLive := webConfigured && view.WebSearch.Mode == "live"
+	webCredentialReady := webConfigured &&
+		(view.WebSearch.CredentialStatus == credentialPresent ||
+			view.WebSearch.CredentialStatus == credentialNotRequired)
 	view.Readiness = ConfigReadiness{
 		ModelProviderConfigured:  modelConfigured,
 		ModelCredentialsPresent:  modelConfigured && modelCredentials,
-		WebSearchConfigured:      view.WebSearch.Provider != "disabled" && view.WebSearch.Provider != "invalid",
-		WebSearchLive:            view.WebSearch.Live,
-		WebSearchCredentialReady: searchCredentialReady && view.WebSearch.Provider != "disabled" && view.WebSearch.Provider != "invalid",
+		WebSearchConfigured:      webConfigured,
+		WebSearchLive:            webLive,
+		WebSearchCredentialReady: webCredentialReady,
 		DurableStorageConfigured: view.Storage.Configured,
 		DurableStorageWritable:   view.Storage.Configured && view.Storage.Exists && view.Storage.IsDirectory && view.Storage.Writable,
 		LiveVerified:             false,
 		GateZeroAuthorized:       false,
 		Notes: []string{
-			"Preconditions are evaluated from boot configuration only; no provider is contacted.",
+			"Preconditions are evaluated from the boot snapshot only; no provider is contacted.",
 			"Live activation additionally requires a recorded Gate 0 authorization and the prerequisite gates in the live-activation runbook.",
 		},
 	}
@@ -403,13 +504,20 @@ func buildConfigurationView(cfg config.Config, env func(string) string, now func
 	} else if !modelCredentials {
 		view.Readiness.Blocking = append(view.Readiness.Blocking, "One or more model provider credentials are not set.")
 	}
-	if view.WebSearch.Provider == "disabled" {
+	switch {
+	case !webConfigured && view.WebSearch.Mode == "disabled":
 		view.Readiness.Blocking = append(view.Readiness.Blocking, "web.search is disabled.")
-	} else if view.WebSearch.Provider == "invalid" {
-		view.Readiness.Blocking = append(view.Readiness.Blocking, "NEXUS_CAPABILITY_WEB is invalid.")
-	} else if !view.WebSearch.Live {
+	case !webConfigured && view.WebSearch.Mode == "invalid":
+		view.Readiness.Blocking = append(view.Readiness.Blocking, "The selected web.search provider is unsupported.")
+	case !webConfigured:
+		view.Readiness.Blocking = append(view.Readiness.Blocking, "The selected web.search provider is not registered in this process.")
+	case !webLive && view.WebSearch.Kind == capability.ResearchKindScripted:
 		view.Readiness.Blocking = append(view.Readiness.Blocking, "web.search is using the scripted provider, not a live provider.")
-	} else if !searchCredentialReady {
+	case !webLive && view.WebSearch.Kind == capability.ResearchKindInjected:
+		view.Readiness.Blocking = append(view.Readiness.Blocking, "web.search uses an injected adapter whose liveness is unknown.")
+	case !webLive:
+		view.Readiness.Blocking = append(view.Readiness.Blocking, "web.search is not using a live provider.")
+	case !webCredentialReady:
 		view.Readiness.Blocking = append(view.Readiness.Blocking, "The selected live web-search credential is not set.")
 	}
 	if !view.Storage.Configured {
@@ -426,50 +534,92 @@ func buildConfigurationView(cfg config.Config, env func(string) string, now func
 	return view
 }
 
-func buildWebSearchView(env func(string) string) WebSearchView {
-	raw := strings.ToLower(strings.TrimSpace(env("NEXUS_CAPABILITY_WEB")))
+// normalizeWebSearchDescriptor makes a missing descriptor the explicit
+// disabled state. A non-empty kind is used as captured; this function never
+// infers liveness from a provider name.
+func normalizeWebSearchDescriptor(desc capability.ResearchProviderDescriptor) capability.ResearchProviderDescriptor {
+	if desc.Kind == "" && desc.Provider == "" {
+		d := capability.DescribeResearchProvider(nil)
+		d.SelectedBy = "NEXUS_CAPABILITY_WEB"
+		return d
+	}
+	if desc.Kind == "" {
+		// A provider name without a captured kind has unknown provenance.
+		desc.Kind = capability.ResearchKindInjected
+	}
+	if desc.SelectedBy == "" {
+		desc.SelectedBy = "boot_configuration"
+	}
+	return desc
+}
+
+func buildWebSearchView(desc capability.ResearchProviderDescriptor, credentialIsPresent bool) WebSearchView {
 	v := WebSearchView{
-		Provider:         raw,
-		SelectedBy:       "NEXUS_CAPABILITY_WEB",
+		Provider:         desc.Provider,
+		Kind:             desc.Kind,
+		Registered:       desc.Registered,
+		Live:             desc.Live,
+		Keyless:          desc.Keyless,
+		CredentialEnv:    desc.CredentialEnv,
+		Language:         desc.Language,
+		SelectedBy:       desc.SelectedBy,
 		LiveVerified:     false,
 		ScriptedFallback: false,
 		VerificationNote: "No live search is performed by this console; a safe test requires explicit Gate 0 authorization.",
 	}
-	switch raw {
-	case "":
+	if desc.Endpoint != "" {
+		v.Endpoint = displayEndpoint(desc.Endpoint)
+	}
+	switch desc.Kind {
+	case capability.ResearchKindDisabled:
 		v.Provider = "disabled"
 		v.Mode = "disabled"
 		v.CredentialStatus = credentialNotRequired
 		v.VerificationNote = "No web-search provider is selected."
-	case "scripted":
+	case capability.ResearchKindScripted:
 		v.Mode = "scripted"
 		v.CredentialStatus = credentialNotRequired
 		v.ScriptedFallback = true
 		v.VerificationNote = "The scripted provider returns deterministic fixtures; it is test-only and never live evidence."
-	case "wikipedia":
+	case capability.ResearchKindLive:
 		v.Mode = "live"
-		v.Live = true
-		v.Keyless = true
-		v.CredentialStatus = credentialNotRequired
-		v.Language = firstNonEmptyString(env("NEXUS_CAPABILITY_WEB_LANGUAGE"), capability.DefaultWikipediaLanguage)
-		v.Endpoint = displayEndpoint(firstNonEmptyString(env("NEXUS_CAPABILITY_WEB_ENDPOINT"), capability.DefaultWikipediaEndpoint))
-	case "brave":
-		v.Mode = "live"
-		v.Live = true
-		v.CredentialEnv = "BRAVE_API_KEY"
-		v.CredentialStatus = credentialMissing
-		if strings.TrimSpace(env("BRAVE_API_KEY")) != "" {
-			v.CredentialStatus = credentialPresent
+		switch {
+		case desc.Keyless:
+			v.CredentialStatus = credentialNotRequired
+		case desc.CredentialEnv != "":
+			if credentialIsPresent {
+				v.CredentialStatus = credentialPresent
+			} else {
+				v.CredentialStatus = credentialMissing
+			}
+		default:
+			// A live adapter that declares no credential requirement and is
+			// not keyless has unknown provenance; do not invent "not required".
+			v.CredentialStatus = credentialUnknown
 		}
-		v.Endpoint = displayEndpoint(firstNonEmptyString(env("NEXUS_CAPABILITY_WEB_ENDPOINT"), capability.DefaultBraveEndpoint))
+	case capability.ResearchKindInjected:
+		v.Mode = "injected"
+		v.CredentialStatus = credentialUnknown
+		v.VerificationNote = "The web-search adapter was injected by the embedding process; its liveness and credential requirements are not declared and are not verified."
 	default:
 		v.Provider = "invalid"
-		v.Mode = "disabled"
-		v.CredentialStatus = credentialNotRequired
-		v.UnsupportedReason = "NEXUS_CAPABILITY_WEB must be empty, scripted, wikipedia or brave."
-		v.VerificationNote = "The configured value is unsupported; boot fails closed."
+		v.Kind = "invalid"
+		v.Mode = "invalid"
+		v.CredentialStatus = credentialUnknown
+		v.UnsupportedReason = "The selected web-search provider is not supported; boot fails closed."
+		v.VerificationNote = "The selected provider is unsupported; boot fails closed."
 	}
 	return v
+}
+
+// sourceStrings converts the snapshot's typed section metadata to the wire
+// shape. It is a fresh map; callers cannot mutate snapshot state through it.
+func sourceStrings(in map[string]config.Source) map[string]string {
+	out := make(map[string]string, len(in))
+	for section, src := range in {
+		out[section] = string(src)
+	}
+	return out
 }
 
 func inspectStorage(dataDir string) StorageView {
@@ -1042,13 +1192,4 @@ func displayEndpoint(raw string) string {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String()
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-	return ""
 }

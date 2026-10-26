@@ -69,6 +69,38 @@ func TestLauncherStartFailsOnInvalidWebProviderConfiguration(t *testing.T) {
 	}
 }
 
+// The boot snapshot supplied by cmd/nexus is authoritative. The launcher must
+// not quietly prefer a second, stale Config value.
+func TestLauncherPrefersBootSnapshot(t *testing.T) {
+	snapCfg := testConfig()
+	snapCfg.Nexus.ID = "nx:nexus:snapshot"
+	snapCfg.Logging.Level = "debug"
+	snap := snapCfg.Snapshot()
+
+	stale := testConfig()
+	stale.Nexus.ID = "nx:nexus:stale"
+
+	l := New(Options{
+		Config:    stale,
+		Snapshot:  snap,
+		Logger:    logging.New(logging.Options{}),
+		Health:    health.NewServer(),
+		Lifecycle: lifecycle.New(lifecycle.Options{}),
+		Addr:      ":0",
+	})
+
+	if l.cfg.Nexus.ID != "nx:nexus:snapshot" || l.cfg.Logging.Level != "debug" {
+		t.Fatalf("launcher must derive its config from the snapshot: %+v", l.cfg)
+	}
+	if l.snapshot.Fingerprint() != snap.Fingerprint() {
+		t.Fatalf("launcher must keep the exact boot snapshot: %q vs %q",
+			l.snapshot.Fingerprint(), snap.Fingerprint())
+	}
+	if l.snapshot.Fingerprint() == stale.Snapshot().Fingerprint() {
+		t.Fatal("stale Config must not influence the boot snapshot")
+	}
+}
+
 // TEST-LAUNCH-001: Launcher creation
 func TestLauncherCreation(t *testing.T) {
 	cfg := testConfig()

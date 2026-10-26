@@ -87,10 +87,12 @@ A store backup is not a snapshot of the running system. See §6.
   `NEXUS_BOOTSTRAP_CREDENTIAL`, or any `.env` file.
 - **Verifying effective configuration without exposing secrets:** the process
   emits structured JSON startup logs (secrets are never logged); provider
-  registration logs `provider_id`/`model_id`/`endpoint` only; the config
-  fingerprint and redacted snapshot are produced internally
-  (`config.Snapshot.Redacted()`). There is no secret-dumping CLI; inspect the
-  config file plus non-secret environment variables and the startup logs.
+  registration logs `provider_id`/`model_id`/`endpoint` only; the startup
+  record includes `config_fingerprint` (`sha256:v2:<64 hex>`) for correlation.
+  The authenticated `GET /api/v1/control/config` surface exposes the same
+  fingerprint, section-level sources and a redacted boot snapshot; it never
+  exposes secret values. There is no secret-dumping CLI; inspect the config
+  file plus non-secret environment variables and the startup logs.
 
 ---
 

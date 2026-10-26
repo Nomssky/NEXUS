@@ -13,6 +13,23 @@ import * as path from 'node:path';
  * a provider. Credential values are synthetic and only checked for absence.
  */
 
+/** Fingerprints emitted by the real launcher's startup log. */
+function startupFingerprints(nexus: NexusHandle): string[] {
+  const logs = `${nexus.stdout()}\n${nexus.stderr()}`;
+  const found: string[] = [];
+  for (const line of logs.split(/\r?\n/)) {
+    if (!line.includes('config_fingerprint')) continue;
+    try {
+      const record = JSON.parse(line);
+      const value = record?.context?.config_fingerprint;
+      if (typeof value === 'string') found.push(value);
+    } catch {
+      // Non-JSON log lines cannot be the structured startup record.
+    }
+  }
+  return found;
+}
+
 function makeWorkspace(): { root: string; dataDir: string; configPath: string } {
   const tmpRoot = path.join(fixtures.E2E_DIR, '.tmp');
   fs.mkdirSync(tmpRoot, { recursive: true });
@@ -93,6 +110,31 @@ test('configuration surface is gated, redacted, bounded and non-mutating', async
     const snapshot = JSON.parse(snapshotText);
     expect(snapshot.loaded).toBe(true);
     expect(snapshot.credential_storage).toBe('environment_only');
+    // The versioned fingerprint is a deterministic identifier, not authority.
+    expect(snapshot.fingerprint_version).toBe('sha256:v2');
+    expect(snapshot.fingerprint).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
+    expect(snapshot.provenance).toMatchObject({
+      kind: 'boot_snapshot',
+      immutable: true,
+      precedence: 'defaults < file < environment',
+    });
+    expect(snapshot.runtime_mutable).toBe(false);
+    expect(snapshot.restart_required).toBe(true);
+    // Every documented section is attributed, including rate limiting and
+    // HTTP/CORS, which previously had no source metadata.
+    for (const section of [
+      'nexus', 'logging', 'health', 'lifecycle', 'security',
+      'storage', 'models', 'rate_limit', 'http',
+    ]) {
+      expect(['default', 'file', 'environment', 'mixed'], `source for ${section}`)
+        .toContain(snapshot.sources[section]);
+    }
+    expect(snapshot.sources.models).toBe('file');
+    expect(snapshot.sources.storage).toBe('mixed');
+    // The startup log and the control surface must name the same boot snapshot.
+    const logged = startupFingerprints(nexus);
+    expect(logged.length).toBeGreaterThan(0);
+    expect(logged[logged.length - 1]).toBe(snapshot.fingerprint);
     expect(snapshot.model_providers).toHaveLength(1);
     expect(snapshot.model_providers[0]).toMatchObject({
       id: 'e2e-openai-compatible',
@@ -171,6 +213,112 @@ test('configuration surface is gated, redacted, bounded and non-mutating', async
 
     // The provider configuration is never probed by these routes.
     expect(nexus.stdout() + nexus.stderr()).not.toContain(secret);
+  } finally {
+    if (nexus) await nexus.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint is stable across restart and reflects changed boot settings', async ({ request }) => {
+  const { root, dataDir, configPath } = makeWorkspace();
+  let first: NexusHandle | undefined;
+  let second: NexusHandle | undefined;
+  try {
+    first = await startNexus({
+      args: ['--config', configPath],
+      dataDir,
+      extraEnv: {
+        NEXUS_DATA_DIR: dataDir,
+        NEXUS_E2E_CONFIG_KEY: 'e2e-fingerprint-secret',
+        NEXUS_CAPABILITY_WEB: '',
+        NEXUS_LOG_LEVEL: 'info',
+      },
+    });
+
+    const readFingerprint = async (handle: NexusHandle): Promise<string> => {
+      const response = await request.get(`${handle.baseURL}/api/v1/control/config`, {
+        headers: controlHeaders(handle),
+      });
+      const text = await response.text();
+      expect(response.status(), text).toBe(200);
+      const body = JSON.parse(text);
+      expect(body.fingerprint_version).toBe('sha256:v2');
+      expect(body.fingerprint).toMatch(/^sha256:v2:[0-9a-f]{64}$/);
+      const logged = startupFingerprints(handle);
+      expect(logged.length).toBeGreaterThan(0);
+      expect(logged[logged.length - 1]).toBe(body.fingerprint);
+      return body.fingerprint;
+    };
+
+    const before = await readFingerprint(first);
+    await first.restart();
+    const afterRestart = await readFingerprint(first);
+    expect(afterRestart).toBe(before);
+
+    // Change a material boot setting (logging.level) and boot a fresh process
+    // against the same file/data directory. The fingerprint must change.
+    await first.stop();
+    first = undefined;
+    second = await startNexus({
+      args: ['--config', configPath],
+      dataDir,
+      extraEnv: {
+        NEXUS_DATA_DIR: dataDir,
+        NEXUS_E2E_CONFIG_KEY: 'e2e-fingerprint-secret',
+        NEXUS_CAPABILITY_WEB: '',
+        NEXUS_LOG_LEVEL: 'debug',
+      },
+    });
+    const changed = await readFingerprint(second);
+    expect(changed).not.toBe(before);
+  } finally {
+    if (first) await first.dispose();
+    if (second) await second.dispose();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a scripted web-search selection is reported canonically and stays non-live', async ({ request }) => {
+  const { root, dataDir, configPath } = makeWorkspace();
+  const secret = 'e2e-scripted-secret-must-not-appear';
+  let nexus: NexusHandle | undefined;
+  try {
+    nexus = await startNexus({
+      args: ['--config', configPath],
+      dataDir,
+      extraEnv: {
+        NEXUS_DATA_DIR: dataDir,
+        NEXUS_E2E_CONFIG_KEY: secret,
+        NEXUS_CAPABILITY_WEB: 'scripted',
+      },
+    });
+
+    const response = await request.get(`${nexus.baseURL}/api/v1/control/config`, {
+      headers: controlHeaders(nexus),
+    });
+    const text = await response.text();
+    expect(response.status(), text).toBe(200);
+    expect(response.headers()['cache-control'] ?? '').toContain('no-store');
+    expect(text).not.toContain(secret);
+    const body = JSON.parse(text);
+
+    expect(body.web_search).toMatchObject({
+      provider: 'scripted-research',
+      kind: 'scripted',
+      mode: 'scripted',
+      registered: true,
+      live: false,
+      keyless: true,
+      credential_status: 'not_required',
+      selected_by: 'NEXUS_CAPABILITY_WEB',
+      live_verified: false,
+      scripted_fallback: true,
+    });
+    expect(body.web_search.endpoint ?? '').toBe('');
+    expect(body.readiness.live_verified).toBe(false);
+    expect(body.readiness.gate_zero_authorized).toBe(false);
+    expect(body.readiness.live_preconditions_met).toBe(false);
+    expect(JSON.stringify(body.readiness.blocking)).toContain('scripted provider');
   } finally {
     if (nexus) await nexus.dispose();
     fs.rmSync(root, { recursive: true, force: true });

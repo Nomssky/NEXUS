@@ -5,7 +5,21 @@
  * credential value: only the environment-variable name and a presence status.
  */
 
-export type CredentialStatus = 'present' | 'missing' | 'not_required';
+/**
+ * `unknown` is used for injected adapters whose credential requirements were
+ * not declared. It is never a "present" claim.
+ */
+export type CredentialStatus = 'present' | 'missing' | 'not_required' | 'unknown';
+
+/** Section-level provenance reported by the boot snapshot. */
+export type ConfigurationSource = 'default' | 'file' | 'environment' | 'mixed';
+
+export interface ConfigurationProvenance {
+  kind: string;
+  precedence: string;
+  immutable: boolean;
+  captured_at: string;
+}
 
 export interface ModelProviderView {
   id: string;
@@ -32,11 +46,23 @@ export interface ModelRoutingView {
   note: string;
 }
 
-export type WebSearchProvider = 'disabled' | 'scripted' | 'wikipedia' | 'brave' | 'invalid';
+/**
+ * Canonical adapter identifier (for example "scripted-research", "wikipedia"
+ * or "brave"). Older servers may send the loose legacy value "scripted".
+ */
+export type WebSearchProvider = string;
+
+/** How the adapter was selected at boot. */
+export type WebSearchKind = 'disabled' | 'scripted' | 'live' | 'injected' | 'invalid';
+export type WebSearchMode = 'disabled' | 'scripted' | 'live' | 'injected' | 'invalid';
 
 export interface WebSearchView {
   provider: WebSearchProvider;
-  mode: 'disabled' | 'scripted' | 'live';
+  /** Optional for compatibility with servers that predate the boot descriptor. */
+  kind?: WebSearchKind;
+  mode: WebSearchMode;
+  /** Optional for compatibility with servers that predate the boot descriptor. */
+  registered?: boolean;
   live: boolean;
   keyless: boolean;
   credential_env?: string;
@@ -89,6 +115,13 @@ export interface ConfigurationSnapshot {
   environment: string;
   nexus_id: string;
   source: string;
+  /** Versioned SHA-256 identifier of the boot snapshot; absent on older servers. */
+  fingerprint?: string;
+  /** Fingerprint schema version, e.g. "sha256:v2"; absent on older servers. */
+  fingerprint_version?: string;
+  /** Section-level provenance; absent on older servers. */
+  sources?: Record<string, ConfigurationSource>;
+  provenance?: ConfigurationProvenance;
   runtime_mutable: boolean;
   restart_required: boolean;
   credential_storage: 'environment_only';

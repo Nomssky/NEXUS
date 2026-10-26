@@ -182,6 +182,126 @@ describe('Settings states', () => {
     expect(html).toContain('No provider calls are made from this console');
   });
 
+  it('shows the boot fingerprint, provenance and section sources', () => {
+    const fingerprint = `sha256:v2:${'a'.repeat(64)}`;
+    stubHooks({
+      configuration: {
+        data: snapshot({
+          fingerprint,
+          fingerprint_version: 'sha256:v2',
+          sources: {
+            nexus: 'default',
+            logging: 'environment',
+            models: 'mixed',
+            http: 'file',
+            rate_limit: 'default',
+          },
+          provenance: {
+            kind: 'boot_snapshot',
+            precedence: 'defaults < file < environment',
+            immutable: true,
+            captured_at: '2026-10-26T00:00:00Z',
+          },
+        }),
+        isLoading: false,
+        isError: false,
+        error: null,
+        isFetching: false,
+        refetch: vi.fn(),
+      },
+    });
+
+    const html = renderToStaticMarkup(<Settings controlKey="test-key" />);
+    expect(html).toContain('Configuration provenance');
+    expect(html).toContain(fingerprint);
+    expect(html).toContain('sha256:v2');
+    expect(html).toContain('boot_snapshot');
+    expect(html).toContain('Immutable');
+    expect(html).toContain('rate_limit');
+    expect(html).toContain('environment');
+    expect(html).toContain('mixed');
+  });
+
+  it('does not invent a fingerprint when an older server omits it', () => {
+    const html = renderToStaticMarkup(<Settings controlKey="test-key" />);
+    expect(html).toContain('Fingerprint not reported');
+    expect(html).not.toContain('sha256:v2:');
+    expect(html).toContain('No section-level source metadata was reported.');
+  });
+
+  it('canonicalizes a legacy scripted provider identifier', () => {
+    stubHooks({
+      configuration: {
+        data: snapshot({
+          web_search: {
+            provider: 'scripted',
+            mode: 'scripted',
+            live: false,
+            keyless: true,
+            credential_status: 'not_required',
+            selected_by: 'NEXUS_CAPABILITY_WEB',
+            live_verified: false,
+            verification_note: 'The scripted provider returns deterministic fixtures.',
+            scripted_fallback: true,
+          },
+        }),
+        isLoading: false,
+        isError: false,
+        error: null,
+        isFetching: false,
+        refetch: vi.fn(),
+      },
+    });
+
+    const html = renderToStaticMarkup(<Settings controlKey="test-key" />);
+    expect(html).toContain('scripted-research');
+    expect(html).toContain('Scripted test-only');
+    expect(html).toContain('<span>Registered</span>');
+    expect(html).not.toContain('Live adapter selected');
+  });
+
+  it('reports an injected adapter without claiming liveness or credentials', () => {
+    stubHooks({
+      configuration: {
+        data: snapshot({
+          web_search: {
+            provider: 'injected-adapter',
+            kind: 'injected',
+            mode: 'injected',
+            registered: true,
+            live: false,
+            keyless: false,
+            credential_status: 'unknown',
+            selected_by: 'launcher_option',
+            live_verified: false,
+            verification_note: 'The web-search adapter was injected by the embedding process.',
+            scripted_fallback: false,
+          },
+          readiness: {
+            ...snapshot().readiness,
+            web_search_configured: true,
+            web_search_credential_ready: false,
+            blocking: ['web.search uses an injected adapter whose liveness is unknown.'],
+          },
+        }),
+        isLoading: false,
+        isError: false,
+        error: null,
+        isFetching: false,
+        refetch: vi.fn(),
+      },
+    });
+
+    const html = renderToStaticMarkup(<Settings controlKey="test-key" />);
+    expect(html).toContain('Injected adapter');
+    expect(html).toContain('Credential unknown');
+    expect(html).toContain('Unknown — adapter did not declare requirements');
+    expect(html).toContain('<span>Registered</span>');
+    expect(html).toContain('not declared');
+    expect(html).not.toContain('Live adapter selected');
+    expect(html).not.toContain('Credential present');
+  });
+
   it('labels a selected live adapter as unverified', () => {
     stubHooks({
       configuration: {
