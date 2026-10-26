@@ -248,6 +248,37 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 			mdl.ID, mdl.ProviderID, genReq.Structured.Name)
 	}
 
+	// A request that advertises tool definitions must only reach a model that
+	// explicitly advertises CapabilityToolCalling — never silently sent to a
+	// model that cannot honor them. As with structured output, the check is
+	// repeated here so a caller that sets Tools without the matching
+	// RequiredCaps fails honestly instead of shipping tools into the void.
+	if len(genReq.Tools) > 0 && !mr.modelAdvertises(decision.ModelID, CapabilityToolCalling) {
+		reselected := ""
+		for _, modelID := range decision.FallbackChain {
+			if !mr.modelAdvertises(modelID, CapabilityToolCalling) {
+				continue
+			}
+			// Never trade away a structured-output capability the request
+			// depends on just to reach a tool-calling model.
+			if genReq.Structured != nil && !mr.modelAdvertises(modelID, CapabilityStructuredOutput) {
+				continue
+			}
+			reselected = modelID
+			break
+		}
+		if reselected == "" {
+			return nil, decision, fmt.Errorf("no routed model advertises %q for a tool-calling request", CapabilityToolCalling)
+		}
+		mdl, ok := mr.registry.GetModel(reselected)
+		if !ok {
+			return nil, decision, fmt.Errorf("no routed model advertises %q for a tool-calling request", CapabilityToolCalling)
+		}
+		decision.ModelID = mdl.ID
+		decision.ProviderID = mdl.ProviderID
+		decision.Reason = fmt.Sprintf("reselected %s (provider=%s) for tool calling", mdl.ID, mdl.ProviderID)
+	}
+
 	// D2: the primary attempt must invoke the model routing actually chose
 	// — callers pass an empty/placeholder ModelID and the router owns
 	// selection (routing ≠ authorization; selection here, governance at
@@ -289,6 +320,11 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 			// A structured request never falls back to a model that cannot
 			// honor it — skipping is honest, downgrading would not be.
 			if genReq.Structured != nil && !hasModelCapability(mdl, CapabilityStructuredOutput) {
+				continue
+			}
+			// Likewise a tool-calling request never falls back to a model that
+			// does not advertise tool calling.
+			if len(genReq.Tools) > 0 && !hasModelCapability(mdl, CapabilityToolCalling) {
 				continue
 			}
 			genReq.ModelID = modelID

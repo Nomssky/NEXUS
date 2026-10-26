@@ -104,8 +104,28 @@ func (p *OpenAIProvider) ListModels() ([]string, error) { return nil, nil }
 // fields are ignored rather than rejected, so the adapter tolerates
 // OpenAI-compatible implementations with extra metadata.
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolCalls  []chatToolCall `json:"tool_calls,omitempty"`
+}
+
+type chatToolDef struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description,omitempty"`
+		Parameters  json.RawMessage `json:"parameters,omitempty"`
+	} `json:"function"`
+}
+
+type chatToolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 type chatRequest struct {
@@ -114,6 +134,7 @@ type chatRequest struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Temperature float64       `json:"temperature,omitempty"`
 	ResponseFmt *chatRespFmt  `json:"response_format,omitempty"`
+	Tools       []chatToolDef `json:"tools,omitempty"`
 }
 
 type chatRespFmt struct {
@@ -158,13 +179,37 @@ func (p *OpenAIProvider) Invoke(ctx context.Context, req *GenerateRequest) (*Gen
 
 	msgs := make([]chatMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		msgs = append(msgs, chatMessage{Role: m.Role, Content: m.Content})
+		wire := chatMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
+		for _, call := range m.ToolCalls {
+			wire.ToolCalls = append(wire.ToolCalls, chatToolCall{
+				ID: call.ID, Type: "function",
+				Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: call.Name, Arguments: call.Arguments},
+			})
+		}
+		msgs = append(msgs, wire)
 	}
 	chatReq := chatRequest{
 		Model:       req.ModelID,
 		Messages:    msgs,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
+	}
+	for _, definition := range req.Tools {
+		if strings.TrimSpace(definition.Name) == "" {
+			return nil, &ProviderError{Kind: "invalid_request", Provider: p.config.ID, Cause: fmt.Errorf("tool name is required")}
+		}
+		params, err := json.Marshal(definition.Parameters)
+		if err != nil || !json.Valid(params) {
+			return nil, &ProviderError{Kind: "invalid_request", Provider: p.config.ID, Cause: fmt.Errorf("tool %q has invalid parameters schema", definition.Name)}
+		}
+		wire := chatToolDef{Type: "function"}
+		wire.Function.Name = definition.Name
+		wire.Function.Description = definition.Description
+		wire.Function.Parameters = params
+		chatReq.Tools = append(chatReq.Tools, wire)
 	}
 	// The canonical structured-output request renders as the provider's
 	// strict JSON-schema response format. A malformed schema declaration is
@@ -236,6 +281,11 @@ func (p *OpenAIProvider) Invoke(ctx context.Context, req *GenerateRequest) (*Gen
 	if len(chat.Choices) == 0 {
 		return nil, fmt.Errorf("provider %s: malformed response: no choices", p.config.ID)
 	}
+	for _, call := range chat.Choices[0].Message.ToolCalls {
+		if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" || strings.TrimSpace(call.Function.Arguments) == "" {
+			return nil, &ProviderError{Kind: "malformed_output", Provider: p.config.ID, Cause: fmt.Errorf("tool call is incomplete")}
+		}
+	}
 	return &GenerateResponse{
 		RequestID:    req.RequestID,
 		ModelID:      req.ModelID,
@@ -245,7 +295,19 @@ func (p *OpenAIProvider) Invoke(ctx context.Context, req *GenerateRequest) (*Gen
 		OutputTokens: chat.Usage.CompletionTokens,
 		TotalTokens:  chat.Usage.TotalTokens,
 		LatencyMs:    latency,
+		ToolCalls:    normalizeToolCalls(chat.Choices[0].Message.ToolCalls),
 	}, nil
+}
+
+func normalizeToolCalls(calls []chatToolCall) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]ToolCall, 0, len(calls))
+	for _, call := range calls {
+		out = append(out, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
+	}
+	return out
 }
 
 // ProviderError classifies failures into the contract's model-failure model

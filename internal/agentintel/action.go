@@ -8,6 +8,8 @@ import (
 
 	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/executor"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/tool"
 	"github.com/Nomssky/NEXUS/internal/memory"
 )
 
@@ -43,6 +45,9 @@ type Action struct {
 	Prompt string `json:"prompt,omitempty"`
 	// tool_call
 	Tool string `json:"tool,omitempty"`
+	// ProviderToolCallID preserves the provider's opaque proposal id for audit
+	// correlation. It never grants authority or selects the capability.
+	ProviderToolCallID string `json:"provider_tool_call_id,omitempty"`
 	// Operation selects an explicit manifest operation for tools that declare
 	// more than one (e.g. filesystem read/write/list, http methods). It is a
 	// closed vocabulary enforced against the manifest — it can never widen
@@ -434,6 +439,9 @@ type DecisionPrompt struct {
 	// or authorization internals, and it grants nothing — every invocation is
 	// validated again by the capability platform.
 	Tools []ToolHint
+	// ToolConversation contains runtime-authored provider tool-call/result
+	// messages from this execution only. It is process-local and bounded.
+	ToolConversation []modelrouter.Message
 	// Evidence is the validated source snapshot captured by THIS execution. It
 	// is authoritative runtime data, not model output: the prompt renders only
 	// source ids and their captured metadata, and completion validation resolves
@@ -470,7 +478,8 @@ type ToolHint struct {
 	// InputShape names the accepted input fields ("a:string*,b:string"):
 	// a trailing "*" marks a required field. Derived from the tool manifest's
 	// input schema, never from model input.
-	InputShape string
+	InputShape  string
+	InputSchema tool.Schema
 }
 
 // PlanPrompt is the advisory planning request.
