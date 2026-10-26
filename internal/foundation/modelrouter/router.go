@@ -434,9 +434,12 @@ func (mr *ModelRouter) demoteUnhealthy(models []*ModelDefinition) []*ModelDefini
 
 // sortByPolicy orders candidates by the router policy. local_first splits
 // local before remote (stable within each class); cheapest sorts by input
-// price ascending (stable). nearest/random have no distance/load signal in
-// this milestone and keep registry order — deterministic routing is an
-// accepted risk (audit §6), not load balancing.
+// price ascending (stable). nearest/random keep the deterministic candidate
+// order from FindByCapabilities (ascending model ID). Tie-break contract:
+// ascending lexicographic model ID resolves equal-rank ties. This is
+// intentional for failover semantics — selection is deterministic, not
+// load-balanced, and `random` is not genuine randomness (it preserves the
+// deterministic enumeration order).
 func (mr *ModelRouter) sortByPolicy(candidates []*ModelDefinition, req *RoutingRequest) []*ModelDefinition {
 	if mr.policy == RoutingPolicyCheapest {
 		sorted := append([]*ModelDefinition(nil), candidates...)

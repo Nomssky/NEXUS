@@ -19,6 +19,7 @@ package modelrouter
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -121,6 +122,12 @@ func (mr *ModelRegistry) FindByCapabilities(required []ModelCapability) []*Model
 			result = append(result, def)
 		}
 	}
+	// Deterministic enumeration: sort by model ID so that equal-rank ties
+	// resolve the same way regardless of map iteration order or registration
+	// order. Tie-break contract: ascending lexicographic model ID.
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ID < result[j].ID
+	})
 	return result
 }
 

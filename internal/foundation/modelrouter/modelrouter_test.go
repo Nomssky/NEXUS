@@ -879,6 +879,302 @@ func TestScriptedProviderPromotesRuntimeObservations(t *testing.T) {
 	}
 }
 
+// TEST-M6-031: Repeated routing requests with equivalent inputs yield the
+// same selected ModelID — candidate enumeration is deterministic regardless
+// of Go map iteration order (regression for map-order nondeterminism).
+func TestRouteDeterministicRepeatedCalls(t *testing.T) {
+	reg := NewModelRegistry()
+	for _, d := range []*ModelDefinition{
+		{ID: "zeta", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.005},
+		{ID: "alpha", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.005},
+		{ID: "mid", ProviderID: "p-m", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.005},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyCheapest)
+
+	var first string
+	for i := 0; i < 50; i++ {
+		d, err := router.Route(&RoutingRequest{
+			RequestID:    fmt.Sprintf("req-det-%d", i),
+			RequiredCaps: []ModelCapability{CapabilityReasoning},
+		})
+		if err != nil {
+			t.Fatalf("route: %v", err)
+		}
+		if i == 0 {
+			first = d.ModelID
+		}
+		if d.ModelID != first {
+			t.Fatalf("route %d: model changed from %q to %q", i, first, d.ModelID)
+		}
+		if d.FallbackChain[0] != d.ModelID {
+			t.Fatalf("route %d: primary != fallback chain head", i)
+		}
+	}
+}
+
+// TEST-M6-032: Equal-price candidates under cheapest resolve by ascending
+// model ID (tie-break contract), not by registration order.
+func TestRouteCheapestEqualPriceTieBreak(t *testing.T) {
+	reg := NewModelRegistry()
+	// Register in reverse-ID order to prove registration order doesn't matter.
+	for _, d := range []*ModelDefinition{
+		{ID: "zeta", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.01},
+		{ID: "alpha", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.01},
+		{ID: "mid", ProviderID: "p-m", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.01},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyCheapest)
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-eq",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	want := []string{"alpha", "mid", "zeta"}
+	if len(d.FallbackChain) != len(want) {
+		t.Fatalf("chain: want %v, got %v", want, d.FallbackChain)
+	}
+	for i, id := range want {
+		if d.FallbackChain[i] != id {
+			t.Errorf("chain[%d]: want %s, got %s (chain=%v)", i, id, d.FallbackChain[i], d.FallbackChain)
+		}
+	}
+	if d.ModelID != "alpha" {
+		t.Errorf("primary: want alpha (lexicographically first), got %s", d.ModelID)
+	}
+	if d.Strategy != StrategyCostOptimize {
+		t.Errorf("strategy: want cost_optimize, got %s", d.Strategy)
+	}
+}
+
+// TEST-M6-033: Equal-rank candidates under local_first resolve by ascending
+// model ID within each locality class.
+func TestRouteLocalFirstEqualRankTieBreak(t *testing.T) {
+	reg := NewModelRegistry()
+	// Register remote before local to prove registration order doesn't matter.
+	for _, d := range []*ModelDefinition{
+		{ID: "zeta-remote", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "alpha-remote", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "zeta-local", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeLocal, Status: ModelStatusActive},
+		{ID: "alpha-local", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeLocal, Status: ModelStatusActive},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyLocalFirst)
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-lf",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+		PreferLocal:  true,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	// local models first (alpha-local, zeta-local), then remote (alpha-remote, zeta-remote),
+	// each class in ascending ID order.
+	want := []string{"alpha-local", "zeta-local", "alpha-remote", "zeta-remote"}
+	if len(d.FallbackChain) != len(want) {
+		t.Fatalf("chain: want %v, got %v", want, d.FallbackChain)
+	}
+	for i, id := range want {
+		if d.FallbackChain[i] != id {
+			t.Errorf("chain[%d]: want %s, got %s (chain=%v)", i, id, d.FallbackChain[i], d.FallbackChain)
+		}
+	}
+	if d.ModelID != "alpha-local" {
+		t.Errorf("primary: want alpha-local, got %s", d.ModelID)
+	}
+}
+
+// TEST-M6-034: nearest and random policies are deterministic (ascending ID
+// tie-break). `random` is not genuine randomness — it preserves the
+// deterministic enumeration order; this test pins that contract.
+func TestRouteNearestAndRandomDeterministic(t *testing.T) {
+	reg := NewModelRegistry()
+	for _, d := range []*ModelDefinition{
+		{ID: "zeta", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "alpha", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "mid", ProviderID: "p-m", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+
+	for _, policy := range []RoutingPolicy{RoutingPolicyNearest, RoutingPolicyRandom} {
+		router := NewModelRouter(reg, policy)
+		var first string
+		for i := 0; i < 50; i++ {
+			d, err := router.Route(&RoutingRequest{
+				RequestID:    fmt.Sprintf("req-%s-%d", policy, i),
+				RequiredCaps: []ModelCapability{CapabilityReasoning},
+			})
+			if err != nil {
+				t.Fatalf("route: %v", err)
+			}
+			if i == 0 {
+				first = d.ModelID
+			}
+			if d.ModelID != first {
+				t.Fatalf("%s route %d: model changed from %q to %q", policy, i, first, d.ModelID)
+			}
+		}
+		// Ascending ID tie-break: alpha is lexicographically first.
+		d, _ := router.Route(&RoutingRequest{
+			RequestID:    "req-final",
+			RequiredCaps: []ModelCapability{CapabilityReasoning},
+		})
+		if d.ModelID != "alpha" {
+			t.Errorf("%s primary: want alpha, got %s", policy, d.ModelID)
+		}
+	}
+}
+
+// TEST-M6-035: Candidate registration order changes do not change the
+// routing result (registration order is not a significant tie-break).
+func TestRouteRegistrationOrderInvariant(t *testing.T) {
+	buildRegistry := func(order []string) *ModelRegistry {
+		reg := NewModelRegistry()
+		prices := map[string]float64{"zeta": 0.01, "alpha": 0.01, "mid": 0.01}
+		runtimes := map[string]RuntimeType{"zeta": RuntimeRemote, "alpha": RuntimeLocal, "mid": RuntimeRemote}
+		for _, id := range order {
+			if err := reg.RegisterModel(&ModelDefinition{
+				ID:           id,
+				ProviderID:   "p-" + id,
+				Capabilities: []ModelCapability{CapabilityReasoning},
+				Runtime:      runtimes[id],
+				Status:       ModelStatusActive,
+				PricingInput: prices[id],
+			}); err != nil {
+				t.Fatalf("register %s: %v", id, err)
+			}
+		}
+		return reg
+	}
+
+	orders := [][]string{{"zeta", "alpha", "mid"}, {"mid", "zeta", "alpha"}, {"alpha", "mid", "zeta"}}
+	var firstChain []string
+	for _, order := range orders {
+		reg := buildRegistry(order)
+		router := NewModelRouter(reg, RoutingPolicyCheapest)
+		d, err := router.Route(&RoutingRequest{
+			RequestID:    "req-inv",
+			RequiredCaps: []ModelCapability{CapabilityReasoning},
+		})
+		if err != nil {
+			t.Fatalf("route: %v", err)
+		}
+		if firstChain == nil {
+			firstChain = d.FallbackChain
+		}
+		if len(d.FallbackChain) != len(firstChain) {
+			t.Fatalf("order %v: chain length changed", order)
+		}
+		for i := range firstChain {
+			if d.FallbackChain[i] != firstChain[i] {
+				t.Errorf("order %v: chain[%d] changed from %q to %q", order, i, firstChain[i], d.FallbackChain[i])
+			}
+		}
+	}
+}
+
+// TEST-M6-036: Ineligible candidates and capability filtering remain correct
+// with deterministic enumeration.
+func TestRouteCapabilityFilteringUnchanged(t *testing.T) {
+	reg := NewModelRegistry()
+	for _, d := range []*ModelDefinition{
+		{ID: "m-reason", ProviderID: "p1", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeLocal, Status: ModelStatusActive},
+		{ID: "m-vision", ProviderID: "p2", Capabilities: []ModelCapability{CapabilityVision}, Runtime: RuntimeRemote, Status: ModelStatusActive},
+		{ID: "m-offline", ProviderID: "p3", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusOffline},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyCheapest)
+
+	// Reasoning matches m-reason only (m-vision lacks it, m-offline is excluded).
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-reason",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if d.ModelID != "m-reason" {
+		t.Errorf("reasoning: want m-reason, got %s", d.ModelID)
+	}
+	if len(d.FallbackChain) != 1 || d.FallbackChain[0] != "m-reason" {
+		t.Errorf("reasoning chain: want [m-reason], got %v", d.FallbackChain)
+	}
+
+	// Vision matches m-vision only.
+	d, err = router.Route(&RoutingRequest{
+		RequestID:    "req-vision",
+		RequiredCaps: []ModelCapability{CapabilityVision},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if d.ModelID != "m-vision" {
+		t.Errorf("vision: want m-vision, got %s", d.ModelID)
+	}
+
+	// No model has both reasoning and vision.
+	_, err = router.Route(&RoutingRequest{
+		RequestID:    "req-both",
+		RequiredCaps: []ModelCapability{CapabilityReasoning, CapabilityVision},
+	})
+	if err == nil {
+		t.Error("expected error when no model has all required capabilities")
+	}
+}
+
+// TEST-M6-037: Existing primary/fallback precedence remains correct with
+// deterministic enumeration — the best candidate leads the chain.
+func TestRoutePrimaryFallbackPrecedenceUnchanged(t *testing.T) {
+	reg := NewModelRegistry()
+	for _, d := range []*ModelDefinition{
+		{ID: "m-pricey", ProviderID: "p-z", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.09},
+		{ID: "m-cheap", ProviderID: "p-a", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.01},
+		{ID: "m-mid", ProviderID: "p-m", Capabilities: []ModelCapability{CapabilityReasoning}, Runtime: RuntimeRemote, Status: ModelStatusActive, PricingInput: 0.05},
+	} {
+		if err := reg.RegisterModel(d); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+	router := NewModelRouter(reg, RoutingPolicyCheapest)
+	d, err := router.Route(&RoutingRequest{
+		RequestID:    "req-prec",
+		RequiredCaps: []ModelCapability{CapabilityReasoning},
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	// Cheapest leads the chain regardless of ID.
+	if d.ModelID != "m-cheap" {
+		t.Errorf("primary: want m-cheap (lowest price), got %s", d.ModelID)
+	}
+	want := []string{"m-cheap", "m-mid", "m-pricey"}
+	if len(d.FallbackChain) != len(want) {
+		t.Fatalf("chain: want %v, got %v", want, d.FallbackChain)
+	}
+	for i, id := range want {
+		if d.FallbackChain[i] != id {
+			t.Errorf("chain[%d]: want %s, got %s (chain=%v)", i, id, d.FallbackChain[i], d.FallbackChain)
+		}
+	}
+}
+
 // A governance refusal is not an execution: an observation whose status is
 // pending_approval, denied or escalated records a proposal that never ran.
 // The deterministic table must therefore re-propose the named tool after an
