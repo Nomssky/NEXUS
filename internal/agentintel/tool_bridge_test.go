@@ -341,6 +341,11 @@ func TestProviderToolCallIDFlowsThroughGovernedPath(t *testing.T) {
 	if !json.Valid([]byte(conv[1].Content)) {
 		t.Fatalf("tool result content must be structured: %q", conv[1].Content)
 	}
+	// The mediated calculator actually ran: its computed value (6*7) is the
+	// payload the model receives, not merely a "success" flag.
+	if !strings.Contains(conv[1].Content, "42") {
+		t.Fatalf("tool result must carry the mediated side effect: %q", conv[1].Content)
+	}
 }
 
 // TestProviderToolCallMissingCatalogEntryFailsClosed verifies a provider-native
