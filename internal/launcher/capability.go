@@ -238,11 +238,12 @@ func (c capabilityCatalog) Catalog(businessID, divisionID string) []agentintel.T
 	out := make([]agentintel.ToolHint, 0, len(manifests))
 	for _, m := range manifests {
 		out = append(out, agentintel.ToolHint{
-			ID:         m.ID,
-			Summary:    m.Description,
-			Operations: m.SortedOperations(),
-			SideEffect: string(m.SideEffectClass),
-			InputShape: inputShapeOf(m),
+			ID:          m.ID,
+			Summary:     m.Description,
+			Operations:  m.SortedOperations(),
+			SideEffect:  string(m.SideEffectClass),
+			InputShape:  inputShapeOf(m),
+			InputSchema: m.InputSchema,
 		})
 	}
 	return out

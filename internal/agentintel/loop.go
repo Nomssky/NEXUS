@@ -2,8 +2,10 @@ package agentintel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -42,7 +44,23 @@ func (d *Decision) Decide(ctx context.Context, p DecisionPrompt) (string, error)
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	return d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest())
+	raw, err := d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), p.Tools, p.ToolConversation)
+	if err != nil {
+		return "", err
+	}
+	if len(p.Tools) == 0 {
+		return raw, nil
+	}
+	// A tool-bearing request carries no response_format (it would suppress
+	// native tool calls), so a non-tool answer can come back unstructured.
+	// Perform at most ONE strict retry — without tools and with the decision
+	// schema — preserving the tool conversation so the model still sees its own
+	// proposal and the result. This never multiplies: exactly one extra call,
+	// and only when the first answer was not a valid action.
+	if _, perr := ParseAction(raw); perr == nil {
+		return raw, nil
+	}
+	return d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), nil, p.ToolConversation)
 }
 
 // Plan asks the model for an advisory plan (§3, protocol v2).
@@ -50,31 +68,174 @@ func (d *Decision) Plan(ctx context.Context, p PlanPrompt) (string, error) {
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	return d.invoke(ctx, "plan", buildPlanEnvelope(p), PlanStructuredRequest())
+	return d.invoke(ctx, "plan", buildPlanEnvelope(p), PlanStructuredRequest(), nil, nil)
 }
 
-func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, structured *modelrouter.StructuredOutputSchema) (string, error) {
+func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, structured *modelrouter.StructuredOutputSchema, hints []ToolHint, conversation []modelrouter.Message) (string, error) {
+	required := []modelrouter.ModelCapability{modelrouter.CapabilityStructuredOutput}
+	if len(hints) > 0 {
+		// A decision that advertises tool definitions must be routed to a model
+		// that actually declares tool calling: never send `tools` to a model
+		// that cannot honor them, and never downgrade silently.
+		required = append(required, modelrouter.CapabilityToolCalling)
+	}
 	routeReq := &modelrouter.RoutingRequest{
 		RequestID:       id,
 		AgentID:         d.AgentID,
-		RequiredCaps:    []modelrouter.ModelCapability{modelrouter.CapabilityStructuredOutput},
+		RequiredCaps:    required,
 		FallbackEnabled: true,
 	}
+	providerMessages := toProviderMessages(msgs)
+	providerMessages = append(providerMessages, conversation...)
 	gen := &modelrouter.GenerateRequest{
-		RequestID:      id,
-		Messages:       toProviderMessages(msgs),
-		ResponseFormat: "json",
-		Structured:     structured,
+		RequestID: id,
+		Messages:  providerMessages,
 		// Bounded, but large enough for a bounded plan with explicit operations
 		// and a synthesized answer with several citations. MaxDecisionBytes
 		// remains the hard wire-shape bound on what the runtime accepts.
 		MaxTokens: 2048,
 	}
+	if len(hints) > 0 {
+		// Native tool calling and a response_format are mutually exclusive on
+		// OpenAI-compatible servers: the response_format wins and the model
+		// emits the tool call as text instead of a real tool_calls array. When
+		// tools are advertised, keep the instruction envelope for the decision
+		// shape and rely on strict parsing at the boundary — a response that is
+		// neither a valid action nor a single tool call fails closed.
+		gen.Tools = providerToolDefinitions(hints)
+	} else {
+		gen.ResponseFormat = "json"
+		gen.Structured = structured
+	}
 	resp, _, err := d.Router.Invoke(ctx, routeReq, gen)
 	if err != nil {
 		return "", fmt.Errorf("provider invocation failed: %w", err)
 	}
+	if len(resp.ToolCalls) > 0 {
+		if len(resp.ToolCalls) != 1 {
+			return "", fmt.Errorf("provider returned %d tool calls; only one mediated call per decision is supported", len(resp.ToolCalls))
+		}
+		call := resp.ToolCalls[0]
+		nameToID := make(map[string]string, len(hints))
+		for _, hint := range hints {
+			nameToID[hint.ID] = hint.ID
+		}
+		toolID, ok := nameToID[call.Name]
+		if !ok || strings.TrimSpace(call.ID) == "" {
+			return "", fmt.Errorf("provider tool call is missing a valid id or registered tool name")
+		}
+		args, err := providerToolArguments(call.Arguments)
+		if err != nil {
+			return "", fmt.Errorf("provider tool call arguments are invalid: %w", err)
+		}
+		action, err := json.Marshal(Action{Type: ActionToolCall, Tool: toolID, Operation: args.Operation, Input: args.Input, ProviderToolCallID: call.ID})
+		if err != nil {
+			return "", fmt.Errorf("encode provider tool proposal: %w", err)
+		}
+		return string(action), nil
+	}
 	return resp.Content, nil
+}
+
+type providerToolArgs struct {
+	Operation string            `json:"operation,omitempty"`
+	Input     map[string]string `json:"input,omitempty"`
+}
+
+func providerToolArguments(raw string) (providerToolArgs, error) {
+	var args providerToolArgs
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&args); err != nil {
+		return providerToolArgs{}, err
+	}
+	// Reject trailing content: one JSON object, nothing after it.
+	var extra any
+	if err := dec.Decode(&extra); err == nil {
+		return providerToolArgs{}, fmt.Errorf("multiple JSON values")
+	} else if !errors.Is(err, io.EOF) {
+		return providerToolArgs{}, fmt.Errorf("trailing content after JSON object")
+	}
+	if args.Input == nil {
+		args.Input = map[string]string{}
+	}
+	return args, nil
+}
+
+// marshalToolArguments renders a validated action back into the provider's
+// opaque argument shape so a tool result can be correlated to the proposal
+// that produced it (OpenAI tool-role messages echo the original arguments).
+func marshalToolArguments(operation string, input map[string]string) string {
+	args := map[string]interface{}{"input": input}
+	if operation != "" {
+		args["operation"] = operation
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func providerToolDefinitions(hints []ToolHint) []modelrouter.ToolDefinition {
+	out := make([]modelrouter.ToolDefinition, 0, len(hints))
+	for _, hint := range hints {
+		// The advertised argument shape mirrors the strict action the runtime
+		// reconstructs: an `input` object of the manifest's declared fields,
+		// plus an explicit `operation` only for multi-operation tools. The
+		// manifest stays authoritative — this schema is advisory context and
+		// every field is re-validated by the capability platform.
+		fields := map[string]interface{}{}
+		required := []string{}
+		for _, field := range hint.InputSchema.Fields {
+			property := map[string]interface{}{"type": providerJSONType(string(field.Type))}
+			if field.Description != "" {
+				property["description"] = field.Description
+			}
+			if field.MaxLength > 0 {
+				property["maxLength"] = field.MaxLength
+			}
+			if len(field.Enum) > 0 {
+				property["enum"] = field.Enum
+			}
+			fields[field.Name] = property
+			if field.Required {
+				required = append(required, field.Name)
+			}
+		}
+		input := map[string]interface{}{"type": "object", "properties": fields, "additionalProperties": false}
+		if len(required) > 0 {
+			input["required"] = required
+		}
+		properties := map[string]interface{}{"input": input}
+		topRequired := []string{"input"}
+		if len(hint.Operations) > 1 {
+			properties["operation"] = map[string]interface{}{"type": "string", "enum": hint.Operations}
+			topRequired = append(topRequired, "operation")
+		}
+		params := map[string]interface{}{
+			"type":                 "object",
+			"properties":           properties,
+			"additionalProperties": false,
+			"required":             topRequired,
+		}
+		out = append(out, modelrouter.ToolDefinition{Name: hint.ID, Description: hint.Summary, Parameters: params})
+	}
+	return out
+}
+
+// providerJSONType maps the manifest's closed field type set onto JSON Schema
+// primitives. The tool manifest's own validator remains the sole authority on
+// what a field accepts.
+func providerJSONType(t string) string {
+	switch t {
+	case "int", "float":
+		return "number"
+	case "bool":
+		return "boolean"
+	default:
+		return "string"
+	}
 }
 
 // Runtime is the bounded control loop (§4). It runs as an executor handler
@@ -99,6 +260,9 @@ type Runtime struct {
 	// (CAPABILITY_TOOL_CONTRACTS §4). Optional: without it the prompt carries
 	// no catalog and tool calls are still validated by the platform.
 	Catalog CatalogProvider
+	// ToolConversationCapacity bounds provider-native tool exchange messages.
+	// Zero selects the small shipped default; it is state local to one Run.
+	ToolConversationCapacity int
 
 	mu     sync.Mutex
 	states map[string]State
@@ -192,7 +356,8 @@ type run struct {
 	// synthesis is the validated typed completion answer for this execution.
 	// It is process-local (never journaled) and only attached to a completed
 	// outcome by the terminal defer.
-	synthesis *executor.ResearchSynthesis
+	synthesis        *executor.ResearchSynthesis
+	toolConversation []modelrouter.Message
 }
 
 // captureResearchEvidence merges one complete web.search snapshot into this
@@ -767,8 +932,9 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			Context:  assembled.Text,
 			// Authoritative runtime state travels with every decision: the
 			// active plan version and the ledger's step facts (contract §12).
-			PlanVersion: plan.Version,
-			StepStates:  ledger.describe(),
+			PlanVersion:      plan.Version,
+			StepStates:       ledger.describe(),
+			ToolConversation: rn.toolConversation,
 		})
 		if derr != nil {
 			if ctx.Err() != nil {
@@ -865,8 +1031,35 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			return failedOutcome(req, start, r.now(), StateDeadlineExceeded, "deadline exceeded"), nil
 		}
 		working.SetPending(string(action.Type) + " " + firstNonEmpty(action.Tool, action.Key, action.AgentID))
+		// A provider-native proposal is correlated back to the model through a
+		// bounded assistant/tool exchange. Only a validated tool-call action can
+		// carry a provider call id, so this never widens any other action.
+		providerToolCall := action.Type == ActionToolCall && action.ProviderToolCallID != ""
+		if providerToolCall {
+			rn.toolConversation = append(rn.toolConversation,
+				modelrouter.Message{Role: "assistant", Content: "", ToolCalls: []modelrouter.ToolCall{{ID: action.ProviderToolCallID, Name: action.Tool, Arguments: marshalToolArguments(action.Operation, action.Input)}}})
+		}
 		obs, next, termState, termMsg := r.perform(rn, loopCtx, obj, action, currentStepID, agentID, working, usage, budget)
 		usage = next
+		if providerToolCall && obs != nil {
+			result := map[string]string{}
+			for k, v := range obs.Result {
+				result[k] = v
+			}
+			if obs.Text != "" && len(result) == 0 {
+				result["status"] = obs.Status
+				result["message"] = obs.Text
+			}
+			payload, _ := json.Marshal(result)
+			rn.toolConversation = append(rn.toolConversation, modelrouter.Message{Role: "tool", ToolCallID: action.ProviderToolCallID, Content: string(payload)})
+			limit := r.ToolConversationCapacity
+			if limit <= 0 {
+				limit = 16
+			}
+			if len(rn.toolConversation) > limit {
+				rn.toolConversation = rn.toolConversation[len(rn.toolConversation)-limit:]
+			}
+		}
 		// Completion gate (contract §7). With criteria on the objective, a
 		// completion claim is only a REQUEST: it is accepted when every
 		// criterion is satisfied by evidence from THIS execution. Rejection
