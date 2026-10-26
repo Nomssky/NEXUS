@@ -114,6 +114,9 @@ authentication groups cover all of them:
 | `POST` | `/api/v1/control/resume` | Resume admission |
 | `GET` | `/api/v1/control/metrics` | Executor / backpressure / circuit-breaker / recovery metrics |
 | `GET` | `/api/v1/control/components` | Component states (constructed vs running) |
+| `GET` | `/api/v1/control/config` | Redacted boot-configuration snapshot |
+| `GET` | `/api/v1/control/config/storage` | Bounded host volume discovery |
+| `POST` | `/api/v1/control/config/storage/validate` | Validate a data-directory path (read-only) |
 | `GET` | `/api/v1/control/policies` | List the effective policy set |
 | `GET` | `/api/v1/control/policies/{id}` | Read one policy record |
 | `PUT` | `/api/v1/control/policies/{id}` | Create or replace one policy record |
@@ -539,6 +542,63 @@ have no start/stop lifecycle — never a blanket "active" claim.
 
 While paused: `GET /ready` → `503`, `POST /api/v1/requests` → `503
 RESOURCE_UNAVAILABLE` (never `202`).
+
+### Configuration & storage inspection — `/api/v1/control/config…`
+
+These routes are key-gated by the same `X-API-Key` control check. They expose
+the **running process's boot configuration** and a bounded view of the host
+storage. They are deliberately read-only:
+
+- There is no route to write configuration, change providers, store secrets or
+  apply a data directory.
+- Control responses carry `Cache-Control: no-store` so a shared browser or
+  intermediary cache cannot retain configuration or filesystem metadata.
+- The snapshot never contains a credential value. A model provider reports the
+  name of its `api_key_env` and `credential_status`
+  (`present`/`missing`/`not_required`); a Brave search provider reports
+  `BRAVE_API_KEY` presence the same way. `credential_storage` is always
+  `environment_only`.
+- `live_verified` and `readiness.gate_zero_authorized` are always `false`. The
+  gateway does not probe a model or search endpoint from these routes.
+- `model_routing.per_purpose_selection` is always `false`: this build registers
+  providers in configuration order and has no per-purpose selector.
+
+`GET /api/v1/control/config` returns the redacted snapshot: environment, nexus
+id, providers (adapter `openai_compatible`, endpoint, model id, timeout,
+capabilities), actual web-search provider (`disabled`, `scripted`, `wikipedia`
+or `brave`; an unknown value is reported as `invalid`), storage posture,
+readiness blockers and warnings. `scripted` is labelled test-only; it is never
+presented as live evidence.
+
+`GET /api/v1/control/config/storage` returns bounded volume candidates: the
+configured `storage.data_dir`, the process user's home, `/`, mounts under
+`/mnt`, `/media`, `/srv` and `/data`, plus any absolute paths in
+`NEXUS_STORAGE_ROOTS` (colon-separated). There is no directory-listing API.
+Capacity and filesystem metadata come from `statfs` and
+`/proc/self/mountinfo`; a media type is reported only when
+`/sys/block/<device>/rotational` is readable. NVMe is reported as a bus, not as
+"SSD". Paths are host-local: they belong to the machine running NEXUS, not to
+the browser.
+
+`POST /api/v1/control/config/storage/validate` accepts
+`{"path":"/absolute/path"}` and returns deterministic server-side checks:
+absolute-path requirement, `..` traversal rejection, final-symlink rejection,
+sensitive-root rejection, existence/parent checks, writability via an access
+check, readability of an existing directory, and capacity thresholds (fail
+below 64 MiB, warn below 1 GiB). A directory is reported writable only when the
+process has both write and search (execute) permission, because creating an
+entry requires both; an existing directory must also be readable and searchable
+so the file store can load records. Allowed roots are the home directory,
+`/mnt`, `/media`, `/srv`, `/opt`, `/var/lib`, `/data`, `/tmp`, the configured
+data directory, and `NEXUS_STORAGE_ROOTS`.
+Validation never creates, moves or deletes anything. The response always
+reports `applying_supported:false`, `restart_required:true` and
+`migration_supported:false`; a validated path must still be set by an operator
+and applied with a controlled restart. One process must own one data directory.
+Validation is advisory and point-in-time: it is not a guarantee that a later
+writer will be allowed to create or keep data there. Symlink replacement and
+other time-of-check/time-of-use changes remain possible after validation, so
+the eventual storage writer must enforce its own boundary at the point of use.
 
 ### Server-Sent Events — `/events`
 

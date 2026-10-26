@@ -149,6 +149,19 @@ func TestOpenAIProviderHTTPSRequired(t *testing.T) {
 	}
 }
 
+func TestOpenAIProviderRejectsEndpointSecrets(t *testing.T) {
+	withTestEnv(t, "k")
+	for _, endpoint := range []string{
+		"https://user:password@api.example.com/v1",
+		"https://api.example.com/v1?api_key=secret",
+		"https://api.example.com/v1#secret",
+	} {
+		if _, err := NewOpenAIProvider(ProviderConfig{ID: "t", Endpoint: endpoint, APIKeyEnv: "NEXUS_MODEL_API_KEY_TEST"}); err == nil {
+			t.Fatalf("endpoint %q must be rejected: credentials belong in api_key_env, not the URL", endpoint)
+		}
+	}
+}
+
 func TestOpenAIProviderCredentialMissing(t *testing.T) {
 	t.Setenv("NEXUS_MODEL_API_KEY_TEST", "")
 	if _, err := NewOpenAIProvider(ProviderConfig{ID: "t", Endpoint: "http://127.0.0.1:1", APIKeyEnv: "NEXUS_MODEL_API_KEY_TEST", AllowInsecureHTTP: true}); err == nil {

@@ -43,6 +43,12 @@ func NewOpenAIProvider(cfg ProviderConfig) (*OpenAIProvider, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("provider %q: invalid base URL", cfg.ID)
 	}
+	if u.User != nil {
+		return nil, fmt.Errorf("provider %q: base URL must not embed credentials", cfg.ID)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("provider %q: base URL must not contain a query or fragment", cfg.ID)
+	}
 	if u.Scheme != "https" {
 		if u.Scheme != "http" {
 			return nil, fmt.Errorf("provider %q: base URL must be https (or http with allow_insecure_http)", cfg.ID)

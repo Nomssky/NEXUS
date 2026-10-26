@@ -40,6 +40,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/capability"
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/executor"
+	"github.com/Nomssky/NEXUS/internal/foundation/config"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
@@ -118,6 +119,11 @@ type Server struct {
 	// nexusID stamps the installation identity onto external event
 	// projections (SCHEMA_COMMON §3.2 Universal Required; §2.2 nexus_id).
 	nexusID string
+
+	// configuration is the effective boot configuration exposed by the
+	// read-only control-plane configuration surface. It contains credential
+	// references only; raw secret values are never stored here.
+	configuration *config.Config
 
 	// G-010: maxResponseBytes caps one-shot JSON response bodies (GET result).
 	// maxSSEEventBytes caps each individual SSE event frame; it does not bound
@@ -346,6 +352,14 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 	s.mux.HandleFunc("GET /api/v1/control/metrics", s.handleControlMetrics)
 	s.mux.HandleFunc("GET /api/v1/control/components", s.handleControlComponents)
 
+	// Read-only configuration and bounded storage inspection. These routes are
+	// deliberately under the control prefix so the existing X-API-Key gate
+	// applies unchanged. There is no write/apply route: configuration is
+	// boot-time and secrets stay environment-injected.
+	s.mux.HandleFunc("GET /api/v1/control/config", s.handleGetConfiguration)
+	s.mux.HandleFunc("GET /api/v1/control/config/storage", s.handleGetStorageVolumes)
+	s.mux.HandleFunc("POST /api/v1/control/config/storage/validate", s.handleValidateStoragePath)
+
 	// Policy control surface (SCHEMA_GOVERNANCE §9): under the control prefix
 	// so authMiddleware's existing X-API-Key check covers them unchanged.
 	s.mux.HandleFunc("GET /api/v1/control/policies", s.handleListPolicies)
@@ -501,7 +515,11 @@ func (p *muxProbe) WriteHeader(code int) {
 // disabled entirely (403) rather than left unprotected.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
+		// Exact match keeps the gate in front of the bare control prefix too;
+		// current routes all live below it, but a future route must not become
+		// reachable by registering the prefix itself.
+		if r.URL.Path == "/api/v1/control" || strings.HasPrefix(r.URL.Path, "/api/v1/control/") {
+			w.Header().Set("Cache-Control", "no-store")
 			if s.controlAPIKey == "" {
 				s.writeError(w, r, http.StatusForbidden, "CONTROL_DISABLED",
 					"control API key not configured — control endpoints disabled")

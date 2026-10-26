@@ -95,7 +95,8 @@ Registration behavior:
   serialized into config snapshots, logs, accounting records or errors;
 - `endpoint` must be `https`, or `http` **only** with
   `allow_insecure_http: true` and a loopback host (a dev/fixture posture, not
-  a production default);
+  a production default). It must not embed URL userinfo, a query string or a
+  fragment: credentials belong in `api_key_env`, never in the endpoint;
 - model invocation honors the request context (deadline + cancellation) and
   the configured `timeout_ms`; hang/length responses are bounded;
 - token usage is taken from the provider's `usage` block as-is; nothing is

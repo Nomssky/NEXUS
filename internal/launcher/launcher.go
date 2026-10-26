@@ -309,6 +309,7 @@ func New(opts Options) *Launcher {
 		gateway.WithIdentity(opts.Authenticator, opts.Memberships),
 		gateway.WithRegistry(opts.Registry),
 		gateway.WithNexusID(opts.Config.Nexus.ID),
+		gateway.WithConfiguration(opts.Config),
 		gateway.WithRequireAuthentication(opts.RequireAuthentication),
 		gateway.WithEnforceBusinessScope(opts.EnforceBusinessScope),
 		// F4: process-local HTTP rate limiting (config defaults: enabled).

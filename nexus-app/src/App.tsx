@@ -9,12 +9,21 @@ import { Research } from './pages/Research';
 import { Development } from './pages/Development';
 import { Media } from './pages/Media';
 import { Meeting } from './pages/Meeting';
+import { Settings } from './pages/Settings';
+import { stripPersistedControlKey } from './authStorage';
 import { apiClient } from './api/client';
+import { queryKeys } from './api/hooks';
 import './tokens/css-variables.css';
 import './App.css';
 
 // Route type for top-level navigation
-export type AppRoute = 'command' | 'research' | 'development' | 'media' | 'meeting';
+export type AppRoute =
+  | 'command'
+  | 'research'
+  | 'development'
+  | 'media'
+  | 'meeting'
+  | 'settings';
 
 // Global styles
 const AppStyles = () => (
@@ -103,6 +112,19 @@ const queryClient = new QueryClient({
   },
 });
 
+// Configuration is fetched with an operator key that is deliberately kept out
+// of the query key. Drop or refetch the cached snapshot whenever that key
+// changes so data authorized by a previous key is never shown as current.
+function resetConfigurationQueries(refetch: boolean): void {
+  for (const queryKey of [queryKeys.configuration, queryKeys.storageVolumes]) {
+    if (refetch) {
+      void queryClient.resetQueries({ queryKey });
+    } else {
+      queryClient.removeQueries({ queryKey });
+    }
+  }
+}
+
 interface AuthState {
   actorId: string;
   credential: string;
@@ -127,18 +149,27 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const stored = localStorage.getItem('nexus-auth');
     if (stored) {
-      try {
-        const parsed = JSON.parse(stored);
-        if (parsed.actorId && parsed.credential) {
-          setAuth(parsed);
-          apiClient.setAuth(parsed.actorId, parsed.credential);
-          if (parsed.controlKey) {
-            apiClient.setControlKey(parsed.controlKey);
-          }
-          setIsAuthenticated(true);
-        }
-      } catch {
-        // Ignore parse errors
+      // The control-plane key is intentionally memory-only. Remove a legacy
+      // persisted value even when the record has no usable actor credential.
+      const { parsed, serialized } = stripPersistedControlKey(stored);
+      if (serialized) {
+        localStorage.setItem('nexus-auth', serialized);
+      }
+      if (
+        parsed &&
+        typeof parsed.actorId === 'string' &&
+        parsed.actorId &&
+        typeof parsed.credential === 'string' &&
+        parsed.credential
+      ) {
+        const restored: AuthState = {
+          ...DEFAULT_AUTH,
+          ...(parsed as Partial<AuthState>),
+          controlKey: '',
+        };
+        setAuth(restored);
+        apiClient.setAuth(restored.actorId, restored.credential);
+        setIsAuthenticated(true);
       }
     }
     setIsLoading(false);
@@ -197,12 +228,16 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const setControlKey = useCallback((key: string) => {
+    apiClient.setControlKey(key);
     setAuth((prev) => {
       const updated = { ...prev, controlKey: key };
-      localStorage.setItem('nexus-auth', JSON.stringify(updated));
-      apiClient.setControlKey(key);
+      // Deliberately not persisted: the key lives in this tab's memory only.
+      // Persisting an operator key in localStorage would leave the secret on
+      // disk and survive sign-out.
+      localStorage.setItem('nexus-auth', JSON.stringify({ ...updated, controlKey: '' }));
       return updated;
     });
+    resetConfigurationQueries(key !== '');
   }, []);
 
   const logout = useCallback(() => {
@@ -210,6 +245,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem('nexus-auth');
     setAuth(DEFAULT_AUTH);
     setIsAuthenticated(false);
+    resetConfigurationQueries(false);
   }, []);
 
   if (isLoading) {
@@ -420,6 +456,23 @@ function AppContent() {
               </svg>
               Meeting
             </button>
+            <button
+              role="tab"
+              aria-selected={route === 'settings'}
+              onClick={() => setRoute('settings')}
+              className={`app-nav-item ${route === 'settings' ? 'active' : ''}`}
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+                <circle cx="9" cy="9" r="2.4" stroke="currentColor" strokeWidth="1.5" />
+                <path
+                  d="M9 2.4v1.7M9 13.9v1.7M2.4 9h1.7M13.9 9h1.7M4.3 4.3l1.2 1.2M12.5 12.5l1.2 1.2M13.7 4.3l-1.2 1.2M5.5 12.5l-1.2 1.2"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  strokeLinecap="round"
+                />
+              </svg>
+              Settings
+            </button>
           </nav>
         </div>
         <div className="app-header-right">
@@ -435,6 +488,8 @@ function AppContent() {
           <Development businessId={auth.businessId} actorId={auth.actorId} />
         ) : route === 'media' ? (
           <Media businessId={auth.businessId} actorId={auth.actorId} />
+        ) : route === 'settings' ? (
+          <Settings controlKey={auth.controlKey} />
         ) : (
           <Meeting businessId={auth.businessId} actorId={auth.actorId} />
         )}
