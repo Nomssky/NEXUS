@@ -127,6 +127,7 @@ func TestFileStoreReopenPreservesSoftDeletedVisibility(t *testing.T) {
 	if err := fs.Delete("gone"); err != nil {
 		t.Fatal(err)
 	}
+	closeStore(t, fs)
 	fs2, err := NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)

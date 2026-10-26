@@ -234,6 +234,7 @@ func TestApprovalHistorySurvivesRestart(t *testing.T) {
 	f := newRecoveryFixture(t)
 	seedApprovalHistory(t, f.engine.ExecutionJournal(), recApprID, recBiz, "")
 
+	closeStore(t, f.store)
 	st, err := store.NewFileStore(f.storeDir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)

@@ -48,6 +48,9 @@ func TestRegistryPersistenceRoundTrip(t *testing.T) {
 	}
 
 	// Reopen the same directory with a fresh store and registry.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -195,6 +198,9 @@ func TestRegistryRemoveIdentityPersists(t *testing.T) {
 		t.Fatal("identity must be gone from memory")
 	}
 
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatal(err)

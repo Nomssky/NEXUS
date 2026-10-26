@@ -119,6 +119,9 @@ func TestInterruptedDispatchRecoversUnknownNotReplayed(t *testing.T) {
 	}
 
 	// "Restart": reopen the store and recover.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)

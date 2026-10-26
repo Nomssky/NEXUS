@@ -231,6 +231,7 @@ func TestRepeatedDeleteStaysNoOpAfterFileStoreReopen(t *testing.T) {
 	}
 	before := snapshot(t, fs, "k")
 
+	closeStore(t, fs)
 	fs2, err := NewFileStoreWithClock(dir, clk)
 	if err != nil {
 		t.Fatal(err)

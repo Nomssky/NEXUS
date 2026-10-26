@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,6 +35,9 @@ func seedStore(t *testing.T) string {
 		if err := fs.Put(r); err != nil {
 			t.Fatalf("put %s: %v", r.ID, err)
 		}
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
 	}
 	return dir
 }
@@ -154,6 +158,80 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	if a, b := snapshotFiles(t, src), snapshotFiles(t, dest); !equalMaps(a, b) {
 		t.Fatalf("restored files differ:\n src=%v\n dst=%v", a, b)
 	}
+}
+
+// Backups and restored stores embed credential hashes and organizational
+// data, so the artifact, restored directories and restored records must all
+// be owner-only.
+func TestBackupArtifactAndRestoredStoreAreOwnerOnly(t *testing.T) {
+	src := seedStore(t)
+	art := filepath.Join(t.TempDir(), "b.tar")
+	if _, err := Create(src, art); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	assertMode(t, art, 0o600)
+
+	dest := filepath.Join(t.TempDir(), "restored")
+	if _, err := Restore(art, dest); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	assertMode(t, dest, 0o700)
+	for _, typeDir := range []store.RecordType{
+		store.RecordTypeIdentity, store.RecordTypeBusiness,
+		store.RecordTypeCredential, store.RecordTypeMemory,
+	} {
+		assertMode(t, filepath.Join(dest, string(typeDir)), 0o700)
+	}
+	err := filepath.WalkDir(dest, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if got := dirMode(t, p); got != 0o700 {
+				t.Errorf("restored directory %s mode = %04o, want 0700", p, got)
+			}
+			return nil
+		}
+		if got := dirMode(t, p); got != 0o600 {
+			t.Errorf("restored file %s mode = %04o, want 0600", p, got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk restored store: %v", err)
+	}
+}
+
+// The live ownership marker is process state, not a durable record, and must
+// never enter a backup manifest.
+func TestBackupExcludesStorageLockMarker(t *testing.T) {
+	src := seedStore(t)
+	art := filepath.Join(t.TempDir(), "b.tar")
+	man, err := Create(src, art)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for _, fe := range man.Files {
+		if strings.Contains(fe.Path, ".nexus-store.lock") {
+			t.Fatalf("backup must not include the ownership marker: %s", fe.Path)
+		}
+	}
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	if got := dirMode(t, path); got != want {
+		t.Fatalf("%s mode = %04o, want %04o", path, got, want)
+	}
+}
+
+func dirMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info.Mode().Perm()
 }
 
 func TestRestoreIsDeterministicAcrossDestinations(t *testing.T) {
@@ -470,6 +548,9 @@ func loadAll(t *testing.T, dir string) map[string]*store.Record {
 		for _, r := range recs {
 			out[r.ID] = r
 		}
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("close store %s: %v", dir, err)
 	}
 	return out
 }

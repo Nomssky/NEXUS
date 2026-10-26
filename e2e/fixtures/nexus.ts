@@ -46,6 +46,8 @@ export interface NexusHandle {
   stderr(): string;
   /** Terminate the process with SIGTERM and wait for it to exit. */
   stop(): Promise<void>;
+  /** Terminate the process abruptly with SIGKILL (simulated crash). */
+  kill(): Promise<void>;
   /** Start a fresh process on the same data dir and ports. */
   restart(): Promise<void>;
   /** Stop the process (if running) and delete its temporary data. */
@@ -87,7 +89,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Reserve a free consecutive port pair (health, health+1 = gateway default). */
-async function reservePortPair(): Promise<{ healthPort: number; gatewayPort: number }> {
+export async function reservePortPair(): Promise<{ healthPort: number; gatewayPort: number }> {
   for (let attempt = 0; attempt < 50; attempt++) {
     const ports = await Promise.all([listenOnce(), listenOnce()]);
     const sorted = ports.sort((a, b) => a - b);
@@ -262,6 +264,29 @@ export async function startNexus(opts: StartOptions = {}): Promise<NexusHandle> 
       }
       child = null;
       log(`stopped ${baseURL}`);
+    },
+    async kill() {
+      if (!child || child.exitCode !== null) {
+        child = null;
+        return;
+      }
+      const proc = child;
+      // SIGKILL cannot run shutdown hooks: this is the crash path whose
+      // kernel-level lock release the restart must observe.
+      proc.kill('SIGKILL');
+      const deadline = Date.now() + 15_000;
+      while (
+        Date.now() < deadline &&
+        proc.exitCode === null &&
+        proc.signalCode === null
+      ) {
+        await sleep(50);
+      }
+      child = null;
+      if (proc.exitCode === null && proc.signalCode === null) {
+        throw new Error(`killed process ${proc.pid} did not exit within 15s`);
+      }
+      log(`killed ${baseURL} (exit ${proc.exitCode ?? 'null'}, signal ${proc.signalCode ?? 'null'})`);
     },
     async restart() {
       await handle.stop();

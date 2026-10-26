@@ -12,6 +12,7 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
+	"github.com/Nomssky/NEXUS/internal/foundation/store"
 )
 
 func noEnv() func() []string { return func() []string { return nil } }
@@ -246,6 +247,9 @@ func TestAppRegistryDurability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("close first boot: %v", err)
+	}
 
 	a2, err := New(Options{Environ: env})
 	if err != nil {
@@ -281,5 +285,104 @@ func TestAppDataDirFailureFailsClosed(t *testing.T) {
 	}
 	if nerrors.CategoryOf(err) != nerrors.CategoryInternalFailure {
 		t.Errorf("expected INTERNAL_FAILURE, got %s", nerrors.CategoryOf(err))
+	}
+}
+
+// A startup that fails after the store opened (here: corrupt membership
+// hydration) must release storage ownership, so an operator can fix the
+// data and boot again without hunting for a phantom writer.
+func TestAppPartialStartupReleasesStorageOwnership(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if err := st.Put(&store.Record{
+		ID: "nexus.membership:broken", Type: store.RecordTypeMembership,
+		Status: store.RecordStatusActive, Data: []byte("{not json"),
+	}); err != nil {
+		t.Fatalf("seed corrupt membership: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	env := func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+			"NEXUS_DATA_DIR=" + dir,
+		}
+	}
+	if _, err := New(Options{Environ: env}); err == nil {
+		t.Fatal("corrupt membership data must abort startup")
+	}
+
+	// The failed boot must not leave ownership behind.
+	probe, err := store.NewFileStore(dir)
+	if err != nil {
+		t.Fatalf("failed startup retained storage ownership: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close probe: %v", err)
+	}
+
+	// Removing the corrupt record makes the installation bootable again.
+	if err := os.Remove(filepath.Join(dir, string(store.RecordTypeMembership), "nexus.membership:broken.json")); err != nil {
+		t.Fatalf("remove corrupt record: %v", err)
+	}
+	a, err := New(Options{Environ: env})
+	if err != nil {
+		t.Fatalf("boot after repair: %v", err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatalf("close repaired app: %v", err)
+	}
+}
+
+// The lifecycle close hook releases storage ownership, and the store refuses
+// further operations instead of writing without the lock.
+func TestAppLifecycleShutdownReleasesStorageOwnership(t *testing.T) {
+	dir := t.TempDir()
+	a, err := New(Options{Environ: func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+			"NEXUS_DATA_DIR=" + dir,
+		}
+	}})
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	if a.Store() == nil {
+		t.Fatal("durable boot must expose its store")
+	}
+
+	if code := a.Lifecycle().Shutdown(context.Background()); code != lifecycle.ExitOK {
+		t.Fatalf("shutdown exit code = %v, want ExitOK", code)
+	}
+	if err := a.Store().Put(&store.Record{ID: "after", Type: store.RecordTypeMemory, Status: store.RecordStatusActive}); err == nil {
+		t.Fatal("store operation after lifecycle shutdown must fail")
+	}
+	// Ownership is available to the next boot immediately, and Close remains
+	// safe to call again.
+	next, err := New(Options{Environ: func() []string {
+		return []string{
+			"NEXUS_ID=nx:nexus:test",
+			"NEXUS_ENVIRONMENT=development",
+			"NEXUS_HEALTH_ENABLED=false",
+			"NEXUS_DATA_DIR=" + dir,
+		}
+	}})
+	if err != nil {
+		t.Fatalf("next boot after shutdown: %v", err)
+	}
+	if err := next.Close(); err != nil {
+		t.Fatalf("close next boot: %v", err)
+	}
+	if err := next.Close(); err != nil {
+		t.Fatalf("second Close must be idempotent: %v", err)
 	}
 }

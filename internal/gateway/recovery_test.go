@@ -23,6 +23,19 @@ type recoveryFixture struct {
 	store    store.Store // the SAME store the engine's journal reads through
 }
 
+// closeStore releases exclusive ownership before a test reopens the directory
+// as a second process would.
+func closeStore(t *testing.T, st store.Store) {
+	t.Helper()
+	closer, ok := st.(interface{ Close() error })
+	if !ok {
+		return
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+}
+
 const (
 	recBiz      = "biz-1"
 	recOtherBiz = "biz-other"
@@ -397,7 +410,7 @@ func TestRecoveryDetailEvidenceSurvivesRestart(t *testing.T) {
 	ev := recoverySampleEvidence()
 
 	// First process: seed a source-bearing record, then read it through the API.
-	s1, e1, _ := newEvidenceServer(t, dir)
+	s1, e1, st1 := newEvidenceServer(t, dir)
 	j1 := e1.ExecutionJournal()
 	if err := j1.Accepted("exec-evi", recBiz, "", "user-wide"); err != nil {
 		t.Fatalf("seed accepted: %v", err)
@@ -424,6 +437,7 @@ func TestRecoveryDetailEvidenceSurvivesRestart(t *testing.T) {
 	}
 
 	// Second process: reopen the same directory and read through a fresh API.
+	closeStore(t, st1)
 	s2, _, _ := newEvidenceServer(t, dir)
 	w2 := evidenceGet(t, s2, "/api/v1/recovery/executions/exec-evi?business_id="+recBiz, wideHeaders())
 	if w2.Code != 200 {

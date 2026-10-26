@@ -60,11 +60,6 @@ func TestNewRecordsCarryTheCurrentSchemaVersion(t *testing.T) {
 	if !bytes.Contains(rawBytes(t, st, "v1"), []byte(`"version":1`)) {
 		t.Fatalf("persisted bytes must carry the schema version: %s", rawBytes(t, st, "v1"))
 	}
-	// And it survives a real reopen.
-	rec2, _, err := reopenJournal(t, dir).Get("v1")
-	if err != nil || rec2.Version != SchemaVersion {
-		t.Fatalf("version must survive reopen: %+v err=%v", rec2, err)
-	}
 	// Terminal writes on an existing record preserve its version.
 	if err := j.Terminal("v1", StateCompleted, ""); err != nil {
 		t.Fatal(err)
@@ -82,6 +77,15 @@ func TestNewRecordsCarryTheCurrentSchemaVersion(t *testing.T) {
 	}
 	if inv, _, ok, err := j.getInvocation(invID); err != nil || !ok || inv.Version != SchemaVersion {
 		t.Fatalf("invocation must be versioned at the current version: %+v ok=%v err=%v", inv, ok, err)
+	}
+
+	// And the record survives a real reopen.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	rec2, _, err := reopenJournal(t, dir).Get("v1")
+	if err != nil || rec2.Version != SchemaVersion {
+		t.Fatalf("version must survive reopen: %+v err=%v", rec2, err)
 	}
 }
 

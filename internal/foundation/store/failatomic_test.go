@@ -93,6 +93,7 @@ func TestDeletePersistsAcrossReopen(t *testing.T) {
 	}
 
 	// Reopen: the deleted record must still read as deleted.
+	closeStore(t, fs)
 	fs2, err := NewFileStoreWithClock(dir, time.Now)
 	if err != nil {
 		t.Fatalf("reopen filestore: %v", err)
@@ -191,6 +192,7 @@ func TestDeleteBatchPersistsAcrossReopen(t *testing.T) {
 	}
 
 	// Reopen: both records must read as deleted.
+	closeStore(t, fs)
 	fs2, err := NewFileStoreWithClock(dir, time.Now)
 	if err != nil {
 		t.Fatalf("reopen filestore: %v", err)
@@ -306,6 +308,7 @@ func TestStaleBatchJournalIsRolledBackOnReopen(t *testing.T) {
 	}
 
 	// Reopen: recovery must roll back to pre-batch state (active, version 1).
+	closeStore(t, fs)
 	fs2, err := NewFileStoreWithClock(dir, time.Now)
 	if err != nil {
 		t.Fatalf("reopen filestore: %v", err)

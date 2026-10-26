@@ -50,7 +50,7 @@ func Restore(artifactPath, destDir string) (*Manifest, error) {
 	}
 
 	parent := filepath.Dir(absDest)
-	if err := os.MkdirAll(parent, 0o755); err != nil {
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, fmt.Errorf("restore: destination parent: %w", err)
 	}
 	staging, err := os.MkdirTemp(parent, "."+filepath.Base(absDest)+".restoring-*")
@@ -86,7 +86,12 @@ func Restore(artifactPath, destDir string) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("restore: restored store failed to reopen: %w", err)
 	}
-	_ = fs // opening validates recovery + index hydration; nothing to keep
+	// Release the validation lock BEFORE publishing: the destination must be
+	// owned by no process when it appears, and a lock held across the rename
+	// would otherwise pin the staging inode rather than the published root.
+	if err := fs.Close(); err != nil {
+		return nil, fmt.Errorf("restore: release validation store: %w", err)
+	}
 
 	// Publish: an existing empty destination directory is replaced.
 	if _, statErr := os.Stat(absDest); statErr == nil {

@@ -56,6 +56,9 @@ func TestAuthenticatorCredentialPersistence(t *testing.T) {
 	}
 
 	// Reopen the same directory: the verifier is hydrated.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
@@ -179,6 +182,9 @@ func TestMembershipPersistence(t *testing.T) {
 		t.Fatal("membership must be visible before the restart")
 	}
 
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	st2, err := store.NewFileStore(dir)
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)

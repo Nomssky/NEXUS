@@ -67,6 +67,7 @@ func TestFileStoreHardDeleteReclaimsFiles(t *testing.T) {
 		t.Fatal("the index must drop a hard-deleted record")
 	}
 
+	closeStore(t, fs)
 	reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
 	if err != nil {
 		t.Fatal(err)
@@ -174,6 +175,7 @@ func TestFileStoreHardDeleteCrashMatrix(t *testing.T) {
 
 			tc.setup(t, dir, journal)
 
+			closeStore(t, fs)
 			reopened, err := NewFileStoreWithClock(dir, func() time.Time { return now })
 			if tc.wantOpenFail {
 				if err == nil {

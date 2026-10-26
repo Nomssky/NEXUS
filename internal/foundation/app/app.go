@@ -94,9 +94,9 @@ func New(opts Options) (*App, error) {
 	// a corrupt membership record aborts boot exactly like a corrupt identity).
 	members, err := identity.OpenMembershipSet(st)
 	if err != nil {
-		return nil, nerrors.Internal("app.memberships_hydration_failed",
+		return nil, closeStoreOnError(st, nerrors.Internal("app.memberships_hydration_failed",
 			fmt.Sprintf("cannot hydrate memberships from %s: %v", cfg.Storage.DataDir, err)).
-			WithDetail("data_dir", cfg.Storage.DataDir)
+			WithDetail("data_dir", cfg.Storage.DataDir))
 	}
 
 	a := &App{
@@ -138,11 +138,25 @@ func openStore(cfg config.Config) (store.Store, *identity.Registry, error) {
 	}
 	reg, err := identity.OpenRegistry(cfg.Nexus.ID, st)
 	if err != nil {
-		return nil, nil, nerrors.Internal("app.registry_hydration_failed",
+		return nil, nil, closeStoreOnError(st, nerrors.Internal("app.registry_hydration_failed",
 			fmt.Sprintf("cannot hydrate registry from %s: %v", cfg.Storage.DataDir, err)).
-			WithDetail("data_dir", cfg.Storage.DataDir)
+			WithDetail("data_dir", cfg.Storage.DataDir))
 	}
 	return st, reg, nil
+}
+
+// closeStoreOnError releases storage ownership after a partial startup while
+// preserving the original error. Cleanup failure is appended as diagnostic
+// context, never substituted for the primary failure.
+func closeStoreOnError(st store.Store, primary error) error {
+	closer, ok := st.(interface{ Close() error })
+	if !ok {
+		return primary
+	}
+	if err := closer.Close(); err != nil {
+		return fmt.Errorf("%w; additionally failed to release storage ownership: %v", primary, err)
+	}
+	return primary
 }
 
 // Config returns the effective configuration.
@@ -162,6 +176,20 @@ func (a *App) Memberships() *identity.MembershipSet { return a.members }
 // the membership set. It is nil for an in-memory installation
 // (storage.data_dir unset).
 func (a *App) Store() store.Store { return a.st }
+
+// Close releases exclusive storage ownership, if this App owns a durable
+// store. It is idempotent, so it is safe to call from both the lifecycle close
+// hook and a startup-failure defer.
+func (a *App) Close() error {
+	if a.st == nil {
+		return nil
+	}
+	closer, ok := a.st.(interface{ Close() error })
+	if !ok {
+		return nil
+	}
+	return closer.Close()
+}
 
 // Registry returns the organization entity registry (Identity/Business/
 // Division, SCHEMA_IDENTITIES_ORG §2–§4), stamped with the installation's
@@ -216,11 +244,26 @@ func (a *App) registerHooks() {
 			return a.srv.Shutdown(ctx)
 		},
 	})
+
+	// Registered after the health hook so reverse-order shutdown stops the
+	// core runtime first (via the launcher's later registration), then releases
+	// storage ownership, then the health surface. Releasing ownership last
+	// among the writers ensures no store operation can race the release.
+	a.life.RegisterHook(lifecycle.Hook{
+		Name: "record-store",
+		Close: func(context.Context) error {
+			return a.Close()
+		},
+	})
 }
 
 // Run starts the application and blocks until a shutdown signal is received,
 // then returns the process exit code.
 func (a *App) Run(ctx context.Context) lifecycle.ExitCode {
+	// Every normal and early-exit path releases the storage lock. This is a
+	// no-op when the lifecycle hooks already closed the store.
+	defer func() { _ = a.Close() }()
+
 	a.log.Info("nexus starting", logging.Fields{
 		Context: map[string]any{
 			"version":            version.Version,

@@ -59,6 +59,9 @@ func TestValidApprovalHistoryRoundTrips(t *testing.T) {
 		t.Fatalf("order must be preserved: %+v", rec.Approvals)
 	}
 	// And it survives a real reopen.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	rec2, _, err := reopenJournal(t, dir).Get("ok-1")
 	if err != nil || len(rec2.Approvals) != 2 || rec2.Approvals[1].Outcome != ApprovalGranted {
 		t.Fatalf("history must survive reopen: %+v err=%v", rec2.Approvals, err)

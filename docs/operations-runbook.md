@@ -28,6 +28,7 @@ The durable store is a `FileStore` rooted at `storage.data_dir`:
   memory/<id>.json           durable memory records (when enabled)
   <other type>/<id>.json     any other store record type
   .batch-journal.json        transient crash-recovery journal (present only mid-batch / after a crash)
+  .nexus-store.lock          OS advisory single-writer marker (not durable data; never deleted)
   workspaces/<business>/…    filesystem sandbox (NOT part of the store backup)
 ```
 
@@ -35,6 +36,14 @@ Records are written **atomically** (temp file → fsync → rename → directory
 fsync). A delete batch is atomic across a crash via `.batch-journal.json`, which
 the store replays and removes on the next open; a corrupt or ambiguous journal
 aborts the open rather than guessing.
+
+The store root is **single-writer**. A live process holds an OS `flock` on
+`.nexus-store.lock`; a second process pointed at the same `storage.data_dir`
+fails closed before serving requests, and the kernel releases ownership on
+orderly exit or crash. The marker is intentionally never deleted, so a leftover
+file after a crash is harmless. Do not delete it to force a second writer. See
+`docs/storage-ownership.md` for the path/permission contract, lifecycle
+guarantees, and network-filesystem limits.
 
 **Durable and recoverable from a backup:** identities, businesses, divisions,
 credentials (hashes), memberships, agent definitions, and durable memory — the
@@ -112,6 +121,11 @@ active is a consistent committed state**. `nexus-backup backup` therefore
 source store. A recursive copy of a *live* data directory is NOT supported and
 is not what this tool does.
 
+A live NEXUS process holds an exclusive ownership lock on the store root, so it
+cannot share the directory with a second writer. Stop the process (do not
+delete `.nexus-store.lock`) before taking a backup. The ownership marker itself
+is process state, not durable data, and is excluded from the backup manifest.
+
 ### 3.2 Create a backup
 
 ```bash
@@ -129,6 +143,8 @@ nexus-backup backup -data-dir /var/lib/nexus -out /backups/nexus-$(date -u +%Y%m
 - The tool **refuses to overwrite an existing artifact**, refuses a symlinked
   store root entry, and never includes the `workspaces/` sandbox, temp files,
   `.env` files or secrets.
+- The artifact is created owner-only (`0600`) because it embeds the durable
+  store, including credential verification hashes.
 - On any failure no artifact is published (it is written to a temp file and
   atomically renamed only on success).
 
@@ -154,10 +170,12 @@ nexus-backup restore -in /backups/nexus-….tar -dest /var/lib/nexus-restored
 - The store is built in a hidden staging directory beside the destination and
   **published with an atomic rename only after the whole artifact verifies and
   the store reopens cleanly** through the real `FileStore` initialization/
-  recovery path.
+  recovery path. The validation store is closed (releasing its ownership lock)
+  before the rename, so the published directory is owned by no process.
 - A non-empty destination is refused; a failure removes the staging directory
   and leaves the source artifact and any existing data untouched — a partial
   restore is never published as a valid store.
+- Restored directories are `0700` and restored files are `0600`.
 - Restoring the same artifact into two empty destinations yields equivalent
   logical state.
 
@@ -181,8 +199,9 @@ The source store and any existing data are never touched by a failed restore.
 ### 3.7 Retention and access control (operational guidance)
 
 Artifacts contain the durable organization records — treat them as sensitive.
-Restrict filesystem access (e.g. `0600`/directory `0700`), store them off-host
-or in encrypted storage, and keep a bounded number of generations (e.g. a
+The backup tool creates the artifact as `0600`, and restore creates directories
+as `0700` and files as `0600`. Store them off-host or in encrypted storage, and
+keep a bounded number of generations (e.g. a
 daily/weekly rotation). These are recommendations, not features this code
 enforces.
 
@@ -319,22 +338,30 @@ Contract: `contracts/EXECUTION_JOURNAL_RETENTION_CONTRACTS.md`.
 
 Journal disk grows with the number of executions and consequential tool calls.
 **Nothing is pruned automatically** — not at startup, backup or restore. An
-operator reclaims space deliberately with the offline `nexus-retention` tool
-(the store must be quiesced, exactly like a backup):
+operator reclaims space deliberately with the offline `nexus-retention` tool,
+which acquires the same exclusive ownership lock as the application: a live
+NEXUS process makes the tool fail closed, so run it only while the application
+is stopped (quiesced, exactly like a backup):
 
 ```
 bin/nexus-retention plan  -data-dir <dir> [-min-age 168h] [-batch 256]   # dry-run report
 bin/nexus-retention apply -data-dir <dir>  -min-age 168h  [-batch 256]   # remove eligible records
 ```
 
+The tool releases ownership on every exit, including failures. If a run fails
+only while releasing the lock, it still reports the close error and exits
+non-zero rather than claiming success.
+
 - Only a **terminal** execution (`completed`/`failed`/`cancelled`/`timed_out`)
   whose invocations are **all** known terminal outcomes and that is at least
   `-min-age` old is removed. Nonterminal, `unknown`, too-young and
   ambiguous-invocation records are always retained; `plan` reports the counts.
   Age is measured from the record's last durable transition (`updated_at`).
-- `plan` mutates nothing. `apply` requires an explicit `-min-age` and removes
-  eligible records in one atomic batch; an interrupted batch is rolled back on
-  the next open, so no recovery evidence is lost.
+- `plan` mutates nothing durable — it reports eligible records without deleting
+  them (opening the store still creates the lock marker and tightens dirs).
+- `apply` requires an explicit `-min-age` and removes eligible records in one
+  atomic batch; an interrupted batch is rolled back on the next open, so no
+  recovery evidence is lost.
 - A backup taken after retention simply contains fewer records; a restore never
   resurrects a committed removal. There is no disk cap that deletes to make room.
 - Each run reports its own accounting: the run timestamp, the `min-age`/`batch`

@@ -87,6 +87,9 @@ func TestFailedOperationSurvivesReopenWithLastCommittedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Reopen the journal — state must survive.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
 	j2 := New(mustStore(t, dir), fixedClock())
 	rec, ok, err := j2.Get("e3")
 	if err != nil || !ok || rec.State != StateCompleted {

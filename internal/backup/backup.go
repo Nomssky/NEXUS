@@ -82,6 +82,7 @@ var Exclusions = []string{
 	"process-local runtime state: cancellation and escalation state",
 	"process-local runtime state: event buffers and execution traces",
 	"filesystem sandbox tree (workspaces/)",
+	"storage ownership marker (.nexus-store.lock) — process state, not durable data",
 	"provider API keys and secrets (environment-only, never stored)",
 	"host environment files and unrelated host data",
 }
@@ -130,7 +131,7 @@ func Create(dataDir, artifactPath string) (*Manifest, error) {
 
 	// Write to a temp file in the destination directory, then rename atomically.
 	dir := filepath.Dir(artifactPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("backup: artifact dir: %w", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".nexus-backup-*.tmp")
@@ -170,7 +171,9 @@ func Create(dataDir, artifactPath string) (*Manifest, error) {
 	if err := tmp.Close(); err != nil {
 		return nil, fmt.Errorf("backup: close: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	// The artifact embeds the whole durable store, including credential
+	// verification hashes and organizational state: it is owner-only.
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return nil, fmt.Errorf("backup: chmod: %w", err)
 	}
 	if err := os.Rename(tmpName, artifactPath); err != nil {
@@ -253,7 +256,7 @@ func hashFile(dataDir, rel string) (FileEntry, error) {
 func writeTarEntry(tw *tar.Writer, name string, data []byte) error {
 	hdr := &tar.Header{
 		Name:     name,
-		Mode:     0o644,
+		Mode:     0o600,
 		Size:     int64(len(data)),
 		Typeflag: tar.TypeReg,
 		ModTime:  time.Unix(0, 0).UTC(),
@@ -417,10 +420,10 @@ func writeRestored(outDir, rel string, data []byte) error {
 	if !withinDir(outDir, dst) {
 		return fmt.Errorf("verify: entry %q escapes the destination", rel)
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 		return fmt.Errorf("restore: mkdir for %s: %w", rel, err)
 	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return fmt.Errorf("restore: write %s: %w", rel, err)
 	}
 	return nil
