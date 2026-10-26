@@ -246,6 +246,50 @@ func TestProviderToolDefinitionsRequireInputAndOperation(t *testing.T) {
 	}
 }
 
+// TestProviderToolDefinitionsAdvertiseStringEncodedInputs pins the wire
+// contract: the decision protocol, Action.Input and the manifest all treat
+// input values as strings, so every advertised property must be a string —
+// even for int/float/bool manifest fields — or a schema-conformant model call
+// would be rejected by the decoder.
+func TestProviderToolDefinitionsAdvertiseStringEncodedInputs(t *testing.T) {
+	m := tool.ToolManifest{
+		ID: "web.search",
+		InputSchema: tool.Schema{Fields: []tool.SchemaField{
+			{Name: "query", Type: tool.FieldString, Required: true, MaxLength: 512},
+			{Name: "limit", Type: tool.FieldInt, Max: 10, Min: 1},
+			{Name: "ratio", Type: tool.FieldFloat},
+			{Name: "exact", Type: tool.FieldBool},
+			{Name: "mode", Type: tool.FieldString, Enum: []string{"fast", "deep"}},
+		}},
+	}
+	defs := providerToolDefinitions([]ToolHint{{ID: m.ID, Summary: "web", Operations: []string{"search"}, InputSchema: m.InputSchema}})
+	params := defs[0].Parameters.(map[string]interface{})
+	input := params["properties"].(map[string]interface{})["input"].(map[string]interface{})
+	props := input["properties"].(map[string]interface{})
+	for _, name := range []string{"query", "limit", "ratio", "exact", "mode"} {
+		p, ok := props[name].(map[string]interface{})
+		if !ok {
+			t.Fatalf("missing property %q in %+v", name, props)
+		}
+		if p["type"] != "string" {
+			t.Fatalf("property %q must be advertised as string, got %v", name, p["type"])
+		}
+	}
+	// A schema-conformant (string-encoded) argument decodes and passes the
+	// manifest's own validation.
+	args, err := providerToolArguments(`{"operation":"search","input":{"query":"nexus","limit":"5","ratio":"0.5","exact":"true","mode":"fast"}}`)
+	if err != nil {
+		t.Fatalf("string-encoded arguments must decode: %v", err)
+	}
+	if err := m.ValidateInput(args.Input); err != nil {
+		t.Fatalf("string-encoded arguments must validate against the manifest: %v", err)
+	}
+	// The numeric form the old schema invited must fail closed, never coerce.
+	if _, err := providerToolArguments(`{"input":{"query":"nexus","limit":5}}`); err == nil {
+		t.Fatal("a JSON number for a string-encoded field must be rejected")
+	}
+}
+
 // bridgeDecider is a DecisionRequester that replays canned actions and records
 // the prompts it was asked, so the runtime's tool-conversation bookkeeping can
 // be asserted without a real provider.

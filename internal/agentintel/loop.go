@@ -182,13 +182,21 @@ func providerToolDefinitions(hints []ToolHint) []modelrouter.ToolDefinition {
 	for _, hint := range hints {
 		// The advertised argument shape mirrors the strict action the runtime
 		// reconstructs: an `input` object of the manifest's declared fields,
-		// plus an explicit `operation` only for multi-operation tools. The
-		// manifest stays authoritative — this schema is advisory context and
-		// every field is re-validated by the capability platform.
+		// plus an explicit `operation` only for multi-operation tools.
+		//
+		// Every input value is advertised as a JSON string, because that is the
+		// established wire contract: agent_decision_v1 types `input` as
+		// additionalProperties {"type":"string"}, Action.Input is a
+		// map[string]string, and the manifest's ValidateInput parses the
+		// semantic type (int/float/bool) FROM the string. Advertising a numeric
+		// or boolean schema here would invite a schema-conformant value the
+		// decoder must reject. The manifest stays authoritative — this schema is
+		// advisory context and every field is re-validated by the capability
+		// platform.
 		fields := map[string]interface{}{}
 		required := []string{}
 		for _, field := range hint.InputSchema.Fields {
-			property := map[string]interface{}{"type": providerJSONType(string(field.Type))}
+			property := map[string]interface{}{"type": "string"}
 			if field.Description != "" {
 				property["description"] = field.Description
 			}
@@ -222,20 +230,6 @@ func providerToolDefinitions(hints []ToolHint) []modelrouter.ToolDefinition {
 		out = append(out, modelrouter.ToolDefinition{Name: hint.ID, Description: hint.Summary, Parameters: params})
 	}
 	return out
-}
-
-// providerJSONType maps the manifest's closed field type set onto JSON Schema
-// primitives. The tool manifest's own validator remains the sole authority on
-// what a field accepts.
-func providerJSONType(t string) string {
-	switch t {
-	case "int", "float":
-		return "number"
-	case "bool":
-		return "boolean"
-	default:
-		return "string"
-	}
 }
 
 // Runtime is the bounded control loop (§4). It runs as an executor handler
