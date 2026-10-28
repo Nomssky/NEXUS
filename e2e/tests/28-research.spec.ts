@@ -110,7 +110,9 @@ async function loginViaUI(page, nexus) {
   await page.fill('input[id="credential"]', nexus.credential);
   await page.fill('input[id="business-id"]', nexus.businessID);
   await page.click('button[type="submit"]:has-text("Sign in")');
-  await page.waitForSelector('text=Command Input', { timeout: 30000 });
+  // After login, the app may show Command Center (if already bootstrapped)
+  // or the Bootstrap screen (first run). Wait for either.
+  await page.waitForSelector('text=Command Input, text=Create your first business', { timeout: 30000 });
   return true;
 }
 
@@ -120,6 +122,16 @@ async function loginViaUI(page, nexus) {
  */
 async function loginAndNavigateToResearch(page, nexus) {
   await loginViaUI(page, nexus);
+
+  // If on bootstrap screen, complete it to reach Command Center
+  if (await page.isVisible('text=Create your first business', { timeout: 2000 })) {
+    await page.fill('input[id="business-name"]', nexus.businessID);
+    await page.fill('input[id="primary-objective"]', 'Research E2E');
+    await page.click('button[type="submit"]:has-text("Create business")');
+    await page.waitForSelector('text=Command Input', { timeout: 30000 });
+  }
+
+  // Navigate to Research workspace
   const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
   await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
   await page.waitForSelector('text=Research Query', { timeout: 10000 });
