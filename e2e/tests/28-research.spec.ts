@@ -99,6 +99,33 @@ class FrontendServer {
   }
 }
 
+
+/**
+ * Performs the real UI login flow through the SignInScreen.
+ * Returns true if login succeeded.
+ */
+async function loginViaUI(page, nexus) {
+  await page.waitForSelector('text=Sign in to NEXUS', { timeout: 10000 });
+  await page.fill('input[id="actor-id"]', nexus.actorID);
+  await page.fill('input[id="credential"]', nexus.credential);
+  await page.fill('input[id="business-id"]', nexus.businessID);
+  await page.click('button[type="submit"]:has-text("Sign in")');
+  await page.waitForSelector('text=Command Input', { timeout: 30000 });
+  return true;
+}
+
+/**
+ * Performs login and navigates to Research workspace.
+ * Returns true if login and navigation succeeded.
+ */
+async function loginAndNavigateToResearch(page, nexus) {
+  await loginViaUI(page, nexus);
+  const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
+  await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
+  await page.waitForSelector('text=Research Query', { timeout: 10000 });
+  return true;
+}
+
 test.describe('Research Workspace E2E', () => {
   let nexus: NexusHandle;
   let frontend: FrontendServer;
@@ -150,29 +177,8 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: durable source evidence is rendered for a real web.search run', async ({ page }) => {
-    // Set auth credentials via localStorage BEFORE page loads so React's
-    // AuthProvider reads them on mount and skips the login screen.
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
-    // Navigate to the frontend (localStorage already set → authenticated on mount)
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-
-    // Wait for Command Center page to load (authentication successful)
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-
-    // Navigate to Research workspace using the app's main navigation.
-    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
-    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     // Submit a research objective. The scripted provider deterministically
     // calls web.search once, then completes.
@@ -283,23 +289,8 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: durable evidence and timestamps survive a binary restart', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-
-    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
-    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
     await page.click('button[type="submit"]', { timeout: 5000 });
@@ -381,23 +372,8 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: multi-step research collects evidence and recovers after restart', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-
-    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
-    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     // Submit a research objective. The scripted planner produces a two-step
     // plan (gather -> summarize) and the scripted decision table runs
@@ -641,23 +617,8 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: citation audit renders clean state and survives restart', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-
-    const mainNav = page.getByRole('tablist', { name: 'Main navigation' });
-    await mainNav.getByRole('tab', { name: 'Research', exact: true }).click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
     await page.click('button[type="submit"]', { timeout: 5000 });
@@ -719,23 +680,8 @@ test.describe('Research Workspace E2E', () => {
   });
 
   test('research workspace: compares two settled runs without scores or inferred identity', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     const listExecutions = async (): Promise<Array<{ execution_id: string; state: string }>> => {
       const response = await fetch(
@@ -933,23 +879,8 @@ test.describe('Research Workspace real web provider', () => {
   });
 
   test('research workspace: the real adapter retrieves and renders provider records', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
     await page.click('button[type="submit"]', { timeout: 5000 });
@@ -1090,23 +1021,8 @@ test.describe('Research Workspace Brave web provider', () => {
   });
 
   test('research workspace: the Brave adapter retrieves and renders general web records', async ({ page }) => {
-    await page.context().addInitScript(({ actorID, credential, businessID }) => {
-      localStorage.setItem('nexus-auth', JSON.stringify({
-        actorID,
-        actorId: actorID,
-        credential,
-        businessID,
-        businessId: businessID,
-        controlKey: '',
-      }));
-    }, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
-
     await page.goto(frontendURL, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     await page.fill('textarea[placeholder*="research"]', RESEARCH_OBJECTIVE);
     await page.click('button[type="submit"]', { timeout: 5000 });
