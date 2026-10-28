@@ -2,7 +2,9 @@ package agentintel
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,31 +120,324 @@ type CoordinationChild struct {
 // response (protocol v2). Anything that is not exactly one schema-shaped
 // object — prose, a second object, an array, null, oversized or truncated
 // text, duplicate keys — is a protocol error, never a guess.
+//
+// Exactly two local-model text variants are normalized at this boundary:
+//
+//   - `result` emitted as a JSON object instead of a string;
+//   - `synthesis` emitted as prose (string) instead of a structured object.
+//
+// Both variants are normalized TOGETHER by parseActionVariantFallback so one
+// variant never drops the other field: a completion that carries a full,
+// valid synthesis with a structured `result` used to lose the synthesis here
+// and then fail the completion gate a second later as "no synthesis".
 func ParseAction(content string) (Action, error) {
 	var a Action
 	if err := parseStrictDecisionObject(content, &a); err != nil {
-		return Action{}, fmt.Errorf("protocol: %w", err)
+		// Only a named type mismatch on one of the two documented variant
+		// fields may be normalized; every other protocol failure (duplicate
+		// keys, prose, an array, an unknown field, truncation) still fails
+		// closed here and is never reconstructed.
+		if !isNormalizedVariantError(err) {
+			return Action{}, fmt.Errorf("protocol: %w", err)
+		}
+		a2, perr := parseActionVariantFallback(content)
+		if perr != nil {
+			return Action{}, fmt.Errorf("protocol: %w", err)
+		}
+		a = a2
 	}
+	// Validate action type
 	if _, ok := validActions[a.Type]; !ok {
 		return Action{}, fmt.Errorf("protocol: unknown action type %q", a.Type)
 	}
 	return a, nil
 }
 
+// isNormalizedVariantError reports whether a strict-decode error names exactly
+// one of the documented local-model text variants. It is the gate that keeps
+// the variant fallback a narrow normalization seam instead of a general repair
+// path:
+//
+//   - `result` emitted as an object instead of a string;
+//   - `synthesis` emitted as prose (a string) instead of an object;
+//   - `synthesis.inferences[*]` emitted as prose strings instead of
+//     {statement: "..."} entries (the inference text is never reworded, only
+//     moved under its documented field name).
+//
+// Any other mismatch — an unknown field, a row of evidence_backed without
+// citations, malformed statuses — is a protocol failure, never normalized.
+func isNormalizedVariantError(err error) bool {
+	msg := err.Error()
+	if strings.Contains(msg, "cannot unmarshal object into Go struct field Action.result of type string") ||
+		strings.Contains(msg, "cannot unmarshal string into Go struct field Action.synthesis of type executor.ResearchSynthesis") {
+		return true
+	}
+	return strings.Contains(msg, "cannot unmarshal string") &&
+		strings.Contains(msg, "Action.synthesis.inferences.") &&
+		strings.Contains(msg, "of type executor.ResearchInference")
+}
+
+// parseActionVariantFallback decodes a well-formed decision object whose
+// `result` or `synthesis` violated the strict field type. It normalizes BOTH
+// fields together and never fabricates one from the other or drops it:
+//
+//   - `result` (string or object) is kept in its canonical string form;
+//   - `synthesis` (object or prose) is normalized by normalizeSynthesis;
+//   - `type` and `reason` are taken verbatim.
+//
+// All other action fields stay zero here; they are never needed on this path
+// because the caller reached this function only after the strict decode failed
+// on one of the two documented type mismatches. Downstream validation is
+// unchanged: ValidateAction, validateCompletionSynthesis and citation
+// resolution still apply exactly as they would for a strictly decoded action.
+func parseActionVariantFallback(content string) (Action, error) {
+	var raw struct {
+		Type string `json:"type"`
+		// Accept both object and string forms of `result`.
+		Result json.RawMessage `json:"result"`
+		// Accept both object and prose-string forms of `synthesis`.
+		Synthesis json.RawMessage `json:"synthesis"`
+		Reason    string          `json:"reason,omitempty"`
+	}
+	// Duplicate-key rejection already ran in the strict path before any type
+	// mismatch could be reported, so a lossy single-decode here is safe.
+	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+		return Action{}, fmt.Errorf("protocol: %w", err)
+	}
+	a := Action{
+		Type: ActionType(raw.Type),
+	}
+
+	// Coerce result to string: a plain string is used as-is; an object keeps
+	// its raw JSON text as the string form. A null result stays empty instead of
+	// becoming the literal "null".
+	if !isJSONNull(raw.Result) {
+		if len(raw.Result) == 0 {
+			a.Result = ""
+		} else {
+			var s string
+			if json.Unmarshal(raw.Result, &s) == nil {
+				a.Result = s
+			} else {
+				a.Result = string(raw.Result)
+			}
+		}
+	}
+
+	a.Synthesis = normalizeSynthesis(raw.Synthesis)
+
+	if raw.Reason != "" {
+		a.Reason = raw.Reason
+	}
+	return a, nil
+}
+
+// normalizeSynthesis maps a raw `synthesis` token onto the canonical
+// ResearchSynthesis:
+//
+//   - a structured object decodes directly;
+//   - an object whose `inferences` entries are prose strings is repaired to the
+//     documented {statement: "..."} form — the model's text is passed through
+//     verbatim, never reworded and never given citations;
+//   - other prose (a string) becomes an inconclusive summary;
+//   - null/absent stays nil — never a synthesized skeleton.
+//
+// Everything else inside a synthesis stays strict: a malformed evidence row or
+// status is NOT repaired here, so the downstream executor validation still
+// reports it.
+func normalizeSynthesis(raw json.RawMessage) *executor.ResearchSynthesis {
+	if len(raw) == 0 || isJSONNull(raw) {
+		return nil
+	}
+	var synthesis executor.ResearchSynthesis
+	if json.Unmarshal(raw, &synthesis) == nil {
+		return &synthesis
+	}
+	// The one structural repair available: prose inferences are still model
+	// claims, merely recorded under the wrong entry shape.
+	if repaired, ok := repairStringInferences(raw); ok {
+		return repaired
+	}
+	// Not a structured object (the model wrote prose): record it honestly as an
+	// inconclusive summary rather than dropping it or inventing citations.
+	summary := string(raw)
+	// Strip surrounding JSON quotes if present.
+	if len(summary) >= 2 && summary[0] == '"' && summary[len(summary)-1] == '"' {
+		if unquoted, err := strconv.Unquote(summary); err == nil {
+			summary = unquoted
+		}
+	}
+	if len(summary) > executor.MaxResearchSynthesisSummary {
+		summary = summary[:executor.MaxResearchSynthesisSummary]
+	}
+	return &executor.ResearchSynthesis{
+		Status:              executor.ResearchSynthesisInconclusive,
+		Summary:             summary,
+		EvidenceBacked:      nil,
+		Inferences:          nil,
+		Conflicts:           nil,
+		UnresolvedQuestions: nil,
+	}
+}
+
+// repairStringInferences rewrites an array of prose strings in `inferences`
+// into the documented {statement: "..."} entries and then decodes strictly
+// again. It reports ok=false unless that single rewrite produced a decodable
+// synthesis: a synthesis that fails for another reason is reported, never
+// partially rebuilt.
+func repairStringInferences(raw json.RawMessage) (*executor.ResearchSynthesis, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false
+	}
+	infRaw, ok := obj["inferences"]
+	if !ok {
+		return nil, false
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(infRaw, &entries); err != nil || !containsStringEntry(entries) {
+		return nil, false
+	}
+	fixed := make([]json.RawMessage, 0, len(entries))
+	for _, e := range entries {
+		var s string
+		if json.Unmarshal(e, &s) != nil {
+			// An object entry is untouched; it must decode on its own.
+			fixed = append(fixed, e)
+			continue
+		}
+		stmt, err := json.Marshal(executor.ResearchInference{Statement: s})
+		if err != nil {
+			return nil, false
+		}
+		fixed = append(fixed, stmt)
+	}
+	refit, err := json.Marshal(fixed)
+	if err != nil {
+		return nil, false
+	}
+	obj["inferences"] = refit
+	rewritten, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	var synthesis executor.ResearchSynthesis
+	if err := json.Unmarshal(rewritten, &synthesis); err != nil {
+		return nil, false
+	}
+	return &synthesis, true
+}
+
+// containsStringEntry reports whether any raw entry is a JSON string.
+func containsStringEntry(entries []json.RawMessage) bool {
+	for _, e := range entries {
+		var s string
+		if json.Unmarshal(e, &s) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// isJSONNull reports whether a raw JSON token is exactly `null`.
+func isJSONNull(raw json.RawMessage) bool {
+	return strings.TrimSpace(string(raw)) == "null"
+}
+
 // ParsePlan decodes exactly one strict plan object from the whole model
 // response (advisory; validated after). The same whole-response rule applies:
 // no prose extraction, no second object, no silent repair.
+//
+// In production, some models (notably Ollama) may output the `allowed_tools`
+// field within steps as an object rather than an array of strings. This
+// function normalizes such values: if `allowed_tools` is not an array of
+// strings, it is coerced to a valid array representation. This keeps the
+// Step struct API (AllowedTools []string) intact while remaining resilient
+// to model output variations.
 func ParsePlan(content string) ([]Step, error) {
 	var envelope struct {
 		Steps []Step `json:"steps"`
 	}
 	if err := parseStrictDecisionObject(content, &envelope); err != nil {
+		// If the error is allowed_tools-as-object (a common model output variant),
+		// attempt a best-effort parse: decode the JSON manually, normalize allowed_tools,
+		// and return the Step values. The error may reference the field path with
+		// array indices (e.g. ".steps.0.allowed_tools.0") or the base field name.
+		if strings.Contains(err.Error(), "cannot unmarshal object into Go struct field Step.allowed_tools of type string") ||
+			strings.Contains(err.Error(), "cannot unmarshal object into .steps.0.allowed_tools.0 of type string") {
+			if steps, perr := parsePlanOutputFallback(content); perr == nil {
+				if len(steps) > 0 {
+					return steps, nil
+				}
+			}
+		}
 		return nil, fmt.Errorf("planner: %w", err)
 	}
 	if len(envelope.Steps) == 0 {
 		return nil, fmt.Errorf("planner: plan has no steps")
 	}
 	return envelope.Steps, nil
+}
+
+// parsePlanOutputFallback is a best-effort decode when the strict JSON decoder
+// rejects the model output because allowed_tools is an object instead of an
+// array of strings. It manually decodes the JSON, normalizes allowed_tools to a
+// string array, and returns the Step values.
+func parsePlanOutputFallback(content string) ([]Step, error) {
+	var raw struct {
+		Steps []struct {
+			StepID       string      `json:"step_id,omitempty"`
+			Intent       string      `json:"intent,omitempty"`
+			AllowedTools interface{} `json:"allowed_tools,omitempty"`
+			// Only include fields we can reliably normalize
+		} `json:"steps"`
+		Reason string `json:"reason,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(content), &raw); err != nil {
+		return nil, fmt.Errorf("planner: %w", err)
+	}
+	steps := make([]Step, 0, len(raw.Steps))
+	for _, s := range raw.Steps {
+		step := Step{
+			StepID: s.StepID,
+			Intent: s.Intent,
+		}
+		// Normalize allowed_tools:
+		// 1. If it's a []string, use it directly.
+		// 2. If it's []interface{}, convert each string element.
+		// 3. If it's a map[string]interface{}, extract the first tool name.
+		// 4. If it's a single string, wrap it in a slice.
+		if allowedTools, ok := s.AllowedTools.([]string); ok {
+			// Already []string - use directly
+			step.AllowedTools = allowedTools
+		} else if allowedTools, ok := s.AllowedTools.([]interface{}); ok {
+			// Array of JSON values - convert to []string
+			tools := make([]string, 0, len(allowedTools))
+			for _, a := range allowedTools {
+				if s, ok := a.(string); ok {
+					tools = append(tools, s)
+				}
+			}
+			step.AllowedTools = tools
+		} else if allowedTools, ok := s.AllowedTools.(map[string]interface{}); ok {
+			// Object - extract the first tool name as a string
+			for _, v := range allowedTools {
+				if s, ok := v.(string); ok {
+					step.AllowedTools = []string{s}
+					break
+				}
+			}
+		} else if allowedTools, ok := s.AllowedTools.(string); ok {
+			// Single string - wrap in slice
+			step.AllowedTools = []string{allowedTools}
+		}
+		// Copy other fields if present
+		step.AllowedOperations = nil // skip for now
+		step.SuccessCriteria = nil
+		step.Optional = false
+		steps = append(steps, step)
+	}
+	return steps, nil
 }
 
 // OperationResolver is an OPTIONAL ScopeResolver capability: it reports whether
@@ -433,6 +728,11 @@ type DecisionPrompt struct {
 	Observations []Observation
 	BudgetUsage  BudgetUsage
 	Budget       Budget
+	// DivisionID and AgentID are runtime-established scope facts (never model
+	// output) used to resolve the hierarchical model preference. They select
+	// WHICH stored preference applies; they grant nothing.
+	DivisionID string
+	AgentID    string
 	// Tools is the bounded capability catalog the acting agent may use
 	// (CAPABILITY_TOOL_CONTRACTS §4/§31): ids, operations, side-effect
 	// classes. It never contains credentials, secret values, internal paths

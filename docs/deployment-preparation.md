@@ -78,7 +78,7 @@ stored in config files; they are read from environment variables at startup.
 | `NEXUS_HEALTH_ENABLED` | Enable health/readiness surface | `true` | `true` |
 | `NEXUS_HEALTH_HOST` | Health bind host (loopback default) | `127.0.0.1` | `127.0.0.1` |
 | `NEXUS_HEALTH_PORT` | Health bind port | `8080` | Any free port |
-| `NEXUS_HTTP_ADDR` | Gateway bind address (`<host>:<port>`) | `127.0.0.1:8081` | Any free port |
+| *(CLI flag `-http-addr`, not an env var)* | Gateway bind address (`<host>:<port>`) | `<health-host>:<health-port+1>` (e.g. `127.0.0.1:8081`) | Any free port |
 | `NEXUS_SHUTDOWN_TIMEOUT_SECONDS` | Graceful drain budget | `30` | `30` or higher |
 | `NEXUS_DATA_DIR` | Durable record root (`storage.data_dir`); empty = in-memory | `` | **Required** — non-empty, local durable filesystem |
 | `NEXUS_SEEDED_PROVIDER_STATUS` | Seeded provider health: `""`/`healthy`/`offline` | `` | Not used in production |

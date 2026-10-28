@@ -80,6 +80,12 @@ type GenerateRequest struct {
 	// AGENT_MODEL_PROTOCOL_CONTRACTS §3: the provider must honor the declared
 	// JSON schema exactly, or fail honestly — never silently return free text.
 	Structured *StructuredOutputSchema `json:"structured,omitempty"`
+	// EstimatedInputTokens is the caller's best estimate of input tokens for
+	// this invocation. Used for cost estimation and budget checking.
+	EstimatedInputTokens int `json:"estimated_input_tokens,omitempty"`
+	// EstimatedOutputTokens is the caller's best estimate of output tokens for
+	// this invocation. Used for cost estimation and budget checking.
+	EstimatedOutputTokens int `json:"estimated_output_tokens,omitempty"`
 }
 
 // StructuredOutputSchema is the provider-neutral form of "the model must

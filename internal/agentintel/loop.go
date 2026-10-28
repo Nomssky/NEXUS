@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
@@ -18,7 +19,9 @@ import (
 	"github.com/Nomssky/NEXUS/internal/foundation/agent"
 	"github.com/Nomssky/NEXUS/internal/foundation/event"
 	"github.com/Nomssky/NEXUS/internal/foundation/governance"
+	"github.com/Nomssky/NEXUS/internal/foundation/hardware"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelselect"
 	"github.com/Nomssky/NEXUS/internal/memory"
 	"github.com/Nomssky/NEXUS/internal/researchquality"
 )
@@ -30,6 +33,142 @@ type Decision struct {
 	Router  *modelrouter.ModelRouter
 	AgentID string
 	Now     func() time.Time
+
+	// ModelPreferences resolves the hierarchical preference for the scope of a
+	// decision. nil disables preference-aware routing (shipped default until a
+	// launcher wires it), and routing then behaves exactly as before.
+	ModelPreferences *modelselect.PrefSource
+	// InstalledModels reports locally installed model IDs (nil = unknown).
+	InstalledModels func(ctx context.Context) (map[string]bool, bool, error)
+	// Hardware returns a bounded local resource snapshot (nil = unknown).
+	Hardware func(ctx context.Context) hardware.Inventory
+	// ReserveBytes is the RAM headroom held back from memory-based limits.
+	ReserveBytes int64
+	// SelectionPolicy controls uncertainty/fallback. The launcher sets
+	// StrictPreference so an explicit preference is either honored or fails
+	// loudly, and never silently becomes a different model.
+	SelectionPolicy modelselect.Policy
+
+	lastMu sync.Mutex
+	last   *modelselect.Decision
+
+	// toolCallSeq is a process-wide monotonic sequence used only to mint a
+	// collision-safe correlation id for a native provider tool call that
+	// omitted its own id. It never grants authority, selects a tool, or
+	// fabricates arguments.
+	toolCallSeq int64
+}
+
+// nextToolCallID mints a collision-safe internal correlation id for a provider
+// tool call that legitimately omitted its own id. It is a correlation handle
+// only: the tool name and arguments are validated independently, and a call
+// that is structurally invalid is still rejected.
+func (d *Decision) nextToolCallID() string {
+	return fmt.Sprintf("nexus-toolcall-%d", atomic.AddInt64(&d.toolCallSeq, 1))
+}
+
+// LastRoutingDecision returns a copy of the most recent routing decision for
+// diagnostics, or nil when preference-aware routing is disabled.
+func (d *Decision) LastRoutingDecision() *modelselect.Decision {
+	if d == nil {
+		return nil
+	}
+	d.lastMu.Lock()
+	defer d.lastMu.Unlock()
+	if d.last == nil {
+		return nil
+	}
+	cp := *d.last
+	return &cp
+}
+
+func (d *Decision) setLast(dec modelselect.Decision) {
+	d.lastMu.Lock()
+	d.last = &dec
+	d.lastMu.Unlock()
+}
+
+// applyModelSelection constrains the candidate set for one routing attempt
+// through the existing AllowedModels mechanism. It never admits work, never
+// calls a provider, and never falls back to a model other than the one the
+// policy explicitly selected.
+func (d *Decision) applyModelSelection(ctx context.Context, scope modelselect.Scope, req *modelrouter.RoutingRequest, required []modelrouter.ModelCapability, estimatedInputTokens, estimatedOutputTokens int) error {
+	if d == nil || d.Router == nil || d.ModelPreferences == nil {
+		return nil
+	}
+	reg := d.Router.Registry()
+	if reg == nil {
+		return nil
+	}
+	installed := map[string]bool{}
+	known := false
+	if d.InstalledModels != nil {
+		m, k, err := d.InstalledModels(ctx)
+		if err != nil {
+			return fmt.Errorf("local model discovery failed: %w", err)
+		}
+		installed, known = m, k
+	}
+	var inv hardware.Inventory
+	if d.Hardware != nil {
+		inv = d.Hardware(ctx)
+	}
+	cands := make([]modelselect.Candidate, 0, reg.ModelCount())
+	for _, m := range reg.All() {
+		if !modelHasAllCaps(m, required) {
+			continue
+		}
+		caps := make([]string, 0, len(m.Capabilities))
+		for _, c := range m.Capabilities {
+			caps = append(caps, string(c))
+		}
+		cands = append(cands, modelselect.Candidate{
+			ModelID: m.ID, ProviderID: m.ProviderID, Installed: true, Capabilities: caps,
+		})
+	}
+	reqCaps := make([]string, 0, len(required))
+	for _, c := range required {
+		reqCaps = append(reqCaps, string(c))
+	}
+	dec, err := modelselect.Choose(modelselect.RoutingFacts{
+		Prefs: *d.ModelPreferences, Scope: scope,
+		Task: modelselect.Task{
+			RequiredCapabilities:  reqCaps,
+			EstimatedInputTokens:  estimatedInputTokens,
+			EstimatedOutputTokens: estimatedOutputTokens,
+		},
+		Policy:     d.SelectionPolicy,
+		Candidates: cands,
+		Installed:  installed, InstalledKnown: known,
+		Inventory: inv, ReserveBytes: d.ReserveBytes,
+	})
+	if err != nil {
+		return err
+	}
+	d.setLast(dec)
+	if dec.ModelID != "" {
+		req.AllowedModels = []string{dec.ModelID}
+	}
+	return nil
+}
+
+// modelHasAllCaps reports whether a registry definition declares every
+// required capability (mirrors the registry filter; the registry remains the
+// authority for Route).
+func modelHasAllCaps(m *modelrouter.ModelDefinition, required []modelrouter.ModelCapability) bool {
+	for _, want := range required {
+		ok := false
+		for _, have := range m.Capabilities {
+			if have == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Decision) now() time.Time {
@@ -44,23 +183,24 @@ func (d *Decision) Decide(ctx context.Context, p DecisionPrompt) (string, error)
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	raw, err := d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), p.Tools, p.ToolConversation)
+	raw, err := d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), p.Tools, p.ToolConversation,
+		modelselect.Scope{DivisionID: p.DivisionID, AgentID: p.AgentID})
 	if err != nil {
 		return "", err
 	}
-	if len(p.Tools) == 0 {
-		return raw, nil
-	}
-	// A tool-bearing request carries no response_format (it would suppress
-	// native tool calls), so a non-tool answer can come back unstructured.
-	// Perform at most ONE strict retry — without tools and with the decision
-	// schema — preserving the tool conversation so the model still sees its own
-	// proposal and the result. This never multiplies: exactly one extra call,
-	// and only when the first answer was not a valid action.
+	// Validate with the strict protocol boundary. On failure, retry at most
+	// once with the same schema-explicit prompt (the instruction envelope now
+	// lists valid decision fields). This never multiplies: exactly one extra
+	// call, and only when the first answer was not a valid decision.
 	if _, perr := ParseAction(raw); perr == nil {
 		return raw, nil
 	}
-	return d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), nil, p.ToolConversation)
+	raw2, err2 := d.invoke(ctx, p.StepID, buildDecisionEnvelope(p), DecisionStructuredRequest(), nil, p.ToolConversation,
+		modelselect.Scope{DivisionID: p.DivisionID, AgentID: p.AgentID})
+	if err2 != nil {
+		return "", err2
+	}
+	return raw2, nil
 }
 
 // Plan asks the model for an advisory plan (§3, protocol v2).
@@ -68,10 +208,10 @@ func (d *Decision) Plan(ctx context.Context, p PlanPrompt) (string, error) {
 	if d == nil || d.Router == nil {
 		return "", fmt.Errorf("no model router wired")
 	}
-	return d.invoke(ctx, "plan", buildPlanEnvelope(p), PlanStructuredRequest(), nil, nil)
+	return d.invoke(ctx, "plan", buildPlanEnvelope(p), PlanStructuredRequest(), nil, nil, modelselect.Scope{})
 }
 
-func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, structured *modelrouter.StructuredOutputSchema, hints []ToolHint, conversation []modelrouter.Message) (string, error) {
+func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, structured *modelrouter.StructuredOutputSchema, hints []ToolHint, conversation []modelrouter.Message, scope modelselect.Scope) (string, error) {
 	required := []modelrouter.ModelCapability{modelrouter.CapabilityStructuredOutput}
 	if len(hints) > 0 {
 		// A decision that advertises tool definitions must be routed to a model
@@ -85,15 +225,27 @@ func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, s
 		RequiredCaps:    required,
 		FallbackEnabled: true,
 	}
+	// Estimate input tokens from message content (roughly 1 token per 4 runes)
+	// and use MaxTokens as the output upper bound. These are advisory estimates
+	// used only for cost-aware model selection and budget checking; they are
+	// never treated as actual billed usage.
+	estInput := 0
+	for _, m := range msgs {
+		estInput += len([]rune(m.Content)) / 4
+	}
+	if err := d.applyModelSelection(ctx, scope, routeReq, required, estInput, 2048); err != nil {
+		return "", fmt.Errorf("model routing failed: %w", err)
+	}
 	providerMessages := toProviderMessages(msgs)
 	providerMessages = append(providerMessages, conversation...)
 	gen := &modelrouter.GenerateRequest{
-		RequestID: id,
-		Messages:  providerMessages,
-		// Bounded, but large enough for a bounded plan with explicit operations
-		// and a synthesized answer with several citations. MaxDecisionBytes
-		// remains the hard wire-shape bound on what the runtime accepts.
-		MaxTokens: 2048,
+		RequestID:            id,
+		Messages:             providerMessages,
+		MaxTokens:            2048,
+		EstimatedInputTokens: estInput,
+		// MaxTokens is the hard output cap; use it as the conservative output
+		// estimate so budget checks assume the worst case.
+		EstimatedOutputTokens: 2048,
 	}
 	if len(hints) > 0 {
 		// Native tool calling and a response_format are mutually exclusive on
@@ -116,19 +268,23 @@ func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, s
 			return "", fmt.Errorf("provider returned %d tool calls; only one mediated call per decision is supported", len(resp.ToolCalls))
 		}
 		call := resp.ToolCalls[0]
-		nameToID := make(map[string]string, len(hints))
-		for _, hint := range hints {
-			nameToID[hint.ID] = hint.ID
+		hint, ok := hintByID(hints, call.Name)
+		if !ok {
+			return "", fmt.Errorf("provider tool call names an unregistered tool %q", call.Name)
 		}
-		toolID, ok := nameToID[call.Name]
-		if !ok || strings.TrimSpace(call.ID) == "" {
-			return "", fmt.Errorf("provider tool call is missing a valid id or registered tool name")
-		}
-		args, err := providerToolArguments(call.Arguments)
+		args, err := providerToolArguments(call.Arguments, declaredInputFields(hint))
 		if err != nil {
 			return "", fmt.Errorf("provider tool call arguments are invalid: %w", err)
 		}
-		action, err := json.Marshal(Action{Type: ActionToolCall, Tool: toolID, Operation: args.Operation, Input: args.Input, ProviderToolCallID: call.ID})
+		// Preserve the provider's opaque proposal id when present. A provider
+		// that legitimately omits it still gets a collision-safe internal id so
+		// the assistant/tool correlation stays well-formed; the id is a
+		// correlation handle, never an authority and never a tool selection.
+		providerCallID := strings.TrimSpace(call.ID)
+		if providerCallID == "" {
+			providerCallID = d.nextToolCallID()
+		}
+		action, err := json.Marshal(Action{Type: ActionToolCall, Tool: hint.ID, Operation: args.Operation, Input: args.Input, ProviderToolCallID: providerCallID})
 		if err != nil {
 			return "", fmt.Errorf("encode provider tool proposal: %w", err)
 		}
@@ -137,27 +293,121 @@ func (d *Decision) invoke(ctx context.Context, id string, msgs []ModelMessage, s
 	return resp.Content, nil
 }
 
+// hintByID returns the capability hint whose id equals id.
+func hintByID(hints []ToolHint, id string) (ToolHint, bool) {
+	for _, h := range hints {
+		if h.ID == id {
+			return h, true
+		}
+	}
+	return ToolHint{}, false
+}
+
+// declaredInputFields returns the set of declared input field names for one
+// capability hint, or nil when the hint declares none. It is used only to
+// normalize a model that inlines the tool's input fields at the top level.
+func declaredInputFields(hint ToolHint) map[string]struct{} {
+	if len(hint.InputSchema.Fields) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(hint.InputSchema.Fields))
+	for _, f := range hint.InputSchema.Fields {
+		out[f.Name] = struct{}{}
+	}
+	return out
+}
+
 type providerToolArgs struct {
 	Operation string            `json:"operation,omitempty"`
 	Input     map[string]string `json:"input,omitempty"`
 }
 
-func providerToolArguments(raw string) (providerToolArgs, error) {
+// providerToolArguments normalizes a provider tool-call argument object into
+// the strict {operation, input} shape.
+//
+// Two shapes are accepted:
+//
+//  1. The canonical advertised shape:
+//     {"operation":"search","input":{"query":"x","limit":"5"}}.
+//  2. A flat shape in which the model inlines the selected tool's declared
+//     input fields (and an optional operation) at the top level — a common
+//     small-model variant, e.g. {"query":"x","limit":"5"}. Every inlined key
+//     must name a field the tool actually declares (declaredFields); the
+//     normalizer never invents, drops, coerces or renames a field.
+//
+// A top-level key that is neither "operation"/"input" nor a declared input
+// field is rejected, and a declared field whose value is not a string is
+// rejected — the wire contract encodes every input value as a string.
+// declaredFields may be nil when the tool declares no input fields, in which
+// case only the canonical shape is accepted.
+func providerToolArguments(raw string, declaredFields map[string]struct{}) (providerToolArgs, error) {
 	var args providerToolArgs
+
+	// Canonical shape first: expect {"operation": "search", "input": {...}}.
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&args); err != nil {
-		return providerToolArgs{}, err
+	if err := dec.Decode(&args); err == nil {
+		if args.Input == nil {
+			args.Input = map[string]string{}
+		}
+		// Reject trailing content: one JSON object, nothing after it.
+		var extra any
+		if err := dec.Decode(&extra); err == nil {
+			return providerToolArgs{}, fmt.Errorf("multiple JSON values")
+		} else if !errors.Is(err, io.EOF) {
+			return providerToolArgs{}, fmt.Errorf("trailing content after JSON object")
+		}
+		return args, nil
 	}
-	// Reject trailing content: one JSON object, nothing after it.
-	var extra any
-	if err := dec.Decode(&extra); err == nil {
-		return providerToolArgs{}, fmt.Errorf("multiple JSON values")
-	} else if !errors.Is(err, io.EOF) {
-		return providerToolArgs{}, fmt.Errorf("trailing content after JSON object")
+
+	// Strict decode failed (e.g. the model inlined the input fields, a common
+	// Ollama variant). Fall back to a best-effort manual decode that normalizes
+	// the model's output shape while still rejecting truly unknown fields.
+	var rawMap map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &rawMap); err != nil {
+		return providerToolArgs{}, fmt.Errorf("provider tool call arguments are invalid: %w", err)
 	}
-	if args.Input == nil {
-		args.Input = map[string]string{}
+
+	// Extract operation if present
+	operation, _ := rawMap["operation"].(string)
+
+	// Build input map from recognized fields, rejecting unknown top-level keys.
+	inputMap := make(map[string]string)
+	for k, v := range rawMap {
+		switch k {
+		case "operation":
+			// already handled above; skip
+		case "input":
+			inner, ok := v.(map[string]interface{})
+			if !ok {
+				return providerToolArgs{}, fmt.Errorf("provider tool call arguments are invalid: input must be an object, got %T", v)
+			}
+			for ik, iv := range inner {
+				s, ok := iv.(string)
+				if !ok {
+					// Non-string value in input — fail closed so that JSON
+					// numbers (e.g. `"limit":5`) are never silently coerced.
+					return providerToolArgs{}, fmt.Errorf("provider tool call arguments are invalid: input field %q must be a string, got %T", ik, iv)
+				}
+				inputMap[ik] = s
+			}
+		default:
+			// A top-level key is accepted only when the tool declares it as an
+			// input field (the flattened variant). Anything else fails closed.
+			if _, declared := declaredFields[k]; !declared {
+				return providerToolArgs{}, fmt.Errorf("provider tool call arguments are invalid: unknown field %q", k)
+			}
+			s, ok := v.(string)
+			if !ok {
+				return providerToolArgs{}, fmt.Errorf("provider tool call arguments are invalid: field %q must be a string, got %T", k, v)
+			}
+			inputMap[k] = s
+		}
+	}
+
+	args = providerToolArgs{
+		Operation: operation,
+		Input:     inputMap,
 	}
 	return args, nil
 }
@@ -929,6 +1179,8 @@ func (r *Runtime) Run(ctx context.Context, req *executor.WorkRequest, ag *agent.
 			PlanVersion:      plan.Version,
 			StepStates:       ledger.describe(),
 			ToolConversation: rn.toolConversation,
+			DivisionID:       rn.divisionID,
+			AgentID:          agentID,
 		})
 		if derr != nil {
 			if ctx.Err() != nil {

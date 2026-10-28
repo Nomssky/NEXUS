@@ -108,6 +108,9 @@ type Server struct {
 	// intel is the agent intelligence control loop (v1). Nil makes the
 	// objective endpoints fail closed (503).
 	intel *agentintel.Runtime
+	// localRuntime is the read-only local model/runtime diagnostics producer
+	// (nil reports a not-configured state; never fabricated data).
+	localRuntime func(ctx context.Context) LocalRuntimeInfo
 	// capability is the Capability & Tool Platform seam (nil ⇒ the discovery
 	// surface fails closed with 503).
 	capability *capability.Platform
@@ -318,6 +321,8 @@ func NewServer(engine *core.Engine, addr string, opts ...ServerOption) *Server {
 
 	// Capability & Tool Platform v1: informational capability discovery.
 	s.mux.HandleFunc("GET /api/v1/tools", s.handleListTools)
+	// Read-only local model/runtime diagnostics (identity-scoped).
+	s.mux.HandleFunc("GET /api/v1/runtime/models", s.handleLocalRuntime)
 	// Capability lifecycle control (OPERATIONAL_RELIABILITY_CONTRACTS §10):
 	// under the control prefix so the existing X-API-Key gate covers it.
 	s.mux.HandleFunc("POST /api/v1/control/capabilities/{id}/state", s.handleSetCapabilityState)

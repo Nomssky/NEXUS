@@ -70,6 +70,14 @@ type ModelDefinition struct {
 	DataRetention    string            `json:"data_retention"`    // "none", "standard", "extended"
 	ExternalTransfer bool              `json:"external_transfer"` // allowed to send data externally
 	Tags             []string          `json:"tags,omitempty"`
+	// Source classifies the model as free, paid, or local. Default is "local"
+	// for backward compatibility with existing registrations.
+	Source SourceCategory `json:"source,omitempty"`
+	// FreeTierQuota describes free-tier limits for free models. Nil for paid
+	// and local models.
+	FreeTierQuota *FreeTierQuota `json:"free_tier_quota,omitempty"`
+	// SourceInfo provides provenance and privacy classification metadata.
+	SourceInfo ModelSourceInfo `json:"source_info,omitempty"`
 }
 
 // ModelRegistry manages model definitions and provides capability queries.
@@ -129,6 +137,23 @@ func (mr *ModelRegistry) FindByCapabilities(required []ModelCapability) []*Model
 		return result[i].ID < result[j].ID
 	})
 	return result
+}
+
+// All returns every registered model that is not offline, sorted by model ID
+// (deterministic). It is the raw candidate set; callers filter by capability
+// as needed.
+func (mr *ModelRegistry) All() []*ModelDefinition {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	out := make([]*ModelDefinition, 0, len(mr.models))
+	for _, def := range mr.models {
+		if def.Status == ModelStatusOffline {
+			continue
+		}
+		out = append(out, def)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // FindByRuntime returns models matching the runtime type.

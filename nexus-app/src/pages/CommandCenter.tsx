@@ -25,7 +25,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
   const [recentExecutions, setRecentExecutions] = useState<string[]>([]);
 
   const { data: agentsData } = useAgents(businessId);
-  const { data: toolsData } = useTools();
+  const { data: toolsData } = useTools(businessId);
   const queryClient = useQueryClient();
 
   // SSE: refetch executions, approvals, and authoritative activity when real-time

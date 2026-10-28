@@ -126,17 +126,35 @@ function resetConfigurationQueries(refetch: boolean): void {
 }
 
 interface AuthState {
+  // Non-secret session state persisted across reloads. The credential is
+  // deliberately NOT stored: it must be re-entered on every session.
   actorId: string;
-  credential: string;
   businessId: string;
   controlKey: string;
 }
 
 const DEFAULT_AUTH: AuthState = {
   actorId: 'nx:human:bootstrap',
-  credential: '',
   businessId: 'default',
   controlKey: '',
+};
+
+type FirstRunStage = 'signin' | 'bootstrap' | 'complete';
+
+interface FirstRunState {
+  stage: FirstRunStage;
+  businessName: string;
+  primaryObjective: string;
+  divisions: string[];
+  isSubmitting: boolean;
+}
+
+const DEFAULT_FIRST_RUN: FirstRunState = {
+  stage: 'signin',
+  businessName: '',
+  primaryObjective: '',
+  divisions: [],
+  isSubmitting: false,
 };
 
 function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -144,85 +162,179 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [firstRun, setFirstRun] = useState<FirstRunState>(DEFAULT_FIRST_RUN);
 
-  // Check for stored auth on mount
+  // Check for stored non-secret auth on mount. The credential is never
+  // persisted: on reload the user must re-enter it. Stored actorId and
+  // businessId are only presentation hints — they are never trusted as proof
+  // of identity. The credential is always re-verified against the server.
   useEffect(() => {
-    const stored = localStorage.getItem('nexus-auth');
-    if (stored) {
-      // The control-plane key is intentionally memory-only. Remove a legacy
-      // persisted value even when the record has no usable actor credential.
-      const { parsed, serialized } = stripPersistedControlKey(stored);
-      if (serialized) {
-        localStorage.setItem('nexus-auth', serialized);
+    let mounted = true;
+    (async () => {
+      const stored = localStorage.getItem('nexus-auth');
+      if (stored && mounted) {
+        // The control-plane key is intentionally memory-only. Remove a legacy
+        // persisted value even when the record has no usable actor credential.
+        const { parsed, serialized } = stripPersistedControlKey(stored);
+        if (serialized) {
+          localStorage.setItem('nexus-auth', serialized);
+        }
+        if (
+          parsed &&
+          typeof parsed.actorId === 'string' &&
+          parsed.actorId &&
+          typeof parsed.businessId === 'string' &&
+          parsed.businessId
+        ) {
+          const restored: AuthState = {
+            ...DEFAULT_AUTH,
+            actorId: parsed.actorId,
+            businessId: parsed.businessId,
+          };
+          setAuth(restored);
+        }
       }
-      if (
-        parsed &&
-        typeof parsed.actorId === 'string' &&
-        parsed.actorId &&
-        typeof parsed.credential === 'string' &&
-        parsed.credential
-      ) {
-        const restored: AuthState = {
-          ...DEFAULT_AUTH,
-          ...(parsed as Partial<AuthState>),
-          controlKey: '',
-        };
-        setAuth(restored);
-        apiClient.setAuth(restored.actorId, restored.credential);
-        setIsAuthenticated(true);
+      if (mounted) {
+        setIsLoading(false);
       }
-    }
-    setIsLoading(false);
+    })();
+    return () => {
+      mounted = false;
+    };
   }, []);
 
-  const login = useCallback(async (actorId: string, credential: string, businessId: string = 'default') => {
-    setAuthError(null);
-
-    // --- Input validation (before any network call) ---
+  // Validate input before any network call.
+  function validateInput(actorId: string, credential: string, businessId: string): string | null {
     const cleanActorId = actorId.trim();
     const cleanCredential = credential.trim();
     const cleanBusinessId = businessId.trim() || 'default';
 
-    if (!cleanActorId) {
-      setAuthError('Actor ID is required');
+    if (!cleanActorId) return 'Actor ID is required';
+    if (!/^[\w:.-]+$/.test(cleanActorId)) return 'Actor ID contains invalid characters';
+    if (cleanActorId.length > 128) return 'Actor ID is too long (max 128 characters)';
+    if (!cleanCredential) return 'Credential is required';
+    if (cleanCredential.length > 512) return 'Credential is too long (max 512 characters)';
+    if (!/^[\w.-]*$/.test(cleanBusinessId)) return 'Business ID contains invalid characters';
+    return null;
+  }
+
+  const login = useCallback(async (actorId: string, credential: string, businessId: string = 'default') => {
+    setAuthError(null);
+
+    const err = validateInput(actorId, credential, businessId);
+    if (err) {
+      setAuthError(err);
       return false;
     }
-    // Actor ID is sent as an HTTP header — allow only safe identifier characters
-    if (!/^[\w:.-]+$/.test(cleanActorId)) {
-      setAuthError('Actor ID contains invalid characters');
-      return false;
-    }
-    if (cleanActorId.length > 128) {
-      setAuthError('Actor ID is too long (max 128 characters)');
-      return false;
-    }
-    if (!cleanCredential) {
-      setAuthError('Credential is required');
-      return false;
-    }
-    if (cleanCredential.length > 512) {
-      setAuthError('Credential is too long (max 512 characters)');
-      return false;
-    }
-    if (!/^[\w.-]*$/.test(cleanBusinessId)) {
-      setAuthError('Business ID contains invalid characters');
-      return false;
-    }
+
+    const cleanActorId = actorId.trim();
+    const cleanCredential = credential.trim();
+    const cleanBusinessId = businessId.trim() || 'default';
 
     try {
-      // Test the credentials by calling health endpoint
+      // Verify credentials server-side via an authenticated, business-scoped
+      // endpoint. /health is unauthenticated and must never be used for login.
       apiClient.setAuth(cleanActorId, cleanCredential);
-      await apiClient.getHealth();
+      await apiClient.verifyCredentials(cleanBusinessId);
 
-      const newAuth = { actorId: cleanActorId, credential: cleanCredential, businessId: cleanBusinessId, controlKey: '' };
+      // Persist only non-secret state. The credential lives in this tab's
+      // memory for the duration of the session and is cleared on unload.
+      const newAuth: AuthState = { actorId: cleanActorId, businessId: cleanBusinessId, controlKey: '' };
       setAuth(newAuth);
+      apiClient.setAuth(cleanActorId, cleanCredential);
       localStorage.setItem('nexus-auth', JSON.stringify(newAuth));
       setIsAuthenticated(true);
+      setFirstRun({ ...DEFAULT_FIRST_RUN, stage: 'bootstrap' });
       return true;
     } catch (err) {
       apiClient.clearAuth();
-      const message = err instanceof Error ? err.message : 'Authentication failed';
-      setAuthError(message);
+      const apiErr = err as { status?: number; message?: string } | undefined;
+      if (apiErr && apiErr.status === 401) {
+        setAuthError('Invalid actor ID or credential');
+      } else {
+        setAuthError('Unable to reach NEXUS. Check that the backend is running.');
+      }
+      return false;
+    }
+  }, []);
+
+  const provisionBusiness = useCallback(async (
+    actorId: string,
+    credential: string,
+    businessId: string,
+    businessName: string,
+    primaryObjective: string,
+    divisions: string[]
+  ): Promise<boolean> => {
+    setAuthError(null);
+    setFirstRun(prev => ({ ...prev, isSubmitting: true }));
+
+    try {
+      // 1. Verify credentials server-side.
+      // Only set auth headers if a credential was explicitly provided;
+      // otherwise the credentials from sign-in are already in effect.
+      if (credential) {
+        apiClient.setAuth(actorId, credential);
+      }
+      await apiClient.verifyCredentials(businessId);
+
+      // 2. Persist non-secret session state.
+      // Only re-set auth headers if a credential was explicitly provided;
+      // otherwise the credentials from sign-in are already in effect.
+      if (credential) {
+        apiClient.setAuth(actorId, credential);
+      }
+      const newAuth: AuthState = { actorId, businessId, controlKey: '' };
+      setAuth(newAuth);
+      localStorage.setItem('nexus-auth', JSON.stringify(newAuth));
+
+      // 3. Create the business. If it already exists (conflict), proceed to
+      // membership — the business was provisioned earlier or by bootstrap.
+      try {
+        await apiClient.createBusiness({
+          entity_id: businessId,
+          name: businessName,
+          owner_identity_id: actorId,
+          metadata: {
+            objective: primaryObjective,
+            divisions: divisions.join(','),
+            provisioned_via: 'first-run',
+          },
+        });
+      } catch (err) {
+        const apiErr = err as { status?: number } | undefined;
+        if (!(apiErr && apiErr.status === 409)) {
+          throw err;
+        }
+        // Business already exists — continue to membership.
+      }
+
+      // 4. Establish initial membership. The actor must be the owner.
+      try {
+        await apiClient.createBusinessMember(businessId);
+      } catch (err) {
+        const apiErr = err as { status?: number } | undefined;
+        if (!(apiErr && apiErr.status === 409)) {
+          throw err;
+        }
+        // Membership already exists — proceed.
+      }
+
+      setIsAuthenticated(true);
+      setFirstRun({ ...DEFAULT_FIRST_RUN, stage: 'complete' });
+      return true;
+    } catch (err) {
+      apiClient.clearAuth();
+      const apiErr = err as { status?: number; message?: string } | undefined;
+      console.log('Provisioning error:', apiErr?.status, apiErr?.message, err);
+      if (apiErr && apiErr.status === 401) {
+        setAuthError('Invalid actor ID or credential');
+      } else if (apiErr && apiErr.status === 403) {
+        setAuthError('Not authorized to provision this business.');
+      } else {
+        setAuthError('Provisioning failed. Check that the backend is running.');
+      }
+      setFirstRun(prev => ({ ...prev, isSubmitting: false }));
       return false;
     }
   }, []);
@@ -265,7 +377,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ auth, login, setControlKey, logout, authError, isAuthenticated }}>
+    <AuthContext.Provider value={{ auth, login, provisionBusiness, setControlKey, logout, authError, isAuthenticated, firstRun, setFirstRun, setAuthError }}>
       {children}
     </AuthContext.Provider>
   );
@@ -274,10 +386,21 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
 const AuthContext = React.createContext<{
   auth: AuthState;
   login: (actorId: string, credential: string, businessId?: string) => Promise<boolean>;
+  provisionBusiness: (
+    actorId: string,
+    credential: string,
+    businessId: string,
+    businessName: string,
+    primaryObjective: string,
+    divisions: string[]
+  ) => Promise<boolean>;
   setControlKey: (key: string) => void;
   logout: () => void;
   authError: string | null;
   isAuthenticated: boolean;
+  firstRun: FirstRunState;
+  setFirstRun: React.Dispatch<React.SetStateAction<FirstRunState>>;
+  setAuthError: (message: string) => void;
 } | null>(null);
 
 function useAuth() {
@@ -288,11 +411,11 @@ function useAuth() {
   return context;
 }
 
-function LoginScreen() {
-  const { login, authError } = useAuth();
-  const [actorId, setActorId] = useState('nx:human:bootstrap');
+function SignInScreen() {
+  const { login, authError, auth } = useAuth();
+  const [actorId, setActorId] = useState(auth.actorId || 'nx:human:bootstrap');
   const [credential, setCredential] = useState('');
-  const [businessId, setBusinessId] = useState('default');
+  const [businessId, setBusinessId] = useState(auth.businessId || 'default');
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -305,68 +428,342 @@ function LoginScreen() {
   return (
     <div className="login-container">
       <div className="login-card">
-        <div className="login-header">
-          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-            <rect x="5" y="5" width="38" height="38" rx="8" stroke="currentColor" strokeWidth="2" />
-            <path d="M16 24h16M24 16v16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-          </svg>
-          <h1>NEXUS</h1>
-          <p>Command Center & Virtual HQ</p>
+        <aside className="login-brand">
+          <div className="logo-wrap">
+            <div className="logo-mark" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 48 48" fill="none">
+                <rect x="5" y="5" width="38" height="38" rx="8" stroke="currentColor" strokeWidth="2" />
+                <path d="M16 24h16M24 16v16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <h1>NEXUS</h1>
+              <p className="login-tagline">personal AI operating system</p>
+            </div>
+          </div>
+
+          <div className="login-steps">
+            <div className="login-step login-step-current">
+              <span className="login-step-num">1</span>
+              <span>Business</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">2</span>
+              <span>Objective</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">3</span>
+              <span>Authority</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">4</span>
+              <span>Agents</span>
+            </div>
+          </div>
+
+          <h2>Welcome</h2>
+          <p>NEXUS runs the work.</p>
+          <p className="login-lead">
+            Give it one business, one objective and a clear limit of authority.
+            It will plan, delegate and keep working while you are away.
+          </p>
+
+          <div className="login-pillars">
+            <div className="login-pillar">
+              <p className="login-pillar-title">You stay the root authority</p>
+              <p className="login-pillar-desc">
+                Nothing runs outside delegated authority. Default deny holds.
+              </p>
+            </div>
+            <div className="login-pillar">
+              <p className="login-pillar-title">It keeps a why for every task</p>
+              <p className="login-pillar-desc">
+                Objective lineage survives every delegation.
+              </p>
+            </div>
+            <div className="login-pillar">
+              <p className="login-pillar-title">The office is only a view</p>
+              <p className="login-pillar-desc">
+                Every action exists as a list and a table too.
+              </p>
+            </div>
+          </div>
+        </aside>
+
+        <div className="login-form-card">
+          <p className="login-eyebrow">Sign in to NEXUS</p>
+          <h3>Enter your credentials</h3>
+          <p className="login-hint">
+            Credentials are verified by the backend before a session is created.
+            The credential is not stored — you will enter it again on reload.
+          </p>
+
+          {authError && (
+            <div className="login-error" role="alert">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="2" />
+                <path d="M8 4v6M8 12v.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              {authError}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="login-form">
+            <div className="login-field">
+              <label htmlFor="actor-id">Actor ID</label>
+              <div className="field-wrap">
+                <div className="field-lead" aria-hidden="true" />
+                <input
+                  id="actor-id"
+                  type="text"
+                  value={actorId}
+                  onChange={(e) => setActorId(e.target.value)}
+                  required
+                  autoComplete="username"
+                  placeholder="e.g. nx:human:bootstrap"
+                  disabled={isSubmitting}
+                />
+              </div>
+            </div>
+
+            <div className="login-field credential">
+              <label htmlFor="credential">Credential</label>
+              <div className="field-wrap">
+                <div className="field-lead" aria-hidden="true" />
+                <input
+                  id="credential"
+                  type="password"
+                  value={credential}
+                  onChange={(e) => setCredential(e.target.value)}
+                  required
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                  disabled={isSubmitting}
+                />
+              </div>
+            </div>
+
+            <div className="login-field business">
+              <label htmlFor="business-id">Business ID</label>
+              <div className="field-wrap">
+                <div className="field-lead" aria-hidden="true" />
+                <input
+                  id="business-id"
+                  type="text"
+                  value={businessId}
+                  onChange={(e) => setBusinessId(e.target.value)}
+                  required
+                  placeholder="default"
+                  disabled={isSubmitting}
+                />
+              </div>
+            </div>
+
+            <button type="submit" className="login-submit login-submit-primary" disabled={isSubmitting}>
+              {isSubmitting ? 'Signing in…' : 'Sign in'}
+            </button>
+          </form>
+
+          <div className="login-footer">
+            <p>
+              Default bootstrap actor: <code>nx:human:bootstrap</code>. The
+              credential is sourced from{' '}
+              <code>NEXUS_BOOTSTRAP_CREDENTIAL</code> (env-only, never echoed
+              here).
+            </p>
+          </div>
         </div>
+      </div>
+    </div>
+  );
+}
 
-        {authError && (
-          <div className="login-error" role="alert">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="2" />
-              <path d="M8 4v6M8 12v.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-            </svg>
-            {authError}
+function BootstrapScreen() {
+  const { provisionBusiness, firstRun, setFirstRun, authError, auth, setAuthError } = useAuth();
+  const [businessName, setBusinessName] = useState('');
+  const [primaryObjective, setPrimaryObjective] = useState('');
+  const [divisions, setDivisions] = useState<string[]>([]);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const divisionOptions = [
+    { id: 'research', name: 'Research', color: '#4FD1C5' },
+    { id: 'business', name: 'Business', color: '#F5B759' },
+    { id: 'media', name: 'Media', color: '#B18CFF' },
+    { id: 'development', name: 'Development', color: '#3DD68C' },
+  ];
+
+  const handleToggleDivision = (id: string) => {
+    setDivisions((prev) =>
+      prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]
+    );
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+    const success = await provisionBusiness(
+      auth.actorId,
+      '', // credential already verified at sign-in
+      auth.businessId,
+      businessName,
+      primaryObjective,
+      divisions
+    );
+    setIsSubmitting(false);
+    if (!success) {
+      console.log('Provisioning failed');
+    }
+    if (success) {
+      setFirstRun({ ...DEFAULT_FIRST_RUN, stage: 'complete' });
+    }
+  };
+
+  return (
+    <div className="login-container">
+      <div className="login-card">
+        <aside className="login-brand">
+          <div className="logo-wrap">
+            <div className="logo-mark" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 48 48" fill="none">
+                <rect x="5" y="5" width="38" height="38" rx="8" stroke="currentColor" strokeWidth="2" />
+                <path d="M16 24h16M24 16v16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </div>
+            <div>
+              <h1>NEXUS</h1>
+              <p className="login-tagline">personal AI operating system</p>
+            </div>
           </div>
-        )}
 
-        <form onSubmit={handleSubmit} className="login-form">
-          <div className="login-field">
-            <label htmlFor="actor-id">Actor ID</label>
-            <input
-              id="actor-id"
-              type="text"
-              value={actorId}
-              onChange={(e) => setActorId(e.target.value)}
-              required
-              autoComplete="username"
-            />
+          <div className="login-steps">
+            <div className="login-step login-step-current">
+              <span className="login-step-num">1</span>
+              <span>Business</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">2</span>
+              <span>Objective</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">3</span>
+              <span>Authority</span>
+            </div>
+            <div className="login-step">
+              <span className="login-step-num">4</span>
+              <span>Agents</span>
+            </div>
           </div>
 
-          <div className="login-field">
-            <label htmlFor="credential">Credential</label>
-            <input
-              id="credential"
-              type="password"
-              value={credential}
-              onChange={(e) => setCredential(e.target.value)}
-              required
-              autoComplete="current-password"
-            />
+          <h2>Welcome</h2>
+          <p>NEXUS runs the work.</p>
+          <p className="login-lead">
+            Give it one business, one objective and a clear limit of authority.
+            It will plan, delegate and keep working while you are away.
+          </p>
+
+          <div className="login-pillars">
+            <div className="login-pillar">
+              <p className="login-pillar-title">You stay the root authority</p>
+              <p className="login-pillar-desc">
+                Nothing runs outside delegated authority. Default deny holds.
+              </p>
+            </div>
+            <div className="login-pillar">
+              <p className="login-pillar-title">It keeps a why for every task</p>
+              <p className="login-pillar-desc">
+                Objective lineage survives every delegation.
+              </p>
+            </div>
+            <div className="login-pillar">
+              <p className="login-pillar-title">The office is only a view</p>
+              <p className="login-pillar-desc">
+                Every action exists as a list and a table too.
+              </p>
+            </div>
           </div>
+        </aside>
 
-          <div className="login-field">
-            <label htmlFor="business-id">Business ID</label>
-            <input
-              id="business-id"
-              type="text"
-              value={businessId}
-              onChange={(e) => setBusinessId(e.target.value)}
-              required
-            />
+        <div className="login-form-card">
+          <p className="login-eyebrow">Create your first business</p>
+          <h3>A business is the scope everything else hangs from.</h3>
+          <p className="login-hint">This becomes the business_id on every record.</p>
+
+          {authError && (
+            <div className="login-error" role="alert">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="7" stroke="currentColor" strokeWidth="2" />
+                <path d="M8 4v6M8 12v.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+              {authError}
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="login-form">
+            <div className="login-field">
+              <label htmlFor="business-name">Business Name</label>
+              <input
+                id="business-name"
+                type="text"
+                value={businessName}
+                onChange={(e) => setBusinessName(e.target.value)}
+                required
+                placeholder="e.g. AI Agency"
+                disabled={isSubmitting}
+              />
+              <p className="login-field-note">This becomes the business_id on every record.</p>
+            </div>
+
+            <div className="login-field">
+              <label htmlFor="primary-objective">Primary Objective</label>
+              <input
+                id="primary-objective"
+                type="text"
+                value={primaryObjective}
+                onChange={(e) => setPrimaryObjective(e.target.value)}
+                required
+                placeholder="e.g. Win three enterprise deals this quarter"
+                disabled={isSubmitting}
+              />
+              <p className="login-field-note">The why every task will point back to.</p>
+            </div>
+
+            <div className="login-field">
+              <label>Divisions</label>
+              <p className="login-field-note">A division is a room with its own policy and memory scope.</p>
+              <div className="division-chips" role="group" aria-label="Divisions">
+                {divisionOptions.map((d) => (
+                  <button
+                    key={d.id}
+                    type="button"
+                    onClick={() => handleToggleDivision(d.id)}
+                    className={`division-chip ${divisions.includes(d.id) ? 'division-chip-selected' : ''}`}
+                    style={{ borderColor: d.color }}
+                  >
+                    {d.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="login-actions">
+              <button type="button" className="login-submit login-submit-secondary" disabled={isSubmitting} onClick={() => {
+                setAuthError('Load a sample is not available through the current backend contracts.');
+              }}>
+                Load a sample
+              </button>
+              <button type="submit" className="login-submit login-submit-primary" disabled={isSubmitting}>
+                {isSubmitting ? 'Creating business…' : 'Create business'}
+              </button>
+            </div>
+
+            <p className="login-step-indicator">Step 1 of 4</p>
+          </form>
+
+          <div className="login-footer">
+            <p>
+              Runtime runs locally. Nothing leaves this machine unless a policy allows it.
+            </p>
           </div>
-
-          <button type="submit" className="login-submit" disabled={isSubmitting}>
-            {isSubmitting ? 'Connecting…' : 'Connect to NEXUS'}
-          </button>
-        </form>
-
-        <div className="login-footer">
-          <p>Default bootstrap: <code>nx:human:bootstrap</code> with credential from <code>NEXUS_BOOTSTRAP_CREDENTIAL</code> env var</p>
         </div>
       </div>
     </div>
@@ -374,11 +771,15 @@ function LoginScreen() {
 }
 
 function AppContent() {
-  const { isAuthenticated, auth, logout } = useAuth();
+  const { isAuthenticated, auth, logout, firstRun } = useAuth();
   const [route, setRoute] = useState<AppRoute>('command');
 
   if (!isAuthenticated) {
-    return <LoginScreen />;
+    return <SignInScreen />;
+  }
+
+  if (firstRun.stage === 'bootstrap') {
+    return <BootstrapScreen />;
   }
 
   return (
