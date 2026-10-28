@@ -111,8 +111,11 @@ async function loginViaUI(page, nexus) {
   await page.fill('input[id="business-id"]', nexus.businessID);
   await page.click('button[type="submit"]:has-text("Sign in")');
   // After login, the app may show Command Center (if already bootstrapped)
-  // or the Bootstrap screen (first run). Wait for either.
-  await page.waitForSelector('text=Command Input, text=Create your first business', { timeout: 30000 });
+  // or the Bootstrap screen (first run). Wait for either using race.
+  await Promise.race([
+    page.waitForSelector('text=Command Input', { timeout: 30000 }),
+    page.waitForSelector('text=Create your first business', { timeout: 30000 }),
+  ]);
   return true;
 }
 
