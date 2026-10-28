@@ -288,11 +288,7 @@ test.describe('Research Workspace E2E', () => {
     // Reload without restart: the completed result stays readable via the
     // same-process execution read.
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
     await expect(output.locator('[aria-label="Typed research synthesis"]')).toBeVisible({
       timeout: 20000,
     });
@@ -331,11 +327,7 @@ test.describe('Research Workspace E2E', () => {
     await nexus.restart();
 
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     // Durable evidence survives the restart and is rendered honestly.
     await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible({
@@ -559,11 +551,7 @@ test.describe('Research Workspace E2E', () => {
     await nexus.restart();
 
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     // Durable evidence from both searches survives the restart.
     await expect(evidence.getByText('Nexus capability boundary', { exact: true })).toBeVisible({
@@ -679,11 +667,7 @@ test.describe('Research Workspace E2E', () => {
     await nexus.restart();
 
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     const recoveredAudit = page.locator('section[aria-labelledby="research-citation-audit-heading"]');
     await expect(recoveredAudit).toBeVisible({ timeout: 20000 });
@@ -746,11 +730,7 @@ test.describe('Research Workspace E2E', () => {
 
     // Reload so the comparison selectors read the complete settled list.
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('text=Command Input', { timeout: 15000 });
-    await page.getByRole('tablist', { name: 'Main navigation' })
-      .getByRole('tab', { name: 'Research', exact: true })
-      .click();
-    await page.waitForSelector('text=Research Query', { timeout: 5000 });
+    await loginAndNavigateToResearch(page, { actorID: nexus.actorID, credential: nexus.credential, businessID: nexus.businessID });
 
     const comparison = page.locator('section[aria-labelledby="research-comparison-heading"]');
     await expect(comparison).toBeVisible();
