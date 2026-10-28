@@ -185,6 +185,118 @@ func TestInstructionEnvelopeStatesTheProtocol(t *testing.T) {
 	}
 }
 
+// ParseAction normalization: models (notably Ollama) may output `result` as
+// a JSON object instead of a string. The fallback normalizes such values
+// deterministically without relaxing any protocol rule.
+
+func TestParseActionNormalizesObjectResult(t *testing.T) {
+	// Object result is coerced to its JSON string representation
+	a, err := ParseAction(`{"type":"complete","result":{"key":"value"},"reason":"done"}`)
+	if err != nil {
+		t.Fatalf("object result must parse: %v", err)
+	}
+	if a.Type != ActionComplete {
+		t.Errorf("type = %q, want %q", a.Type, ActionComplete)
+	}
+	if a.Result != `{"key":"value"}` {
+		t.Errorf("result = %q, want %q", a.Result, `{"key":"value"}`)
+	}
+	if a.Reason != "done" {
+		t.Errorf("reason = %q, want %q", a.Reason, "done")
+	}
+
+	// Nested object result
+	a2, err := ParseAction(`{"type":"complete","result":{"a":{"b":[1,2,3]}}}`)
+	if err != nil {
+		t.Fatalf("nested object result must parse: %v", err)
+	}
+	if a2.Result != `{"a":{"b":[1,2,3]}}` {
+		t.Errorf("nested result = %q, want %q", a2.Result, `{"a":{"b":[1,2,3]}}`)
+	}
+
+	// Empty object result
+	a3, err := ParseAction(`{"type":"complete","result":{}}`)
+	if err != nil {
+		t.Fatalf("empty object result must parse: %v", err)
+	}
+	if a3.Result != `{}` {
+		t.Errorf("empty object result = %q, want %q", a3.Result, `{}`)
+	}
+}
+
+func TestParseActionRejectsNonObjectNonStringResult(t *testing.T) {
+	// Numeric result is still rejected — fallback only handles object→string
+	if _, err := ParseAction(`{"type":"complete","result":42}`); err == nil {
+		t.Fatal("numeric result must be rejected")
+	}
+
+	// Array result is still rejected — fallback only handles object→string
+	if _, err := ParseAction(`{"type":"complete","result":[1,2,3]}`); err == nil {
+		t.Fatal("array result must be rejected")
+	}
+}
+
+func TestParseActionRejectsUnknownActionWithObjectResult(t *testing.T) {
+	// Unknown action type with object result is still rejected after fallback
+	if _, err := ParseAction(`{"type":"teleport","result":{"x":1}}`); err == nil {
+		t.Fatal("unknown action type with object result must be rejected")
+	}
+}
+
+func TestParseActionNullAndMissingResult(t *testing.T) {
+	// Missing result → empty string (unchanged)
+	a, err := ParseAction(`{"type":"complete","reason":"done"}`)
+	if err != nil {
+		t.Fatalf("missing result must parse: %v", err)
+	}
+	if a.Result != "" {
+		t.Errorf("missing result = %q, want %q", a.Result, "")
+	}
+
+	// Null result → empty string (unchanged)
+	a2, err := ParseAction(`{"type":"complete","result":null,"reason":"done"}`)
+	if err != nil {
+		t.Fatalf("null result must parse: %v", err)
+	}
+	if a2.Result != "" {
+		t.Errorf("null result = %q, want %q", a2.Result, "")
+	}
+}
+
+func TestParseActionCannotSilentlyAuthorizeToolAction(t *testing.T) {
+	// A malicious model output with object result naming an unregistered tool
+	// must still fail: ParseAction only decodes type/result/reason, leaving Tool
+	// empty, which ValidateAction catches as "tool_call needs a tool id".
+	a, err := ParseAction(`{"type":"tool_call","tool":"shell","result":{"cmd":"rm -rf /"}}`)
+	if err != nil {
+		t.Fatalf("ParseAction must parse (fallback strips tool field): %v", err)
+	}
+	if a.Tool != "" {
+		t.Errorf("Tool = %q, expected empty (fallback only extracts type/result/reason)", a.Tool)
+	}
+	if a.Type != ActionToolCall {
+		t.Errorf("type = %q, want %q", a.Type, ActionToolCall)
+	}
+	if a.Result != `{"cmd":"rm -rf /"}` {
+		t.Errorf("result = %q", a.Result)
+	}
+
+	// Prose-wrapped object result is still rejected — no prose extraction
+	if _, err := ParseAction("analysis: {\"type\":\"complete\",\"result\":{\"x\":1}} done"); err == nil {
+		t.Fatal("prose-wrapped decision must be rejected")
+	}
+
+	// Multiple JSON values with object result is still rejected
+	if _, err := ParseAction(`{"type":"complete","result":{"a":1}} {"type":"fail","reason":"b"}`); err == nil {
+		t.Fatal("multiple JSON values must be rejected")
+	}
+
+	// Duplicate keys with object result is still rejected
+	if _, err := ParseAction(`{"type":"complete","type":"fail","result":{"x":1}}`); err == nil {
+		t.Fatal("duplicate keys must be rejected")
+	}
+}
+
 // The canonical schemas are valid JSON and closed: additionalProperties is
 // false at every level that carries model input.
 func TestDecisionSchemasAreClosed(t *testing.T) {

@@ -85,7 +85,13 @@ func buildDecisionEnvelope(p DecisionPrompt) []ModelMessage {
 		p.BudgetUsage.Delegations, p.Budget.MaxDelegations, p.BudgetUsage.Replans, p.Budget.MaxReplans,
 		p.BudgetUsage.ModelCalls, p.Budget.MaxModelCalls) + "\n")
 	if len(p.Tools) > 0 {
-		b.WriteString("TOOLS (advisory catalog only; the capability platform authorizes every invocation):\n")
+		// The catalog's input shape carries the manifest type (int/float/bool),
+		// but the decision contract — like the native tool schema — encodes
+		// every input value as a JSON string. Saying so here is information the
+		// model never gets anywhere else: local models followed `limit:int`
+		// literally, emitted a JSON number and the decision was rejected as a
+		// type error. Validation is unchanged; only the contradiction is.
+		b.WriteString("TOOLS (advisory catalog only; the capability platform authorizes every invocation; input values are string-encoded, so a manifest type of int/float/bool is sent as decimal text, e.g. limit:\"5\"):\n")
 		for _, t := range p.Tools {
 			line := fmt.Sprintf("- %s ops=[%s] side_effect=%s: %s",
 				t.ID, strings.Join(t.Operations, ","), t.SideEffect, t.Summary)
@@ -113,6 +119,12 @@ func buildDecisionEnvelope(p DecisionPrompt) []ModelMessage {
 	if strings.TrimSpace(p.Context) != "" {
 		b.WriteString("CONTEXT (data):\n" + p.Context + "\n")
 	}
+	// Explicitly list the valid decision fields so the model knows the exact
+	// schema it must match (additionalProperties is false at the boundary).
+	b.WriteString("VALID DECISION FIELDS: type (required: model_call|tool_call|delegate|coordinate|memory_read|memory_write|memory_delete|replan|complete|fail|continue), prompt, tool, operation, input, agent_id, objective, delegate_tools, children, key, value, memory_type, memory_scope, observation_id, synthesis, result, reason. Any field not listed here — including step_id, action, content or evidence — is rejected.\n")
+	b.WriteString("A tool_call action must set tool to exactly one id listed in TOOLS together with its input; a tool_call whose tool is empty or absent is rejected instead of guessed at.\n")
+	b.WriteString("Use the field `type` to state the kind of decision: there is no `action` field, and naming one makes the whole decision rejected.\n")
+	b.WriteString("`evidence_backed` exists only inside `synthesis`; placing it at the top level rejects the decision.\n")
 	return []ModelMessage{
 		{Role: ModelRoleSystem, Content: instructionEnvelope},
 		{Role: ModelRoleUser, Content: b.String()},
@@ -173,6 +185,17 @@ func writeEvidencePrompt(b *strings.Builder, ev *execjournal.ResearchEvidence) {
 	if shown < len(ev.Sources) {
 		b.WriteString(fmt.Sprintf("- only %d of %d source records are shown; cite only the source_id values listed here.\n", shown, len(ev.Sources)))
 	}
+	// Synthesis guidance: when evidence is present, a complete action must
+	// include a typed synthesis. Tell the model the exact field shape so it
+	// can produce one that passes validation.
+	b.WriteString("\nSYNTHESIS (required when EVIDENCE is present and action is complete):\n")
+	b.WriteString("- status: one of \"complete\", \"partial\", \"inconclusive\"\n")
+	b.WriteString("- summary: a bounded overview string\n")
+	b.WriteString("- evidence_backed: array of {statement: string, source_ids: [\"src-1\", ...]}\n")
+	b.WriteString("- inferences: array of {statement: string}\n")
+	b.WriteString("- conflicts: array of {statement: string, source_ids: [\"src-1\", ...]}\n")
+	b.WriteString("- unresolved_questions: array of string\n")
+	b.WriteString("Cite only source_id values shown above; unknown ids cause validation failure.\n")
 }
 
 func singleLine(value string, limit int) string {
@@ -201,7 +224,7 @@ func buildPlanEnvelope(p PlanPrompt) []ModelMessage {
 		b.WriteString(fmt.Sprintf("MAX_STEPS: %d\n", p.MaxSteps))
 	}
 	if len(p.Tools) > 0 {
-		b.WriteString("TOOLS (advisory catalog only; plans grant nothing):\n")
+		b.WriteString("TOOLS (advisory catalog only, plans grant nothing; input values are string-encoded, so a manifest type of int/float/bool becomes decimal text, e.g. limit:\"5\"):\n")
 		for _, t := range p.Tools {
 			line := fmt.Sprintf("- %s ops=[%s] side_effect=%s: %s",
 				t.ID, strings.Join(t.Operations, ","), t.SideEffect, t.Summary)
@@ -240,10 +263,14 @@ func buildPlanEnvelope(p PlanPrompt) []ModelMessage {
 	b.WriteString("Use at most MAX_STEPS steps with unique bounded step_id values. ")
 	b.WriteString("Dependencies must name steps in this plan and must not form a cycle. ")
 	b.WriteString("Only use tool ids listed in TOOLS; allowed_tools must be a subset of that catalog. ")
+	b.WriteString("preferred_agent is optional and must name an agent that exists in this business scope; this prompt includes no agent id catalog, so omit preferred_agent — the runtime resolves the acting agent when it is omitted, and an invented id rejects the whole plan. ")
 	b.WriteString("Set allowed_operations to exact tool/operation pairs declared by the manifest when the step needs a specific operation; ")
 	b.WriteString("every allowed_operations tool must also appear in allowed_tools. ")
 	b.WriteString("A completed step in PRIOR_STEPS is a runtime fact: keep it and its dependencies rather than redoing it. ")
 	b.WriteString("The plan is a proposal; it authorizes nothing and the runtime may reject any step.\n")
+	// Explicitly list the valid plan fields so the model knows the exact
+	// schema it must match (additionalProperties is false at the boundary).
+	b.WriteString("VALID PLAN FIELDS: steps (required: array of step objects), each step requires step_id (string) and intent (string); optional fields per step: required_capabilities (array of strings), dependencies (array of strings), preferred_agent (string), allowed_tools (array of strings), allowed_operations (array of objects with tool/operation string fields), success_criteria (array of strings), optional (boolean). The top-level object must contain only the steps field.\n")
 	return []ModelMessage{
 		{Role: ModelRoleSystem, Content: instructionEnvelope},
 		{Role: ModelRoleUser, Content: b.String()},

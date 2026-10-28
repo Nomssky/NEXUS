@@ -179,11 +179,11 @@ func TestDecisionFailsClosedOnProviderProposals(t *testing.T) {
 			{ID: "c1", Name: "calc", Arguments: `{}`},
 			{ID: "c2", Name: "calc", Arguments: `{}`},
 		}},
-		"out of catalog":  {calls: []modelrouter.ToolCall{{ID: "c1", Name: "evil", Arguments: `{}`}}},
-		"missing call id": {calls: []modelrouter.ToolCall{{ID: "", Name: "calc", Arguments: `{}`}}},
+		"out of catalog": {calls: []modelrouter.ToolCall{{ID: "c1", Name: "evil", Arguments: `{}`}}},
 		"malformed args": {calls: []modelrouter.ToolCall{
 			{ID: "c1", Name: "calc", Arguments: `{"input":{"a":"1"},"unexpected":true}`}}},
 		"non-json args": {calls: []modelrouter.ToolCall{{ID: "c1", Name: "calc", Arguments: `not json`}}},
+		"unnamed call":  {calls: []modelrouter.ToolCall{{ID: "c1", Name: "", Arguments: `{}`}}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -196,25 +196,129 @@ func TestDecisionFailsClosedOnProviderProposals(t *testing.T) {
 	}
 }
 
+// TestDecisionNormalizesProviderCallWithFlatArguments verifies the exact local
+// Ollama variant captured from `bonsai-2:9b`: a native tool call whose
+// `arguments` inline the tool's declared input fields at the top level
+// ({"query":"...","limit":"5"}) instead of nesting them under "input". The
+// adapter must normalize it into a strict, decodable action whose input carries
+// every declared field — never dropping or inventing one.
+func TestDecisionNormalizesProviderCallWithFlatArguments(t *testing.T) {
+	hints := []ToolHint{{
+		ID: "web.search", Summary: "web", Operations: []string{"search"},
+		InputSchema: tool.Schema{Fields: []tool.SchemaField{
+			{Name: "query", Type: tool.FieldString, Required: true, MaxLength: 512},
+			{Name: "limit", Type: tool.FieldInt, Max: 10, Min: 1},
+		}},
+	}}
+	p := &toolCallProvider{id: "fake", resp: &modelrouter.GenerateResponse{
+		FinishReason: "tool_calls",
+		ToolCalls: []modelrouter.ToolCall{{
+			ID: "call_bti3ub0y", Name: "web.search",
+			Arguments: `{"query":"NEXUS runtime capabilities","limit":"5"}`,
+		}},
+	}}
+	d := &Decision{Router: toolBridgeRouter(t, p), AgentID: "helper"}
+	raw, err := d.Decide(context.Background(), DecisionPrompt{StepID: "s1", Tools: hints})
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	action, err := ParseAction(raw)
+	if err != nil {
+		t.Fatalf("normalized action must parse strictly: %v (%s)", err, raw)
+	}
+	if action.Type != ActionToolCall || action.Tool != "web.search" {
+		t.Fatalf("unexpected action: %+v", action)
+	}
+	if action.Input["query"] != "NEXUS runtime capabilities" || action.Input["limit"] != "5" {
+		t.Fatalf("flat arguments were not normalized onto input: %+v", action.Input)
+	}
+	if action.ProviderToolCallID != "call_bti3ub0y" {
+		t.Fatalf("provider call id not preserved: %q", action.ProviderToolCallID)
+	}
+}
+
+// TestDecisionSynthesizesIdForProviderCallWithoutOne verifies a structurally
+// valid native call that omits its provider id is normalized with a
+// collision-safe internal correlation id rather than rejected, while the tool
+// name and arguments remain strictly validated.
+func TestDecisionSynthesizesIdForProviderCallWithoutOne(t *testing.T) {
+	p := &toolCallProvider{id: "fake", resp: &modelrouter.GenerateResponse{
+		FinishReason: "tool_calls",
+		ToolCalls: []modelrouter.ToolCall{{
+			ID: "", Name: "calc", Arguments: `{"operation":"mul","input":{"a":"6","b":"7"}}`,
+		}},
+	}}
+	d := &Decision{Router: toolBridgeRouter(t, p), AgentID: "helper"}
+	raw, err := d.Decide(context.Background(), DecisionPrompt{StepID: "s1", Tools: bridgeHints()})
+	if err != nil {
+		t.Fatalf("a structurally valid call without an id must normalize: %v", err)
+	}
+	action, err := ParseAction(raw)
+	if err != nil {
+		t.Fatalf("normalized action must parse: %v (%s)", err, raw)
+	}
+	if action.ProviderToolCallID == "" {
+		t.Fatal("a synthesized correlation id is required")
+	}
+	if action.Tool != "calc" || action.Operation != "mul" || action.Input["a"] != "6" {
+		t.Fatalf("call contents must be preserved: %+v", action)
+	}
+	// Two ids minted by the same decider must never collide.
+	if second := d.nextToolCallID(); second == action.ProviderToolCallID {
+		t.Fatalf("synthesized ids must be collision-safe: %q", second)
+	}
+}
+
 func TestProviderToolArguments(t *testing.T) {
-	got, err := providerToolArguments(`{"operation":"mul","input":{"a":"6"}}`)
+	got, err := providerToolArguments(`{"operation":"mul","input":{"a":"6"}}`, nil)
 	if err != nil {
 		t.Fatalf("valid arguments rejected: %v", err)
 	}
 	if got.Operation != "mul" || got.Input["a"] != "6" {
 		t.Fatalf("unexpected decode: %+v", got)
 	}
-	if _, err := providerToolArguments(`{"input":{"a":"1"}} trailing`); err == nil {
+	if _, err := providerToolArguments(`{"input":{"a":"1"}} trailing`, nil); err == nil {
 		t.Fatal("trailing content must be rejected")
 	}
-	if _, err := providerToolArguments(`{"unknown":1}`); err == nil {
+	if _, err := providerToolArguments(`{"unknown":1}`, nil); err == nil {
 		t.Fatal("unknown fields must be rejected")
+	}
+}
+
+// TestProviderToolArgumentsDeclaredFields pins the flat (inlined) argument
+// normalization: declared input fields may appear at the top level, unknown
+// keys and non-string values are rejected, and an explicit operation survives.
+func TestProviderToolArgumentsDeclaredFields(t *testing.T) {
+	declared := map[string]struct{}{"query": {}, "limit": {}}
+
+	got, err := providerToolArguments(`{"query":"nexus","limit":"5"}`, declared)
+	if err != nil {
+		t.Fatalf("declared flat fields must decode: %v", err)
+	}
+	if got.Input["query"] != "nexus" || got.Input["limit"] != "5" || len(got.Input) != 2 {
+		t.Fatalf("unexpected flat decode: %+v", got)
+	}
+
+	got, err = providerToolArguments(`{"operation":"search","query":"nexus"}`, declared)
+	if err != nil || got.Operation != "search" || got.Input["query"] != "nexus" {
+		t.Fatalf("flat field with operation must decode: got=%+v err=%v", got, err)
+	}
+
+	if _, err := providerToolArguments(`{"query":"nexus","bogus":"x"}`, declared); err == nil {
+		t.Fatal("an undeclared flat field must be rejected")
+	}
+	if _, err := providerToolArguments(`{"query":"nexus","limit":5}`, declared); err == nil {
+		t.Fatal("a non-string flat field must be rejected")
+	}
+	// With no declared fields, the flat form is not recognized.
+	if _, err := providerToolArguments(`{"query":"nexus"}`, nil); err == nil {
+		t.Fatal("a flat field must be rejected when the tool declares none")
 	}
 }
 
 func TestMarshalToolArgumentsRoundTrips(t *testing.T) {
 	raw := marshalToolArguments("mul", map[string]string{"a": "6", "b": "7"})
-	got, err := providerToolArguments(raw)
+	got, err := providerToolArguments(raw, nil)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)
 	}
@@ -277,7 +381,7 @@ func TestProviderToolDefinitionsAdvertiseStringEncodedInputs(t *testing.T) {
 	}
 	// A schema-conformant (string-encoded) argument decodes and passes the
 	// manifest's own validation.
-	args, err := providerToolArguments(`{"operation":"search","input":{"query":"nexus","limit":"5","ratio":"0.5","exact":"true","mode":"fast"}}`)
+	args, err := providerToolArguments(`{"operation":"search","input":{"query":"nexus","limit":"5","ratio":"0.5","exact":"true","mode":"fast"}}`, nil)
 	if err != nil {
 		t.Fatalf("string-encoded arguments must decode: %v", err)
 	}
@@ -285,7 +389,7 @@ func TestProviderToolDefinitionsAdvertiseStringEncodedInputs(t *testing.T) {
 		t.Fatalf("string-encoded arguments must validate against the manifest: %v", err)
 	}
 	// The numeric form the old schema invited must fail closed, never coerce.
-	if _, err := providerToolArguments(`{"input":{"query":"nexus","limit":5}}`); err == nil {
+	if _, err := providerToolArguments(`{"input":{"query":"nexus","limit":5}}`, nil); err == nil {
 		t.Fatal("a JSON number for a string-encoded field must be rejected")
 	}
 }

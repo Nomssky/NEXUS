@@ -48,7 +48,7 @@ export const queryKeys = {
   approvals: (businessId: string) => ['approvals', businessId] as const,
   agents: (businessId: string) => ['agents', businessId] as const,
   agent: (id: string, businessId: string) => ['agent', id, businessId] as const,
-  tools: ['tools'] as const,
+  tools: (businessId: string) => ['tools', businessId] as const,
   capabilities: ['capabilities'] as const,
   memory: (params: MemoryQueryRequest) => ['memory', params] as const,
   recoveryExecutions: (businessId: string) => ['recoveryExecutions', businessId] as const,
@@ -215,10 +215,11 @@ export function useCreateAgent(
 }
 
 // Tools
-export function useTools(options?: QueryOptions<{ tools: Tool[] }>) {
+export function useTools(businessId: string, options?: QueryOptions<{ tools: Tool[] }>) {
   return useQuery({
-    queryKey: queryKeys.tools,
-    queryFn: () => apiClient.listTools(),
+    queryKey: queryKeys.tools(businessId),
+    queryFn: () => apiClient.listTools(businessId),
+    enabled: !!businessId,
     ...options,
   });
 }

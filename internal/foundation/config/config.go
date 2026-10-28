@@ -70,6 +70,17 @@ type ModelsConfig struct {
 	// error category and no event; rejected values abort boot.
 	SeededProviderMode string `json:"seeded_provider_mode"`
 
+	// PreferredModel is the GLOBAL model preference: the model identifier that
+	// hierarchical selection prefers before division/agent overrides and above
+	// automatic selection (modelselect precedence). It is advisory input to the
+	// router's allowed-candidate constrainer — it grants no authority and is
+	// distinguishable in every routing decision from the model actually
+	// selected. An unknown/unavailable model does not break boot: it is
+	// reported as an unmet preference in routing diagnostics (fail-safe
+	// fallback policy applies, never a silent explicit-model substitution).
+	// Override precedence: file < NEXUS_MODEL_PREFERRED_MODEL.
+	PreferredModel string `json:"preferred_model,omitempty"`
+
 	// Providers lists real production inference adapters. When any entry is
 	// configured the launcher registers them instead of the seeded simulator,
 	// so real inference is always an explicit configuration choice.
@@ -79,6 +90,11 @@ type ModelsConfig struct {
 // ModelProviderConfig is one production provider registration. It never holds
 // the API key: APIKeyEnv names the environment variable that carries it.
 type ModelProviderConfig struct {
+	// Kind selects the provider constructor: "openai" (default, the shipped
+	// OpenAI-compatible adapter) or "ollama" (the local Ollama runtime). A
+	// local Ollama entry never carries a credential and never routes a prompt
+	// off the machine. Empty means "openai"; an unknown kind aborts boot.
+	Kind              string        `json:"kind,omitempty"`
 	ID                string        `json:"id"`
 	Name              string        `json:"name,omitempty"`
 	Endpoint          string        `json:"endpoint"`
@@ -91,6 +107,12 @@ type ModelProviderConfig struct {
 	// Capabilities defaults to reasoning/tool_calling/structured_output —
 	// the exact set the agent intelligence loop requires.
 	Capabilities []string `json:"capabilities,omitempty"`
+	// DisableThinking disables the model's internal reasoning/thinking channel
+	// when the local Ollama model supports it (Ollama >= 0.40, thinking-capable
+	// models such as qwen35). Thinking models can exhaust their token budget on
+	// reasoning and emit no visible content; disabling thinking yields a final
+	// answer faster. Default false preserves existing behavior.
+	DisableThinking bool `json:"disable_thinking,omitempty"`
 }
 
 // StorageConfig configures durable storage (C05). The default is empty:
@@ -328,9 +350,11 @@ type fileConfig struct {
 	Models *struct {
 		SeededProviderStatus *string `json:"seeded_provider_status"`
 		SeededProviderMode   *string `json:"seeded_provider_mode"`
+		PreferredModel       *string `json:"preferred_model"`
 		Providers            []struct {
 			ID                string   `json:"id"`
 			Name              string   `json:"name"`
+			Kind              string   `json:"kind"`
 			Endpoint          string   `json:"endpoint"`
 			ModelID           string   `json:"model_id"`
 			APIKeyEnv         string   `json:"api_key_env"`
@@ -339,6 +363,7 @@ type fileConfig struct {
 			MaxRequestBytes   *int64   `json:"max_request_bytes"`
 			MaxResponseBytes  *int64   `json:"max_response_bytes"`
 			Capabilities      []string `json:"capabilities"`
+			DisableThinking   *bool    `json:"disable_thinking"`
 		} `json:"providers"`
 	} `json:"models"`
 	RateLimit *struct {
@@ -414,11 +439,15 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 	if fc.Models != nil && fc.Models.SeededProviderMode != nil {
 		cfg.Models.SeededProviderMode = *fc.Models.SeededProviderMode
 	}
+	if fc.Models != nil && fc.Models.PreferredModel != nil {
+		cfg.Models.PreferredModel = strings.TrimSpace(*fc.Models.PreferredModel)
+	}
 	if fc.Models != nil && len(fc.Models.Providers) > 0 {
 		for _, p := range fc.Models.Providers {
 			entry := ModelProviderConfig{
 				ID: p.ID, Name: p.Name, Endpoint: p.Endpoint, ModelID: p.ModelID,
 				APIKeyEnv: p.APIKeyEnv, Capabilities: append([]string(nil), p.Capabilities...),
+				Kind: strings.TrimSpace(p.Kind),
 			}
 			if p.TimeoutMS != nil {
 				entry.Timeout = time.Duration(*p.TimeoutMS) * time.Millisecond
@@ -431,6 +460,9 @@ func applyOverlay(cfg *Config, fc fileConfig) {
 			}
 			if p.MaxResponseBytes != nil {
 				entry.MaxResponseBytes = *p.MaxResponseBytes
+			}
+			if p.DisableThinking != nil {
+				entry.DisableThinking = *p.DisableThinking
 			}
 			cfg.Models.Providers = append(cfg.Models.Providers, entry)
 		}
@@ -505,6 +537,10 @@ const (
 	// "scripted" = deterministic decision-table provider for the agent
 	// intelligence control loop). Non-secret operational setting.
 	EnvSeededProviderMode = "NEXUS_SEEDED_PROVIDER_MODE"
+
+	// EnvModelPreferredModel overrides models.preferred_model: the GLOBAL model
+	// preference used by hierarchical selection (non-secret).
+	EnvModelPreferredModel = "NEXUS_MODEL_PREFERRED_MODEL"
 
 	// Rate limiting (F4). Non-secret operational settings.
 	EnvRateLimitEnabled          = "NEXUS_RATE_LIMIT_ENABLED"
@@ -589,6 +625,9 @@ func applyEnv(cfg *Config, environ []string) error {
 	}
 	if v, ok := envMap[EnvSeededProviderMode]; ok {
 		cfg.Models.SeededProviderMode = v
+	}
+	if v, ok := envMap[EnvModelPreferredModel]; ok {
+		cfg.Models.PreferredModel = strings.TrimSpace(v)
 	}
 	if v, ok := envMap[EnvRateLimitEnabled]; ok {
 		b, err := parseStrictBool(v)
@@ -829,6 +868,15 @@ func (c Config) Validate() error {
 	// named environment variable at provider construction (NewOpenAIProvider),
 	// never here, and a missing/empty secret fails closed there.
 	for i, p := range c.Models.Providers {
+		kind := strings.TrimSpace(p.Kind)
+		if kind == "" {
+			kind = "openai"
+		}
+		if kind != "openai" && kind != "ollama" {
+			return nerrors.Configuration("config.invalid",
+				fmt.Sprintf("models.providers[%d].kind must be %q or %q", i, "openai", "ollama")).
+				WithDetail("provider", p.ID).WithDetail("value", p.Kind)
+		}
 		switch {
 		case strings.TrimSpace(p.ID) == "":
 			return nerrors.Configuration("config.invalid",
@@ -839,7 +887,7 @@ func (c Config) Validate() error {
 		case strings.TrimSpace(p.ModelID) == "":
 			return nerrors.Configuration("config.invalid",
 				fmt.Sprintf("models.providers[%d].model_id is required", i)).WithDetail("provider", p.ID)
-		case strings.TrimSpace(p.APIKeyEnv) == "":
+		case kind == "openai" && strings.TrimSpace(p.APIKeyEnv) == "":
 			return nerrors.Configuration("config.invalid",
 				fmt.Sprintf("models.providers[%d].api_key_env must name the environment variable that carries the credential", i)).WithDetail("provider", p.ID)
 		}

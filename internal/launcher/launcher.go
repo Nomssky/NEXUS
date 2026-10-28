@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Nomssky/NEXUS/internal/agentexec"
@@ -20,12 +22,14 @@ import (
 	"github.com/Nomssky/NEXUS/internal/core"
 	"github.com/Nomssky/NEXUS/internal/execjournal"
 	"github.com/Nomssky/NEXUS/internal/foundation/config"
+	"github.com/Nomssky/NEXUS/internal/foundation/hardware"
 	"github.com/Nomssky/NEXUS/internal/foundation/health"
 	"github.com/Nomssky/NEXUS/internal/foundation/identity"
 	"github.com/Nomssky/NEXUS/internal/foundation/lifecycle"
 	"github.com/Nomssky/NEXUS/internal/foundation/logging"
 	"github.com/Nomssky/NEXUS/internal/foundation/metrics"
 	"github.com/Nomssky/NEXUS/internal/foundation/modelrouter"
+	"github.com/Nomssky/NEXUS/internal/foundation/modelselect"
 	"github.com/Nomssky/NEXUS/internal/foundation/nerrors"
 	"github.com/Nomssky/NEXUS/internal/foundation/store"
 	"github.com/Nomssky/NEXUS/internal/foundation/tool"
@@ -56,6 +60,32 @@ type Launcher struct {
 // Metrics returns the process-local operational metrics owner
 // (contracts/OPERATIONAL_OBSERVABILITY_CONTRACTS.md). It is read-only from the
 // caller's perspective; a nil result is safe to snapshot.
+// localRuntimeRuntime maps a provider marked kind=ollama onto the registry's
+// runtime vocabulary: a model served by the local machine is a local runtime,
+// so derived routing flags (privacy/external-transfer constants) stay honest.
+func localRuntimeRuntime(local bool) modelrouter.RuntimeType {
+	if local {
+		return modelrouter.RuntimeLocal
+	}
+	return modelrouter.RuntimeRemote
+}
+
+// sanitizedEndpoint renders the configured local provider endpoint as host:port
+// only — never userinfo, path, query or fragment.
+func sanitizedEndpoint(cfg config.Config) string {
+	for _, p := range cfg.Models.Providers {
+		if !strings.EqualFold(strings.TrimSpace(p.Kind), "ollama") {
+			continue
+		}
+		u, err := url.Parse(strings.TrimSpace(p.Endpoint))
+		if err != nil || u.Host == "" {
+			return ""
+		}
+		return u.Host
+	}
+	return ""
+}
+
 func (l *Launcher) Metrics() *metrics.Metrics {
 	if l == nil {
 		return nil
@@ -197,16 +227,37 @@ func New(opts Options) *Launcher {
 	// Production inference is exclusively opt-in: the launcher registers real
 	// providers ONLY from explicit models.providers configuration. Without it,
 	// the deterministic seeded simulation remains the default (offline/CI).
+	var localRuntimeProvider *modelrouter.OllamaProvider
 	for _, prov := range cfg.Models.Providers {
-		p, err := modelrouter.NewOpenAIProvider(modelrouter.ProviderConfig{
-			ID: prov.ID, Name: prov.Name, Endpoint: prov.Endpoint,
-			APIKeyEnv: prov.APIKeyEnv, Timeout: prov.Timeout,
-			AllowInsecureHTTP: prov.AllowInsecureHTTP,
-			MaxRequestBytes:   prov.MaxRequestBytes, MaxResponseBytes: prov.MaxResponseBytes,
-		})
-		if err != nil {
-			return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
-				metrics: m, initErr: fmt.Errorf("model provider %q: %w", prov.ID, err)}
+		var p modelrouter.Provider
+		localRuntime := strings.EqualFold(strings.TrimSpace(prov.Kind), "ollama")
+		if localRuntime {
+			// Local Ollama: registered through the same Provider seam, but it
+			// owns no credential and never forwards a prompt off the machine.
+			op, oerr := modelrouter.NewOllamaProvider(modelrouter.OllamaConfig{
+				ID: prov.ID, BaseURL: prov.Endpoint, Timeout: prov.Timeout,
+				AllowInsecureHTTP: prov.AllowInsecureHTTP,
+				MaxResponseBytes:  prov.MaxResponseBytes,
+				DisableThinking:   prov.DisableThinking,
+			})
+			if oerr != nil {
+				return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+					metrics: m, initErr: fmt.Errorf("model provider %q: %w", prov.ID, oerr)}
+			}
+			p = op
+			localRuntimeProvider = op
+		} else {
+			op, oerr := modelrouter.NewOpenAIProvider(modelrouter.ProviderConfig{
+				ID: prov.ID, Name: prov.Name, Endpoint: prov.Endpoint,
+				APIKeyEnv: prov.APIKeyEnv, Timeout: prov.Timeout,
+				AllowInsecureHTTP: prov.AllowInsecureHTTP,
+				MaxRequestBytes:   prov.MaxRequestBytes, MaxResponseBytes: prov.MaxResponseBytes,
+			})
+			if oerr != nil {
+				return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+					metrics: m, initErr: fmt.Errorf("model provider %q: %w", prov.ID, oerr)}
+			}
+			p = op
 		}
 		engine.ModelRouter().RegisterProvider(p)
 		caps := make([]modelrouter.ModelCapability, 0, len(prov.Capabilities))
@@ -229,10 +280,20 @@ func New(opts Options) *Launcher {
 			ID:               prov.ModelID,
 			ProviderID:       p.Identify(),
 			Capabilities:     caps,
-			Runtime:          modelrouter.RuntimeRemote,
+			Runtime:          localRuntimeRuntime(localRuntime),
 			Status:           modelrouter.ModelStatusActive,
-			ExternalTransfer: true,
+			ExternalTransfer: !localRuntime,
 			DataRetention:    "standard",
+			Source: func() modelrouter.SourceCategory {
+				if localRuntime {
+					return modelrouter.SourceCategoryLocal
+				}
+				return modelrouter.SourceCategoryPaid
+			}(),
+			SourceInfo: modelrouter.ModelSourceInfo{
+				EvidenceSource:    "launcher_config",
+				EvidenceFreshness: time.Now().UTC().Format(time.RFC3339),
+			},
 		}); regErr != nil {
 			return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
 				metrics: m, initErr: fmt.Errorf("register model %q: %w", prov.ModelID, regErr)}
@@ -416,14 +477,116 @@ func New(opts Options) *Launcher {
 	if err != nil {
 		return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle, metrics: m, initErr: err}
 	}
-	intelRt := agentintel.New(agentReg, agentRt,
-		&agentintel.Decision{Router: engine.ModelRouter()}, engine.EventBus(), intelMem)
+	// Hardware-aware, preference-aware local routing. The preference source
+	// reads the durable layers live (config for global, the agent registry for
+	// agent overrides); hardware snapshots are cached and refreshed at a
+	// bounded interval. With no preference configured the resolution is
+	// automatic and routing is unchanged.
+	hwCollector := hardware.NewCollector(nil, 30*time.Second)
+	globalPref := modelselect.Inherit()
+	if pm := strings.TrimSpace(cfg.Models.PreferredModel); pm != "" {
+		pp, perr := modelselect.Explicit(pm)
+		if perr != nil {
+			return &Launcher{cfg: cfg, snapshot: snap, log: opts.Logger, health: opts.Health, life: opts.Lifecycle,
+				metrics: m, initErr: fmt.Errorf("models.preferred_model: %w", perr)}
+		}
+		globalPref = pp
+	}
+	prefSource := &modelselect.PrefSource{
+		Global: globalPref,
+		// Agent override: the agent definition already carries a durable
+		// preferred_model (ModelRequirements), so this reads the SAME record the
+		// registry serves — no second persistence system.
+		Agent: func(agentID string) (modelselect.Preference, error) {
+			def, ok := agentReg.Get(agentID)
+			if !ok {
+				return modelselect.Preference{}, fmt.Errorf("agent %q is not registered; model preference cannot be resolved", agentID)
+			}
+			pm := strings.TrimSpace(def.Model.PreferredModel)
+			if pm == "" {
+				return modelselect.Inherit(), nil
+			}
+			return modelselect.Explicit(pm)
+		},
+	}
+	decider := &agentintel.Decision{
+		Router:           engine.ModelRouter(),
+		ModelPreferences: prefSource,
+		InstalledModels: func(ctx context.Context) (map[string]bool, bool, error) {
+			return engine.ModelRouter().InstalledModels(ctx)
+		},
+		Hardware:     hwCollector.Snapshot,
+		ReserveBytes: 1 << 30, // 1 GiB headroom for the OS and other processes
+		// StrictPreference: an explicit preference is honored or fails loudly;
+		// it never silently becomes a different model. Unknown memory is
+		// permitted (CPU-only/unknown hosts) but flagged as uncertainty.
+		SelectionPolicy: modelselect.Policy{StrictPreference: true, AllowUnknownMemory: true},
+	}
+	intelRt := agentintel.New(agentReg, agentRt, decider, engine.EventBus(), intelMem)
 	if platform != nil {
 		// The bounded capability catalog reaches the decision prompt as
 		// informational discovery; it grants nothing (contract §4/§31).
 		intelRt.Catalog = capabilityCatalog{platform: platform}
 	}
 	gwOpts = append(gwOpts, gateway.WithIntelligence(intelRt))
+	// Local runtime diagnostics for the Settings experience: real Ollama
+	// discovery + metadata, a bounded hardware snapshot, the configured global
+	// preference, and the last routing decision. Read-only; no mutation.
+	if localRuntimeProvider != nil {
+		lp := localRuntimeProvider
+		preferred := strings.TrimSpace(cfg.Models.PreferredModel)
+		gwOpts = append(gwOpts, gateway.WithLocalRuntime(func(ctx context.Context) gateway.LocalRuntimeInfo {
+			info := gateway.LocalRuntimeInfo{
+				Configured: true, ProviderID: lp.Identify(), Endpoint: sanitizedEndpoint(cfg),
+				Status: "unavailable", GlobalPreference: preferred,
+			}
+			models, err := lp.Discover(ctx)
+			if err != nil {
+				info.Error = "local runtime is not reachable"
+			} else {
+				info.Status = "ready"
+				for i, m := range models {
+					if i >= 50 {
+						break
+					}
+					mi := gateway.ModelInfo{Name: m.Name, Family: m.Family,
+						ParameterSize: m.ParameterSize, Quantization: m.Quantization, SizeBytes: m.Size}
+					if md, mdErr := lp.ShowModel(ctx, m.Name); mdErr == nil {
+						if mi.Family == "" {
+							mi.Family = md.Family
+						}
+						if mi.ParameterSize == "" {
+							mi.ParameterSize = md.ParameterSize
+						}
+						if mi.Quantization == "" {
+							mi.Quantization = md.Quantization
+						}
+					}
+					info.Models = append(info.Models, mi)
+				}
+			}
+			inv := hwCollector.Snapshot(ctx)
+			info.Hardware = gateway.HardwareInfo{
+				OS: inv.OS, Arch: inv.Arch, CPUCores: inv.CPUCores,
+				RAMKnown: inv.RAMKnown, TotalRAMBytes: inv.TotalRAMBytes, AvailRAMBytes: inv.AvailableRAMBytes,
+				GPUKnown: len(inv.GPUs) > 0, GPUCount: len(inv.GPUs),
+				CollectedAt: inv.CollectedAt.UTC().Format(time.RFC3339),
+				Notes:       append([]string(nil), inv.ProbeNotes...),
+			}
+			if dec := decider.LastRoutingDecision(); dec != nil {
+				sel := &gateway.RoutingSelection{
+					ModelID: dec.ModelID, ProviderID: dec.ProviderID, Source: string(dec.Source),
+					FallbackUsed: dec.FallbackUsed, Uncertain: dec.MissingHardwareData,
+					Explanation: dec.Explanation,
+				}
+				for _, rej := range dec.Rejections {
+					sel.Rejected = append(sel.Rejected, rej.ModelID+": "+rej.Reason)
+				}
+				info.Selection = sel
+			}
+			return info
+		}))
+	}
 	// Agent Memory & Context Platform v1: the same platform the loop uses, over
 	// the same identity and membership gates.
 	gwOpts = append(gwOpts, gateway.WithMemory(intelMem))

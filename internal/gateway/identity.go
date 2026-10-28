@@ -103,6 +103,11 @@ func isScopedAPIPath(path string) bool {
 	if path == "/api/v1/divisions" || strings.HasPrefix(path, "/api/v1/divisions/") {
 		return true
 	}
+	// Local model/runtime diagnostics are identity-scoped (no anonymous
+	// hardware/model enumeration).
+	if path == "/api/v1/runtime/models" || strings.HasPrefix(path, "/api/v1/runtime/") {
+		return true
+	}
 	if path == "/api/v1/agents" || strings.HasPrefix(path, "/api/v1/agents/") {
 		return true
 	}

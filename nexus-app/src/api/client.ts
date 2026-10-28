@@ -113,6 +113,23 @@ async function handleResponse<T>(response: Response): Promise<T> {
   return response.text() as T;
 }
 
+// Business provisioning
+export interface CreateBusinessRequest {
+  entity_id: string;
+  name: string;
+  owner_identity_id: string;
+  settings?: Record<string, unknown>;
+  metadata?: Record<string, string>;
+}
+
+export interface CreateBusinessResponse {
+  business_id: string;
+  entity_id: string;
+  name: string;
+  owner_identity_id: string;
+  status: string;
+}
+
 class NexusAPIClient {
   private baseURL: string;
   private defaultHeaders: Record<string, string> = {
@@ -332,6 +349,23 @@ class NexusAPIClient {
     return this.request('GET', `/approvals?business_id=${businessId}`);
   }
 
+  // verifyCredentials checks an actor credential against the backend by
+  // calling an ordinary authenticated, business-scoped endpoint. It resolves
+  // only when the server accepts the credential; a 401 or network failure
+  // rejects. Never use /health for login: it is unauthenticated and returns
+  // 200 for any request.
+  async verifyCredentials(businessId: string): Promise<void> {
+    await this.listApprovals(businessId);
+  }
+
+  async createBusiness(request: CreateBusinessRequest): Promise<CreateBusinessResponse> {
+    return this.request<CreateBusinessResponse>('POST', '/businesses', request);
+  }
+
+  async createBusinessMember(businessId: string): Promise<{ business_id: string; identity_id: string; role: string; status: string }> {
+    return this.request('POST', `/businesses/${encodeURIComponent(businessId)}/members`, {});
+  }
+
   async approveApproval(id: string, businessId: string, request: ApproveRequest): Promise<{ approval_id: string; status: string }> {
     return this.request('POST', `/approvals/${encodeURIComponent(id)}/approve?business_id=${businessId}`, request);
   }
@@ -353,9 +387,10 @@ class NexusAPIClient {
     return this.request('POST', '/agents', request);
   }
 
-  // Tools
-  async listTools(): Promise<{ tools: Tool[] }> {
-    return this.request('GET', '/tools');
+  // Tools — business-scoped. The tool catalogue is filtered by business scope
+  // on the backend; an unauthenticated or wrong-scope call fails closed.
+  async listTools(businessId: string): Promise<{ tools: Tool[] }> {
+    return this.request('GET', `/tools?business_id=${encodeURIComponent(businessId)}`);
   }
 
   // Capabilities

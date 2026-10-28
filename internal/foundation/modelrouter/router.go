@@ -2,7 +2,9 @@ package modelrouter
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -42,6 +44,12 @@ type RoutingRequest struct {
 	AllowedModels    []string          `json:"allowed_models,omitempty"`
 	MaxLatencyMs     int64             `json:"max_latency_ms,omitempty"`
 	MaxCostPerToken  float64           `json:"max_cost_per_token,omitempty"`
+	// EstimatedInputTokens is the caller's best estimate of input tokens for
+	// this invocation. Used for cost-aware selection when provided.
+	EstimatedInputTokens int `json:"estimated_input_tokens,omitempty"`
+	// EstimatedOutputTokens is the caller's best estimate of output tokens for
+	// this invocation. Used for cost-aware selection when provided.
+	EstimatedOutputTokens int `json:"estimated_output_tokens,omitempty"`
 	// PrivacyFirst excludes models that send data to external providers
 	// (m6: privacy-aware routing — respect external transfer policies).
 	PrivacyFirst    bool `json:"privacy_first,omitempty"`
@@ -84,36 +92,40 @@ type InvocationRecord struct {
 // ModelRouter selects the best provider/model based on needs, policy, and conditions.
 // It implements local-first routing, capability matching, and failover.
 type ModelRouter struct {
-	registry   *ModelRegistry
-	providers  map[string]Provider
-	health     *HealthRegistry
-	accounting *InvocationAccounting
-	policy     RoutingPolicy
-	mu         sync.RWMutex
-	now        func() time.Time
+	registry      *ModelRegistry
+	providers     map[string]Provider
+	health        *HealthRegistry
+	accounting    *InvocationAccounting
+	budgetTracker *BudgetTracker
+	budgetPolicy  BudgetPolicy
+	policy        RoutingPolicy
+	mu            sync.RWMutex
+	now           func() time.Time
 }
 
 // NewModelRouter creates a new model router.
 func NewModelRouter(registry *ModelRegistry, policy RoutingPolicy) *ModelRouter {
 	return &ModelRouter{
-		registry:   registry,
-		providers:  make(map[string]Provider),
-		health:     NewHealthRegistry(),
-		accounting: NewInvocationAccounting(),
-		policy:     policy,
-		now:        time.Now,
+		registry:     registry,
+		providers:    make(map[string]Provider),
+		health:       NewHealthRegistry(),
+		accounting:   NewInvocationAccounting(),
+		policy:       policy,
+		budgetPolicy: BudgetPolicyOptional,
+		now:          time.Now,
 	}
 }
 
 // NewModelRouterWithClock creates a new model router with an injectable clock.
 func NewModelRouterWithClock(registry *ModelRegistry, policy RoutingPolicy, now func() time.Time) *ModelRouter {
 	return &ModelRouter{
-		registry:   registry,
-		providers:  make(map[string]Provider),
-		health:     NewHealthRegistry(),
-		accounting: NewInvocationAccounting(),
-		policy:     policy,
-		now:        now,
+		registry:     registry,
+		providers:    make(map[string]Provider),
+		health:       NewHealthRegistry(),
+		accounting:   NewInvocationAccounting(),
+		policy:       policy,
+		budgetPolicy: BudgetPolicyOptional,
+		now:          now,
 	}
 }
 
@@ -122,6 +134,70 @@ func (mr *ModelRouter) RegisterProvider(provider Provider) {
 	mr.mu.Lock()
 	defer mr.mu.Unlock()
 	mr.providers[provider.Identify()] = provider
+}
+
+// WithBudgetTracker sets the budget tracker for cost enforcement. When set,
+// the router checks affordability before each invocation and deducts the
+// actual cost after a successful call. A nil tracker means no budget is
+// enforced (all invocations allowed) under BudgetPolicyOptional; under
+// BudgetPolicyMandatory a nil tracker fails closed.
+func (mr *ModelRouter) WithBudgetTracker(bt *BudgetTracker) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.budgetTracker = bt
+}
+
+// WithBudgetPolicy sets the budget enforcement policy. BudgetPolicyOptional
+// (default) allows invocations when no tracker is configured.
+// BudgetPolicyMandatory fails closed when no tracker is configured.
+func (mr *ModelRouter) WithBudgetPolicy(p BudgetPolicy) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+	mr.budgetPolicy = p
+}
+
+// Registry exposes the underlying model registry so callers can build
+// capability-filtered candidate sets (never a parallel router).
+func (mr *ModelRouter) Registry() *ModelRegistry { return mr.registry }
+
+// ModelDiscoverer is implemented by providers that can enumerate locally
+// installed models (the kind=ollama local runtime). It is optional: remote
+// providers need not implement it.
+type ModelDiscoverer interface {
+	Discover(ctx context.Context) ([]InstalledModel, error)
+}
+
+// InstalledModels queries every registered discovery-capable provider and
+// returns the set of locally installed model IDs.
+//
+// The boolean reports whether ANY source responded: false means installation
+// state is UNKNOWN (e.g. remote-only configuration) and callers must treat it
+// as uncertainty — never as "nothing is installed".
+func (mr *ModelRouter) InstalledModels(ctx context.Context) (map[string]bool, bool, error) {
+	mr.mu.RLock()
+	providers := make([]Provider, 0, len(mr.providers))
+	for _, p := range mr.providers {
+		providers = append(providers, p)
+	}
+	mr.mu.RUnlock()
+
+	installed := map[string]bool{}
+	known := false
+	for _, p := range providers {
+		d, ok := p.(ModelDiscoverer)
+		if !ok {
+			continue
+		}
+		models, err := d.Discover(ctx)
+		if err != nil {
+			return nil, false, fmt.Errorf("installed-model discovery via %s: %w", p.Identify(), err)
+		}
+		known = true
+		for _, m := range models {
+			installed[m.Name] = true
+		}
+	}
+	return installed, known, nil
 }
 
 // Route selects the best model/provider for a request.
@@ -285,8 +361,14 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 	// the gate).
 	genReq.ModelID = decision.ModelID
 
-	// Try the selected provider first
-	resp, invokeErr := mr.invokeProvider(ctx, decision.ProviderID, genReq)
+	// Look up the model definition for budget estimation.
+	mdl, ok := mr.registry.GetModel(decision.ModelID)
+	if !ok {
+		return nil, decision, fmt.Errorf("model %q not found in registry", decision.ModelID)
+	}
+
+	// Try the selected provider first with budget enforcement.
+	resp, invokeErr := mr.invokeWithBudget(ctx, mdl, decision.ProviderID, genReq)
 	if invokeErr == nil {
 		mr.health.RecordSuccess(decision.ProviderID, resp.LatencyMs)
 		// Record successful invocation
@@ -328,7 +410,7 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 				continue
 			}
 			genReq.ModelID = modelID
-			resp, err := mr.invokeProvider(ctx, mdl.ProviderID, genReq)
+			resp, err := mr.invokeWithBudget(ctx, mdl, mdl.ProviderID, genReq)
 			if err == nil {
 				mr.health.RecordSuccess(mdl.ProviderID, resp.LatencyMs)
 				mr.accounting.Record(&InvocationRecord{
@@ -366,6 +448,159 @@ func (mr *ModelRouter) Invoke(ctx context.Context, req *RoutingRequest, genReq *
 	})
 
 	return nil, decision, fmt.Errorf("all providers failed: %w", invokeErr)
+}
+
+// invokeWithBudget reserves budget before invoking a provider, then settles
+// the actual cost after a successful call or handles the reservation on
+// failure. Returns a budgetExceeded error if the model cannot be afforded.
+// The reservation is atomic: concurrent calls cannot both reserve the same
+// funds.
+// Reservation lifecycle:
+//   - Reserve estimated cost atomically (unique reservation ID returned)
+//   - On provider success: ConsumeReserved against actual cost. If actual
+//     cost exceeds the reservation, the excess is tracked as unresolved
+//     exposure (Disputed state) and the reservation is not fully settled.
+//   - On provider error with definite-no-charge semantics
+//     (invalid_request, policy_rejection, model_missing): ReleaseReserved.
+//   - On provider error with ambiguous semantics (unavailable, timeout,
+//     cancelled, malformed_output): MarkDisputed — funds remain held as
+//     unresolved exposure because a charge may have occurred.
+//   - Unknown reservation IDs and duplicate transitions are rejected
+//     (exactly-once enforcement).
+func (mr *ModelRouter) invokeWithBudget(
+	ctx context.Context,
+	mdl *ModelDefinition,
+	providerID string,
+	genReq *GenerateRequest,
+) (*GenerateResponse, error) {
+	// Mandatory budget policy: fail closed if no tracker is configured.
+	if mr.budgetTracker == nil {
+		if mr.budgetPolicy == BudgetPolicyMandatory {
+			return nil, &ProviderError{
+				Kind:     "budget_missing_tracker",
+				Provider: providerID,
+				Cause:    fmt.Errorf("model %q requires budget enforcement but no tracker is configured", mdl.ID),
+			}
+		}
+		// Optional policy: nil tracker means all invocations allowed.
+		return mr.invokeProvider(ctx, providerID, genReq)
+	}
+
+	// Unresolved exposure from a prior ambiguous error blocks new paid calls.
+	// Free/local calls (cost 0) are still allowed.
+	if mr.budgetTracker.UnresolvedExposure() > 0 {
+		estimate := mdl.EstimateCost(
+			genReq.EstimatedInputTokens,
+			genReq.EstimatedOutputTokens,
+			mr.budgetTracker.Remaining(),
+		)
+		if estimate.EstimatedCost > 0 {
+			return nil, &ProviderError{
+				Kind:     "budget_unresolved_exposure",
+				Provider: providerID,
+				Cause:    fmt.Errorf("model %q cannot be invoked: unresolved budget exposure of %v blocks new paid calls", mdl.ID, mr.budgetTracker.UnresolvedExposure()),
+			}
+		}
+	}
+
+	// Estimate cost before invocation.
+	estimate := mdl.EstimateCost(
+		genReq.EstimatedInputTokens,
+		genReq.EstimatedOutputTokens,
+		mr.budgetTracker.Remaining(),
+	)
+
+	// Unknown pricing: cannot verify affordability, fail closed.
+	if estimate.EstimatedCost < 0 {
+		return nil, &ProviderError{
+			Kind:     "budget_unknown_pricing",
+			Provider: providerID,
+			Cause:    fmt.Errorf("model %q pricing unknown: cannot verify affordability", mdl.ID),
+		}
+	}
+
+	// Invalid estimate (NaN, Inf, negative): never affordable.
+	if !isValidEstimate(estimate.EstimatedCost) {
+		return nil, &ProviderError{
+			Kind:     "budget_invalid_estimate",
+			Provider: providerID,
+			Cause:    fmt.Errorf("model %q has invalid estimated cost %v", mdl.ID, estimate.EstimatedCost),
+		}
+	}
+
+	// Free or local calls (zero estimated cost) never consume budget.
+	if estimate.EstimatedCost == 0 {
+		return mr.invokeProvider(ctx, providerID, genReq)
+	}
+
+	// Reserve the estimated cost atomically. This prevents concurrent calls
+	// from both reserving the same funds.
+	resID, _, ok := mr.budgetTracker.Reserve(estimate.EstimatedCost)
+	if !ok {
+		return nil, &ProviderError{
+			Kind:     "budget_exceeded",
+			Provider: providerID,
+			Cause:    fmt.Errorf("model %q estimated cost %v exceeds remaining budget %v", mdl.ID, estimate.EstimatedCost, mr.budgetTracker.Remaining()),
+		}
+	}
+
+	// Invoke the provider while holding the reservation.
+	resp, err := mr.invokeProvider(ctx, providerID, genReq)
+	if err != nil {
+		// Classify the error to decide whether to release or dispute the
+		// reservation. A provider error is not automatically proof that no
+		// charge occurred.
+		if isDefiniteNoChargeError(err) {
+			// Definite: the provider definitely did not process the request.
+			// Safe to release the reservation.
+			mr.budgetTracker.ReleaseReserved(resID)
+		} else {
+			// Ambiguous: a charge may or may not have occurred. Hold the
+			// funds as unresolved exposure to prevent silent overspend.
+			mr.budgetTracker.MarkDisputed(resID)
+		}
+		return nil, err
+	}
+
+	// Provider call succeeded: settle the reservation against actual cost.
+	actualCost := mdl.TotalCost(resp.InputTokens, resp.OutputTokens)
+	_, ok = mr.budgetTracker.ConsumeReserved(resID, actualCost)
+	if !ok {
+		// Reservation was already consumed or released — should not happen
+		// since we hold the reservation from above. Fail closed.
+		return nil, &ProviderError{
+			Kind:     "budget_exceeded",
+			Provider: providerID,
+			Cause:    fmt.Errorf("budget reservation already settled for model %q", mdl.ID),
+		}
+	}
+
+	return resp, nil
+}
+
+// isDefiniteNoChargeError classifies provider errors where we can be
+// reasonably certain no charge occurred (the request was rejected before
+// processing). Ambiguous errors (unavailable, timeout, cancelled,
+// malformed_output) are treated as potentially-charged and the reservation
+// is held as disputed exposure.
+func isDefiniteNoChargeError(err error) bool {
+	if err == nil {
+		return true
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) {
+		switch pe.Kind {
+		case "invalid_request", "policy_rejection", "model_missing":
+			return true
+		}
+	}
+	return false
+}
+
+// isValidEstimate reports whether an estimated cost is a valid, finite,
+// non-negative monetary value.
+func isValidEstimate(cost float64) bool {
+	return !math.IsNaN(cost) && !math.IsInf(cost, 0) && cost >= 0
 }
 
 func (mr *ModelRouter) invokeProvider(ctx context.Context, providerID string, req *GenerateRequest) (*GenerateResponse, error) {
