@@ -32,6 +32,27 @@ import type {
   ResearchComparison,
   ResearchSynthesis,
   ResearchEvaluation,
+  Business,
+  CreateBusinessRequest,
+  Division,
+  CreateDivisionRequest,
+  Execution,
+  SubmitExecutionRequest,
+  SubmitExecutionResponse,
+  Escalation,
+  AckEscalationRequest,
+  ResolveEscalationRequest,
+  Identity,
+  AgentTransitionRequest,
+  BusinessMember,
+  CreateBusinessMemberRequest,
+  UpdateAgentRequest,
+  SubmitRequestRequest,
+  SubmitRequestResponse,
+  RequestResult,
+  ControlStatus,
+  ControlComponent,
+  ControlMetrics,
 } from '../types/api';
 import type {
   ConfigurationSnapshot,
@@ -39,7 +60,7 @@ import type {
   StorageValidation,
 } from '../types/config';
 
-const DEFAULT_BASE_URL = '/api/v1';
+const DEFAULT_BASE_URL = 'http://localhost:8081/api/v1';
 
 class APIErrorImpl extends Error implements APIError {
   status: number;
@@ -120,6 +141,9 @@ class NexusAPIClient {
   };
   private authHeaders: AuthHeaders | null = null;
   private controlKey: string | null = null;
+  /** Callback invoked when a 401 response is received, so the app layer can
+   *  invalidate React Query caches and reset authenticated UI state. */
+  private onUnauthenticated: (() => void) | null = null;
 
   constructor(baseURL: string = DEFAULT_BASE_URL) {
     this.baseURL = baseURL;
@@ -137,9 +161,19 @@ class NexusAPIClient {
     this.controlKey = key;
   }
 
+  setOnUnauthenticated(cb: () => void): void {
+    this.onUnauthenticated = cb;
+  }
+
   clearAuth(): void {
     this.authHeaders = null;
     this.controlKey = null;
+  }
+
+  /** Replace the API base URL at runtime (used for local desktop launch
+   * where the frontend and gateway run on different localhost ports). */
+  setBaseURL(baseURL: string): void {
+    this.baseURL = baseURL;
   }
 
   getHeaders(useControl: boolean = false, controlOnly: boolean = false): Record<string, string> {
@@ -175,12 +209,36 @@ class NexusAPIClient {
     const controlPath = path === '/control' || path.startsWith('/control/');
     const headers = this.getHeaders(options.useControl, controlPath);
 
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      credentials: 'include',
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        credentials: 'omit',
+      });
+    } catch (err) {
+      // Network-level failure (e.g. DNS, refused connection). Do not treat as
+      // an auth failure — surface it as a normal API error so callers can
+      // distinguish "server unreachable" from "unauthenticated".
+      throw err;
+    }
+
+    if (response.status === 401) {
+      // A 401 means the current credentials are invalid or missing. Clear
+      // client auth state and notify the app layer so it can reset UI state
+      // and invalidate protected React Query caches. Control-plane endpoints
+      // authenticate with X-API-Key, not actor credentials, so a control 401
+      // must not invalidate an actor session.
+      if (!controlPath) {
+        this.clearAuth();
+        if (this.onUnauthenticated) {
+          this.onUnauthenticated();
+        }
+      }
+      // Fall through to handleResponse so the error envelope is parsed
+      // normally and the caller gets a structured APIError.
+    }
 
     return handleResponse<T>(response);
   }
@@ -188,11 +246,11 @@ class NexusAPIClient {
   // Health — served by the health server on a different port than the API
   // gateway. In development these are proxied directly (not via /api/v1).
   async getHealth(): Promise<HealthResponse> {
-    return this.request<HealthResponse>('GET', '/health', undefined, { baseUrl: '' });
+    return this.request<HealthResponse>('GET', '/health', undefined, { baseUrl: 'http://localhost:8080' });
   }
 
   async getStatus(): Promise<StatusResponse> {
-    return this.request<StatusResponse>('GET', '/status', undefined, { baseUrl: '' });
+    return this.request<StatusResponse>('GET', '/status', undefined, { baseUrl: 'http://localhost:8080' });
   }
 
   // Intelligence / Executions
@@ -273,6 +331,19 @@ class NexusAPIClient {
 
   async cancelIntelligence(id: string, businessId: string): Promise<void> {
     return this.request('POST', `/intelligence/${encodeURIComponent(id)}/cancel?business_id=${businessId}`);
+  }
+
+  // Businesses — authenticated endpoint; used to validate credentials at login.
+  // Returns the businesses the authenticated actor is a member of.
+  async listBusinesses(): Promise<{ businesses: unknown[] }> {
+    return this.request<{ businesses: unknown[] }>('GET', '/businesses');
+  }
+
+  // Create a new business during first-run onboarding.
+  // POST /api/v1/businesses — membership-free (the business does not exist yet).
+  // Body: { name, owner_identity_id, entity_id?, settings?, metadata? }
+  async createBusiness(request: CreateBusinessRequest): Promise<Business> {
+    return this.request<Business>('POST', '/businesses', request);
   }
 
   // Durable recovery read (authoritative execution state)
@@ -431,6 +502,195 @@ class NexusAPIClient {
       { useControl: true }
     );
   }
+
+  // ============================================================================
+  // Health / readiness (served on the health port)
+  // ============================================================================
+
+  async getReady(): Promise<StatusResponse> {
+    return this.request<StatusResponse>('GET', '/ready', undefined, { baseUrl: 'http://localhost:8080' });
+  }
+
+  // ============================================================================
+  // Requests (generic submit / result)
+  // ============================================================================
+
+  async submitRequest(request: SubmitRequestRequest): Promise<SubmitRequestResponse> {
+    return this.request<SubmitRequestResponse>('POST', '/requests', request);
+  }
+
+  async getRequest(id: string, businessId: string): Promise<RequestResult> {
+    return this.request<RequestResult>(
+      'GET',
+      `/requests/${encodeURIComponent(id)}?business_id=${businessId}`
+    );
+  }
+
+  async cancelRequest(id: string, businessId: string): Promise<void> {
+    return this.request('POST', `/requests/${encodeURIComponent(id)}/cancel?business_id=${businessId}`);
+  }
+
+  // ============================================================================
+  // Escalations
+  // ============================================================================
+
+  async listEscalations(businessId: string): Promise<{ escalations: Escalation[] }> {
+    return this.request('GET', `/escalations?business_id=${businessId}`);
+  }
+
+  async ackEscalation(id: string, businessId: string, request: AckEscalationRequest): Promise<{ escalation_id: string; status: string }> {
+    return this.request('POST', `/escalations/${encodeURIComponent(id)}/ack?business_id=${businessId}`, request);
+  }
+
+  async resolveEscalation(id: string, businessId: string, request: ResolveEscalationRequest): Promise<{ escalation_id: string; status: string }> {
+    return this.request('POST', `/escalations/${encodeURIComponent(id)}/resolve?business_id=${businessId}`, request);
+  }
+
+  // ============================================================================
+  // Identities (detail + lifecycle)
+  // ============================================================================
+
+  async getIdentity(id: string, businessId: string): Promise<Identity> {
+    return this.request<Identity>(
+      'GET',
+      `/identities/${encodeURIComponent(id)}?business_id=${businessId}`
+    );
+  }
+
+  async suspendIdentity(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/identities/${encodeURIComponent(id)}/suspend?business_id=${businessId}`, request, { useControl: true });
+  }
+
+  async revokeIdentity(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/identities/${encodeURIComponent(id)}/revoke?business_id=${businessId}`, request, { useControl: true });
+  }
+
+  async activateIdentity(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/identities/${encodeURIComponent(id)}/activate?business_id=${businessId}`, request, { useControl: true });
+  }
+
+  // ============================================================================
+  // Businesses (detail + lifecycle + members)
+  // ============================================================================
+
+  async createBusinessMember(businessId: string, request: CreateBusinessMemberRequest): Promise<BusinessMember> {
+    return this.request<BusinessMember>(
+      'POST',
+      `/businesses/${encodeURIComponent(businessId)}/members`,
+      request
+    );
+  }
+
+  async getBusiness(id: string): Promise<Business> {
+    return this.request<Business>('GET', `/businesses/${encodeURIComponent(id)}`);
+  }
+
+  async suspendBusiness(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/businesses/${encodeURIComponent(id)}/suspend`, request, { useControl: true });
+  }
+
+  async archiveBusiness(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/businesses/${encodeURIComponent(id)}/archive`, request, { useControl: true });
+  }
+
+  async activateBusiness(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/businesses/${encodeURIComponent(id)}/activate`, request, { useControl: true });
+  }
+
+  // ============================================================================
+  // Divisions
+  // ============================================================================
+
+  async listDivisions(businessId: string): Promise<{ divisions: Division[] }> {
+    return this.request('GET', `/divisions?business_id=${businessId}`);
+  }
+
+  async createDivision(request: CreateDivisionRequest): Promise<Division> {
+    return this.request<Division>('POST', '/divisions', request);
+  }
+
+  async getDivision(id: string): Promise<Division> {
+    return this.request<Division>('GET', `/divisions/${encodeURIComponent(id)}`);
+  }
+
+  async suspendDivision(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/divisions/${encodeURIComponent(id)}/suspend`, request, { useControl: true });
+  }
+
+  async archiveDivision(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/divisions/${encodeURIComponent(id)}/archive`, request, { useControl: true });
+  }
+
+  async activateDivision(id: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/divisions/${encodeURIComponent(id)}/activate`, request, { useControl: true });
+  }
+
+  // ============================================================================
+  // Agents (lifecycle)
+  // ============================================================================
+
+  async updateAgent(id: string, businessId: string, request: UpdateAgentRequest): Promise<Agent> {
+    return this.request<Agent>(
+      'POST',
+      `/agents/${encodeURIComponent(id)}/update?business_id=${businessId}`,
+      request
+    );
+  }
+
+  async suspendAgent(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/agents/${encodeURIComponent(id)}/suspend?business_id=${businessId}`, request);
+  }
+
+  async archiveAgent(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/agents/${encodeURIComponent(id)}/archive?business_id=${businessId}`, request);
+  }
+
+  async activateAgent(id: string, businessId: string, request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', `/agents/${encodeURIComponent(id)}/activate?business_id=${businessId}`, request);
+  }
+
+  // ============================================================================
+  // Executions (agent execution layer v1)
+  // ============================================================================
+
+  async submitExecution(request: SubmitExecutionRequest): Promise<SubmitExecutionResponse> {
+    return this.request<SubmitExecutionResponse>('POST', '/executions', request);
+  }
+
+  async getExecution(id: string, businessId: string): Promise<Execution> {
+    return this.request<Execution>(
+      'GET',
+      `/executions/${encodeURIComponent(id)}?business_id=${businessId}`
+    );
+  }
+
+  async cancelExecution(id: string, businessId: string): Promise<void> {
+    return this.request('POST', `/executions/${encodeURIComponent(id)}/cancel?business_id=${businessId}`);
+  }
+
+  // ============================================================================
+  // Control surface
+  // ============================================================================
+
+  async getControlStatus(): Promise<ControlStatus> {
+    return this.request<ControlStatus>('GET', '/control/status', undefined, { useControl: true });
+  }
+
+  async pauseControl(request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', '/control/pause', request, { useControl: true });
+  }
+
+  async resumeControl(request: AgentTransitionRequest): Promise<void> {
+    return this.request('POST', '/control/resume', request, { useControl: true });
+  }
+
+  async getControlMetrics(): Promise<ControlMetrics> {
+    return this.request<ControlMetrics>('GET', '/control/metrics', undefined, { useControl: true });
+  }
+
+  async getControlComponents(): Promise<{ components: ControlComponent[] }> {
+    return this.request('GET', '/control/components', undefined, { useControl: true });
+  }
 }
 
 // SSE Event Stream
@@ -557,7 +817,11 @@ export class EventStream {
     this.setState('connecting');
 
     const base = this.api.baseUrl();
-    const url = `${base.replace('/api/v1', '')}/events?business_id=${encodeURIComponent(this.businessId)}`;
+    // The SSE event stream must connect directly to the gateway port (8081)
+    // because the vite dev proxy does not handle long-lived SSE connections.
+    // In production, the frontend is served on port 8082 and the gateway on
+    // 8081, both on the same host, so a direct connection works in both cases.
+    const url = `http://localhost:8081/events?business_id=${encodeURIComponent(this.businessId)}`;
 
     fetch(url, {
       method: 'GET',
@@ -566,7 +830,7 @@ export class EventStream {
         Cache: 'no-cache',
         ...this.api.getHeaders(true), // auth headers
       },
-      credentials: 'include',
+      credentials: 'omit',
       signal: controller.signal,
     })
       .then((response) => {

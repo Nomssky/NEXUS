@@ -1,0 +1,43 @@
+{
+  "nexus": {
+    "id": "<NEXUS_INSTALLATION_ID>",
+    "environment": "development"
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  },
+  "health": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8080
+  },
+  "lifecycle": {
+    "shutdown_timeout_seconds": 30
+  },
+  "storage": {
+    "data_dir": "<STORAGE_DATA_DIR>"
+  },
+  "security": {
+    "audit_enabled": true,
+    "require_authentication": true,
+    "enforce_business_scope": true,
+    "dev_allow_unsafe_overrides": false,
+    "egress_allow_list": [],
+    "sandbox_enabled": true
+  },
+  "models": {
+    "seeded_provider_mode": "scripted",
+    "seeded_provider_status": "healthy",
+    "providers": []
+  },
+  "rate_limit": {
+    "enabled": true,
+    "submit_per_minute": 60,
+    "request_per_minute": 600,
+    "per_ip_per_minute": 6000
+  },
+  "http": {
+    "cors_allowed_origins": []
+  }
+}

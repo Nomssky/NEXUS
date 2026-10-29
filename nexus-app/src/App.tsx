@@ -4,13 +4,16 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { OfficeLayout } from './components/OfficeLayout/OfficeLayout';
 import { CommandCenter } from './pages/CommandCenter';
 import { Research } from './pages/Research';
 import { Development } from './pages/Development';
 import { Media } from './pages/Media';
 import { Meeting } from './pages/Meeting';
 import { Settings } from './pages/Settings';
+import { PenpotPage } from './pages/PenpotPage';
 import { stripPersistedControlKey } from './authStorage';
+import { parseLocalSessionConfig } from './localSession';
 import { apiClient } from './api/client';
 import { queryKeys } from './api/hooks';
 import './tokens/css-variables.css';
@@ -23,7 +26,26 @@ export type AppRoute =
   | 'development'
   | 'media'
   | 'meeting'
-  | 'settings';
+  | 'settings'
+  | 'knowledge'
+  | 'first-run'
+  | 'virtual-office'
+  | 'agent-inspector'
+  | 'agent-roster'
+  | 'task-inspector'
+  | 'states'
+  | 'businesses'
+  | 'division-detail'
+  | 'command-palette'
+  | 'attention-inbox'
+  | 'analytics'
+  | 'settings-system'
+  | 'activity-events'
+  | 'governance-approvals'
+  | 'model-providers'
+  | 'web-search'
+  | 'storage'
+  | 'configuration';
 
 // Global styles
 const AppStyles = () => (
@@ -102,7 +124,7 @@ const AppStyles = () => (
 );
 
 // Create React Query client
-const queryClient = new QueryClient({
+export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 5000,
@@ -139,41 +161,121 @@ const DEFAULT_AUTH: AuthState = {
   controlKey: '',
 };
 
-function AuthProvider({ children }: { children: React.ReactNode }) {
+export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [auth, setAuth] = useState<AuthState>(DEFAULT_AUTH);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
 
-  // Check for stored auth on mount
-  useEffect(() => {
+  // When the API client receives a 401, clear protected React Query caches and
+  // reset authenticated UI state so stale authorized data is never presented
+  // after the session is rejected.
+  apiClient.setOnUnauthenticated(() => {
+    queryClient.clear();
+    setIsAuthenticated(false);
+    setAuthError('Session expired or invalid. Please sign in again.');
+  });
+
+  // Restore an authenticated session from a stored record, validating the
+  // credentials against a real endpoint before marking the app authenticated.
+  // Returns true when a usable session was restored.
+  const restoreStoredSession = useCallback(async (): Promise<boolean> => {
     const stored = localStorage.getItem('nexus-auth');
-    if (stored) {
-      // The control-plane key is intentionally memory-only. Remove a legacy
-      // persisted value even when the record has no usable actor credential.
-      const { parsed, serialized } = stripPersistedControlKey(stored);
-      if (serialized) {
-        localStorage.setItem('nexus-auth', serialized);
-      }
-      if (
-        parsed &&
-        typeof parsed.actorId === 'string' &&
-        parsed.actorId &&
-        typeof parsed.credential === 'string' &&
-        parsed.credential
-      ) {
-        const restored: AuthState = {
-          ...DEFAULT_AUTH,
-          ...(parsed as Partial<AuthState>),
-          controlKey: '',
-        };
-        setAuth(restored);
-        apiClient.setAuth(restored.actorId, restored.credential);
-        setIsAuthenticated(true);
-      }
+    if (!stored) return false;
+    // The control-plane key is intentionally memory-only. Remove a legacy
+    // persisted value even when the record has no usable actor credential.
+    const { parsed, serialized } = stripPersistedControlKey(stored);
+    if (serialized) {
+      localStorage.setItem('nexus-auth', serialized);
     }
-    setIsLoading(false);
+    if (
+      parsed &&
+      typeof parsed.actorId === 'string' &&
+      parsed.actorId &&
+      typeof parsed.credential === 'string' &&
+      parsed.credential
+    ) {
+      const restored: AuthState = {
+        ...DEFAULT_AUTH,
+        ...(parsed as Partial<AuthState>),
+        controlKey: '',
+      };
+      setAuth(restored);
+      apiClient.setAuth(restored.actorId, restored.credential);
+      try {
+        await apiClient.listBusinesses();
+      } catch {
+        // Stored credentials no longer valid; fall through to login.
+        apiClient.clearAuth();
+        localStorage.removeItem('nexus-auth');
+        setAuth(DEFAULT_AUTH);
+        setIsAuthenticated(false);
+        return false;
+      }
+      setIsAuthenticated(true);
+      return true;
+    }
+    return false;
   }, []);
+
+  // On a fresh local desktop launch there is no stored auth. The launcher
+  // provisions a bootstrap identity and writes a short-lived local-session
+  // file (served only on localhost by the frontend static server) carrying
+  // the API base URL and bootstrap credentials. Fetch it first so the user
+  // lands directly in the Virtual Office without copying a credential.
+  //
+  // This is a single-user local-desktop convenience only. The login screen
+  // remains the default for every other deployment mode, and the bootstrap
+  // identity grants no permissions beyond what the local user already holds.
+  useEffect(() => {
+    let mounted = true;
+
+    const establishSession = async (): Promise<void> => {
+      let established = false;
+
+      // 1. Local desktop session (preferred): launcher-provided credentials.
+      try {
+        const res = await fetch('/local-session.json', { cache: 'no-store' });
+        if (res.ok) {
+          const config = parseLocalSessionConfig(await res.text());
+          if (config) {
+            apiClient.setBaseURL(config.apiBase);
+            apiClient.setAuth(config.actorId, config.credential);
+            // Validate against a real authenticated endpoint before trusting it.
+            await apiClient.listBusinesses();
+            if (!mounted) return;
+            const restored: AuthState = {
+              actorId: config.actorId,
+              credential: config.credential,
+              businessId: config.businessId,
+              controlKey: '',
+            };
+            setAuth(restored);
+            localStorage.setItem('nexus-auth', JSON.stringify(restored));
+            setIsAuthenticated(true);
+            established = true;
+          }
+        }
+      } catch {
+        // local-session.json unavailable or invalid: fall through to stored auth or login.
+        setIsAuthenticated(false);
+      }
+
+      // 2. Stored auth (refresh persistence, or non-desktop deployments).
+      if (!established) {
+        established = await restoreStoredSession();
+      }
+
+      if (!mounted) return;
+      setIsLoading(false);
+    };
+
+    void establishSession();
+
+    return () => {
+      mounted = false;
+    };
+  }, [restoreStoredSession]);
 
   const login = useCallback(async (actorId: string, credential: string, businessId: string = 'default') => {
     setAuthError(null);
@@ -210,9 +312,12 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
-      // Test the credentials by calling health endpoint
+      // Test the credentials against an authenticated endpoint.
+      // GET /health is public and does not validate credentials, so we use
+      // GET /api/v1/businesses, which requires a valid actor + credential
+      // and returns 401 for wrong or missing credentials.
       apiClient.setAuth(cleanActorId, cleanCredential);
-      await apiClient.getHealth();
+      await apiClient.listBusinesses();
 
       const newAuth = { actorId: cleanActorId, credential: cleanCredential, businessId: cleanBusinessId, controlKey: '' };
       setAuth(newAuth);
@@ -223,6 +328,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
       apiClient.clearAuth();
       const message = err instanceof Error ? err.message : 'Authentication failed';
       setAuthError(message);
+      setIsAuthenticated(false);
       return false;
     }
   }, []);
@@ -246,6 +352,9 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     setAuth(DEFAULT_AUTH);
     setIsAuthenticated(false);
     resetConfigurationQueries(false);
+    // Clear all protected React Query caches so no stale authorized data
+    // survives logout or session invalidation.
+    queryClient.clear();
   }, []);
 
   if (isLoading) {
@@ -287,6 +396,8 @@ function useAuth() {
   }
   return context;
 }
+
+export { useAuth };
 
 function LoginScreen() {
   const { login, authError } = useAuth();
@@ -374,189 +485,80 @@ function LoginScreen() {
 }
 
 function AppContent() {
-  const { isAuthenticated, auth, logout } = useAuth();
+  const { auth, logout, setControlKey, isAuthenticated } = useAuth();
   const [route, setRoute] = useState<AppRoute>('command');
+  const storedBusinessId = (() => {
+    try {
+      const stored = localStorage.getItem('nexus-auth');
+      if (!stored) return undefined;
+      const parsed = JSON.parse(stored);
+      if (parsed && parsed.businessId && parsed.businessId !== 'default') {
+        return parsed.businessId as string;
+      }
+    } catch {
+      // Ignore parse errors.
+    }
+    return undefined;
+  })();
+  const [businessId, setBusinessId] = useState(storedBusinessId ?? auth.businessId);
+  const [onboardingComplete, setOnboardingComplete] = useState(!!storedBusinessId);
 
   if (!isAuthenticated) {
     return <LoginScreen />;
   }
 
-  return (
-    <div className="app-layout">
-      <header className="app-header">
-        <div className="app-header-left">
-          <button onClick={logout} className="logout-button">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M10 4L6 8M6 8l4 4M6 8h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-            </svg>
-            Sign out
-          </button>
-          <span className="app-user">
-            {auth.actorId} @ {auth.businessId}
-          </span>
-          <nav className="app-nav" role="tablist" aria-label="Main navigation">
-            <button
-              role="tab"
-              aria-selected={route === 'command'}
-              onClick={() => setRoute('command')}
-              className={`app-nav-item ${route === 'command' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <rect x="2" y="2" width="14" height="14" rx="3" stroke="currentColor" strokeWidth="1.5" />
-                <path d="M6 9h6M9 6v6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-              </svg>
-              Command
-            </button>
-            <button
-              role="tab"
-              aria-selected={route === 'research'}
-              onClick={() => setRoute('research')}
-              className={`app-nav-item ${route === 'research' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <circle cx="9" cy="9" r="6" stroke="currentColor" strokeWidth="1.5" />
-                <path d="M9 14v4M14 14l-5-5 5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-              </svg>
-              Research
-            </button>
-            <button
-              role="tab"
-              aria-selected={route === 'development'}
-              onClick={() => setRoute('development')}
-              className={`app-nav-item ${route === 'development' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <path d="M3 15l4-4 4 4M7 11v8M11 11v8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-              </svg>
-              Development
-            </button>
-            <button
-              role="tab"
-              aria-selected={route === 'media'}
-              onClick={() => setRoute('media')}
-              className={`app-nav-item ${route === 'media' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <rect x="3" y="4" width="12" height="10" rx="2" stroke="currentColor" strokeWidth="1.5" />
-                <circle cx="9" cy="9" r="2.5" stroke="currentColor" strokeWidth="1.5" />
-              </svg>
-              Media
-            </button>
-            <button
-              role="tab"
-              aria-selected={route === 'meeting'}
-              onClick={() => setRoute('meeting')}
-              className={`app-nav-item ${route === 'meeting' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <circle cx="6" cy="6" r="3" stroke="currentColor" strokeWidth="1.5" />
-                <circle cx="12" cy="6" r="3" stroke="currentColor" strokeWidth="1.5" />
-                <circle cx="6" cy="12" r="3" stroke="currentColor" strokeWidth="1.5" />
-                <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.5" />
-              </svg>
-              Meeting
-            </button>
-            <button
-              role="tab"
-              aria-selected={route === 'settings'}
-              onClick={() => setRoute('settings')}
-              className={`app-nav-item ${route === 'settings' ? 'active' : ''}`}
-            >
-              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-                <circle cx="9" cy="9" r="2.4" stroke="currentColor" strokeWidth="1.5" />
-                <path
-                  d="M9 2.4v1.7M9 13.9v1.7M2.4 9h1.7M13.9 9h1.7M4.3 4.3l1.2 1.2M12.5 12.5l1.2 1.2M13.7 4.3l-1.2 1.2M5.5 12.5l-1.2 1.2"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                  strokeLinecap="round"
-                />
-              </svg>
-              Settings
-            </button>
-          </nav>
-        </div>
-        <div className="app-header-right">
-          <ControlKeyInput />
-        </div>
-      </header>
-      <main className="app-main">
-        {route === 'command' ? (
-          <CommandCenter businessId={auth.businessId} actorId={auth.actorId} />
-        ) : route === 'research' ? (
-          <Research businessId={auth.businessId} actorId={auth.actorId} />
-        ) : route === 'development' ? (
-          <Development businessId={auth.businessId} actorId={auth.actorId} />
-        ) : route === 'media' ? (
-          <Media businessId={auth.businessId} actorId={auth.actorId} />
-        ) : route === 'settings' ? (
-          <Settings controlKey={auth.controlKey} />
-        ) : (
-          <Meeting businessId={auth.businessId} actorId={auth.actorId} />
-        )}
-      </main>
-    </div>
+  // First-run onboarding skipped - go directly to CommandCenter.
+  // FirstRunPenpot remains available as a Penpot design route.
+
+  // Penpot routes are complete full-page designs (1440×1024 with their own
+  // topbar, panels, status bar). They render WITHOUT the OfficeLayout wrapper
+  // so they match the Penpot design 1:1. Original NEXUS routes keep the
+  // OfficeLayout shell.
+  const PENPOT_ROUTES: Set<AppRoute> = new Set([
+    'first-run', 'virtual-office', 'agent-inspector', 'agent-roster',
+    'task-inspector', 'states', 'businesses', 'division-detail',
+    'command-palette', 'attention-inbox', 'analytics', 'settings-system',
+    'activity-events', 'governance-approvals', 'model-providers', 'web-search',
+    'storage', 'configuration', 'knowledge',
+  ]);
+
+  const renderPenpotPage = () => (
+    <PenpotPage
+      route={route}
+      businessId={businessId}
+      actorId={auth.actorId}
+    />
   );
-}
 
-function ControlKeyInput() {
-  const { auth, setControlKey } = useAuth();
-  const [key, setKey] = useState('');
-  const [showInput, setShowInput] = useState(false);
-
-  if (!showInput && !auth.controlKey) {
-    return (
-      <button onClick={() => setShowInput(true)} className="control-key-trigger">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <rect x="2" y="4" width="12" height="8" rx="1" stroke="currentColor" strokeWidth="1.5" />
-          <path d="M6 12v-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-        Set Control Key
-      </button>
-    );
+  // Full-page Penpot designs: render without OfficeLayout chrome.
+  if (PENPOT_ROUTES.has(route)) {
+    return renderPenpotPage();
   }
 
   return (
-    <div className="control-key-input">
-      {showInput && (
-        <input
-          type="password"
-          value={key}
-          onChange={(e) => setKey(e.target.value)}
-          placeholder="Control plane API key"
-          className="control-key-field"
-          onBlur={() => {
-            if (key.trim()) setControlKey(key.trim());
-            setShowInput(false);
-            setKey('');
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && key.trim()) {
-              setControlKey(key.trim());
-              setShowInput(false);
-              setKey('');
-            } else if (e.key === 'Escape') {
-              setShowInput(false);
-              setKey('');
-            }
-          }}
-          autoFocus
-        />
+    <OfficeLayout
+      businessId={businessId}
+      actorId={auth.actorId}
+      controlKey={auth.controlKey}
+      route={route}
+      setRoute={setRoute}
+      onLogout={logout}
+      onSetControlKey={setControlKey}
+    >
+      {route === 'command' ? (
+        <CommandCenter businessId={businessId} actorId={auth.actorId} />
+      ) : route === 'research' ? (
+        <Research businessId={businessId} actorId={auth.actorId} />
+      ) : route === 'development' ? (
+        <Development businessId={businessId} actorId={auth.actorId} />
+      ) : route === 'media' ? (
+        <Media businessId={businessId} actorId={auth.actorId} />
+      ) : route === 'settings' ? (
+        <Settings controlKey={auth.controlKey} />
+      ) : (
+        <Meeting businessId={businessId} actorId={auth.actorId} />
       )}
-      {auth.controlKey && !showInput && (
-        <span className="control-key-display">
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-            <rect x="1" y="3" width="12" height="8" rx="1" stroke="currentColor" strokeWidth="1.5" />
-            <path d="M5 11v-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-          </svg>
-          Control key set
-          <button onClick={() => setControlKey('')} className="control-key-clear" aria-label="Clear control key">
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-              <path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-            </svg>
-          </button>
-        </span>
-      )}
-    </div>
+    </OfficeLayout>
   );
 }
 

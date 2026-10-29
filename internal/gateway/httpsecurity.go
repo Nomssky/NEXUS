@@ -45,10 +45,35 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 // is not authentication or authorization and does not bypass them (preflight
 // requests are unauthenticated by definition and carry no credentials).
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
-	if len(s.corsOrigins) == 0 {
-		return next // same-origin default: no CORS headers at all
-	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always allow CORS for SSE endpoint (needed when frontend and gateway
+		// are on different ports, e.g. dev mode on 3000 with gateway on 8081)
+		if r.URL.Path == "/events" {
+			origin := r.Header.Get("Origin")
+			if origin != "" {
+				w.Header().Add("Access-Control-Allow-Origin", origin)
+			} else {
+				w.Header().Add("Access-Control-Allow-Origin", "*")
+			}
+			w.Header().Add("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Access-Control-Allow-Methods", allowedMethods)
+			w.Header().Add("Access-Control-Allow-Headers", allowedHeaders)
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if len(s.corsOrigins) == 0 {
+			// Same-origin default: no CORS headers at all. Cross-origin access
+			// for the co-located dev frontend is handled by the /events SSE
+			// special case above; the gateway itself stays same-origin by
+			// default to avoid reflecting a wildcard origin.
+			next.ServeHTTP(w, r)
+			return
+		}
 		// The response may vary by Origin; mark caches accordingly.
 		w.Header().Add("Vary", "Origin")
 
@@ -71,6 +96,7 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", origin) // exact allow-listed match only
+		h.Set("Access-Control-Allow-Credentials", "true")
 		if r.Method == http.MethodOptions {
 			h.Set("Access-Control-Allow-Methods", allowedMethods)
 			h.Set("Access-Control-Allow-Headers", allowedHeaders)

@@ -1,0 +1,76 @@
+/**
+ * OfficeFloor - Isometric virtual office floor styles.
+ * Matches Penpot "02 · Virtual Office — Dark" frame.
+ *
+ * Tiles are small diamonds arranged in diagonal rows matching Penpot.
+ * Colors are muted/dark colors matching Penpot design - not bright neon colors.
+ */
+
+.floorContainer {
+  position: relative;
+  width: 100%;
+  max-width: 720px;
+  height: 420px;
+  margin: 0 auto;
+}
+
+.floor {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Grid lines - hairline white at low opacity, matching Penpot */
+.gridLineV {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background-color: rgba(255, 255, 255, 0.022);
+  pointer-events: none;
+}
+
+.gridLineH {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background-color: rgba(255, 255, 255, 0.03);
+  pointer-events: none;
+}
+
+/* Isometric diamond tile - small, muted colors matching Penpot */
+.tile {
+  position: absolute;
+  width: 52px;
+  height: 26px;
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  border: 0.5px solid rgba(255, 255, 255, 0.04);
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.tile.slate {
+  background-color: rgba(110, 130, 160, 0.15);
+}
+
+.tile.teal {
+  background-color: rgba(60, 140, 160, 0.12);
+}
+
+.tile.purple {
+  background-color: rgba(120, 100, 170, 0.15);
+}
+
+.tile.orange {
+  background-color: rgba(180, 130, 80, 0.15);
+}
+
+.tile.green {
+  background-color: rgba(80, 160, 140, 0.15);
+}
+
+.tile.pink {
+  background-color: rgba(180, 100, 140, 0.15);
+}

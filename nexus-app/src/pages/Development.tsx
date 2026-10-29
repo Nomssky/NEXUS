@@ -9,8 +9,16 @@ import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
 import { DevelopmentInput } from '../components/Development/DevelopmentInput';
 import { DevelopmentOutput } from '../components/Development/DevelopmentOutput';
 import { RepositoryContext } from '../components/Development/RepositoryContext';
-import { useIntelligence, useIntelligenceTrace } from '../api/hooks';
+import {
+  useIntelligence,
+  useIntelligenceTrace,
+  useSubmitExecution,
+  useGetExecution,
+  useCancelExecution,
+  useAgents,
+} from '../api/hooks';
 import styles from './Development.module.css';
+import type { Agent } from '../types/api';
 
 interface DevelopmentPageProps {
   businessId: string;
@@ -22,11 +30,27 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
   const [selectedExecution, setSelectedExecution] = useState<string | null>(null);
   const [recentExecutions, setRecentExecutions] = useState<string[]>([]);
   const [currentExecution, setCurrentExecution] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  const { data: agentsData } = useAgents(businessId);
+  const submitExecution = useSubmitExecution();
+  const getExecution = useGetExecution(currentExecution ?? '', businessId, {
+    enabled: !!currentExecution,
+    refetchInterval: (query) => {
+      const state = query.state.data?.state;
+      const terminal = state === 'completed' || state === 'failed' || state === 'cancelled' || state === 'timed_out' || state === 'unknown';
+      return terminal ? false : 2000;
+    },
+  });
+  const cancelExecution = useCancelExecution();
+
+  const agents = agentsData?.agents ?? [];
 
   const handleSubmit = useCallback((executionId: string) => {
     setRecentExecutions((prev) => [executionId, ...prev.slice(0, 9)]);
     setCurrentExecution(executionId);
     setSelectedExecution(executionId);
+    setSubmitError(null);
   }, []);
 
   const handleExecutionSelect = useCallback((executionId: string) => {
@@ -38,28 +62,64 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
     setSelectedExecution(null);
   }, []);
 
+  const handleSubmitDevelopment = useCallback(async (objective: string) => {
+    setSubmitError(null);
+    try {
+      const res = await submitExecution.mutateAsync({
+        business_id: businessId,
+        objective: { description: objective },
+      });
+      const execId = res.execution_id;
+      setRecentExecutions((prev) => [execId, ...prev.slice(0, 9)]);
+      setCurrentExecution(execId);
+      setSelectedExecution(execId);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Submit failed');
+    }
+  }, [submitExecution, businessId]);
+
+  const handleCancel = useCallback(async () => {
+    if (!currentExecution) return;
+    try {
+      await cancelExecution.mutateAsync({ id: currentExecution, businessId });
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Cancel failed');
+    }
+  }, [cancelExecution, currentExecution, businessId]);
+
   // Get the most recent execution that has development tool results
   const latestExecutionId = recentExecutions[0] || currentExecution;
-  const { data: execution } = useIntelligence(latestExecutionId || '', businessId, {
-    enabled: !!latestExecutionId,
+  const { data: execution } = getExecution.data ? { data: getExecution.data } : useIntelligence(latestExecutionId || '', businessId, {
+    enabled: !!latestExecutionId && !getExecution.data,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status === 'pending' || status === 'running' ? 2000 : false;
     },
   });
 
+  // Fallback to intelligence trace for development output
   const { data: trace } = useIntelligenceTrace(latestExecutionId || '', businessId, {
     limit: 100,
   }, {
     enabled: !!latestExecutionId,
   });
 
+  // Normalize execution type: useGetExecution returns Execution, useIntelligence returns ExecutionStatus
+  const devExecution = useMemo(() => {
+    if (!execution) return undefined;
+    return {
+      output: 'output' in execution ? execution.output : undefined,
+      status: 'status' in execution ? execution.status : execution.state,
+      state: 'state' in execution ? execution.state : undefined,
+    };
+  }, [execution]);
+
   // Extract git tool results from execution output or trace
   const gitResult = useMemo((): { output: string; truncated?: string; repo?: string } | undefined => {
-    if (!execution?.output) return undefined;
+    if (!devExecution?.output) return undefined;
     try {
       // The git tool result is embedded in the execution output
-      const parsed = JSON.parse(execution.output);
+      const parsed = JSON.parse(devExecution.output);
       if (parsed.output && (parsed.repo || parsed.truncated !== undefined)) {
         return parsed as { output: string; truncated?: string; repo?: string };
       }
@@ -84,7 +144,7 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
     }
 
     return undefined;
-  }, [execution, trace]);
+  }, [devExecution, trace]);
 
   // Detect which git operation was used from trace
   const gitOperation = useMemo((): 'status' | 'diff' | 'log' => {
@@ -107,7 +167,9 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
     meeting: { executions: 0 },
   };
 
-  const isLoading = execution?.status === 'pending' || execution?.status === 'running';
+  const isLoading = devExecution?.status === 'pending' || devExecution?.status === 'running';
+  const executionState = devExecution?.state ?? devExecution?.status;
+  const canCancel = executionState && executionState !== 'completed' && executionState !== 'failed' && executionState !== 'cancelled' && executionState !== 'timed_out' && executionState !== 'unknown';
 
   return (
     <div className={styles.page}>
@@ -127,6 +189,11 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
             <span className={styles.statusDot} />
             <span>Connected</span>
           </div>
+          {submitError && (
+            <span className={styles.statusText} style={{ color: 'var(--color-text-error)' }}>
+              {submitError}
+            </span>
+          )}
         </div>
       </header>
 
@@ -144,16 +211,19 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
             <DevelopmentZone
               businessId={businessId}
               actorId={actorId}
-              onSubmit={handleSubmit}
+              onSubmit={handleSubmitDevelopment}
+              onCancel={handleCancel}
+              canCancel={!!canCancel}
               recentExecutions={recentExecutions}
               onExecutionSelect={handleExecutionSelect}
               currentExecution={currentExecution}
-              execution={execution}
+              execution={devExecution}
               trace={trace}
               gitResult={gitResult}
               gitOperation={gitOperation}
               isLoading={isLoading}
               onViewTrace={setSelectedExecution}
+              agents={agents}
             />
           )}
 
@@ -185,7 +255,9 @@ export const Development: React.FC<DevelopmentPageProps> = ({ businessId, actorI
 const DevelopmentZone: React.FC<{
   businessId: string;
   actorId: string;
-  onSubmit: (executionId: string) => void;
+  onSubmit: (objective: string) => Promise<void>;
+  onCancel: (() => Promise<void>) | undefined;
+  canCancel: boolean;
   recentExecutions: string[];
   onExecutionSelect: (executionId: string) => void;
   currentExecution: string | null;
@@ -195,10 +267,13 @@ const DevelopmentZone: React.FC<{
   gitOperation: 'status' | 'diff' | 'log';
   isLoading: boolean;
   onViewTrace: (executionId: string) => void;
+  agents: Agent[];
 }> = ({
   businessId,
   actorId,
   onSubmit,
+  onCancel,
+  canCancel,
   recentExecutions,
   onExecutionSelect,
   currentExecution,
@@ -208,6 +283,7 @@ const DevelopmentZone: React.FC<{
   gitOperation,
   isLoading,
   onViewTrace,
+  agents,
 }) => {
   const selectedExecutionData = useMemo(() => {
     if (!currentExecution || !trace) return null;
@@ -224,6 +300,9 @@ const DevelopmentZone: React.FC<{
           businessId={businessId}
           actorId={actorId}
           onSubmit={onSubmit}
+          onCancel={onCancel}
+          canCancel={canCancel}
+          agents={agents}
         />
       </section>
 

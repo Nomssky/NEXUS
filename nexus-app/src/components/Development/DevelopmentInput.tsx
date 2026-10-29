@@ -1,32 +1,39 @@
 /**
  * DevelopmentInput - Focused engineering task input
- * Accepts a development objective and submits to the intelligence API
+ * Accepts a development objective and submits to the executions API
  */
 
 import React, { useState, useCallback, useRef, useEffect } from 'react';
 import { Textarea, Button, Badge } from '../primitives';
-import { useSubmitIntelligence } from '../../api/hooks';
+import { useSubmitExecution, useCancelExecution } from '../../api/hooks';
+import type { Agent } from '../../types/api';
 import styles from './DevelopmentInput.module.css';
 
 interface DevelopmentInputProps {
   businessId: string;
   actorId: string;
   onSubmit?: (executionId: string) => void;
+  onCancel?: (() => Promise<void>) | undefined;
+  canCancel?: boolean;
   disabled?: boolean;
+  agents?: Agent[];
 }
 
 export const DevelopmentInput: React.FC<DevelopmentInputProps> = ({
   businessId,
   actorId,
   onSubmit,
+  onCancel,
+  canCancel = false,
   disabled = false,
+  agents,
 }) => {
   const [value, setValue] = useState('');
   const [error, setError] = useState<string | undefined>(undefined);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const submitCount = useRef(0);
 
-  const submitMutation = useSubmitIntelligence({
+  const submitMutation = useSubmitExecution({
     onSuccess: (response) => {
       setValue('');
       setError(undefined);
@@ -38,6 +45,17 @@ export const DevelopmentInput: React.FC<DevelopmentInputProps> = ({
       submitCount.current = 0;
     },
   });
+
+  const cancelMutation = useCancelExecution();
+
+  const handleCancel = useCallback(async () => {
+    if (!onCancel) return;
+    try {
+      await onCancel();
+    } catch {
+      // Error already surfaced by the caller
+    }
+  }, [onCancel]);
 
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
@@ -63,7 +81,7 @@ export const DevelopmentInput: React.FC<DevelopmentInputProps> = ({
         objective: { description: trimmed },
       });
     },
-    [value, businessId, actorId, submitMutation]
+    [value, businessId, submitMutation]
   );
 
   const handleKeyDown = useCallback(
@@ -107,6 +125,17 @@ export const DevelopmentInput: React.FC<DevelopmentInputProps> = ({
           }
         />
         <div className={styles.actions}>
+          {canCancel && onCancel && (
+            <Button
+              variant="ghost"
+              size="md"
+              onClick={handleCancel}
+              disabled={cancelMutation.isPending}
+              aria-busy={cancelMutation.isPending}
+            >
+              Cancel Execution
+            </Button>
+          )}
           <Button
             type="submit"
             variant="primary"

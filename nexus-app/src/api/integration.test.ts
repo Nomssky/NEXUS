@@ -126,11 +126,11 @@ describe('submit → approve → resume → result journey', () => {
 
     // Verify all requests used correct auth headers and endpoints
     const urls = mockFetch.mock.calls.map((c) => c[0] as string);
-    expect(urls).toContain('/api/v1/intelligence/execute');
-    expect(urls).toContain(`/api/v1/intelligence/${EXECUTION_ID}?business_id=${BUSINESS_ID}`);
-    expect(urls).toContain(`/api/v1/approvals?business_id=${BUSINESS_ID}`);
+    expect(urls).toContain('http://localhost:8081/api/v1/intelligence/execute');
+    expect(urls).toContain(`http://localhost:8081/api/v1/intelligence/${EXECUTION_ID}?business_id=${BUSINESS_ID}`);
+    expect(urls).toContain(`http://localhost:8081/api/v1/approvals?business_id=${BUSINESS_ID}`);
     expect(urls).toContain(
-      `/api/v1/approvals/${APPROVAL_ID}/approve?business_id=${BUSINESS_ID}`
+      `http://localhost:8081/api/v1/approvals/${APPROVAL_ID}/approve?business_id=${BUSINESS_ID}`
     );
 
     // Verify all requests sent auth headers
@@ -287,7 +287,7 @@ describe('submit → approve → resume → result journey', () => {
     // Verify deny used correct endpoint
     const urls = mockFetch.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain(
-      `/api/v1/approvals/${APPROVAL_ID}/deny?business_id=${BUSINESS_ID}`
+      `http://localhost:8081/api/v1/approvals/${APPROVAL_ID}/deny?business_id=${BUSINESS_ID}`
     );
   });
 
@@ -303,7 +303,7 @@ describe('submit → approve → resume → result journey', () => {
     expect(body.business_id).toBe(BUSINESS_ID);
     expect(body.actor_id).toBe(ACTOR_ID);
     expect(body.objective.description).toBe('Test objective');
-    expect(mockFetch.mock.calls[0][0]).toBe('/api/v1/intelligence/execute');
+    expect(mockFetch.mock.calls[0][0]).toBe('http://localhost:8081/api/v1/intelligence/execute');
   });
 });
 

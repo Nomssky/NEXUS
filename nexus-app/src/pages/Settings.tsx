@@ -7,14 +7,40 @@
  * instead of pretending to save secrets or test live providers.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { APIError } from '../api/client';
 import {
   useConfiguration,
   useStorageVolumes,
   useValidateStoragePath,
+  useGetControlStatus,
+  usePauseControl,
+  useResumeControl,
+  useGetControlMetrics,
+  useGetControlComponents,
+  useDivisions,
+  useCreateDivision,
+  useSuspendDivision,
+  useArchiveDivision,
+  useActivateDivision,
+  useIdentity,
+  useSuspendIdentity,
+  useRevokeIdentity,
+  useActivateIdentity,
+  useGetBusiness,
+  useSuspendBusiness,
+  useArchiveBusiness,
+  useActivateBusiness,
 } from '../api/hooks';
 import { Badge, Button } from '../components/primitives';
+import type {
+  ControlStatus,
+  ControlComponent,
+  ControlMetrics,
+  Division,
+  Identity,
+  Business,
+} from '../types/api';
 import type {
   ConfigReadiness,
   ConfigurationSnapshot,
@@ -32,13 +58,17 @@ interface SettingsProps {
   controlKey: string;
 }
 
-type SettingsTab = 'overview' | 'models' | 'search' | 'storage';
+type SettingsTab = 'overview' | 'models' | 'search' | 'storage' | 'control' | 'businesses' | 'identities' | 'divisions';
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'overview', label: 'Overview' },
   { id: 'models', label: 'Model providers' },
   { id: 'search', label: 'Web search' },
   { id: 'storage', label: 'Storage' },
+  { id: 'control', label: 'Control Plane' },
+  { id: 'businesses', label: 'Businesses' },
+  { id: 'identities', label: 'Identities' },
+  { id: 'divisions', label: 'Divisions' },
 ];
 
 function errorStatus(error: unknown): number | undefined {
@@ -996,15 +1026,276 @@ const ValidationResult: React.FC<{ result: StorageValidation }> = ({ result }) =
   </div>
 );
 
+const ControlPlaneTab: React.FC<{
+  status: ControlStatus | undefined;
+  metrics: ControlMetrics | undefined;
+  components: ControlComponent[];
+  isPaused: boolean;
+  onPause: () => void;
+  onResume: () => void;
+  isPausing: boolean;
+  isResuming: boolean;
+}> = ({ status, metrics, components, isPaused, onPause, onResume, isPausing, isResuming }) => {
+  return (
+    <div className={styles.tabStack}>
+      <SectionCard
+        title="Control Plane Status"
+        subtitle="Operator control-plane key gating"
+        icon={<IconLock />}
+        actions={
+          <Badge variant={isPaused ? 'warning' : 'success'} size="sm">
+            {isPaused ? 'Paused' : 'Running'}
+          </Badge>
+        }
+      >
+        <div className={styles.kvList}>
+          <div><span>Paused</span><span className={styles.mono}>{String(status?.paused)}</span></div>
+          <div><span>Pause reason</span><span className={styles.mono}>{status?.pause_reason ?? '—'}</span></div>
+          <div><span>Paused at</span><span className={styles.mono}>{status?.paused_at ?? '—'}</span></div>
+          <div><span>Paused by</span><span className={styles.mono}>{status?.paused_by ?? '—'}</span></div>
+        </div>
+        <div className={styles.actionsRow}>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={isPaused ? onResume : onPause}
+            disabled={isPaused ? isResuming : isPausing}
+            leftIcon={<IconRefresh />}
+          >
+            {isPaused ? 'Resume' : 'Pause'}
+          </Button>
+        </div>
+      </SectionCard>
+
+      <SectionCard
+        title="Control Metrics"
+        subtitle="Live gateway operational metrics"
+        icon={<IconServer />}
+      >
+        {metrics ? (
+          <div className={styles.kvList}>
+            <div><span>Uptime</span><span className={styles.mono}>{metrics.uptime_seconds}s</span></div>
+            <div><span>Requests total</span><span className={styles.mono}>{metrics.requests_total}</span></div>
+            <div><span>Requests active</span><span className={styles.mono}>{metrics.requests_active}</span></div>
+            <div><span>Requests failed</span><span className={styles.mono}>{metrics.requests_failed}</span></div>
+            <div><span>SSE connections</span><span className={styles.mono}>{metrics.sse_connections}</span></div>
+            <div><span>Executions total</span><span className={styles.mono}>{metrics.executions_total}</span></div>
+            <div><span>Executions active</span><span className={styles.mono}>{metrics.executions_active}</span></div>
+          </div>
+        ) : (
+          <EmptyState title="No metrics available">No control metrics reported</EmptyState>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="Control Components"
+        subtitle="Component health status"
+        icon={<IconServer />}
+      >
+        {components.length > 0 ? (
+          <div className={styles.kvList}>
+            {components.map((c) => (
+              <div key={c.id}>
+                <span>{c.name}</span>
+                <Badge variant={c.status === 'healthy' ? 'success' : c.status === 'degraded' ? 'warning' : 'error'} size="sm">
+                  {c.status}
+                </Badge>
+                {c.details && <span className={styles.mono}>{c.details}</span>}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="No components reported">No control components reported</EmptyState>
+        )}
+      </SectionCard>
+    </div>
+  );
+};
+
+const BusinessesTab: React.FC<{
+  businessId: string;
+  business: Business | undefined;
+  suspendBusiness: (req: { id: string; request: { reason: string } }) => void;
+  archiveBusiness: (req: { id: string; request: { reason: string } }) => void;
+  activateBusiness: (req: { id: string; request: { reason: string } }) => void;
+  isSuspending: boolean;
+  isArchiving: boolean;
+  isActivating: boolean;
+}> = ({ businessId, business, suspendBusiness, archiveBusiness, activateBusiness, isSuspending, isArchiving, isActivating }) => {
+  return (
+    <div className={styles.tabStack}>
+      <SectionCard
+        title="Business"
+        subtitle={`Business ID: ${businessId}`}
+        icon={<IconServer />}
+        actions={
+          <Badge variant={business?.status === 'active' ? 'success' : 'warning'} size="sm">
+            {business?.status ?? 'unknown'}
+          </Badge>
+        }
+      >
+        <div className={styles.kvList}>
+          <div><span>Name</span><span className={styles.mono}>{business?.name ?? '—'}</span></div>
+          <div><span>Owner identity</span><span className={styles.mono}>{business?.owner_identity_id ?? '—'}</span></div>
+          <div><span>Status</span><span className={styles.mono}>{business?.status ?? '—'}</span></div>
+          <div><span>Created</span><span className={styles.mono}>{business?.created_at ?? '—'}</span></div>
+          <div><span>Updated</span><span className={styles.mono}>{business?.updated_at ?? '—'}</span></div>
+        </div>
+        <div className={styles.actionsRow}>
+          <Button variant="secondary" size="sm" disabled={isActivating || isSuspending || isArchiving} onClick={() => activateBusiness({ id: businessId, request: { reason: 'Operator activation from Settings' } })}>
+            Activate
+          </Button>
+          <Button variant="secondary" size="sm" disabled={isSuspending || isActivating || isArchiving} onClick={() => suspendBusiness({ id: businessId, request: { reason: 'Operator suspend from Settings' } })}>
+            Suspend
+          </Button>
+          <Button variant="secondary" size="sm" disabled={isSuspending || isActivating || isArchiving} onClick={() => archiveBusiness({ id: businessId, request: { reason: 'Operator archive from Settings' } })}>
+            Archive
+          </Button>
+        </div>
+      </SectionCard>
+    </div>
+  );
+};
+
+const IdentitiesTab: React.FC<{
+  identity: Identity | undefined;
+  suspendIdentity: (req: { id: string; businessId: string; request: { reason: string } }) => void;
+  revokeIdentity: (req: { id: string; businessId: string; request: { reason: string } }) => void;
+  activateIdentity: (req: { id: string; businessId: string; request: { reason: string } }) => void;
+  isSuspending: boolean;
+  isRevoking: boolean;
+  isActivating: boolean;
+}> = ({ identity, suspendIdentity, revokeIdentity, activateIdentity, isSuspending, isRevoking, isActivating }) => {
+  const businessId = identity?.business_id ?? '';
+  const identityId = identity?.entity_id ?? '';
+
+  return (
+    <div className={styles.tabStack}>
+      <SectionCard
+        title="Identity"
+        subtitle={`Identity: ${identityId}`}
+        icon={<IconLock />}
+        actions={
+          <Badge variant={identity?.status === 'active' ? 'success' : 'warning'} size="sm">
+            {identity?.status ?? 'unknown'}
+          </Badge>
+        }
+      >
+        <div className={styles.kvList}>
+          <div><span>Display name</span><span className={styles.mono}>{identity?.display_name ?? '—'}</span></div>
+          <div><span>Identity type</span><span className={styles.mono}>{identity?.identity_type ?? '—'}</span></div>
+          <div><span>Business ID</span><span className={styles.mono}>{identity?.business_id ?? '—'}</span></div>
+          <div><span>Status</span><span className={styles.mono}>{identity?.status ?? '—'}</span></div>
+          <div><span>Credential method</span><span className={styles.mono}>{identity?.credential_method ?? '—'}</span></div>
+          <div><span>Created</span><span className={styles.mono}>{identity?.created_at ?? '—'}</span></div>
+          <div><span>Updated</span><span className={styles.mono}>{identity?.updated_at ?? '—'}</span></div>
+        </div>
+        <div className={styles.actionsRow}>
+          <Button variant="secondary" size="sm" disabled={isActivating || isSuspending || isRevoking} onClick={() => activateIdentity({ id: identityId, businessId, request: { reason: 'Operator activation from Settings' } })}>
+            Activate
+          </Button>
+          <Button variant="secondary" size="sm" disabled={isSuspending || isActivating || isRevoking} onClick={() => suspendIdentity({ id: identityId, businessId, request: { reason: 'Operator suspend from Settings' } })}>
+            Suspend
+          </Button>
+          <Button variant="secondary" size="sm" disabled={isSuspending || isActivating || isRevoking} onClick={() => revokeIdentity({ id: identityId, businessId, request: { reason: 'Operator revoke from Settings' } })}>
+            Revoke
+          </Button>
+        </div>
+      </SectionCard>
+    </div>
+  );
+};
+
+const DivisionsTab: React.FC<{
+  divisions: Division[];
+  createDivision: (req: { name: string; business_id: string; description?: string; entity_id?: string }) => void;
+  suspendDivision: (req: { id: string; request: { reason: string } }) => void;
+  archiveDivision: (req: { id: string; request: { reason: string } }) => void;
+  activateDivision: (req: { id: string; request: { reason: string } }) => void;
+  isCreating: boolean;
+  isSuspending: boolean;
+  isArchiving: boolean;
+  isActivating: boolean;
+}> = ({ divisions, createDivision, suspendDivision, archiveDivision, activateDivision, isCreating, isSuspending, isArchiving, isActivating }) => {
+  return (
+    <div className={styles.tabStack}>
+      <SectionCard
+        title="Divisions"
+        subtitle={`${divisions.length} division${divisions.length === 1 ? '' : 's'} configured`}
+        icon={<IconServer />}
+      >
+        {divisions.length === 0 ? (
+          <EmptyState title="No divisions configured">
+            Create your first division to organize agents and executions.
+          </EmptyState>
+        ) : (
+          <div className={styles.kvList}>
+            {divisions.map((d) => (
+              <div key={d.entity_id}>
+                <span>{d.name}</span>
+                <Badge variant={d.status === 'active' ? 'success' : 'warning'} size="sm">{d.status}</Badge>
+              </div>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+    </div>
+  );
+};
+
 export const Settings: React.FC<SettingsProps> = ({ controlKey }) => {
   const [tab, setTab] = useState<SettingsTab>('overview');
   const configuration = useConfiguration(controlKey);
   const volumes = useStorageVolumes(controlKey);
 
+  // Control surface hooks
+  const controlStatus = useGetControlStatus();
+  const controlMetrics = useGetControlMetrics();
+  const controlComponents = useGetControlComponents();
+  const pauseControl = usePauseControl();
+  const resumeControl = useResumeControl();
+
+  // Business lifecycle hooks
+  const businessId = configuration.data?.nexus_id;
+  const getBusiness = useGetBusiness(businessId ?? '', undefined);
+  const suspendBusiness = useSuspendBusiness();
+  const archiveBusiness = useArchiveBusiness();
+  const activateBusiness = useActivateBusiness();
+
+  // Division hooks
+  const divisions = useDivisions(businessId ?? '');
+  const createDivision = useCreateDivision();
+  const suspendDivision = useSuspendDivision();
+  const archiveDivision = useArchiveDivision();
+  const activateDivision = useActivateDivision();
+
+  // Identity hooks
+  const getIdentity = useIdentity(
+    businessId ?? '',
+    businessId ?? ''
+  );
+  const suspendIdentity = useSuspendIdentity();
+  const revokeIdentity = useRevokeIdentity();
+  const activateIdentity = useActivateIdentity();
+
   const refresh = () => {
     void configuration.refetch();
     void volumes.refetch();
+    void controlStatus.refetch();
+    void controlMetrics.refetch();
+    void controlComponents.refetch();
+    void divisions.refetch();
+    void getBusiness.refetch();
+    void getIdentity.refetch();
   };
+
+  const handlePause = useCallback(() => {
+    pauseControl.mutate({ reason: 'Operator pause from Settings' });
+  }, [pauseControl]);
+
+  const handleResume = useCallback(() => {
+    resumeControl.mutate({ reason: 'Operator resume from Settings' });
+  }, [resumeControl]);
 
   const body = (() => {
     if (!controlKey) return <PermissionState />;
@@ -1027,6 +1318,58 @@ export const Settings: React.FC<SettingsProps> = ({ controlKey }) => {
             volumesLoading={volumes.isLoading}
             volumesError={volumes.error}
             onRefresh={refresh}
+          />
+        );
+      case 'control':
+        return (
+          <ControlPlaneTab
+            status={controlStatus.data}
+            metrics={controlMetrics.data}
+            components={controlComponents.data?.components ?? []}
+            isPaused={controlStatus.data?.paused ?? false}
+            onPause={handlePause}
+            onResume={handleResume}
+            isPausing={pauseControl.isPending}
+            isResuming={resumeControl.isPending}
+          />
+        );
+      case 'businesses':
+        return (
+          <BusinessesTab
+            businessId={config.nexus_id}
+            business={getBusiness.data}
+            suspendBusiness={suspendBusiness.mutate}
+            archiveBusiness={archiveBusiness.mutate}
+            activateBusiness={activateBusiness.mutate}
+            isSuspending={suspendBusiness.isPending}
+            isArchiving={archiveBusiness.isPending}
+            isActivating={activateBusiness.isPending}
+          />
+        );
+      case 'identities':
+        return (
+          <IdentitiesTab
+            identity={getIdentity.data}
+            suspendIdentity={suspendIdentity.mutate}
+            revokeIdentity={revokeIdentity.mutate}
+            activateIdentity={activateIdentity.mutate}
+            isSuspending={suspendIdentity.isPending}
+            isRevoking={revokeIdentity.isPending}
+            isActivating={activateIdentity.isPending}
+          />
+        );
+      case 'divisions':
+        return (
+          <DivisionsTab
+            divisions={divisions.data?.divisions ?? []}
+            createDivision={createDivision.mutate}
+            suspendDivision={suspendDivision.mutate}
+            archiveDivision={archiveDivision.mutate}
+            activateDivision={activateDivision.mutate}
+            isCreating={createDivision.isPending}
+            isSuspending={suspendDivision.isPending}
+            isArchiving={archiveDivision.isPending}
+            isActivating={activateDivision.isPending}
           />
         );
       case 'overview':

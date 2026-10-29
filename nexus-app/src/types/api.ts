@@ -294,9 +294,30 @@ export type TraceEventType =
 // Alias for backward compatibility
 export type ExecutionTraceEntry = TraceEntry;
 
+// Businesses
+export interface Business {
+  entity_id: string;
+  name: string;
+  owner_identity_id: string;
+  settings?: unknown;
+  metadata?: Record<string, string>;
+  status?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CreateBusinessRequest {
+  name: string;
+  owner_identity_id: string;
+  entity_id?: string;
+  settings?: unknown;
+  metadata?: Record<string, string>;
+}
+
 // Agents
 export interface Agent {
-  entity_id: string;
+  entity_id?: string;
+  id?: string;
   name: string;
   business_id: string;
   capabilities: string[];
@@ -1155,4 +1176,208 @@ export interface ResearchCitationAudit {
 export interface APIError extends Error {
   status: number;
   envelope?: Envelope;
+}
+
+// ============================================================================
+// Divisions
+// ============================================================================
+
+export interface Division {
+  entity_id: string;
+  name: string;
+  business_id: string;
+  description?: string;
+  status: 'active' | 'suspended' | 'archived';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateDivisionRequest {
+  name: string;
+  business_id: string;
+  description?: string;
+  entity_id?: string;
+}
+
+export interface DivisionMember {
+  entity_id: string;
+  division_id: string;
+  role: string;
+  created_at: string;
+}
+
+// ============================================================================
+// Executions (agent execution layer v1)
+// ============================================================================
+
+export type ExecutionState =
+  | 'accepted'
+  | 'running'
+  | 'pending_approval'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'unknown';
+
+export interface Execution {
+  execution_id: string;
+  business_id: string;
+  division_id?: string;
+  state: ExecutionState;
+  error_class?: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+  approvals?: DurableApprovalView[];
+}
+
+export interface SubmitExecutionRequest {
+  business_id: string;
+  actor_id: string;
+  objective: {
+    description: string;
+  };
+  division_id?: string;
+  context?: Record<string, string>;
+}
+
+export interface SubmitExecutionResponse {
+  execution_id: string;
+}
+
+// ============================================================================
+// Escalations
+// ============================================================================
+
+export type EscalationStatus = 'open' | 'acknowledged' | 'resolved';
+
+export interface Escalation {
+  entity_id: string;
+  title: string;
+  description?: string;
+  status: EscalationStatus;
+  requested_by: string;
+  requested_at: string;
+  acknowledged_at?: string;
+  acknowledged_by?: string;
+  resolved_at?: string;
+  resolved_by?: string;
+  resolution_reason?: string;
+  correlation_id?: string;
+}
+
+export interface AckEscalationRequest {
+  reason: string;
+}
+
+export interface ResolveEscalationRequest {
+  reason: string;
+}
+
+// ============================================================================
+// Identities (detail)
+// ============================================================================
+
+export interface Identity {
+  entity_id: string;
+  identity_type: 'human' | 'agent';
+  display_name: string;
+  business_id: string;
+  status: 'active' | 'suspended' | 'revoked';
+  credential_method?: 'password' | 'none';
+  created_at: string;
+  updated_at: string;
+}
+
+// ============================================================================
+// Business Members
+// ============================================================================
+
+export interface BusinessMember {
+  entity_id: string;
+  business_id: string;
+  identity_id: string;
+  role: string;
+  created_at: string;
+}
+
+export interface CreateBusinessMemberRequest {
+  identity_id: string;
+  role: string;
+}
+
+// ============================================================================
+// Agent lifecycle
+// ============================================================================
+
+export interface UpdateAgentRequest {
+  name?: string;
+  capabilities?: string[];
+  allowed_tools?: string[];
+}
+
+export interface AgentTransitionRequest {
+  reason: string;
+}
+
+// ============================================================================
+// Control surface
+// ============================================================================
+
+export interface ControlStatus {
+  paused: boolean;
+  pause_reason?: string;
+  paused_at?: string;
+  paused_by?: string;
+}
+
+export interface ControlComponent {
+  id: string;
+  name: string;
+  status: 'healthy' | 'degraded' | 'unhealthy';
+  details?: string;
+  last_check?: string;
+}
+
+export interface ControlMetrics {
+  uptime_seconds: number;
+  requests_total: number;
+  requests_active: number;
+  requests_failed: number;
+  sse_connections: number;
+  executions_total: number;
+  executions_active: number;
+}
+
+// ============================================================================
+// Requests (generic request/result)
+// ============================================================================
+
+export interface SubmitRequestRequest {
+  business_id: string;
+  actor_id: string;
+  objective: {
+    description: string;
+  };
+  context?: Record<string, string>;
+}
+
+export interface SubmitRequestResponse {
+  request_id: string;
+}
+
+export interface RequestResult {
+  request_id: string;
+  business_id: string;
+  status: string;
+  output?: string;
+  error?: {
+    code: string;
+    category: string;
+    message: string;
+    details?: Record<string, unknown>;
+  };
+  created_at: string;
+  completed_at?: string;
 }

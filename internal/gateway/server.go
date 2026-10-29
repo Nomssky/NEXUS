@@ -727,7 +727,7 @@ func (s *Server) handleSubmitRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Correlation-ID", corrID)
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{
-		"request_id":     corrID,
+		"execution_id":   corrID,
 		"correlation_id": corrID,
 		"status":         "accepted",
 		"actor_id":       actorID,
@@ -1114,6 +1114,22 @@ func (s *Server) decideEscalation(w http.ResponseWriter, r *http.Request, resolv
 // When identity enforcement is on, the subscriber must be an active member of
 // business_id before the stream opens (A6); foreign scopes are denied at subscribe.
 func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
+	// Handle CORS preflight for SSE endpoint — must be checked BEFORE
+	// authorization, since preflight requests carry no auth headers.
+	if r.Method == http.MethodOptions {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "X-Actor-ID, X-Actor-Credential, Accept")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Authorization scope is mandatory — no unscoped event stream.
 	businessFilter := r.URL.Query().Get("business_id")
 	if businessFilter == "" {
@@ -1143,6 +1159,16 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	// Add CORS headers for SSE endpoint (needed when frontend and gateway
+	// are on different ports).
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+	w.Header().Set("Access-Control-Allow-Credentials", "true")
 
 	ctx := r.Context()
 	// streamCtx ends when the request context ends (normal client disconnect)

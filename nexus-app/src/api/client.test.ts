@@ -38,7 +38,7 @@ describe('API client base URL', () => {
       objective: { description: 'test' },
     });
     expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/api/v1/intelligence/execute'),
+      expect.stringContaining('http://localhost:8081/api/v1/intelligence/execute'),
       expect.objectContaining({
         method: 'POST',
         headers: expect.objectContaining({
@@ -99,6 +99,37 @@ describe('API client base URL', () => {
       status: 401,
       name: 'APIError',
     });
+  });
+
+  it('calls the businesses endpoint with auth headers', async () => {
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ businesses: [] }), { status: 200 })
+    );
+    await apiClient.listBusinesses();
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/businesses$/),
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          'X-Actor-ID': 'nx:human:test',
+          'X-Actor-Credential': 'test-credential',
+        }),
+      })
+    );
+  });
+
+  it('setBaseURL changes the base used for subsequent API calls', async () => {
+    apiClient.setBaseURL('http://127.0.0.1:8081/api/v1');
+    mockFetch.mockResolvedValueOnce(
+      new Response(JSON.stringify({ businesses: [] }), { status: 200 })
+    );
+    await apiClient.listBusinesses();
+    expect(mockFetch).toHaveBeenCalledWith(
+      'http://127.0.0.1:8081/api/v1/businesses',
+      expect.objectContaining({
+        method: 'GET',
+      })
+    );
   });
 });
 
@@ -451,5 +482,93 @@ describe('configuration client', () => {
     expect((requestOptions(0).headers as Record<string, string>)['X-API-Key']).toBe(
       'test-control-key'
     );
+  });
+
+  describe('401 authentication failure handling', () => {
+    let onUnauthenticatedCalls: number;
+
+    beforeEach(() => {
+      onUnauthenticatedCalls = 0;
+    });
+
+    it('clears auth headers on 401', async () => {
+      const client = createAPIClient('http://localhost:8081/api/v1');
+      client.setAuth('nx:human:test', 'test-credential');
+      expect(client.baseUrl()).toBe('http://localhost:8081/api/v1');
+
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: 'UNAUTHORIZED', category: 'AUTH', message: 'invalid credentials' } }),
+          { status: 401, headers: { 'content-type': 'application/json' } }
+        )
+      );
+
+      const error = await client.listBusinesses().catch((err) => err);
+      expect(error).toBeInstanceOf(APIError);
+      expect(error.status).toBe(401);
+
+      // Auth headers should be cleared after 401
+      // Verify by making another call - it should NOT include auth headers
+      mockFetch.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+      await client.listBusinesses();
+      const headers = requestOptions(1).headers as Record<string, string>;
+      expect(headers['X-Actor-ID']).toBeUndefined();
+      expect(headers['X-Actor-Credential']).toBeUndefined();
+    });
+
+    it('calls onUnauthenticated callback on 401', async () => {
+      const client = createAPIClient('http://localhost:8081/api/v1');
+      client.setAuth('nx:human:test', 'test-credential');
+
+      let callbackCalled = false;
+      client.setOnUnauthenticated(() => {
+        callbackCalled = true;
+      });
+
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: 'UNAUTHORIZED', category: 'AUTH', message: 'invalid credentials' } }),
+          { status: 401, headers: { 'content-type': 'application/json' } }
+        )
+      );
+
+      await client.listBusinesses().catch(() => undefined);
+      expect(callbackCalled).toBe(true);
+    });
+
+    it('does not call onUnauthenticated for non-401 errors', async () => {
+      const client = createAPIClient('http://localhost:8081/api/v1');
+      client.setAuth('nx:human:test', 'test-credential');
+
+      let callbackCalled = false;
+      client.setOnUnauthenticated(() => {
+        callbackCalled = true;
+      });
+
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ error: { code: 'FORBIDDEN', category: 'AUTHORIZATION', message: 'access denied' } }),
+          { status: 403, headers: { 'content-type': 'application/json' } }
+        )
+      );
+
+      await client.listBusinesses().catch(() => undefined);
+      expect(callbackCalled).toBe(false);
+    });
+
+    it('does not call onUnauthenticated for network failures', async () => {
+      const client = createAPIClient('http://localhost:8081/api/v1');
+      client.setAuth('nx:human:test', 'test-credential');
+
+      let callbackCalled = false;
+      client.setOnUnauthenticated(() => {
+        callbackCalled = true;
+      });
+
+      mockFetch.mockRejectedValueOnce(new TypeError('failed to fetch'));
+
+      await client.listBusinesses().catch(() => undefined);
+      expect(callbackCalled).toBe(false);
+    });
   });
 });

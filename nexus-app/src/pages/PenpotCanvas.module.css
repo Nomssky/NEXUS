@@ -1,0 +1,33 @@
+/**
+ * PenpotCanvas.module.css
+ * Responsive scaling wrapper for Penport page designs.
+ *
+ * Penpot designs are authored on a fixed 1440×1024 canvas. This module
+ * scales that canvas down proportionally to fit the viewport, preserving
+ * the 1:1 design on large screens and shrinking it gracefully on smaller
+ * screens (tablets, laptops, small desktops).
+ */
+
+.penpotWrapper {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #0b0e14;
+}
+
+/* The Penpot canvas is authored at 1440×1024. Scale it to fit the viewport. */
+.penpotCanvas {
+  position: relative;
+  width: 1440px;
+  height: 1024px;
+  transform-origin: top left;
+  transform: scale(1);
+  will-change: transform;
+}
+
+/* On very small screens, cap the scale so the canvas never gets too tiny.
+   Below this threshold the canvas will overflow and be scrollable. */
+.penpotCanvas[data-scale="auto"] {
+  transform: scale(var(--penpot-scale, 1));
+}

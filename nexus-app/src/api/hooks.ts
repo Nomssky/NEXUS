@@ -28,6 +28,26 @@ import type {
   DurableExecutionList,
   ResearchCitationAudit,
   ResearchComparison,
+  Division,
+  CreateDivisionRequest,
+  Execution,
+  SubmitExecutionRequest,
+  SubmitExecutionResponse,
+  Escalation,
+  AckEscalationRequest,
+  ResolveEscalationRequest,
+  Identity,
+  AgentTransitionRequest,
+  BusinessMember,
+  CreateBusinessMemberRequest,
+  Business,
+  UpdateAgentRequest,
+  SubmitRequestRequest,
+  SubmitRequestResponse,
+  RequestResult,
+  ControlStatus,
+  ControlComponent,
+  ControlMetrics,
 } from '../types/api';
 import type {
   ConfigurationSnapshot,
@@ -62,6 +82,36 @@ export const queryKeys = {
   // operator credential must never be copied into cache keys or devtools.
   configuration: ['configuration'] as const,
   storageVolumes: ['storageVolumes'] as const,
+
+  // Readiness
+  ready: ['ready'] as const,
+
+  // Requests
+  requests: ['requests'] as const,
+  request: (id: string) => ['requests', id] as const,
+
+  // Escalations
+  escalations: (businessId: string) => ['escalations', businessId] as const,
+
+  // Identities
+  identity: (id: string, businessId: string) => ['identity', id, businessId] as const,
+
+  // Businesses
+  business: (id: string) => ['businesses', id] as const,
+  businessMembers: (businessId: string) => ['businessMembers', businessId] as const,
+
+  // Divisions
+  divisions: (businessId: string) => ['divisions', businessId] as const,
+  division: (id: string) => ['divisions', id] as const,
+
+  // Executions
+  executions: (businessId: string) => ['executions', businessId] as const,
+  execution: (id: string, businessId: string) => ['executions', businessId, id] as const,
+
+  // Control surface
+  controlStatus: ['controlStatus'] as const,
+  controlMetrics: ['controlMetrics'] as const,
+  controlComponents: ['controlComponents'] as const,
 };
 
 // Health & Status
@@ -506,4 +556,487 @@ export function useEventStream(
     retryDelayMs,
     close: () => streamRef.current?.close(),
   };
+}
+
+// ============================================================================
+// Readiness
+// ============================================================================
+
+export function useReady(options?: QueryOptions<StatusResponse>) {
+  return useQuery({
+    queryKey: queryKeys.ready,
+    queryFn: () => apiClient.getReady(),
+    refetchInterval: 30000,
+    ...options,
+  });
+}
+
+// ============================================================================
+// Requests
+// ============================================================================
+
+export function useSubmitRequest(
+  options?: UseMutationOptions<SubmitRequestResponse, Error, SubmitRequestRequest>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request) => apiClient.submitRequest(request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.requests });
+    },
+    ...options,
+  });
+}
+
+export function useGetRequest(
+  id: string,
+  businessId: string,
+  options?: QueryOptions<RequestResult>
+) {
+  return useQuery({
+    queryKey: queryKeys.request(id),
+    queryFn: () => apiClient.getRequest(id, businessId),
+    enabled: !!id && !!businessId,
+    ...options,
+  });
+}
+
+export function useCancelRequest(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId }) => apiClient.cancelRequest(id, businessId),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.request(variables.id) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Escalations
+// ============================================================================
+
+export function useEscalations(
+  businessId: string,
+  options?: QueryOptions<{ escalations: Escalation[] }>
+) {
+  return useQuery({
+    queryKey: queryKeys.escalations(businessId),
+    queryFn: () => apiClient.listEscalations(businessId),
+    enabled: !!businessId,
+    refetchInterval: 10000,
+    ...options,
+  });
+}
+
+export function useAckEscalation(
+  options?: UseMutationOptions<{ escalation_id: string; status: string }, Error, { id: string; businessId: string; request: AckEscalationRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.ackEscalation(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.escalations(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useResolveEscalation(
+  options?: UseMutationOptions<{ escalation_id: string; status: string }, Error, { id: string; businessId: string; request: ResolveEscalationRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.resolveEscalation(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.escalations(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Identities
+// ============================================================================
+
+export function useIdentity(
+  id: string,
+  businessId: string,
+  options?: QueryOptions<Identity>
+) {
+  return useQuery({
+    queryKey: queryKeys.identity(id, businessId),
+    queryFn: () => apiClient.getIdentity(id, businessId),
+    enabled: !!id && !!businessId,
+    ...options,
+  });
+}
+
+export function useSuspendIdentity(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.suspendIdentity(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.identity(variables.id, variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useRevokeIdentity(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.revokeIdentity(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.identity(variables.id, variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useActivateIdentity(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.activateIdentity(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.identity(variables.id, variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Businesses
+// ============================================================================
+
+export function useCreateBusinessMember(
+  options?: UseMutationOptions<BusinessMember, Error, { businessId: string; request: CreateBusinessMemberRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ businessId, request }) => apiClient.createBusinessMember(businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.business(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useGetBusiness(
+  id: string,
+  options?: QueryOptions<Business>
+) {
+  return useQuery({
+    queryKey: queryKeys.business(id),
+    queryFn: () => apiClient.getBusiness(id),
+    enabled: !!id,
+    ...options,
+  });
+}
+
+export function useSuspendBusiness(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.suspendBusiness(id, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.business(variables.id) });
+    },
+    ...options,
+  });
+}
+
+export function useArchiveBusiness(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.archiveBusiness(id, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.business(variables.id) });
+    },
+    ...options,
+  });
+}
+
+export function useActivateBusiness(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.activateBusiness(id, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.business(variables.id) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Divisions
+// ============================================================================
+
+export function useDivisions(
+  businessId: string,
+  options?: QueryOptions<{ divisions: Division[] }>
+) {
+  return useQuery({
+    queryKey: queryKeys.divisions(businessId),
+    queryFn: () => apiClient.listDivisions(businessId),
+    enabled: !!businessId,
+    ...options,
+  });
+}
+
+export function useCreateDivision(
+  options?: UseMutationOptions<Division, Error, CreateDivisionRequest>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request) => apiClient.createDivision(request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.divisions(variables.business_id) });
+    },
+    ...options,
+  });
+}
+
+export function useGetDivision(
+  id: string,
+  options?: QueryOptions<Division>
+) {
+  return useQuery({
+    queryKey: queryKeys.division(id),
+    queryFn: () => apiClient.getDivision(id),
+    enabled: !!id,
+    ...options,
+  });
+}
+
+export function useSuspendDivision(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.suspendDivision(id, request),
+    ...options,
+  });
+}
+
+export function useArchiveDivision(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.archiveDivision(id, request),
+    ...options,
+  });
+}
+
+export function useActivateDivision(
+  options?: UseMutationOptions<void, Error, { id: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, request }) => apiClient.activateDivision(id, request),
+    ...options,
+  });
+}
+
+// ============================================================================
+// Agents (lifecycle)
+// ============================================================================
+
+export function useUpdateAgent(
+  options?: UseMutationOptions<Agent, Error, { id: string; businessId: string; request: UpdateAgentRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.updateAgent(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agent(variables.id, variables.businessId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useSuspendAgent(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.suspendAgent(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agent(variables.id, variables.businessId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useArchiveAgent(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.archiveAgent(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agent(variables.id, variables.businessId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+export function useActivateAgent(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string; request: AgentTransitionRequest }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId, request }) => apiClient.activateAgent(id, businessId, request),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agent(variables.id, variables.businessId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents(variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Executions (agent execution layer v1)
+// ============================================================================
+
+export function useSubmitExecution(
+  options?: UseMutationOptions<SubmitExecutionResponse, Error, SubmitExecutionRequest>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request) => apiClient.submitExecution(request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['executions'] });
+    },
+    ...options,
+  });
+}
+
+export function useGetExecution(
+  id: string,
+  businessId: string,
+  options?: QueryOptions<Execution>
+) {
+  return useQuery({
+    queryKey: queryKeys.execution(id, businessId),
+    queryFn: () => apiClient.getExecution(id, businessId),
+    enabled: !!id && !!businessId,
+    ...options,
+  });
+}
+
+export function useCancelExecution(
+  options?: UseMutationOptions<void, Error, { id: string; businessId: string }>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ id, businessId }) => apiClient.cancelExecution(id, businessId),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.execution(variables.id, variables.businessId) });
+    },
+    ...options,
+  });
+}
+
+// ============================================================================
+// Control surface
+// ============================================================================
+
+export function useGetControlStatus(
+  options?: QueryOptions<ControlStatus>
+) {
+  return useQuery({
+    queryKey: queryKeys.controlStatus,
+    queryFn: () => apiClient.getControlStatus(),
+    refetchInterval: 10000,
+    ...options,
+  });
+}
+
+export function usePauseControl(
+  options?: UseMutationOptions<void, Error, AgentTransitionRequest>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request) => apiClient.pauseControl(request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.controlStatus });
+    },
+    ...options,
+  });
+}
+
+export function useResumeControl(
+  options?: UseMutationOptions<void, Error, AgentTransitionRequest>
+) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (request) => apiClient.resumeControl(request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.controlStatus });
+    },
+    ...options,
+  });
+}
+
+export function useGetControlMetrics(
+  options?: QueryOptions<ControlMetrics>
+) {
+  return useQuery({
+    queryKey: queryKeys.controlMetrics,
+    queryFn: () => apiClient.getControlMetrics(),
+    refetchInterval: 30000,
+    ...options,
+  });
+}
+
+export function useGetControlComponents(
+  options?: QueryOptions<{ components: ControlComponent[] }>
+) {
+  return useQuery({
+    queryKey: queryKeys.controlComponents,
+    queryFn: () => apiClient.getControlComponents(),
+    refetchInterval: 30000,
+    ...options,
+  });
 }

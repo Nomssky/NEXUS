@@ -104,18 +104,18 @@ func TestComponentsSurviveStartupDeadline(t *testing.T) {
 		t.Fatalf("submit: %v", err)
 	}
 	var submitted struct {
-		RequestID string `json:"request_id"`
+		ExecutionID string `json:"execution_id"`
 	}
 	_ = json.NewDecoder(sresp.Body).Decode(&submitted)
 	sresp.Body.Close()
-	if sresp.StatusCode != http.StatusAccepted || submitted.RequestID == "" {
+	if sresp.StatusCode != http.StatusAccepted || submitted.ExecutionID == "" {
 		t.Fatalf("submit: status=%d body=%+v", sresp.StatusCode, submitted)
 	}
 
 	var status string
 	deadline = time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		gresp, err := http.Get(fmt.Sprintf("http://%s/api/v1/requests/%s?business_id=biz-1", gwAddr, submitted.RequestID))
+		gresp, err := http.Get(fmt.Sprintf("http://%s/api/v1/requests/%s?business_id=biz-1", gwAddr, submitted.ExecutionID))
 		if err != nil {
 			t.Fatalf("GET result: %v", err)
 		}

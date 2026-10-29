@@ -11,7 +11,8 @@ import { ExecutionList } from '../components/CommandCenter/ExecutionList';
 import { ActivityPanel } from '../components/CommandCenter/ActivityPanel';
 import { ApprovalsPanel } from '../components/Approvals/ApprovalsPanel';
 import { ExecutionDetail } from '../components/ExecutionDetail/ExecutionDetail';
-import { useAgents, useTools, useIntelligence, useEventStream } from '../api/hooks';
+import { useAgents, useTools, useIntelligence, useEventStream, useDivisions } from '../api/hooks';
+import type { Agent } from '../types/api';
 import styles from './CommandCenter.module.css';
 
 interface CommandCenterProps {
@@ -26,7 +27,11 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
 
   const { data: agentsData } = useAgents(businessId);
   const { data: toolsData } = useTools();
+  const { data: divisionsData } = useDivisions(businessId);
   const queryClient = useQueryClient();
+
+  const agents = agentsData?.agents ?? [];
+  const divisions = divisionsData?.divisions ?? [];
 
   // SSE: refetch executions, approvals, and authoritative activity when real-time
   // events arrive. The connection state is surfaced so the UI can tell the user
@@ -142,6 +147,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
             <CommandCenterZone
               businessId={businessId}
               actorId={actorId}
+              agents={agents}
               onSubmit={handleSubmit}
               recentExecutions={recentExecutions}
               onExecutionSelect={handleExecutionSelect}
@@ -160,12 +166,14 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({ businessId, actorI
 const CommandCenterZone: React.FC<{
   businessId: string;
   actorId: string;
+  agents: Agent[];
   onSubmit: (executionId: string) => void;
   recentExecutions: string[];
   onExecutionSelect: (executionId: string) => void;
 }> = ({
   businessId,
   actorId,
+  agents,
   onSubmit,
   recentExecutions,
   onExecutionSelect,
@@ -179,6 +187,7 @@ const CommandCenterZone: React.FC<{
         <CommandInput
           businessId={businessId}
           actorId={actorId}
+          agents={agents}
           onSubmit={onSubmit}
         />
       </section>

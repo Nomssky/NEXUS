@@ -10,7 +10,29 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { APIError } from '../api/client';
-import { useConfiguration, useStorageVolumes, useValidateStoragePath } from '../api/hooks';
+import {
+  useConfiguration,
+  useStorageVolumes,
+  useValidateStoragePath,
+  useGetControlStatus,
+  useGetControlMetrics,
+  useGetControlComponents,
+  usePauseControl,
+  useResumeControl,
+  useDivisions,
+  useCreateDivision,
+  useSuspendDivision,
+  useArchiveDivision,
+  useActivateDivision,
+  useIdentity,
+  useSuspendIdentity,
+  useRevokeIdentity,
+  useActivateIdentity,
+  useGetBusiness,
+  useSuspendBusiness,
+  useArchiveBusiness,
+  useActivateBusiness,
+} from '../api/hooks';
 import type { ConfigurationSnapshot } from '../types/config';
 import { Settings } from './Settings';
 
@@ -18,11 +40,47 @@ vi.mock('../api/hooks', () => ({
   useConfiguration: vi.fn(),
   useStorageVolumes: vi.fn(),
   useValidateStoragePath: vi.fn(),
+  useGetControlStatus: vi.fn(),
+  useGetControlMetrics: vi.fn(),
+  useGetControlComponents: vi.fn(),
+  usePauseControl: vi.fn(),
+  useResumeControl: vi.fn(),
+  useDivisions: vi.fn(),
+  useCreateDivision: vi.fn(),
+  useSuspendDivision: vi.fn(),
+  useArchiveDivision: vi.fn(),
+  useActivateDivision: vi.fn(),
+  useIdentity: vi.fn(),
+  useSuspendIdentity: vi.fn(),
+  useRevokeIdentity: vi.fn(),
+  useActivateIdentity: vi.fn(),
+  useGetBusiness: vi.fn(),
+  useSuspendBusiness: vi.fn(),
+  useArchiveBusiness: vi.fn(),
+  useActivateBusiness: vi.fn(),
 }));
 
 const configurationMock = vi.mocked(useConfiguration);
 const volumesMock = vi.mocked(useStorageVolumes);
 const validateMock = vi.mocked(useValidateStoragePath);
+const controlStatusMock = vi.mocked(useGetControlStatus);
+const controlMetricsMock = vi.mocked(useGetControlMetrics);
+const controlComponentsMock = vi.mocked(useGetControlComponents);
+const pauseControlMock = vi.mocked(usePauseControl);
+const resumeControlMock = vi.mocked(useResumeControl);
+const divisionsMock = vi.mocked(useDivisions);
+const createDivisionMock = vi.mocked(useCreateDivision);
+const suspendDivisionMock = vi.mocked(useSuspendDivision);
+const archiveDivisionMock = vi.mocked(useArchiveDivision);
+const activateDivisionMock = vi.mocked(useActivateDivision);
+const identityMock = vi.mocked(useIdentity);
+const suspendIdentityMock = vi.mocked(useSuspendIdentity);
+const revokeIdentityMock = vi.mocked(useRevokeIdentity);
+const activateIdentityMock = vi.mocked(useActivateIdentity);
+const getBusinessMock = vi.mocked(useGetBusiness);
+const suspendBusinessMock = vi.mocked(useSuspendBusiness);
+const archiveBusinessMock = vi.mocked(useArchiveBusiness);
+const activateBusinessMock = vi.mocked(useActivateBusiness);
 
 function snapshot(overrides: Partial<ConfigurationSnapshot> = {}): ConfigurationSnapshot {
   return {
@@ -105,6 +163,76 @@ function stubHooks(options: {
     error: null,
     data: undefined,
   } as never);
+
+  controlStatusMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  controlMetricsMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  controlComponentsMock.mockReturnValue({
+    data: { components: [] },
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  pauseControlMock.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+  } as never);
+  resumeControlMock.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+  } as never);
+
+  divisionsMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  createDivisionMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  suspendDivisionMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  archiveDivisionMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  activateDivisionMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+
+  identityMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  suspendIdentityMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  revokeIdentityMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  activateIdentityMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+
+  getBusinessMock.mockReturnValue({
+    data: undefined,
+    isLoading: false,
+    isError: false,
+    error: null,
+    isFetching: false,
+    refetch: vi.fn(),
+  } as never);
+  suspendBusinessMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  archiveBusinessMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
+  activateBusinessMock.mockReturnValue({ mutate: vi.fn(), isPending: false } as never);
 }
 
 beforeEach(() => {
